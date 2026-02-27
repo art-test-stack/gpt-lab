@@ -20,11 +20,15 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--results-path", type=str, default=str(TOKENIZERS_FOLDER / 'scaling_tokenizer_results.pkl'), help="Path to store the results of the tokenizer evaluations.")
 args = parser.parse_args()
 
+import os
+num_procs = min(os.cpu_count(), 32) 
+
 results_path = Path(args.results_path)
 results_path.parent.mkdir(parents=True, exist_ok=True)
 # Initiate test set and evaluation functions
 def enwik8_path():
-    base_dir = DATA_DIR
+    base_dir = DATA_DIR / "corpus/eval_enwik8"
+    base_dir.mkdir(parents=True, exist_ok=True)
     # download and unzip enwik8 to cache directory
     enwik8_url = "https://mattmahoney.net/dc/enwik8.zip"
     enwik8_local_path = base_dir.joinpath("enwik8")
@@ -43,44 +47,108 @@ def enwik8_path():
     else:
         print(f"Using existing enwik8 at {enwik8_local_path}")
     return enwik8_local_path
-
 enwik8_path = enwik8_path()
 
 def enwik8_loader():
     with open(enwik8_path, "r", encoding="utf-8") as f:
-        return f.read(10**7)
+        return f.read(10**7).split("\n") 
+
+eval_configs = {
+    "enwik8": dict(
+        loader_fn=enwik8_loader,
+    ),
+    "HuggingFaceFW/fineweb-edu": dict(
+        split="train" # no test or validation split available
+    ),
+    "HuggingFaceTB/finemath": dict(
+        split="train",
+        name=["finemath-3plus"]
+    ),
+    "ronantakizawa/github-top-code": dict(
+        filter_fn=lambda x: x["file_language"] == "Python" # filter for python files only
+    ),
+    "HuggingFaceFW/fineweb-2": dict(
+        name=["fra_Latn", "jpn_Jpan", "kor_Hang", "arb_Arab"],
+    )
+}
+eval_sets = []
+# prepare config to match the expected input of TokenizerCorpus.from_sources
+for ds_name, ds_config in eval_configs.items():
+    _ds = dict(name=ds_name)
+    _ds["split"] = ds_config.get("split", "test")
+    _ds["loader_fn"] = ds_config.get("loader_fn", None)
+    _ds["generator_source"] = dict(path=ds_name, weight=1.0)
+    if "filter_fn" in ds_config:
+         _ds["generator_source"]["filter_fn"] = ds_config["filter_fn"]
+    if ds_config.get("name", []) == []:
+        _ds["localdir"] = DATA_DIR / f"corpus/eval_{ds_name.replace('/', '_')}"
+        _ds["metricname"] = f"{ds_name.split('/')[-1]}"
+        eval_sets.append(_ds)
+    else:
+        for name in ds_config["name"]:
+            _ds = _ds.copy()
+            _ds["generator_source"] = _ds["generator_source"].copy() # have to copy to avoid mutating the original for the next iteration
+            _ds["subset"] = name
+            _ds["localdir"] = DATA_DIR / f"corpus/eval_{ds_name.replace('/', '_')}:{name}"
+            _ds["generator_source"]["name"] = name
+            _ds["metricname"] = f"{ds_name.split('/')[-1]}:{name}"
+            eval_sets.append(_ds)
+
+for eval_set in eval_sets:
+    print(f"Preparing evaluation set {eval_set['metricname']}...")
+    eval_set["corpus"] = TokenizerCorpus.from_sources(
+        corpus_dir=eval_set["localdir"],
+        sources=[eval_set["generator_source"]],
+        max_chars=500_000, # just for evaluation, we can use a subset of the data
+        chars_per_doc=10_000,
+        split=eval_set["split"],
+        compressed=True,
+        shard_size_chars=50_000,
+        loader_fn=eval_set.get("loader_fn", None), # will overwrite for enwik8
+    )
+
+print("Evaluation sets prepared:", eval_sets)
+# testing_sets = ["HuggingFaceFW/fineweb-edu", "HuggingFaceTB/finemath", "codeparrot/codeparrot-clean", ]
+# "HuggingFaceFW/fineweb-2" "subset=fra_Latn,jpn_Jpan,kor_Hang,arb_Arab"
 
 def eval_tokenizer(tokenizer):
-    enwiki = enwik8_loader()
-    metrics = dict()
-    counter = Counter()
-    len_tokens = 0
-    len_chars = 0
-    for i, text in enumerate(enwiki.split("\n")):
-        if not text.strip():
-            continue
-        tokens = tokenizer.encode(text)
-        counter.update(tokens)
-        len_tokens += len(tokens)
-        len_chars += len(text)
-        decoded = tokenizer.decode(tokens)
-        acc = decoded == text
-        compression_ratio = len(tokens) / len(text) if len(text) > 0 else 0
-        char_by_token = [len(tokenizer.decode([tok])) for tok in tokens]
-        char_by_token_avg = sum(char_by_token) / len(char_by_token) if len(char_by_token) > 0 else 0
-        for key, value in [
-            ("accuracy", acc), 
-            ("compression_ratio", compression_ratio),
-            ("char_by_token_avg", char_by_token_avg)
-            ]:
-            if key not in metrics:
-                metrics[key] = []
-            metrics[key].append(value)
-    res = {key: sum(values) / len(values) for key, values in metrics.items()}
-    res["len_tokens"] = len_tokens
-    res["len_chars"] = len_chars
-    res["token_counter"] = counter
-    return res
+    results = {}
+    for eval_set in eval_sets:
+        metrics = dict()
+        counter = Counter()
+        len_tokens = 0
+        len_chars = 0
+        corpus = eval_set["corpus"].iterator()
+        for text in corpus:
+            if not text.strip():
+                continue
+            tokens = tokenizer.encode(
+                text,  
+                disallowed_special=()
+            )
+            counter.update(tokens)
+            len_tokens += len(tokens)
+            len_chars += len(text)
+            decoded = tokenizer.decode(tokens)
+            acc = decoded == text
+            compression_ratio = len(tokens) / len(text) if len(text) > 0 else 0
+            # maybe optimized
+            char_by_token = [len(tokenizer.decode([tok])) for tok in tokens]
+            char_by_token_avg = sum(char_by_token) / len(char_by_token) if len(char_by_token) > 0 else 0
+            for key, value in [
+                ("accuracy", acc), 
+                ("compression_ratio", compression_ratio),
+                ("nb_char_by_token_avg", char_by_token_avg)
+                ]:
+                if key not in metrics:
+                    metrics[key] = []
+                metrics[key].append(value)
+        res = {key: sum(values) / len(values) for key, values in metrics.items()}
+        res["nb_tokens"] = len_tokens
+        res["nb_chars"] = len_chars
+        res["token_counter"] = counter
+        results[eval_set["metricname"]] = res
+    return results
 
 def store_results(result, path=results_path):
     try:
@@ -93,14 +161,13 @@ def store_results(result, path=results_path):
         pickle.dump(results, f)
     results = []
 
-
 # Baselines: gpt2, cl100k_base, o200k_base
 from tiktoken import get_encoding
 
 baselines = ["gpt2", "cl100k_base", "o200k_base"]
 for baseline in baselines:
     enc = get_encoding(baseline)
-    metrics = eval_tokenizer(enc)
+    evaluation = eval_tokenizer(enc)
     result = dict(
         vocab_size=enc.n_vocab,
         pattern=baseline,
@@ -108,42 +175,37 @@ for baseline in baselines:
         config=None,
         training_time=None,
         corpus_size_mb=None,
-        metrics=metrics,
+        evaluation=evaluation,
         baseline=baseline,
     )
     store_results(result)
 
 # Corpus size varying with different vocab_sizes and split patterns
-patterns = { "gpt2": PAT_STR_GPT2, "gpt4": PAT_STR_GPT4, "punct": PAT_STR_punct, "cl100k_base": PAT_STR_cl100k_base, "o200k_base": PAT_STR_o200k_base }
+patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_str-punct": PAT_STR_punct, "pat_str-cl100k_base": PAT_STR_cl100k_base, "pat_str-o200k_base": PAT_STR_o200k_base }
 # patterns = { "PAT_STR_o200k_base": PAT_STR_o200k_base }
 # TODO: optimize by running the biggest vocab size and slice it on top-k merges for smaller vocabs
-vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 50_000] 
+# vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
+vocab_sizes = [10_000, 20_000,] 
 # vocab_sizes = list(reversed(vocab_sizes))
-_max_char_runs = 10
+_max_char_runs = 5
 max_chars = lambda vocab_size: [int(vocab_size * i * 500) for i in range(1, _max_char_runs+1)] # ~3.5 characters per token on average, adjust as needed based on your corpus
 char_per_doc = lambda max_char: max_char // 1000 # Default to 1000 documents if not specified, adjust as needed
 # Two options: same name for all tokenizers -> overwrite / different names -> many tokenizers on disk, consider cleaning up after training or implementing a caching mechanism to avoid retraining the same tokenizer multiple times.
 # name = lambda vocab_size, max_char, p_str_name: f"ic1-tok-{int(vocab_size//1000)}k_maxchar-{max_char//1e6:.1f}M_pattern-{p_str_name}"
 name = "ic1-scaling-tok"
-import os
-num_procs = min(os.cpu_count(), 32) 
 print(f"Using {num_procs} processes for tokenizer training.")
-corpus_path = Path(".data/scaling_corpus.txt")
+corpus_path = DATA_DIR / "corpus/scaling_tokenizer_corpus"
 results = []
 nb_of_runs = len(vocab_sizes) * len(patterns) * _max_char_runs
 corpus_charmax = max(max_chars(max(vocab_sizes)))
-if args.write_corpus:
-    corpus = TokenizerCorpus.write_from_sources(
-        corpus_dir=corpus_path,
-        sources=None,
-        chars_per_doc=corpus_charmax // 10_000,
-        max_chars=corpus_charmax,
-        random_seed=args.seed
-    )
-else:
-    corpus = TokenizerCorpus.from_path(corpus_path)
+corpus = TokenizerCorpus.from_sources(
+    corpus_dir=corpus_path,
+    sources=None,
+    max_chars=corpus_charmax,
+    chars_per_doc=corpus_charmax // 10_000,
+    random_seed=args.seed
+)
 
-# based on preliminary tests, we can estimate that each tokenizer training run takes approximately 20 seconds for 10k vocab size and 5M characters. We can use this as a baseline to estimate the total time for all runs and provide feedback to the user.
 t_total_start = time.time()
 run = 0
 for vocab_size in vocab_sizes:
@@ -181,7 +243,7 @@ for vocab_size in vocab_sizes:
                 result["nb_subwords_trained"] = result.get("nb_subwords_trained", 0) + len(re.findall(config.pat_str, text))
                 result["nb_tokens_trained"] = result.get("nb_tokens_trained", 0) + len(tokenizer.encode(text, num_threads=num_procs))
             
-            result["metrics"] = eval_tokenizer(tokenizer)
+            result["evaluation"] = eval_tokenizer(tokenizer)
             store_results(result)
             result = dict()
             del tokenizer

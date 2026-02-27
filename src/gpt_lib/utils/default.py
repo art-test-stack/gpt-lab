@@ -36,33 +36,33 @@ MAX_TOKEN_LENGTH = 32
 # https://arxiv.org/pdf/2402.01035
 _pat_str_eng_contr = dict(
     gpt2=r"""'s|'t|'re|'ve|'m|'ll|'d""",
-    gpt4=r"""?i:[sdmt]|ll|ve|re""" # r""""?i:'s|'t|'re|'ve|'m|'ll|'d""" 
+    gpt4=r"""'(?i:[sdmt]|ll|ve|re)""" # r""""?i:'s|'t|'re|'ve|'m|'ll|'d""" 
 )
 _pat_str_words = dict(
-    gpt2=r"""?\\p{L}+""",
-    gpt4=r"""[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+"""
+    gpt2=r""" ?\p{L}+""",
+    gpt4=r"""[^\r\n\p{L}\p{N}]?+\p{L}+"""
 ) 
 _pat_str_digits = dict(
-    gpt2=r"""?\\p{N}+""",
-    gpt4=r"""\\p{N}{1,3}"""
+    gpt2=r""" ?\p{N}+""",
+    gpt4=r"""\p{N}{1,3}"""
 )
 _pat_str_non_alpha = dict(
-    gpt2=r""" ?[^\\s\\p{L}\\p{N}]+""",
-    gpt4=r""" ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*"""
+    gpt2=r""" ?[^\s\p{L}\p{N}]+""",
+    gpt4=r""" ?[^\s\p{L}\p{N}]++[\r\n]*"""
 )
-_pat_str_line_breaks = r"""\\s*[\\r\\n]+"""
-_pat_str_trailing_spaces = r"""\\s+(?!\\S)"""
-_pat_str_whitespace = r"""\\s+"""
+_pat_str_line_breaks = r"""\s*[\r\n]+"""
+_pat_str_trailing_spaces = r"""\s+(?!\S)"""
+_pat_str_whitespace = r"""\s+"""
 
 # PAT_STR_GPT2 = r"""('s|'t|'re|'ve|'m|'ll|'d)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-PAT_STR_GPT2 = f"""{_pat_str_eng_contr['gpt2']}|{_pat_str_words['gpt2']}|{_pat_str_digits['gpt2']}|{_pat_str_non_alpha['gpt2']}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}"""
+PAT_STR_GPT2 = rf"""{_pat_str_eng_contr['gpt2']}|{_pat_str_words['gpt2']}|{_pat_str_digits['gpt2']}|{_pat_str_non_alpha['gpt2']}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}"""
 # PAT_STR_GPT4 = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-PAT_STR_GPT4 = f"""{_pat_str_eng_contr['gpt4']}|{_pat_str_words['gpt4']}|{_pat_str_digits['gpt4']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}"""
+PAT_STR_GPT4 = rf"""{_pat_str_eng_contr['gpt4']}|{_pat_str_words['gpt4']}|{_pat_str_digits['gpt4']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}"""
 # PAT_STR_punct = r"""(?\\p{L}+)|\\p{N}{1,3}|?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|\s+(?!\S)|\s+"""
-PAT_STR_punct = f"""{_pat_str_words['gpt2']}|{_pat_str_digits['gpt4']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}""" # pattern for pre-tokenization that focuses on punctuation, used for ablation
+PAT_STR_punct = rf"""{_pat_str_words['gpt2']}|{_pat_str_digits['gpt4']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}""" # pattern for pre-tokenization that focuses on punctuation, used for ablation
 # copied from tiktoken.get_encoding("cl100k_base")._pat_str and tiktoken.get_encoding("o200k_base")._pat_str
-PAT_STR_cl100k_base = r"""'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}++|\\p{N}{1,3}+| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*+|\\s++$|\\s*[\\r\\n]|\\s+(?!\\S)|\\s"""
-PAT_STR_o200k_base = r"""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"""
+PAT_STR_cl100k_base = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s"""
+PAT_STR_o200k_base = r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 # ------------- DRIVE -------------
 
 SAVE_ON_DRIVE = True

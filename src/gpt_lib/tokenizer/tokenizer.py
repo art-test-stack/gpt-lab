@@ -163,7 +163,6 @@ class Tokenizer:
                     fuse_unk=False
                 ))
             tknzr.normalizer = None
-
             pattern = Regex(config.pat_str)
             tknzr.pre_tokenizer = pre_tokenizers.Sequence([
                 pre_tokenizers.Split(pattern=pattern, behavior="isolated", invert=False),
@@ -265,12 +264,13 @@ class Tokenizer:
     def encode(
             self, 
             text: Union[str, List[str]],
-                num_threads: int = 8,
+            # num_threads: int = 8,
+            *args, **kwargs
         ) -> Union[List[int], List[List[int]]]:
         if isinstance(text, str):
             token_ids = self.enc.encode_ordinary(text)
         elif isinstance(text, list):
-            token_ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
+            token_ids = self.enc.encode_ordinary_batch(text)
         else:
             raise TypeError(f"Expected str or list of str, got {type(text)}")
         

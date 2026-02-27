@@ -10,24 +10,30 @@ from gpt_lib.utils.default import DATA_DIR
 
 
 def load_datasets(
-        sources: Iterable[Dict[str, Union[str, float, Callable]]], # { "path": str, "subset": str (optional), "weight": float (optional), "hook": Callable (optional) } 
+         # { "path": str, "name": str (optional), "weight": float (optional), "hook": Callable (optional) } 
+        sources: Iterable[Dict[str, Union[str, float, Callable]]],
         data_dir: Union[str,Path] = DATA_DIR,
         split: str = "train",
         streaming: bool = True,
         *args, **kwargs
     ) -> Dict[str, Iterable]:
-    ds = { 
-        ds["path"]: ds.get("hook", lambda x: x)(
+    ds = dict()
+    for src in sources:
+        ds_name = src["path"]
+        ds_split = src.get("split", split)
+        ds_hook = src.get("hook", lambda x: x)
+        ds[ds_name] = ds_hook(
             load_dataset(
-                ds["path"], 
-                name=ds.get("name", None),
-                split=split,
+                ds_name, 
+                name=src.get("name", None),
+                split=ds_split,
                 streaming=streaming, 
                 cache_dir=data_dir, 
                 *args, **kwargs
             )
-        ) for ds in sources
-    }
+        )
+        if "filter_fn" in src:
+            ds[ds_name] = ds[ds_name].filter(src["filter_fn"])
     return ds
 
 def weighted_sample_generator(streams, prng):
