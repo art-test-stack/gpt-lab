@@ -25,6 +25,17 @@ num_procs = min(os.cpu_count(), 32)
 
 results_path = Path(args.results_path)
 results_path.parent.mkdir(parents=True, exist_ok=True)
+
+if results_path.exists():
+    backup_path = results_path
+    i = 1
+    while backup_path.exists():
+        new_name = backup_path.stem + f"_{i}"
+        backup_path = backup_path.with_stem(new_name)
+        i += 1
+    results_path.rename(backup_path)
+    print(f"Existing results file found. Renamed to {backup_path} to avoid overwriting. New results will be stored in {results_path}.")
+
 # Initiate test set and evaluation functions
 def enwik8_path():
     base_dir = DATA_DIR / "corpus/eval_enwik8"
