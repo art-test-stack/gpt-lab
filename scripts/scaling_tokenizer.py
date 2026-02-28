@@ -107,7 +107,6 @@ for eval_set in eval_sets:
         loader_fn=eval_set.get("loader_fn", None), # will overwrite for enwik8
     )
 
-print("Evaluation sets prepared:", eval_sets)
 # testing_sets = ["HuggingFaceFW/fineweb-edu", "HuggingFaceTB/finemath", "codeparrot/codeparrot-clean", ]
 # "HuggingFaceFW/fineweb-2" "subset=fra_Latn,jpn_Jpan,kor_Hang,arb_Arab"
 
@@ -184,8 +183,8 @@ for baseline in baselines:
 patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_str-punct": PAT_STR_punct, "pat_str-cl100k_base": PAT_STR_cl100k_base, "pat_str-o200k_base": PAT_STR_o200k_base }
 # patterns = { "PAT_STR_o200k_base": PAT_STR_o200k_base }
 # TODO: optimize by running the biggest vocab size and slice it on top-k merges for smaller vocabs
-# vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
-vocab_sizes = [10_000, 20_000,] 
+vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
+
 # vocab_sizes = list(reversed(vocab_sizes))
 _max_char_runs = 5
 max_chars = lambda vocab_size: [int(vocab_size * i * 500) for i in range(1, _max_char_runs+1)] # ~3.5 characters per token on average, adjust as needed based on your corpus
