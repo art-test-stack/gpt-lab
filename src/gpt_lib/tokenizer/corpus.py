@@ -10,6 +10,7 @@ import zstd
 
 from tqdm import tqdm
 
+_fineweb_2_names = ["rus_Cyrl", "cmn_Hani", "deu_Latn", "jpn_Jpan", "spa_Latn", "fra_Latn", "ita_Latn", "por_Latn", "pol_Latn", "nld_Latn", "ind_Latn", "vie_Latn", "fas_Arab", "arb_Arab", "tur_Latn", "tha_Thai", "ukr_Cyrl", "ell_Grek", "kor_Hang", "ces_Latn", "swe_Latn", "hun_Latn", "ron_Latn", "nob_Latn", "dan_Latn", "fin_Latn", "bul_Cyrl", "hin_Deva", "ben_Beng", "slk_Latn", "slk_Latn", "lit_Latn", "bos_Latn", "slv_Latn", "ekk_Latn", "cat_Latn", "tam_Taml", "hrv_Latn", "lvs_Latn", "zsm_Latn", "azj_Latn", "srp_Cyrl", "kat_Geor", "npi_Deva", "mar_Deva", "nno_Latn"]
 class TokenizerCorpus:
     def __init__(
             self, 
@@ -181,17 +182,31 @@ def write_corpus_sample(
         show_progress: bool = True,
         random_seed: int = RANDOM_SEED,
         compressed: bool = False,
+        streaming: bool = True,
+        shuffle: bool = True,
     ):
 
     if not sources:
         sources = [
-            { "path": "HuggingFaceFW/fineweb-edu", "weight": 0.7 },
-            { "path": "HuggingFaceTB/finemath", "weight": 0.15, "name": "finemath-4plus" },
-            { "path": "codeparrot/codeparrot-clean", "weight": 0.15 },
+            # base corpus for tokenizer training; mostly web text with some code and math
+            { "path": "HuggingFaceFW/fineweb-edu", "weight": 0.45 },
+            { "path": "HuggingFaceTB/finemath", "weight": 0.2, "name": "finemath-4plus" },
+            { "path": "codeparrot/codeparrot-clean", "weight": 0.2 },
         ]
+        for name in _fineweb_2_names:
+            sources.append({ "path": "HuggingFaceFW/fineweb-2", "weight": 0.15 / len(_fineweb_2_names), "name": name })
         # ronantakizawa/github-top-code with file_language="Python"
-    ds = load_datasets(sources, split=split)
-    
+    ds = load_datasets(sources, split=split, random_seed=random_seed, streaming=streaming, shuffle=shuffle)
+    sources = [ { **src, "weight": src.get("weight", 1.0), "name": src["path"] + (f":{src.get('name', None)}" if src.get("name") else "") } for src in sources ] # ensure all sources have weight key
+    len_ds = sum(1 for _ in ds.values())
+    len_src = sum(1 for _ in sources)
+    weights_sum = sum(src.get("weight", 1.0) for src in sources)
+    if not len_src == len_ds:
+        for src in sources:
+            src["weight"] = src.get("weight", 1.0) / weights_sum
+    print("Len sources vs loaded datasets:", len_src, len_ds)
+    print("Sum of dataset weights after adjustment:", sum(src.get("weight", 1.0) for src in sources))
+    print(f"Dataset weights scaled by factor of 1 / {weights_sum:.2f} to match number of loaded datasets.")
     r = random.Random(random_seed)
     if max_chars == -1:
         max_chars = sum(len(text) for subset in ds.values() for text in subset["text"])
@@ -216,46 +231,44 @@ def write_corpus_sample(
 
     with tqdm(total=max_chars, disable=not show_progress) as pbar:
         while total_chars < max_chars:
-            while total_chars < max_chars:
-                p = r.random()
-                try:
-                    for src in sources:
-                        weight = src.get("weight", 1.0)
-                        if p < weight:
-                            sample = next(iters[src["path"]])
-                            break
-                        else:
-                            p -= weight
-                except StopIteration:
-                    break
-                text = sample.get("text") or sample.get("content") or ""
-                if not text.strip():
-                    continue
-                total_docs += 1
-                if src.get("path") == "codeparrot/codeparrot-clean":
-                    text = clean_codeparrot_example(text)
+            p = r.random()
+            try:
+                for src in sources:
+                    weight = src.get("weight", 1.0)
+                    if p < weight:
+                        sample = next(iters[src["name"]])
+                        break
+                    else:
+                        p -= weight
+            except StopIteration:
+                break
+            text = sample.get("text") or sample.get("content") or ""
+            if not text.strip():
+                continue
+            total_docs += 1
+            if src.get("name") == "codeparrot/codeparrot-clean":
+                text = clean_codeparrot_example(text)
 
-                text = text[-chars_per_doc:] # arbitrary truncation
-                if per_dataset_normalizer:
-                    text = per_dataset_normalizer(text, dataset_name=src.get("name", src["path"])) # should be function(text, dataset_name) -> text
+            text = text[-chars_per_doc:] # arbitrary truncation
+            if per_dataset_normalizer:
+                text = per_dataset_normalizer(text, dataset_name=src.get("name", src["name"])) # should be function(text, dataset_name) -> text
+            
+            if not text.strip():
+                continue
                 
-                if not text.strip():
-                    continue
-                    
-                encoded = text.encode("utf-8")
+            encoded = text.encode("utf-8")
 
-                writer.write(encoded.decode("utf-8"))
+            writer.write(encoded.decode("utf-8"))
 
-                total_chars += len(encoded)
-                shard_chars += len(encoded)
-                total_docs += 1
-                pbar.update(len(encoded))
+            total_chars += len(encoded)
+            shard_chars += len(encoded)
+            total_docs += 1
+            pbar.update(len(encoded))
 
-                if shard_chars >= shard_size_chars:
-                    # writer.flush(zstd.FLUSH_FRAME)
-                    writer.close()
-                    shard_index += 1
-                    shard_chars = 0
-                    writer = open_new_shard(shard_index)
+            if shard_chars >= shard_size_chars:
+                writer.close()
+                shard_index += 1
+                shard_chars = 0
+                writer = open_new_shard(shard_index)
     writer.close()
     return total_chars, total_docs

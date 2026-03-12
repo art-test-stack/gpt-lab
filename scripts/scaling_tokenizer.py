@@ -11,6 +11,16 @@ from collections import Counter
 
 import regex as re
 
+def load_all_results(path):
+    results = []
+    with open(path, "rb") as f:
+        while True:
+            try:
+                results.extend(pickle.load(f))
+            except EOFError:
+                break
+    return results
+    
 def enwik8_path():
     base_dir = DATA_DIR / "corpus/eval_enwik8"
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +102,6 @@ def get_eval_corpus(eval_set):
         loader_fn=eval_set.get("loader_fn", None), # will overwrite for enwik8
     )
 
-
 def eval_tokenizer(tokenizer):
     results = {}
     for eval_set in eval_sets:
@@ -160,6 +169,8 @@ def run_tokenizer_experiment(task):
         trainer="huggingface",
         dircorpus=corpus_path,
         pat_str=p_str,
+        show_progress=False,
+        to_save=False,
     )
     t0 = time.time()
     tokenizer = Tokenizer.train_from_iterator(
@@ -208,6 +219,7 @@ def main():
     results_path = Path(args.results_path)
     results_path.parent.mkdir(parents=True, exist_ok=True)
 
+
     if results_path.exists():
         backup_path = results_path
         i = 1
@@ -221,42 +233,52 @@ def main():
             backup_path = backup_path.with_stem(new_name)
             i += 1
         results_path.rename(backup_path)
-        print(f"Existing results file found. Renamed to {backup_path} to avoid overwriting. New results will be stored in {results_path}.")
+        print(f"Existing results file found. Renamed to {backup_path!r} to avoid overwriting. New results will be stored in {results_path!r}.")
 
+
+    def store_results(results_batch, path=results_path):
+        with open(path, "ab") as f:
+            pickle.dump(results_batch, f)
+        
+        # try:
+        #     with open(path, "rb") as f:
+        #         results = pickle.load(f)
+        # except FileNotFoundError:
+        #     results = []
+
+        # results.extend(results_batch)
+
+        # with open(path, "wb") as f:
+        #     pickle.dump(results, f)
     # Initiate test set and evaluation functions
 
     # testing_sets = ["HuggingFaceFW/fineweb-edu", "HuggingFaceTB/finemath", "codeparrot/codeparrot-clean", ]
     # "HuggingFaceFW/fineweb-2" "subset=fra_Latn,jpn_Jpan,kor_Hang,arb_Arab"
 
-    def store_results(result, path=results_path):
-        try:
-            with open(path, "rb") as f:
-                results = pickle.load(f)
-        except FileNotFoundError:
-            results = []
-        results.append(result)
-        with open(path, "wb") as f:
-            pickle.dump(results, f)
-        results = []
 
     # Baselines: gpt2, cl100k_base, o200k_base
     from tiktoken import get_encoding
 
     baselines = ["gpt2", "cl100k_base", "o200k_base"]
-    for baseline in baselines:
-        enc = get_encoding(baseline)
-        evaluation = eval_tokenizer(enc)
-        result = dict(
-            vocab_size=enc.n_vocab,
-            pattern=baseline,
-            max_chars=None,
-            config=None,
-            training_time=None,
-            corpus_size_mb=None,
-            evaluation=evaluation,
-            baseline=baseline,
-        )
-        store_results(result)
+    results = load_all_results(results_path) if results_path.exists() else []
+    if len(results) == 0:
+        results = []
+        for baseline in baselines:
+            enc = get_encoding(baseline)
+            evaluation = eval_tokenizer(enc)
+            result = dict(
+                vocab_size=enc.n_vocab,
+                pattern=baseline,
+                max_chars=None,
+                config=None,
+                training_time=None,
+                corpus_size_mb=None,
+                evaluation=evaluation,
+                baseline=baseline,
+            )
+            results.append(result)
+        store_results(results)
+    
 
     # Corpus size varying with different vocab_sizes and split patterns
     patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_str-punct": PAT_STR_punct, "pat_str-cl100k_base": PAT_STR_cl100k_base, "pat_str-o200k_base": PAT_STR_o200k_base }
@@ -271,10 +293,19 @@ def main():
     # name = lambda vocab_size, max_char, p_str_name: f"ic1-tok-{int(vocab_size//1000)}k_maxchar-{max_char//1e6:.1f}M_pattern-{p_str_name}"
     name = "ic1-scaling-tok"
     print(f"Using {num_procs} processes for tokenizer training.")
-    corpus_path = DATA_DIR / "corpus/scaling_tokenizer_corpus"
+    corpus_path = DATA_DIR / "corpus" / results_path.stem
     results = []
     corpus_charmax = max(max_chars(max(vocab_sizes)))
 
+    if args.write_corpus:
+        print(f"Writing corpus to {corpus_path} with max chars {corpus_charmax}...")
+        corpus = TokenizerCorpus.write_from_sources(
+            corpus_dir=corpus_path,
+            max_chars=corpus_charmax,
+            chars_per_doc=char_per_doc(corpus_charmax),
+            random_seed=args.seed,
+        )
+        print(f"Corpus written to {corpus_path}. Size: {corpus_path.stat().st_size / 1e6:.2f} MB")
     # Prepare run configurations
     tasks = []
 
@@ -301,13 +332,28 @@ def main():
     mp.set_start_method("spawn", force=True)
     max_workers = min(os.cpu_count(), 8)  # be conservative
     results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(run_tokenizer_experiment, task) for task in tasks]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Tokenizer experiments"):
-            results.append(future.result())
+    # tasks_chunks = [tasks[i:i + max_workers] for i in range(0, len(tasks), _max_char_runs)]
+    # for chunk in tqdm(tasks_chunks, desc="Processing task chunks"):
+    #     with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    #         futures = [executor.submit(run_tokenizer_experiment, task) for task in chunk]
+    #         for future in tqdm(as_completed(futures), total=len(futures), desc="Tokenizer experiments"):
+    #             results.append(future.result())
 
-    for result in results:
-        store_results(result)
+    #     store_results(results)
+    #     results = []  # Reset results list for next chunk
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(run_tokenizer_experiment, t) for t in tasks]
+
+        buffer = []
+        for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Tokenizer experiments")):
+            buffer.append(future.result())
+
+            if i % _max_char_runs == 0:
+                store_results(buffer)
+                buffer.clear()
+
+        if buffer:
+            store_results(buffer)
 
     print(f"Total time for all runs: {(time.time() - t_total_start)/3600:.2f} hours.")
     print(f"All runs completed. Results stored in {results_path}.")

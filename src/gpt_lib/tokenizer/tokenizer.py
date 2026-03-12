@@ -5,9 +5,7 @@ import torch
 from typing import Callable, Iterable, List, Optional, Union
 import pickle
 from pathlib import Path
-import os
-import random, warnings, json
-from gpt_lib.utils.special_tokens import SpecialTokens
+import random, warnings, json, os
 from gpt_lib.utils.default import TOKENIZERS_FOLDER
 
 class DummyTokenizer:
@@ -156,6 +154,9 @@ class Tokenizer:
             from tokenizers import decoders, pre_tokenizers, Regex
             from tokenizers.models import BPE
             from tokenizers.trainers import BpeTrainer
+            
+            # from huggingface_hub import logging
+            # logging.disable_progress_bars()
             tknzr = HFTokenizer(
                 BPE(
                     byte_fallback=True,
@@ -179,7 +180,10 @@ class Tokenizer:
                 initial_alphabet=initial_alphabet,
                 special_tokens=[]
             )
+            trainer.show_progress = config.show_progress
             tknzr.train_from_iterator(iterator=text_iterator, trainer=trainer)
+
+            # os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
             # print("Tokenizer state", tknzr.model.__getstate__().keys())
             merges = json.loads(tknzr.to_str())["model"]["merges"]
             def merge_to_bytes(merge):
@@ -214,14 +218,16 @@ class Tokenizer:
             return cls(DummyTokenizer(config), config)
         else:
             raise ValueError(f"Unsupported tokenizer trainer: {config.trainer}")
-        config.save_to_directory()
         tokenizer = cls(
             mergeable_ranks=mergeable_ranks,
             special_tokens=special_tokens,
             # special_tokens=config.special_tokens.list(),
             config=config
         )
-        tokenizer.save_to_directory()
+
+        if config.to_save:
+            config.save_to_directory()
+            tokenizer.save_to_directory()
         return tokenizer
     
     @classmethod

@@ -1,4 +1,4 @@
-from gpt_lib.model.model import GPTModel
+from gpt_lib.model.gpt import GPTModel
 from gpt_lib.utils.default import (
     ModelConfig,
     TransformerOutput,

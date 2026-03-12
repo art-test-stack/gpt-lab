@@ -167,6 +167,8 @@ class TokenizerTrainerConfig(TokenizerConfig):
     merges_per_pass: int = 512 # Only used for fbpe
     num_proc: int = -1
     trainer: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "tiktoken"
+    show_progress: bool = True
+    to_save: bool = True
     
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
@@ -425,7 +427,7 @@ class TrainingConfig(BaseModel):
             }
         elif isinstance(self.optimizer, dict):
             for key, value in self.optimizer.items():
-                if key not in {"emb", "tf", "lm_head", "w_x0", "w_res"}: # emb, tf, lm_head, w_x0, w_res layers
+                if key not in {"emb", "tf", "lm_head", "w_x0", "w_res", "ve"}: # emb, tf, lm_head, w_x0, w_res layers
                     raise ValueError(f"optimizer dict keys must be 'emb' and/or 'tf'. Got {key}.")
                 if isinstance(value, OptimizerSpec):
                     opt[key] = value
@@ -457,8 +459,6 @@ class TrainingConfig(BaseModel):
         if part not in self._optimizers:
             raise ValueError(f"No optimizer specified for part '{part}'. Available parts: {list(self._optimizers.keys())}.")
         return self._optimizers[part].optimizer_class()
-    
-
 
 
 class GPTConfig(BaseModel):
@@ -476,7 +476,7 @@ class GPTConfig(BaseModel):
         loss (LossConfig): Configuration for the training loss.
 
     ## Methods:
-        to_file(mode="json" | "pickle"): Save the configuration to a file in the specified format.
+        to_file (str -> None): Save the configuration to a file in the specified format.
         from_file(model_name: str, model_dir: str | Path): Load the model configuration from a file.
         auto_init(auto_config: AutoGPTConfig): Automatically initialize a GPTConfig based on an AutoGPTConfig, inferring missing parameters.
     """
@@ -562,7 +562,6 @@ class GPTConfig(BaseModel):
         with open(path, "r", encoding="utf-8") as f:
             config_dict = yaml.safe_load(f)
         return cls.model_validate(config_dict)
-    
 
 class TransformerOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)

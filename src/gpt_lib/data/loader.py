@@ -15,25 +15,35 @@ def load_datasets(
         data_dir: Union[str,Path] = DATA_DIR,
         split: str = "train",
         streaming: bool = True,
+        shuffle: bool = True,
+        random_seed: int = 42,
         *args, **kwargs
     ) -> Dict[str, Iterable]:
     ds = dict()
     for src in sources:
-        ds_name = src["path"]
+        path, name = src["path"], src.get("name", None)
+        ds_name = path if name is None else f"{path}:{name}"
         ds_split = src.get("split", split)
         ds_hook = src.get("hook", lambda x: x)
-        ds[ds_name] = ds_hook(
+        # try:
+        _ds = ds_hook(
             load_dataset(
-                ds_name, 
-                name=src.get("name", None),
+                path, 
+                name=name,
                 split=ds_split,
                 streaming=streaming, 
                 cache_dir=data_dir, 
                 *args, **kwargs
             )
         )
+        # except:
+        #     # just skip if dataset or split not found; in practice we should be careful with this
+        #     continue
         if "filter_fn" in src:
-            ds[ds_name] = ds[ds_name].filter(src["filter_fn"])
+            _ds = _ds.filter(src["filter_fn"])
+        if shuffle and streaming:
+            _ds = _ds.shuffle(seed=random_seed)
+        ds[ds_name] = _ds
     return ds
 
 def weighted_sample_generator(streams, prng):
