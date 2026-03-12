@@ -1,6 +1,6 @@
 from gpt_lib.model.trainer import Trainer
 from gpt_lib.model.arg import ModelArgs
-from gpt_lib.model.model import MichelTransformer
+from gpt_lib.model.gpt import MichelTransformer
 from gpt_lib.train.optimizer import AdamW
 
 from gpt_lib.data.datasets.dataset import Dataset

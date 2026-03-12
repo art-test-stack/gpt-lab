@@ -1,5 +1,5 @@
 from gpt_lib.train.base import BaseTrainer
-from gpt_lib.model.model import GPTModel
+from gpt_lib.model.gpt import GPTModel
 from gpt_lib.utils.schemas import TrainingConfig
 from gpt_lib.utils.default import DEVICE
 

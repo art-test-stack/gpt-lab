@@ -1,6 +1,6 @@
 import pytest
 import torch
-from gpt_lib.model.model import GPTModel
+from gpt_lib.model.gpt import GPTModel
 from gpt_lib.model.utils import KVCache
 
 from gpt_lib.utils.schemas import (

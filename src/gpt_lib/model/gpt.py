@@ -52,11 +52,15 @@ def init_weights(model: nn.Module) -> nn.Module:
                 nn.init.xavier_uniform_(p) 
     return model
 
+def build_meta_model(config: GPTConfig) -> "Transformer":
+    with torch.device("meta"):
+        model = Transformer(config=config.model, dtype=config.dtype)
+    return model
+
 def build_model_from_config(
         config: GPTConfig,
     ) -> "GPTModel":
-    with torch.device("meta"):
-        model = Transformer(config=config.model, device=config.device, dtype=config.dtype)
+    model = build_meta_model(config)
     model = init_weights(model)
     # model.load_state_dict(
     #     state_dict=torch.load(
@@ -69,6 +73,9 @@ def build_model_from_config(
     
     model.to_empty(device=config.device)
     return model
+
+def has_ve(layer_idx: int, n_layer: int):
+    return layer_idx % 2 == (n_layer - 1) % 2
 
 class Transformer(Module):
     def __init__(
@@ -84,13 +91,15 @@ class Transformer(Module):
         self.config = config
         # self._model_as_meta = True # TODO: thinking about it to automatically handle meta init -> forward path
         self.vocab_size = config.vocab_size
-        self.pad_token_id = config.pad_id
         self.window_sizes = config._window_sizes
         # self.bos_token_id = config.bos_id
         # self.eos_token_id = config.eos_id
         self.device = device
         self.dtype = dtype
+        
+        self.norm = build_norm(self.config.normalization, eps=self.config.norm_eps, torch_impl=True)
         _pe_cache = self._precompute_pos_enc()
+
         self.register_buffer("pe_cache", _pe_cache, persistent=False)
         # if self.config.positional_encoding == "rope":
         #     rope_cache = precompute_rope(
@@ -113,7 +122,7 @@ class Transformer(Module):
         embedding = nn.Embedding(
             num_embeddings=config.vocab_size, 
             embedding_dim=config.d_model, 
-            padding_idx=config.pad_id,
+            # padding_idx=config.pad_id,
             sparse=False,
             device=device,
             dtype=dtype
@@ -139,6 +148,12 @@ class Transformer(Module):
             ])
         ))
 
+        kv_dim = config.n_kv_heads * config.d_head
+        # same as karpathy
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(config.vocab_size, kv_dim)
+            for i in range(config.n_layers) if has_ve(i, config.n_layers)
+        })
 
         self.lm_head = Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -157,7 +172,6 @@ class Transformer(Module):
         # padded_vocab_size = config.vocab_size
         # self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layers) if has_ve(i, config.n_layers)})
 
-        self.norm = build_norm(self.config.normalization, eps=self.config.norm_eps, torch_impl=True)
     
     def forward(
             self, 
@@ -237,18 +251,22 @@ class Transformer(Module):
             past_key_values=past_key_values
         )
 
-    def resize_token_embeddings(self, new_size: int) -> None:
+    def resize_token_embeddings(self, new_size: int, resize_head: bool = True) -> None:
         # TODO: Dummy implementation, to be improved
-        self.emb = nn.Embedding(
-            num_embeddings = new_size, 
-            embedding_dim = self.config.d_model, 
-            pad_token_id = self.config.pad_id,
-            sparse=False,
-            device=self.device,
-            dtype=self.dtype
-        )
+        weights = self.layers.emb.weight
+        nb_tokens_to_add = new_size - self.vocab_size
+        new_emb_weights = torch.empty((nb_tokens_to_add, weights.size(1)), device=weights.device, dtype=weights.dtype)
+        # TODO: change std based on dim
+        std = 0.02
+        nn.init.uniform_(new_emb_weights, -std, std) 
+        self.layers.emb.weight = torch.nn.Parameter(torch.cat([weights, new_emb_weights], dim=0), requires_grad=True)
         self.vocab_size = new_size
-        self.lm_head = Linear(self.config.d_model, new_size, bias=False)
+        if resize_head:
+            # resize lm head false if gist tokenization: https://arxiv.org/abs/2304.08467
+            head_weights = self.lm_head.weight
+            new_head_weights = torch.empty((nb_tokens_to_add, head_weights.size(1)), device=head_weights.device, dtype=head_weights.dtype)
+            nn.init.uniform_(new_head_weights, -std, std)
+            self.lm_head.weight = torch.nn.Parameter(torch.cat([head_weights, new_head_weights], dim=0), requires_grad=True)
 
     def _precompute_pos_enc(self, new_max_context: Optional[int] = None) -> None:
         if not new_max_context:
@@ -268,6 +286,20 @@ class Transformer(Module):
 
         return pe_cache
     
+    def number_of_parameters(self) -> int:
+        nb_of_params = dict(
+            emb=sum(p.numel() for p in self.layers.emb.parameters()),
+            blocks=sum(p.numel() for p in self.layers.tf.parameters()),
+            lm_head=sum(p.numel() for p in self.lm_head.parameters()),
+            scalars=self.w_x0.numel() + self.w_res.numel(),
+            ve=sum(p.numel() for p in self.ve.parameters()),
+        )
+        nb_of_params["total"] = sum(nb_of_params.values())
+        return nb_of_params
+    
+    def scaling_params(self) -> int:
+        nb_of_params = self.number_of_parameters()
+        return sum(nb_of_params[tab] for tab in ["blocks", "lm_head"])
 
 class GPTModel:
     def __init__(
@@ -282,33 +314,11 @@ class GPTModel:
         # TODO: Add support for loading Dense vs MoE vs Hybrid models
         self.model = model
         self.loss_fn = build_loss(config.loss)
-        # self.model = self.model.to(DEVICE)
-
-        # def compute_grad_norm(module, grad_input, grad_output):
-        #     total_norm = 0.0
-        #     for g in grad_input:
-        #         if g is not None:
-        #             param_norm = g.data.norm(2)
-        #             total_norm += param_norm.item() ** 2
-        #     total_norm = total_norm ** (1. / 2)
-        #     # You can log or print the total_norm here if needed
-        #     # print(f"Gradient norm: {total_norm}")
-            
-            
-        # self.model.register_full_backward_hook(compute_grad_norm)
-
-        self.attn_mask = SelfAttentionMask(pad_idx=config.model.pad_id, max_context=config.model.max_context)
-
         assert self.model is not None, "Model must be provided"
-        assert all(hasattr(self.model, attr) for attr in ["config", "pad_token_id", "vocab_size"]), "Model must have config, pad_token_id and vocab_size attributes"
-        assert self.model.pad_token_id == self.tokenizer.pad_token_id, "Tokenizer pad token id must match model pad id"
         assert self.model.vocab_size == self.tokenizer.vocab_size, "Model vocab size must match tokenizer vocab size"
-        # assert self.model.pad_token_id == self.config.loss.ignore_index, "Loss ignore index must match model pad id"
 
         self.vocab_size = self.config.model.vocab_size
-        self.pad_token_id = self.config.model.pad_id
-        self.bos_token_id = self.config.model.bos_id
-        self.eos_token_id = self.config.model.eos_id
+        self.bos_token_id = self.tokenizer.bos_token_id
     
     @property
     def device(self) -> torch.device:
@@ -316,8 +326,11 @@ class GPTModel:
     
     def __call__(self, input_ids, labels=None, *args, **kwargs) -> ModelOutput:
         input_ids = input_ids.to(self.device)
-        attn_mask = self.attn_mask(input_ids)
-        logits = self.model(input_ids, attn_mask=attn_mask, *args, **kwargs).logits
+        # attn_mask = self.attn_mask(input_ids)
+        logits = self.model(
+            input_ids, 
+            # attn_mask=attn_mask, 
+            *args, **kwargs).logits
         loss = None
         if labels is not None:
             labels = labels.to(self.device)

@@ -1,7 +1,8 @@
-from gpt_lib.model.model import GPTModel
+from gpt_lib.model.gpt import GPTModel
 from gpt_lib.utils.schemas import TrainingConfig, TrainingState, TrainingMetrics
 from gpt_lib.train.optimizer import AdamW
 
+from gpt_lib.train.base import BaseTrainer
 
 from gpt_lib.utils.default import DEVICE
 
@@ -12,43 +13,36 @@ from torch.utils.data import DataLoader
 import numpy as np
 import time, pickle
 # import time, pickle, wandb
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional, Union
 from pathlib import Path
 
 
-class BaseTrainer:
-    def __init__(
-            self,
-            model: GPTModel,
-            train_dataset: Iterable,
-            val_dataset: Iterable,
-            test_dataset: Iterable,
-            config: TrainingConfig | None = None,
-            device: torch.device = DEVICE,
-            dtype: torch.dtype = torch.float32,
-        ):
-        pass
-
-    def fit(self):
-        raise NotImplementedError
-    
-    def save_model(self, path: Path) -> None:
-        raise NotImplementedError
-    
-    def load_model(self, path: Path) -> None:
-        raise NotImplementedError
-    
-    def save_metrics(self) -> None:
-        raise NotImplementedError
-    
-    def load_metrics(self, path: Path) -> None:
-        raise NotImplementedError
-
 class Trainer(BaseTrainer):
+    @classmethod
+    def from_checkpoint(
+        self,
+        model_name: str,
+        version: str,
+        ckpt_dir: Optional[Union[str,Path]]
+    ):
+        model = GPTModel.from_pretrained(
+            model_name=model_name,
+            model_dir=ckpt_dir
+        )
+        config = model.config.trainer
+        # train_dataset =
+
+    @classmethod
+    def from_scratch(
+        self,
+        model_name: str
+    ):
+        ...
+
     def __init__(
             self, 
             model: GPTModel, # tokenizer should be integrated in the model
-            train_dataset: Iterable,
+            train_dataset: Iterable, # TODO: must prepare dataset with tokenizer
             val_dataset: Iterable,
             test_dataset: Iterable,
             config: TrainingConfig | None = None,
@@ -59,7 +53,16 @@ class Trainer(BaseTrainer):
         super().__init__(model=model, train_dataset=train_dataset, val_dataset=val_dataset, test_dataset=test_dataset)
 
         self.config: TrainingConfig = config if config is not None else model.config.trainer 
-        self.model = model.to(device=device, dtype=dtype)
+        # self.model = model.to(device=device, dtype=dtype)
+        self.model = model
+        self.model_config = self.model.config
+        # TODO: 
+        # TRAINER INIT MAP:
+        # 1. load model 
+        # 2. load training steps
+        # if training crashed -> from checkpoint dir (need every thing to be the same)
+        # if sft -> from base model 
+        # if dpo / grpo -> from base model + reward model -> GRPO
 
         if not optimizer:
             optimizer = model.build_optimizer() # to make
@@ -70,6 +73,7 @@ class Trainer(BaseTrainer):
         self.test_set = test_dataset
 
         self.metrics = TrainingMetrics()
+        self.state = TrainingState()
         self.time = .0
         self.iter = 0
         self.tokens = 0
@@ -82,7 +86,6 @@ class Trainer(BaseTrainer):
         self.best_val_loss = float('inf')
             
         self.max_sequence_length = self.model.max_content
-        self.softmax = nn.Softmax(dim=-1)
 
         self.device = device
         self.metrics = {

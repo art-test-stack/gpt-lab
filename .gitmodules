@@ -1,0 +1,3 @@
+[submodule "nanochat-tasks"]
+	path = nanochat-tasks
+	url = git@github.com:art-test-stack/nanochat-tasks.git

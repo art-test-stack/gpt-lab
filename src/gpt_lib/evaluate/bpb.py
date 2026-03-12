@@ -40,9 +40,13 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor) -> float:
         x = x.to(device)
         y = y.to(device)
 
-        loss2d = model(x, y, loss_reduction='none')  # (B, Seq) NATs
-        loss1d = loss2d.reshape(-1)                  # (B*Seq,)
-        y1d    = y.reshape(-1)                       # (B*Seq,)
+        output = model(x, y, loss_reduction='none')  # (B, Seq) NATs
+        try:
+            loss2d = output.loss2d
+        except:
+            loss2d = output # Assume output is directly the loss2d tensor if not wrapped in a ModelOutput-like object. (B, Seq)
+        loss1d = loss2d.reshape(-1)                       # (B*Seq,)
+        y1d    = y.reshape(-1)                            # (B*Seq,)
 
         if (y1d < 0).any():
             # Mask out ignore_index (<0) before indexing into token_bytes
