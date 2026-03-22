@@ -124,7 +124,7 @@ class TestGPTModel:
             UserWarning,
             message_substring="DummyTokenizer",
         )
-        assert model.model.device != torch.device("meta"), "Model initialized on meta device"
+        assert model.main.embeds.weight.device != torch.device("meta"), "Model initialized on meta device"
 
         model.save_checkpoint(ckpt_version="test-1", keep_vars=True)
 
@@ -134,8 +134,8 @@ class TestGPTModel:
             message_substring="DummyTokenizer",
         )
         assert loaded_model.config == self.config, "Loaded model config does not match the original"
-        assert loaded_model.model.state_dict().keys() == model.model.state_dict().keys(), "Loaded model state dict keys do not match the original"
-        assert all(torch.equal(loaded_model.model.state_dict()[k], model.model.state_dict()[k]) for k in model.model.state_dict().keys()), "Loaded model state dict values do not match the original"
+        assert loaded_model.main.state_dict().keys() == model.main.state_dict().keys(), "Loaded model state dict keys do not match the original"
+        assert all(torch.equal(loaded_model.main.state_dict()[k], model.main.state_dict()[k]) for k in model.main.state_dict().keys()), "Loaded model state dict values do not match the original"
     
     @pytest.mark.fast
     def test_model_forward(self):
