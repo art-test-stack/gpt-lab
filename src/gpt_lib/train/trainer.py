@@ -424,6 +424,10 @@ class Trainer:
             if (self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0):
                 self.save_checkpoint(tag=f"step_{step}")
             
+            if sum(step_times) > self.config.target_time * 60:
+                print0(f"Reached target time of {self.config.target_time} minutes. Stopping training.")
+                break
+            
             # ================================================================
             # Cleanup
             # ================================================================

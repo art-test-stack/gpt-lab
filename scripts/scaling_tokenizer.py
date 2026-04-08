@@ -109,6 +109,7 @@ def eval_tokenizer(tokenizer):
         counter = Counter()
         len_tokens = 0
         len_chars = 0
+        len_bytes = 0
         corpus = get_eval_corpus(eval_set).iterator()
         t0 = time.time()
         for text in corpus:
@@ -118,6 +119,7 @@ def eval_tokenizer(tokenizer):
             counter.update(tokens)
             len_tokens += len(tokens)
             len_chars += len(text)
+            len_bytes += len(text.encode("utf-8"))
             decoded = tokenizer.decode(tokens)
             acc = decoded == text
             compression_ratio = len(tokens) / len(text) if len(text) > 0 else 0
@@ -136,6 +138,7 @@ def eval_tokenizer(tokenizer):
         res = {key: sum(values) / len(values) for key, values in metrics.items()}
         res["nb_tokens"] = len_tokens
         res["nb_chars"] = len_chars
+        res["nb_bytes"] = len_bytes
         res["token_counter"] = counter
         res["eval_time"] = t1 - t0
         results[eval_set["metricname"]] = res
@@ -191,18 +194,16 @@ def run_tokenizer_experiment(task):
     for text in corpus.iterator(max_chars=max_char):
         result["nb_chars_trained"] = result.get("nb_chars_trained", 0) + len(text)
         result["nb_words_trained"] = result.get("nb_words_trained", 0) + len(text.split())
-        result["nb_subwords_trained"] = result.get("nb_subwords_trained", 0) + len(
-            re.findall(config.pat_str, text)
-        )
-        result["nb_tokens_trained"] = result.get("nb_tokens_trained", 0) + len(
-            tokenizer.encode(text, disallowed_special=())
-        )
+        result["nb_bytes_trained"] = result.get("nb_bytes_trained", 0) + len(text.encode("utf-8"))
+        result["nb_subwords_trained"] = result.get("nb_subwords_trained", 0) + len(re.findall(config.pat_str, text))
+        result["nb_tokens_trained"] = result.get("nb_tokens_trained", 0) + len(tokenizer.encode(text, disallowed_special=()))
+        
     result["evaluation"] = eval_tokenizer(tokenizer)
 
     del tokenizer
     return result
 
-char_per_doc = lambda max_char: max_char // 1000 # Default to 1000 documents if not specified, adjust as needed
+char_per_doc = lambda max_char: max_char // 10_000 # Default to 1000 documents if not specified, adjust as needed
 
 def main():
     parser = argparse.ArgumentParser(description="Find the optimal corpus size for training a BPE tokenizer with different vocabulary sizes, and evaluate the trained tokenizers on a simple test set to analyze the trade-offs between corpus size, vocabulary size, training time, and tokenization quality.")
@@ -298,15 +299,21 @@ def main():
     corpus_charmax = max(max_chars(max(vocab_sizes)))
 
     if args.write_corpus:
-        print(f"Writing corpus to {corpus_path} with max chars {corpus_charmax}...")
+        print(f"Writing corpus to {corpus_path} with max chars {corpus_charmax:,}...")
         corpus = TokenizerCorpus.write_from_sources(
             corpus_dir=corpus_path,
             max_chars=corpus_charmax,
             chars_per_doc=char_per_doc(corpus_charmax),
             random_seed=args.seed,
         )
-        print(f"Corpus written to {corpus_path}. Size: {corpus_path.stat().st_size / 1e6:.2f} MB")
+        print(f"Corpus written to {corpus_path}. Size: {sum(c.stat().st_size / 1e6 for c in corpus_path.glob('*.txt')):.2f} MB")
     # Prepare run configurations
+    if not args.write_corpus:
+        print(f"Using existing corpus at {corpus_path} with max chars {corpus_charmax:,} for tokenizer training.")
+        if not corpus_path.exists():
+            raise FileNotFoundError(f"Corpus path {corpus_path} does not exist. Please run the script with --write-corpus flag to create the corpus before training tokenizers.")
+        corpus = TokenizerCorpus.from_sources(corpus_dir=corpus_path)
+        corpus.show_stats()
     tasks = []
 
     for vocab_size in vocab_sizes:

@@ -13,7 +13,7 @@ How to run it from root directory of the repo:
     python -m scripts.train_base auto --model-name my_model --depth=12
 
 - Train a new moodel on distributed setup with auto-config:
-    torchrun --nproc_per_node=8 -m scripts.base_train auto --model-name my_model --depth=12
+    torchrun --nproc_per_node=8 -m scripts.train_base auto --model-name my_model --depth=12
 
 - Train on a CPU-only machine (not recommended) or Macbook with MPS backend:
     python -m scripts.train_base auto --model-name my_model --depth=4 --max-seq-len=256 --device-batch-size=1 --total-batch-size=256
@@ -30,6 +30,7 @@ This code is inspired by and adapted from the following sources:
 - plainLM by @Niccolo-Ajroldi (https://github.com/Niccolo-Ajroldi/plainLM)
 - The Hugging Face Transformers library (https://github.com/huggingface/transformers)
 - The nanotron library (https://github.com/nanotron/nanotron)
+- Hugging face's jobs for training models on GPUs
 
 Author: Arthur Testard (arthur.testard.pro@gmail.com)
 Please cite this work if the code is helpful to you.
@@ -308,29 +309,29 @@ if __name__ == "__main__":
 
     from gpt_lib.utils.report import get_report
 
-    get_report().log(section="Base model training", data=[
-        board_args, # CLI args
-        { # stats about the training setup
-            "Number of parameters": model.n_params,
-            "Number of FLOPs per token": f"{model.n_flops_per_token:e}",
-            "Calculated number of iterations": trainer_config.n_steps,
-            "Number of training tokens": trainer_config.total_batch_size,
-            "Tokens : Scaling params ratio": trainer_config.total_batch_size * trainer_config.n_steps / model.n_scaling_params(),
-            "DDP world size": dist_info["world_size"],
-            "warmup_steps": trainer_config.warmup_steps,
-            "warmdown_ratio": trainer_config.warmdown_ratio,
-            "final_lr_frac": trainer_config.final_lr_frac,
-        },
-        { # stats about training outcomes
-            "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
-            "Final validation bpb": val_bpb,
-            "CORE metric estimate": results.get("core_metric", None),
-            "MFU %": f"{mfu:.2f}%",
-            "Total training flops": f"{flops_so_far:e}",
-            "Total training time": f"{total_training_time/60:.2f}m",
-            "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
-        }
-    ])
+    # get_report().log(section="Base model training", data=[
+    #     board_args, # CLI args
+    #     { # stats about the training setup
+    #         "Number of parameters": model.n_params,
+    #         "Number of FLOPs per token": f"{trainer_config.n_flops_per_token:e}",
+    #         "Calculated number of iterations": trainer_config.n_steps,
+    #         "Number of training tokens": trainer_config.total_batch_size,
+    #         "Tokens : Scaling params ratio": trainer_config.total_batch_size * trainer_config.n_steps / model.n_scaling_params(),
+    #         "DDP world size": dist_info["world_size"],
+    #         "warmup_steps": trainer_config.warmup_steps,
+    #         "warmdown_ratio": trainer_config.warmdown_ratio,
+    #         "final_lr_frac": trainer_config.final_lr_frac,
+    #     },
+    #     { # stats about training outcomes
+    #         "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
+    #         "Final validation bpb": val_bpb,
+    #         "CORE metric estimate": results.get("core_metric", None),
+    #         "MFU %": f"{mfu:.2f}%",
+    #         "Total training flops": f"{flops_so_far:e}",
+    #         "Total training time": f"{total_training_time/60:.2f}m",
+    #         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+    #     }
+    # ])
 
     # cleanup
     board.close() # wandb run finish
