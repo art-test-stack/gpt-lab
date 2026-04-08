@@ -11,9 +11,8 @@ from typing import List, Optional
 import torch
 from torch.optim.optimizer import Optimizer
 
-from gpt_lib.utils.types import Betas2, OptFloat, OptLossClosure, Params
+from gpt_lib.utils.types import Betas2, OptFloat, OptLossClosure, TParams
 
-Grads = Params
 
 __all__ = ("Adahessian",)
 
@@ -50,7 +49,7 @@ class Adahessian(Optimizer):
 
     def __init__(
         self,
-        params: Params,
+        params: TParams,
         lr: float = 0.15,
         betas: Betas2 = (0.9, 0.999),
         eps: float = 1e-4,
@@ -85,7 +84,7 @@ class Adahessian(Optimizer):
         )
         super(Adahessian, self).__init__(params, defaults)
 
-    def get_trace(self, params: Params, grads: Grads) -> List[torch.Tensor]:
+    def get_trace(self, params: TParams, grads: TParams) -> List[torch.Tensor]:
         """Get an estimate of Hessian Trace.
         This is done by computing the Hessian vector product with a random
         vector v at the current gradient point, to estimate Hessian trace by
@@ -105,11 +104,7 @@ class Adahessian(Optimizer):
                 raise RuntimeError(msg.format(i))
 
         v = [
-            2
-            * torch.randint_like(
-                p, high=2, memory_format=torch.preserve_format
-            )
-            - 1
+            2 * torch.randint_like(p, high=2, memory_format=torch.preserve_format) - 1
             for p in params
         ]
 
