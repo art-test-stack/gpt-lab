@@ -1,6 +1,7 @@
 import torch
 import os
 from pathlib import Path
+from typing import Tuple, Dict, Literal
 from gpt_lib.utils.special_tokens import SpecialTokens
 
 # ----------- PROCESSOR -----------
@@ -13,7 +14,7 @@ if MPS_AVAILABLE:
 DEVICE_NAME = "cuda" if CUDA_AVAILABLE else "mps" if MPS_AVAILABLE else "cpu"
 DEVICE = torch.device(DEVICE_NAME)
 
-NUM_THREADS = os.cpu_count() # 16
+NUM_THREADS = os.cpu_count()
 
 # ------------- DATA -------------
 
@@ -24,11 +25,12 @@ SPECIAL_TOKENS = SpecialTokens()
 # CACHE_DIR = Path.home() / ".gpt_lib"
 CACHE_DIR = Path(".gpt_lib") # easier for testing; can be overridden by env var or arg
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-DATA_DIR = CACHE_DIR / ".data"
+BOARD_DIR = CACHE_DIR / "runs"
+DATA_DIR = CACHE_DIR / "data"
 MIN_DOCUMENT_SIZE = 0
-OUTPUT_FOLDER = CACHE_DIR / ".output"
-MODELS_FOLDER = CACHE_DIR / ".models"
-TOKENIZERS_FOLDER = CACHE_DIR / ".tokenizers"
+OUTPUT_FOLDER = CACHE_DIR / "output"
+MODELS_FOLDER = CACHE_DIR / "models"
+TOKENIZERS_FOLDER = CACHE_DIR / "tokenizers"
 VOCAB_SIZE = 32_000
 MAX_TOKEN_LENGTH = 32
 
@@ -36,15 +38,16 @@ MAX_TOKEN_LENGTH = 32
 # https://arxiv.org/pdf/2402.01035
 _pat_str_eng_contr = dict(
     gpt2=r"""'s|'t|'re|'ve|'m|'ll|'d""",
-    gpt4=r"""'(?i:[sdmt]|ll|ve|re)""" # r""""?i:'s|'t|'re|'ve|'m|'ll|'d""" 
+    gpt4=r"""'(?i:[sdmt]|ll|ve|re)""", # r""""?i:'s|'t|'re|'ve|'m|'ll|'d""" 
 )
 _pat_str_words = dict(
     gpt2=r""" ?\p{L}+""",
-    gpt4=r"""[^\r\n\p{L}\p{N}]?+\p{L}+"""
+    gpt4=r"""[^\r\n\p{L}\p{N}]?+\p{L}+""",
 ) 
 _pat_str_digits = dict(
     gpt2=r""" ?\p{N}+""",
-    gpt4=r"""\p{N}{1,3}"""
+    gpt4=r"""\p{N}{1,3}""",
+    nanochat=r"""\p{N}{1,2}""",
 )
 _pat_str_non_alpha = dict(
     gpt2=r""" ?[^\s\p{L}\p{N}]+""",
@@ -60,9 +63,20 @@ PAT_STR_GPT2 = rf"""{_pat_str_eng_contr['gpt2']}|{_pat_str_words['gpt2']}|{_pat_
 PAT_STR_GPT4 = rf"""{_pat_str_eng_contr['gpt4']}|{_pat_str_words['gpt4']}|{_pat_str_digits['gpt4']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}"""
 # PAT_STR_punct = r"""(?\\p{L}+)|\\p{N}{1,3}|?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|\s+(?!\S)|\s+"""
 PAT_STR_punct = rf"""{_pat_str_words['gpt2']}|{_pat_str_digits['gpt4']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}""" # pattern for pre-tokenization that focuses on punctuation, used for ablation
+PAT_STR_nanochat = rf"""{_pat_str_eng_contr['gpt4']}|{_pat_str_words['gpt4']}|{_pat_str_digits['nanochat']}|{_pat_str_non_alpha['gpt4']}|{_pat_str_line_breaks}|{_pat_str_trailing_spaces}|{_pat_str_whitespace}"""
 # copied from tiktoken.get_encoding("cl100k_base")._pat_str and tiktoken.get_encoding("o200k_base")._pat_str
 PAT_STR_cl100k_base = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+| ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s"""
 PAT_STR_o200k_base = r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+PAT_STR: Dict[str, str] = dict(
+    gpt2=PAT_STR_GPT2,
+    gpt4=PAT_STR_GPT4,
+    punct=PAT_STR_punct,
+    cl100k_base=PAT_STR_cl100k_base,
+    o200k_base=PAT_STR_o200k_base,
+    nanochat=PAT_STR_nanochat
+)
+PatStr = Literal[tuple(PAT_STR.keys())]
+
 # ------------- DRIVE -------------
 
 SAVE_ON_DRIVE = True
@@ -81,8 +95,6 @@ DIM_MODEL = 128
 DIM_FFN = 4 * DIM_MODEL
 
 DIM_HEAD = DIM_MODEL // NUM_HEADS
-# DIM_KEY = DIM_MODEL // NUM_HEADS
-# DIM_VALUE = DIM_MODEL // NUM_HEADS
 
 DROPOUT = .1
 
@@ -107,26 +119,6 @@ VALIDATION_STEP = 50
 
 RANDOM_SEED = 42
 
-adamw_opt_params = dict()
-adamw_opt_params.setdefault("weight_decay", WEIGHT_DECAY)
-adamw_opt_params.setdefault("beta1", BETA_1)
-adamw_opt_params.setdefault("beta2", BETA_2)
-adamw_opt_params.setdefault("epsilon", EPSILON)
-
-muon_opt_params = dict()
-muon_opt_params.setdefault("lr_min", MIN_LEARNING_RATE)
-muon_opt_params.setdefault("lr_max", MAX_LEARNING_RATE)
-muon_opt_params.setdefault("warmup_steps", WARMUP_ITERS)
-muon_opt_params.setdefault("decay_steps", DECAY_ITERS)
-muon_opt_params.setdefault("weight_decay", WEIGHT_DECAY)
-muon_opt_params.setdefault("beta1", BETA_1)
-muon_opt_params.setdefault("beta2", BETA_2)
-muon_opt_params.setdefault("epsilon", EPSILON)
-
-opt_params = dict(
-    adamw=adamw_opt_params,
-    muon=muon_opt_params
-)
 
 plt_config = {
     "text.usetex": True,

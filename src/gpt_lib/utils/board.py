@@ -1,59 +1,83 @@
 from typing import Literal
-
+from pathlib import Path
 try:
     import wandb
 except:
     wandb = None
 try:
-    import tensorboard as tb
+    from torch.utils import tensorboard as tb
 except:
     tb = None
-
+from gpt_lib.utils.default import BOARD_DIR
+from gpt_lib.utils.report import get_git_info, get_gpu_info, get_system_info
+import warnings
 
 class DummyBoard:
     def __init__(self) -> None:
         pass
+
     def log(self, *args, **kwargs) -> None:
         pass
 
-class WandbBoard:
-    def __init__(self, place: str = "wandb") -> None:
-        self.place = place
-        # self.wandb = wandb
-
-    def log(self, data: dict, step: int | None = None) -> None:
-        if step is not None:
-            wandb.log(data, step=step)
-        else:
-            wandb.log(data)
-
-class TensorBoard:
-    def __init__(self):
-        _board = tb.SummaryWrite()
-
-    def log(self, *args, **kwargs):
-        pass
-
-import os
-rank = os.getenv("RANK", -1)
-
-_available_boards = {"dummy": DummyBoard}
-if rank < 1:
-    if tb is not None:
-        _available_boards["tensorboard"] = TensorBoard
-    if wandb is not None:
-        _available_boards["wandb"] = WandbBoard
     
 class Board:
-    def __init__(self, place: str = "dummy", *args, **kwargs) -> None:
-        self._board = _available_boards.get(place, "dummy")(*args, **kwargs)
+    def __init__(
+            self, 
+            board_type: Literal["wandb", "trackio", "tensorboard", "dummy"],
+            project: str | None = None,
+            run: str | None = None,
+            config: dict | None = None,
+            board_dir: str | Path | None = None,
+        ) -> None:
+        self.board_type = board_type
+        if board_dir is None:
+            board_dir = BOARD_DIR
+        git_info = get_git_info()
+        gpu_info = get_gpu_info()
+        sys_info = get_system_info()
+
+        config = config | {"git_info": git_info, "gpu_info": gpu_info, "sys_info": sys_info}
+
+        if self.board_type == "wandb":
+            if wandb is None:
+                raise ImportError("wandb is not installed. Please install wandb to use the wandb board.")
+            self.main = wandb.init(
+                project=project,
+                name=run,
+                dir=board_dir, # TODO
+                config=config,
+            )
+        elif self.board_type == "trackio":
+            import trackio
+            self.main = trackio.init(
+                project=project,
+                name=run,
+                dir=board_dir, # TODO
+                config=config,
+            )
+        elif self.board_type == "tensorboard":
+            if tb is None:
+                raise ImportError("tensorboard is not installed. Please install tensorboard to use the tensorboard board.")
+            self.main = tb.SummaryWriter(
+                log_dir=board_dir
+            ) # TODO
+            print("config: ", config)
+            for key, value in config.items():
+                import torch
+                if not type(value) in [str, int, float, bool, torch.Tensor]:
+                    config[key] = str(value)
+                    
+            self.main.add_hparams(config, {}, run_name=f"{project}.{run}") # log config as hparams
+        else:
+            self.main = DummyBoard()
 
     def log(self, data: dict, step: int | None = None) -> None:
-        self._board(data, step)
-        # if self.place == "console":
-        #     if step is not None:
-        #         print(f"Step {step}: ", data)
-        #     else:
-        #         print(data)
-        # else:
-        #     raise NotImplementedError(f"Board logging not implemented for place: {self.place}")
+        self.main(data, step)
+
+    def close(self):
+        if self.board_type == "tensorboard":
+            self.main.flush()
+            self.main.close()
+        elif self.board_type == "wandb":
+            wandb.finish()
+        

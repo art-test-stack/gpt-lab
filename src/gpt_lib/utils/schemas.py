@@ -1,5 +1,4 @@
-from gpt_lib.utils.import_utils import is_flash_attn3_available_from_kernel
-
+import math
 import torch
 import torch.distributed as dist
 from pydantic import BaseModel, Field, ConfigDict, PrivateAttr
@@ -9,7 +8,7 @@ import os, time
 import json, pickle
 
 import warnings
-
+from gpt_lib.utils.common import print0
 from gpt_lib.utils.default import (
     DATA_DIR,
     DEVICE,
@@ -21,34 +20,21 @@ from gpt_lib.utils.default import (
     DIM_MODEL, 
     DIM_FFN, 
     DIM_HEAD, 
-    DROPOUT, 
-    BATCH_SIZE, 
-    MAX_LEARNING_RATE, 
-    MIN_LEARNING_RATE, 
     WARMUP_ITERS, 
-    VALIDATION_STEP, 
-    PRETRAINING_VAL_RATIO,
-    PAT_STR_GPT2,
-    PAT_STR_GPT4,
+    PAT_STR,
+    PatStr,
     TOKENIZERS_FOLDER,
-    adamw_opt_params,
-    opt_params
 )
 from gpt_lib.utils.types import (
     AttnImplTypes,
-    Betas2,
     Devices,
     Dtypes,
     LossReductionTypes,
     LossTypes,
     NormalizationTypes,
-    Nus2,
-    OptimizerNames,
     PositionalEncodingTypes,
     TfTypes,
     TokenizerSources,
-    TokenizerTensors,
-    TParams,
     TpModes,
 )
 from gpt_lib.utils.special_tokens import SpecialTokens
@@ -104,19 +90,26 @@ class TokenizerConfig(BaseModel):
     dirname: Union[str, Path] = TOKENIZERS_FOLDER
     dircorpus: Optional[Union[str, Path, Dict[str, Union[str, Path]]]] = None
     vocab_size: int = VOCAB_SIZE
-    pat_str: str = PAT_STR_GPT4
+    pat_str: str = "gpt4"
     special_tokens: Optional[SpecialTokens] = Field(default_factory=SpecialTokens)
     source: TokenizerSources = "tiktoken"
 
     def model_post_init(self, context: Any) -> None:
+        if self.pat_str in PAT_STR.keys():
+            self.pat_str = PAT_STR.get(self.pat_str)  # Use predefined pattern if pat_str is a key in PAT_STR
+        else:
+            warnings.warn(f"Using custom pat_str {self.pat_str!r} without validation." \
+                          "Make sure it is a valid regex pattern for tokenization.")
+
         if isinstance(self.dirname, str):
             self.dirname = Path(self.dirname)
-        if not self.dirname.name == self.name:
-            self.dirname = self.dirname / self.name
+        cleaned_name = self.name.split("/")[-1] # Remove leading/trailing slashes
+        if not self.dirname.name == cleaned_name: # add model name to path if not already included
+            self.dirname = self.dirname / cleaned_name
         if self.dircorpus is not None and isinstance(self.dircorpus, str):
             self.dircorpus = Path(self.dircorpus) 
         if not self.dirname.exists():
-            self.dirname.mkdir(parents=True, exist_ok=True)
+            self.dirname.mkdir(parents=True, exist_ok=False)
 
     def get_mergeable_ranks(self) -> dict:
         if not self.dirname.exists():
@@ -126,8 +119,10 @@ class TokenizerConfig(BaseModel):
             raise FileNotFoundError(f"Mergeable ranks file {mergeable_ranks_path} does not exist.")
         with open(mergeable_ranks_path, "rb") as f:
             mergeable_ranks = pickle.load(f)
-        print(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
-        assert len(mergeable_ranks) + len(self.special_tokens) == self.vocab_size, "Mergeable ranks size does not match vocab size."
+        print0(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
+        if self.vocab_size == -1:
+            self.vocab_size = len(mergeable_ranks) + len(self.special_tokens)
+        assert len(mergeable_ranks) + len(self.special_tokens) == self.vocab_size , "Mergeable ranks size does not match vocab size."
         return mergeable_ranks
     
     @classmethod
@@ -136,7 +131,7 @@ class TokenizerConfig(BaseModel):
             cachedir = TOKENIZERS_FOLDER
         if isinstance(cachedir, str):
             cachedir = Path(cachedir)
-        path = cachedir / name / "config.pkl"
+        path: Path = cachedir / name / "config.pkl"
         if not path.exists():
             raise FileNotFoundError(f"No such tokenizer config file: {path}")
         with open(path, "rb") as f:
@@ -149,11 +144,12 @@ class TokenizerConfig(BaseModel):
                 directory = Path(directory)
         else:
             directory = self.dirname
-        if not directory.name == self.name:
-            directory = directory / self.name
+        cleaned_name = self.name.split("/")[-1] # Remove leading/trailing slashes
+        if not directory.name == cleaned_name: # add model name to path if not already included
+            directory = directory / cleaned_name
         config_path = directory / "config.pkl"
-        if not config_path.parent.exists():
-            config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.mkdir(parents=True, exist_ok=False)
+
         with open(str(config_path), "wb") as f:
             pickle.dump(self, f)
 
@@ -166,7 +162,7 @@ class TokenizerTrainerConfig(TokenizerConfig):
     chars_per_doc: int = -1
     merges_per_pass: int = 512 # Only used for fbpe
     num_proc: int = -1
-    trainer: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "tiktoken"
+    trainer: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "huggingface"
     show_progress: bool = True
     to_save: bool = True
     
@@ -222,14 +218,31 @@ class TokenizerTrainerConfig(TokenizerConfig):
 
 class DatasetConfig(BaseModel):
     name: str
-    source: str
-    split: Literal["train", "validation", "test"]
-    seed: Optional[int]
-    shard_size: Optional[int]
-    num_shards: Optional[int]
-    data_dir: Optional[Union[str,Path]] = DATA_DIR
-    num_proc: Optional[int]
-    stream: bool = True
+    hfkwargs: dict = Field(default_factory=dict)
+    output_dir: str = "dataset"
+    column_name: str = "text"
+    postprocess: Optional[str] = None
+    upload_name: Optional[str] = None
+    shuffle: bool = False
+    sorted: bool = True
+    max_shards: Optional[int] = None
+    # source: str
+    # split: Literal["train", "validation", "test"]
+    # seed: Optional[int]
+    # shard_size: Optional[int]
+    # num_shards: Optional[int]
+    # data_dir: Optional[Union[str,Path]] = DATA_DIR
+    # num_proc: Optional[int]
+    # stream: bool = True
+
+class DataLoaderConfig(BaseModel):
+    batch_size: int = 1
+    sequence_length: int = 1024
+    n_tokenizer_threads: int = -1
+    tokenizer_batch_size: int = 128
+    buffer_size: int = 10000
+    device: str = "cuda"
+    use_pin_memory: bool = False
 
 class BaseConfig(BaseModel):
     data_dir: Union[str, Path] = DATA_DIR
@@ -245,11 +258,6 @@ class DownloadConfig(BaseConfig):
     retry_delay: int = 5  # in seconds
     num_workers: int = 4
     max_shards: int = 1000
-
-class DatasetConfig(BaseModel):
-    name: str
-    # tokenizer: callable | None
-    split: str = "train"
 
 class TransformerConfig(BaseModel):
     # model_config = ConfigDict(frozen=True)
@@ -278,22 +286,24 @@ class TransformerConfig(BaseModel):
     norm_before_attn: bool = True
     normalization: NormalizationTypes = "rms"  # Options: "rms", "layer"
     norm_eps: float = 1e-8
-    act_func: str = "swiglu" # TODO: make it compatible with model.Transformer implementation
+    act_func: str = "swiglu" # TODO: make it compatible with model.DenseTransformer implementation
 
     # TODO: padged attention implementation
     attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not recommended : "impl" if return_weights=False.
     # TODO: # layer_types: Optional[List[TParams]] = None  # e.g., ["standard", "standard", "moe", ...] length must be n_layers
     enable_gqa: bool = False
-
+    
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     # Based on: https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py
-    window_pattern: str = "SSSL" # Can only be composed of 'L' and 'S' characters
+    window_pattern: Optional[str] = "SSSL" # Can only be composed of 'L' and 'S' characters
     window_size: Optional[int] = None  # Size of short windows
     _window_sizes: List[tuple[int, int]] = PrivateAttr(default_factory=list) # TODO later: make it dynamic
 
     softcap: float = 18.0
+
+    quantization: Optional[str] = None 
     
     def model_post_init(self, context: Any) -> None:
         if self.d_model % self.n_heads != 0:
@@ -319,7 +329,9 @@ class TransformerConfig(BaseModel):
         #     #     self.attn_impl = "sdpa"
         # if self.attn_impl == "impl":
         #     warnings.warn("Using 'impl' attention type is not recommended for production use. Only use for experimentation or retrieve attention weights.")
-
+        if self.window_pattern is None:
+            self.window_pattern = "L"
+        self.window_size = self.window_size or (self.max_context // 4)  # Default short window size is 1/4 of max context
         self._window_sizes = self._compute_window()
         # freeze model_config manually to prevent issues with nested models
         self.model_config["frozen"] = True
@@ -329,10 +341,9 @@ class TransformerConfig(BaseModel):
         pattern = self.window_pattern.upper()
         assert all(c in {'L', 'S'} for c in pattern), "Invalid characters in window_pattern. Only 'L' and 'S' are allowed."
 
-        short_window_size = self.window_size or (self.max_context // 2)
         window_table = {
             'L': (-1, 0), # or (self.max_context, 0) works
-            'S': (short_window_size, 0)
+            'S': (self.window_size, 0)
         }
         window_sizes = []
         for idx in range(self.n_layers - 1):
@@ -353,7 +364,7 @@ class LossConfig(BaseModel):
     loss_fn: LossTypes = "cross_entropy"
     kwargs: dict = Field(default_factory=dict)
     ignore_index: int = -100
-    reduction: LossReductionTypes = "none"
+    reduction: LossReductionTypes = "mean"
 
 class GenerationConfig(BaseModel):
     max_length: int = 256
@@ -379,87 +390,83 @@ class GenerationConfig(BaseModel):
         if self.seed is None or self.seed < 0:
             self.seed = 42  # Ensure seed is within valid range for torch.manual_seed
 
-class OptimizerSpec(BaseModel):
-    name: OptimizerNames = "adamw"
-    kwargs: dict = Field(default_factory=dict)
-
-    def optimizer_class(self) -> Any:
-        # TODO: change it to include custom optimizers
-        import gpt_lib.optimizers.optim as optim_module
-        opt_class = optim_module.opt_class.get(self.name, None)
-        if opt_class is not None:
-            return opt_class
-        if self.name not in optim_module.opt_class:
-            raise ValueError(f"Optimizer '{self.name}' is not recognized. Available optimizers: {list(optim_module.opt_class.keys())}")
-
 class TrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
-    batch_size: int = BATCH_SIZE # TODO: decide whether batch_size = B or B x T
-    steps: int = 100_000 # TODO: decide whether step = #forward pass or #tokens seen by model
-    accumulation_steps: int = 100
 
-    batch_size_scheduling: bool = False
-    max_learning_rate: Optional[float] = None # MAX_LEARNING_RATE
-    min_learning_rate: Optional[float] = None # MIN_LEARNING_RATE
-    bs_warmup_iters: Optional[int] = None
-    lr_warmup_iters: int = WARMUP_ITERS
+    # Training settings
+    dist_info: dict = Field(default_factory=dict) # Used for distributed training, populated by get_dist_info()
 
-    optimizer: dict[str, OptimizerSpec] | OptimizerSpec | OptimizerNames | None = None # { "emb": Optimizer(...), "tf": Optimizer(...) } or single Optimizer or "opt_name" 
-    _optimizers: dict[str, OptimizerSpec] = PrivateAttr(default_factory=dict)
-
-    validation_step: int = VALIDATION_STEP
-    pretraining_val_ratio: float = PRETRAINING_VAL_RATIO
-
-    def model_post_init(self, context: Any) -> None:
-        # TODO: TODO: 0-indexed layer number
-        opt: dict[str, OptimizerSpec] = dict()
-
-        if isinstance(self.optimizer, str):
-            if self.optimizer not in get_args(OptimizerNames):
-                raise ValueError(f"optimizer string must be one of {OptimizerNames}. Got {self.optimizer}.")
-            warnings.warn(f"Using a single optimizer for both embeddings and transformer layers. {self.optimizer} is used with default parameters: {opt_params[self.optimizer]}.")
-            self._optimizers = {
-                "emb": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
-                "tf": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
-                "lm_head": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
-                "w_x0": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
-                "w_res": OptimizerSpec(name=self.optimizer, kwargs=opt_params[self.optimizer]),
-            }
-        elif isinstance(self.optimizer, dict):
-            for key, value in self.optimizer.items():
-                if key not in {"emb", "tf", "lm_head", "w_x0", "w_res", "ve"}: # emb, tf, lm_head, w_x0, w_res layers
-                    raise ValueError(f"optimizer dict keys must be 'emb' and/or 'tf'. Got {key}.")
-                if isinstance(value, OptimizerSpec):
-                    opt[key] = value
-                elif isinstance(value, str):
-                    opt[key] = OptimizerSpec(name=value, kwargs=opt_params[value])
-                else:
-                    raise ValueError(f"optimizer[{key}] must be str or OptimizerSpec. Got {type(value)}.")
-
-        elif isinstance(self.optimizer, OptimizerSpec):
-            warnings.warn(f"Using a single optimizer for both embeddings and transformer layers. {self.optimizer.name} is used with specified parameters: {self.optimizer.kwargs}.")
-            opt["emb"] = self.optimizer
-            opt["tf"] = self.optimizer
-            opt["head"] = self.optimizer
-            opt["w_x0"] = self.optimizer
-            opt["w_res"] = self.optimizer
-        else:
-            warnings.warn("No optimizer specified. Using default optimizers: AdamW for embeddings and Muon for transformer layers.")
-        
-        opt.setdefault("emb", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
-        opt.setdefault("tf", OptimizerSpec(name="muon", kwargs=opt_params["muon"]))
-        opt.setdefault("head", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
-        opt.setdefault("w_x0", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
-        opt.setdefault("w_res", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
-        # opt.setdefault("ve", OptimizerSpec(name="adamw", kwargs=opt_params["adamw"]))
-
-        self._optimizers = opt
+    # Training hparams
+    n_steps: int = 1 # TODO: decide whether step = #forward pass or #tokens seen by model
+    n_acc_steps: int = 100
+    target_time: float = -1.0 # in seconds, overrides n_steps if > 0
+    total_batch_size: int = -1 # Overrides device_batch_size if > 0
+    total_tokens: int = -1 # Overrides n_steps if > 0, calculated as total_batch_size * n_steps
     
-    def optimizer_class(self, part: str) -> torch.optim.Optimizer:
-        if part not in self._optimizers:
-            raise ValueError(f"No optimizer specified for part '{part}'. Available parts: {list(self._optimizers.keys())}.")
-        return self._optimizers[part].optimizer_class()
+    device_batch_size: int = 1 
 
+    # Optimization hyperparameters
+    optim_config_path: Optional[str] = None # Path to optimizer config file. If not set, will use default config based on model size.
+    lr_embeddings: float = .3 
+    lr_transformer: float = .02
+    lr_head: float = .008
+    lr_residuals: float = .5
+    weight_decay: float = 0.28
+    adamw_weight_decay: Optional[float] = None # ignored for now
+    muon_weight_decay: Optional[float] = None # ignored for now
+    lr_warmup_steps: int = WARMUP_ITERS
+    lr_warmdown_ratio: float = 0.65
+    final_lr_ratio: float = 0.05
+    batch_lr_scale: float = 1.0
+    weight_decay_scale: float = 1.0
+
+    batch_size_scheduling: bool = False # TODO
+    bs_warmup_iters: Optional[int] = None # TODO
+
+    # Loggin settings
+    n_flops_per_token: Optional[float] = None 
+    
+    # Dtype settings
+    use_amp: bool = False
+    fp8: bool = False
+
+    # Evaluatement settings
+    eval_bpb_every: int = 250 # Evaluate val bpb every N steps (-1 = disable)
+    n_bpb_tokens: int = 80*524288 # Number of tokens to evaluate val loss on
+    eval_core_every: int = 2000 # Evaluate CORE metric every N steps (-1 = disable)
+    n_core_tokens: int = 500 # Examples per task for CORE metric
+    sample_every: int = 2000 # Sample from model every N steps (-1 = disable)
+    
+    # Checkpoint settings
+    save_every: int = -1 # default: -1 (only at the end)
+    log_every: int = -1 # default: -1 (only at the end)
+
+    def lr_schedule(self, step: int) -> float:
+        n_steps = self.n_steps
+        warmup_iters = self.lr_warmup_steps
+        warmdown_iters = round(self.lr_warmdown_ratio * n_steps)
+        if step < warmup_iters:
+            return (step + 1) / warmup_iters
+        elif step <= n_steps - warmdown_iters:
+            return 1.0
+        else:
+            progress = (n_steps - step) / warmdown_iters
+            return progress * 1.0 + (1 - progress) * self.final_lr_ratio
+    
+    def muon_momentum_schedule(self, step: int) -> float:
+        n_steps = self.n_steps
+        warmup_iters = self.lr_warmup_steps
+        warmdown_iters = round(self.lr_warmdown_ratio * n_steps)
+        if step < warmup_iters:
+            return (step + 1) / warmup_iters
+        elif step <= n_steps - warmdown_iters:
+            return 1.0
+        else:
+            progress = (n_steps - step) / warmdown_iters
+            return progress * 1.0 + (1 - progress) * self.final_lr_ratio
+    
+    def weight_decay_schedule(self, step: int) -> float:
+        return self.weight_decay_scale *  0.5 * (1 + math.cos(math.pi * step / self.n_steps))
 
 class GPTConfig(BaseModel):
     """
@@ -562,6 +569,7 @@ class GPTConfig(BaseModel):
         with open(path, "r", encoding="utf-8") as f:
             config_dict = yaml.safe_load(f)
         return cls.model_validate(config_dict)
+
 
 class TransformerOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
