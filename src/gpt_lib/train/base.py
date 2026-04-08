@@ -23,7 +23,7 @@ class BaseTrainer(ABC):
     def __init__(
             self,
             model: GPTModel,
-            train_dataset: Iterable,
+            train: Iterable,
             val_dataset: Iterable,
             test_dataset: Iterable,
             config: TrainingConfig,
