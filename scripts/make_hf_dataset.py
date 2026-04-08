@@ -18,7 +18,7 @@ def read_dataset_config(ds_name: str, config_path: str) -> DatasetConfig:
     return DatasetConfig(name=ds_name, **config_dict)
 
 def download_dataset(ds_config: DatasetConfig):
-    ds = load_dataset(**ds_config.hfkwargs, streaming=True)
+    ds = load_dataset(**ds_config.hfkwargs)
 
     postprocess_fn = None
     if ds_config.postprocess:
@@ -31,14 +31,10 @@ def download_dataset(ds_config: DatasetConfig):
         tokenizer = encoding_for_model("gpt2")
         postprocess_fn = lambda x: tokenizer.decode(x)
 
-    # if ds_config.shuffle:
-    #     ds = ds.shuffle(seed=42)
+    if ds_config.shuffle:
+        ds = ds.shuffle(seed=42)
 
-    # if ds_config.sorted:
-    #     ds.add_column("length", ds[ds_config.column_name].map(lambda x: len(x)))
-    #     ds = ds.sort("length")
-
-    ndocs = 5e10 # len(ds)
+    ndocs = len(ds)
 
     output_dir = DATA_DIR / f"{ds_config.output_dir}-base"
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -54,9 +50,9 @@ def download_dataset(ds_config: DatasetConfig):
     t0 = time.time()
     print(f"Starting download and processing of dataset {ds_config.name!r} with {ndocs:,} documents...")
     print(" Shard index | Shard docs | Shard chars | Total docs | Elapsed time | Est. remaining time (hr) ")
-    it = iter(ds)
-    for _ in range(int(ndocs)):
-        doc = next(it)
+    
+    for doc in ds:
+        
         if ds_config.max_shards is not None and shard_index >= ds_config.max_shards:
             break
         data = doc[ds_config.column_name]
@@ -90,7 +86,6 @@ def download_dataset(ds_config: DatasetConfig):
             shard_docs = []
             shard_chars = 0
             print(f" {shard_index:11d} | {len(shard_docs):10d} | {shard_chars:11d} | {total_docs_written:10d} | {shard_time:12.2f}s | {est_remaining_time_hour:22.2f} ")
-            break # for testing, remove this to process the whole dataset
     
     print(f"Finished processing dataset {ds_config.name!r}. Total documents written: {total_docs_written:,}. Total time: {total_time/3600:.2f} hr.")
     print(f"Shard table schema: {shard_table.schema}")
@@ -137,5 +132,4 @@ if __name__ == "__main__":
             folder_path=DATA_DIR / config.output_dir,  # Path to the local folder containing the dataset
             repo_id=f"ai-teststack/{config.upload_name}",
             repo_type="dataset",
-        )
-
+  
