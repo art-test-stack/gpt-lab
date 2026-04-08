@@ -12,6 +12,7 @@ archive/
 !/*/.github/
 # work in progress, not ready for sharing yet
 dumas.py 
+draft.md
 
 # C extensions
 *.so

@@ -31,14 +31,15 @@ def pytest_report_header(config):
     def format_info(title, info):
         lines = [f"{title}:"]
         for k, v in info.items():
-            lines.append(f"  {k:<18}: {v}")
+            lines.append(f"  {k:<18}: {v:<68}")
         return "\n".join(lines)
 
     return "\n\n".join([
-        "=" * 60,
+        "\n" +"=" * 80,
         banner,
-        "=" * 60,
+        "=" * 80,
         format_info("Git Information", get_git_info()),
         format_info("System Information", get_system_info()),
         format_info("GPU Information", get_gpu_info()),
+        "=" * 80 + "\n"
     ])

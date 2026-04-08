@@ -153,7 +153,7 @@ class TestRoPE:
             apply_rope(x, rope_cache)  # x must have shape (B, n_heads, seq_len, d_head)
         assert excinfo.type is AssertionError
 
-        x = torch.randn(_bs, n_head, seq_len, d_head) 
+        x = torch.randn(_bs, seq_len, n_head, d_head) 
         x_rope = apply_rope(x, rope_cache)
         assert x_rope.shape == x.shape, f"Output shape mismatch: {x_rope.shape} != {x.shape}"
 
