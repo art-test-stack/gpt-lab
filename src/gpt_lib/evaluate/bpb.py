@@ -1,10 +1,12 @@
 # https://medium.com/@dip.patel.ict/bits-per-byte-bpb-a-tokenizer-agnostic-way-to-measure-llms-25dfed3f41af
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import math 
+from typing import Optional
 
 @torch.no_grad()
-def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor) -> float:
+def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info: Optional[dict]) -> float:
     """
     Compute bits-per-byte (bpb) over the given batches.
     
@@ -24,54 +26,70 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor) -> float:
         - batches: An iterable of yielding batches (x,y).
         - step: Number of batches to evaluate.
         - token_bytes (torch.int64): Tensor of shape (V,) containing the byte lengths of each token in the vocabulary; 0 for special tokens.
+        - dist_info (Optional[dict]): Distributed training information. Should contain "world_size" if using distributed evaluation.
+    Returns:
+        - bpb (float): The computed bits-per-byte metric.
+        - loss (float): The average loss per token, for debugging.
     """
-
+    dist_is_init = dist_info["is_init"] if dist_info is not None else dist.is_initialized()
+    world_size = dist_info["world_size"] if dist_info is not None else 1
+    
     device = model.get_device() if hasattr(model, "get_device") else next(model.parameters()).device
 
     # Accumulators across steps (and later across ranks)
-    sum_nats  = torch.tensor(0.0, dtype=torch.float32, device=device)  # scalar
-    sum_bytes = torch.tensor(0,   dtype=torch.int64,   device=device)  # scalar
+    total_nats  = torch.tensor(0.0, dtype=torch.float32, device=device)  # scalar
+    total_bytes = torch.tensor(0,   dtype=torch.int64,   device=device)  # scalar
+    total_loss  = torch.tensor(0.0, dtype=torch.float32, device=device)  # scalar, for debugging
 
     token_bytes = token_bytes.to(device=device, dtype=torch.int64)     # (V,)
-
+    
     batch_iter = iter(batches)
     for _ in range(steps):
-        x, y = next(batch_iter)                  # x: (B, Seq), y: (B, Seq)
-        x = x.to(device)
-        y = y.to(device)
+        x, y, _ = next(batch_iter)
 
-        output = model(x, y, loss_reduction='none')  # (B, Seq) NATs
+        output = model(x) # (B, Seq) NATs
         try:
-            loss2d = output.loss2d
+            logits = output.logits
         except:
-            loss2d = output # Assume output is directly the loss2d tensor if not wrapped in a ModelOutput-like object. (B, Seq)
-        loss1d = loss2d.reshape(-1)                       # (B*Seq,)
-        y1d    = y.reshape(-1)                            # (B*Seq,)
+            logits = output # Assume output is directly the logits tensor if not wrapped in a ModelOutput-like object. (B, Seq)
+        loss2d = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), 
+            y.view(-1), 
+            reduction='none'
+        ).view(y.size()) # (B, Seq) NATs
+        total_loss += loss2d.detach().sum() # For debugging
+        loss2d = loss2d.reshape(-1) # (B*Seq,)
+        y = y.reshape(-1) # (B*Seq,)
 
-        if (y1d < 0).any():
+        if (y.int() < 0).any():
             # Mask out ignore_index (<0) before indexing into token_bytes
-            valid  = (y1d >= 0)                                      # (B*Seq,)
-            ysafe  = torch.where(valid, y1d, torch.zeros_like(y1d))  # (B*Seq,)
-            nb     = torch.where(valid, token_bytes[ysafe], torch.zeros_like(y1d))  # (B*Seq,) int64
+            valid = (y >= 0) # (B*Seq,)
+            ysafe = torch.where(valid, y, torch.zeros_like(y)) # (B*Seq,)
+            n_bytes2d = torch.where(
+                valid, 
+                token_bytes[ysafe], 
+                torch.zeros_like(y, dtype=token_bytes.dtype)
+            )  # (B*Seq,) int64
+            total_nats += (loss2d * (n_bytes2d > 0)).sum() # Only count nats for tokens with positive byte length
+            total_bytes += n_bytes2d.sum() # Sum bytes for all tokens in the batch, but only count nats for tokens with positive byte length
         else:
-            nb = token_bytes[y1d]  # (B*Seq,) int64
-
-        # Count only tokens with positive byte length
-        counted = (nb > 0)                             # (B*Seq,) bool
-        sum_nats  += (loss1d[counted]).sum()           # scalar
-        sum_bytes += nb[counted].sum()                 # scalar int64
+            n_bytes2d = token_bytes[y]  # (B*Seq,) int64
+            total_nats += (loss2d * (n_bytes2d > 0)).sum() # Only count nats for tokens with positive byte length
+            total_bytes += n_bytes2d.sum() # Sum bytes for all tokens in the batch, but only count nats for tokens with positive byte length
 
     # Distributed sum over all ranks, if initialized
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        dist.all_reduce(sum_nats,  op=dist.ReduceOp.SUM)
-        dist.all_reduce(sum_bytes, op=dist.ReduceOp.SUM)
+    if dist_is_init and world_size > 1:
+        dist.all_reduce(total_nats,  op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
 
-    total_nats  = float(sum_nats.item())
-    total_bytes = int(sum_bytes.item())
+    total_nats = total_nats.item()
+    total_bytes = total_bytes.item()
+    total_loss = total_loss.item() / world_size / (steps * x.size(0) * x.size(1))  # Average loss per token, for debugging
 
     # Guard against division by zero (e.g., all tokens were special/ignored)
     if total_bytes == 0:
-        return float("inf")
+        return { "bpb": float("inf"), "loss_per_token": total_loss }
 
     bpb = total_nats / (math.log(2.0) * total_bytes)
-    return bpb
+    return { "bpb": bpb, "loss_per_token": total_loss }

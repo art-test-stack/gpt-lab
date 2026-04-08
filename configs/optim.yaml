@@ -1,0 +1,38 @@
+default:
+  type: "adamw"
+  eps: 1e-10
+  weight_decay: 1e-3
+embeddings: 
+  type: "adamw"
+  lr: .3
+  betas: [.8, .995]
+  eps: 1e-10
+  weight_decay: 1e-3
+transformer:
+  type: "muon"
+  lr: 2e-2
+  momentum: .95
+  ns_steps: 5
+  beta: .9
+  weight_decay: .28
+head:
+  type: "adamw"
+  lr: 8e-3
+  betas: [.8, .96]
+  weight_decay: 1e-2
+residual_hiddens:
+  type: "adamw"
+  lr: 5e-3
+  betas: [.8, .95]
+  weight_decay: .05
+residual_inputs:
+  type: "adamw"
+  lr: .5
+  betas: [.96, .95]
+  weight_decay: 0.0
+value_embeds:
+  type: "adamw"
+  lr: .15
+  betas: [.8, .995]
+  eps: 1e-10
+  weight_decay: 1e-2

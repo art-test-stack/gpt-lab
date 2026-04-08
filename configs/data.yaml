@@ -1,0 +1,21 @@
+climbmix:
+  hfkwargs: 
+    path: "nvidia/Nemotron-ClimbMix"
+    split: "train"
+  output_dir: "climbmix"
+  column_name: "tokens"
+  postprocess: gpt2
+  upload_name: "climbmix-dev-sorted"
+  shuffle: False
+  sorted: True
+fineweb_edu:
+  hfkwargs: 
+    path: "HuggingFaceFW/fineweb-edu"
+    split: "train"
+    name: sample-100BT
+  output_dir: "fineweb_edu"
+  column_name: "text"
+  postprocess: None
+  upload_name: "fineweb-edu-sorted"
+  shuffle: False
+  sorted: True
