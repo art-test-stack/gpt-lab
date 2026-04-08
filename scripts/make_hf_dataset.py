@@ -18,7 +18,7 @@ def read_dataset_config(ds_name: str, config_path: str) -> DatasetConfig:
         raise ValueError(f"No download config found for dataset {ds_name!r} in {config_path!r}.")
     return DatasetConfig(name=ds_name, **config_dict)
 
-def download_and_upload_dataset(ds_config: DatasetConfig, hf_token: str = None, chars_per_shard: int = 250_000_000, row_gp_size: int = 1024):
+def download_and_upload_dataset(ds_config: DatasetConfig, hf_token: str = None, chars_per_shard: int = 25_000_000, row_gp_size: int = 512):
     # Streaming mode for large datasets, but still process shards fully locally
     ds = load_dataset(**ds_config.hfkwargs, streaming=False)  # streaming=False for full download
 
