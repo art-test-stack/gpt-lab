@@ -1,3 +1,4 @@
+from gpt_lib.utils.common import print0
 from gpt_lib.utils.schemas import (
     TransformerConfig
 )
@@ -56,9 +57,9 @@ class Module(nn.Module):
         return sum([np.prod(p.size(), dtype = np.int32) for p in self.parameters() if not p.requires_grad])
 
     def summary(self) -> None:
-        print(f'Number of parameters: {self.nb_parameters():,}')
-        print(f'Number of trainable parameters: {self.nb_trainable_parameters():,}')
-        print(f'Number of non-trainable parameters: {self.nb_non_trainable_parameters():,}')
+        print0(f'Number of parameters: {self.nb_parameters():,}')
+        print0(f'Number of trainable parameters: {self.nb_trainable_parameters():,}')
+        print0(f'Number of non-trainable parameters: {self.nb_non_trainable_parameters():,}')
 
     def clean_nan(self) -> None:
         for p in self.parameters():
@@ -239,12 +240,15 @@ class CausalSelfAttention(Module):
         assert normalization in get_args(NormalizationTypes), f'Normalization {normalization} is not supported. Supported normalizations are in {get_args(NormalizationTypes)}.'
         assert n_heads % n_kv_heads == 0, f'Number of heads must be divisible by number of key-value heads. Got n_heads={n_heads}, n_kv_heads={n_kv_heads}.'
         
+        self.d_model = d_model
         self.layer_idx = layer_idx
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.d_head = d_head
         self.norm_before_attn = norm_before_attn
         self.dropout_rate = dropout
+
+        self.ve_gate = None # TODO: add gate for value embedding
 
         self.norm = build_norm(normalization, eps=norm_eps, torch_impl=True)
         # if enable_gqa:
@@ -254,17 +258,16 @@ class CausalSelfAttention(Module):
         # else:
         #     d_k = d_head * n_heads
         self.attn_impl = attn_impl
+        # TODO: try an implementation with separate q, k, v proj
         self.qkv_proj = Linear(d_model, (n_heads + 2 * n_kv_heads) * d_head, bias=False)
         self.o_proj = Linear(d_model, d_model, bias=False)
 
+    @torch.no_grad()
     def init_weights(self) -> None:
-        dim_model = self.n_heads * self.d_head
-        std = math.sqrt(3.0 / dim_model)
-        self.qkv_proj.init_weights(std)
-        # self.w_q.init_weights(std)
-        # self.w_k.init_weights(std)
-        # self.w_v.init_weights(std)
-        self.o_proj.init_weights(method='zero')
+        d_model = self.n_heads * self.d_head
+        std = 3**0.5 * d_model**-0.5 
+        torch.nn.init.uniform_(self.qkv_proj.weight, -std, std) # weights use Uniform to avoid outliers
+        torch.nn.init.zeros_(self.o_proj.weight) # projections are zero
 
     def forward(self, x: torch.Tensor, rope_cache=None, attn_mask=None, 
                 kv_cache=None, window_size=None, return_attn_weights: bool = False
@@ -359,22 +362,19 @@ class CausalSelfAttention(Module):
         x = self.o_proj(x)
         return x, attn_weights
     
-    def unfused(self, qkv) -> torch.Tensor:
-        B, Tq, _, _ = qkv.size()
+    def unfused(self, qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         Hq, Hk, D = self.n_heads, self.n_kv_heads, self.d_head
         q, k, v = torch.split(qkv, [Hq, Hk, Hk], dim=-2)
 
         # TODO: this is dummy
-        device, dtype = q.device, q.dtype
+        device, dtype = qkv.device, qkv.dtype
 
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        k.to(device=device, dtype=dtype)
-        v.to(device=device, dtype=dtype)
+        q = q.contiguous().to(device=device, dtype=dtype)
+        k = k.contiguous().to(device=device, dtype=dtype)
+        v = v.contiguous().to(device=device, dtype=dtype)
         return q, k, v
     
-# -------------- Transformer layers definitions -------------- #
+# -------------- DenseTransformer layers definitions -------------- #
     
 class FeedForward(Module):
     '''Position-Wise Feed Forward Network'''
@@ -402,17 +402,27 @@ class SwigLUFeedForward(Module):
         self.w_2 = Linear(d_latent, d_in)
         self.dropout_rate = dropout
 
+    @torch.no_grad()
+    def init_weights(self) -> None:
+        d_in = self.w_1.in_features
+        d_latent = self.w_1.out_features // 2
+        std = 3**0.5 * d_in**-0.5 * (d_latent / d_in)**-0.5  # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal, and adjust for the increased width of the first layer
+       
+        self.w_1.init_weights(std=std, method='uniform')
+        self.w_2.init_weights(std=std * 0.4, method='uniform')
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_proj = self.w_1(x)
         x1, x2 = x_proj.chunk(2, dim=-1)
         h = self.w_2(F.silu(x1) * x2)
 
-        if self.training:
+        if self.training and self.dropout_rate > 0.0:
             h = F.dropout(h, p=self.dropout_rate, training=True)
                 
         output = h + x
         # output = apply_rms_norm(h)
         return output
+    
     
 class DecoderLayer(Module):
     '''Decoder layer'''
@@ -458,9 +468,10 @@ class DecoderLayer(Module):
     def forward(self, x, attn_mask=None, kv_cache=None, rope_cache=None, window_size=None, return_attn_weights=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.norm_before_attn:
             x = self.norm(x)
-        h, attn_weights = self.attention(x, attn_mask=attn_mask, kv_cache=kv_cache, 
-                                             rope_cache=rope_cache, window_size=window_size, 
-                                             return_attn_weights=return_attn_weights)
+        h, attn_weights = self.attention(
+            x, attn_mask=attn_mask, kv_cache=kv_cache, 
+            rope_cache=rope_cache, window_size=window_size, 
+            return_attn_weights=return_attn_weights)
         h = x + h
         h = self.norm(h)
         h = h + self.ffn(h)
@@ -470,9 +481,16 @@ class DecoderLayer(Module):
             h = F.dropout(h, p=self.dropout_rate, training=True)
         
         return h, attn_weights
+    
+    @torch.no_grad()
+    def init_weights(self) -> None:
+        self.attention.init_weights()
 
 class MixtureOfExpertsLayer(Module):
-    '''Mixture of Experts layer. Note: This is a naive version without load balancing or capacity constraints. '''
+    '''
+    dummy
+    Mixture of Experts layer. Note: This is a naive version without load balancing or capacity constraints.
+    '''
     def __init__(
             self, 
             dim_model: int, 

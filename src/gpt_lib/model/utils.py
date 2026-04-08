@@ -1,6 +1,7 @@
 import torch
 import warnings
 
+from gpt_lib.utils.common import print0
 from gpt_lib.utils.default import DEVICE
 from gpt_lib.utils.schemas import TransformerConfig
 
@@ -36,23 +37,26 @@ def precompute_positional_encoding(n_pos: int, d_model: int, dtype: torch.dtype 
     return pos_enc
 
 def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor, pairwise_split: bool = True) -> torch.Tensor:
-    assert x.dim() == 4, 'Input tensor x must be of shape (batch_size, n_heads, seq_len, d_head)'
+    assert x.dim() == 4, 'Input tensor x must be of shape (B, T, H, D). Got shape: {}'.format(x.shape)
+    D = x.shape[-1]
+    assert D % 2 == 0, 'Embedding dimension D must be even for RoPE. Got D: {}'.format(D)
+
     sin, cos = rope_cache[..., 0], rope_cache[..., 1]
-    sin = sin.unsqueeze(0).unsqueeze(0).to(x.device)
-    cos = cos.unsqueeze(0).unsqueeze(0).to(x.device)
+    sin = sin.unsqueeze(0).unsqueeze(2).to(x.device) # 1, T, 1, D//2
+    cos = cos.unsqueeze(0).unsqueeze(2).to(x.device) # 1, T, 1, D//2
     if pairwise_split:
         x1, x2 = x[..., ::2], x[..., 1::2]
     else:
         x1, x2 = x[..., :x.size(-1)//2], x[..., x.size(-1)//2:]
     batch, n_heads, seq_len, d_head = x.shape
     assert x1.shape == x2.shape == (batch, n_heads, seq_len, d_head // 2), f'Unexpected shapes: x1 {x1.shape}, x2 {x2.shape}'
-
     _x1 = x1 * cos - x2 * sin
-    _x2 = - x1 * sin + x2 * cos
-    x = torch.stack([_x1, _x2], dim=-1).reshape_as(x)
-    # x_rotated = torch.stack([-x2, x1], dim=-1).reshape_as(x)
-    # x = x * cos + x_rotated * sin
-    return x
+    _x2 = x1 * sin + x2 * cos
+
+    x_out = torch.empty_like(x)
+    x_out[..., ::2] = _x1
+    x_out[..., 1::2] = _x2
+    return x_out
 
 
 def apply_positional_encoding(x: torch.Tensor, pos_enc: torch.Tensor) -> torch.Tensor:
@@ -84,7 +88,7 @@ class SelfAttentionMask:
         
         if is_causal:
             causal_mask = self.base_mask[:S, :S].to(device)
-            print("causal_mask", causal_mask)
+            print0("causal_mask", causal_mask)
         else:
             warnings.warn("Non-causal attention mask is not yet optimized for large sequences.", UserWarning)
             causal_mask = torch.ones((S, S), dtype=torch.bool, device=device)

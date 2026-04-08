@@ -10,7 +10,36 @@ import zstd
 
 from tqdm import tqdm
 
-_fineweb_2_names = ["rus_Cyrl", "cmn_Hani", "deu_Latn", "jpn_Jpan", "spa_Latn", "fra_Latn", "ita_Latn", "por_Latn", "pol_Latn", "nld_Latn", "ind_Latn", "vie_Latn", "fas_Arab", "arb_Arab", "tur_Latn", "tha_Thai", "ukr_Cyrl", "ell_Grek", "kor_Hang", "ces_Latn", "swe_Latn", "hun_Latn", "ron_Latn", "nob_Latn", "dan_Latn", "fin_Latn", "bul_Cyrl", "hin_Deva", "ben_Beng", "slk_Latn", "slk_Latn", "lit_Latn", "bos_Latn", "slv_Latn", "ekk_Latn", "cat_Latn", "tam_Taml", "hrv_Latn", "lvs_Latn", "zsm_Latn", "azj_Latn", "srp_Cyrl", "kat_Geor", "npi_Deva", "mar_Deva", "nno_Latn"]
+_fineweb_2_names_raw = ["rus_Cyrl", "cmn_Hani", "deu_Latn", "jpn_Jpan", "spa_Latn", "fra_Latn", "ita_Latn", "por_Latn", "pol_Latn", "nld_Latn", "ind_Latn", "vie_Latn", "fas_Arab", "arb_Arab", "tur_Latn", "tha_Thai", "ukr_Cyrl", "ell_Grek", "kor_Hang", "ces_Latn", "swe_Latn", "hun_Latn", "ron_Latn", "nob_Latn", "dan_Latn", "fin_Latn", "bul_Cyrl", "hin_Deva", "ben_Beng", "slk_Latn", "slk_Latn", "lit_Latn", "bos_Latn", "slv_Latn", "ekk_Latn", "cat_Latn", "tam_Taml", "hrv_Latn", "lvs_Latn", "zsm_Latn", "azj_Latn", "srp_Cyrl", "kat_Geor", "npi_Deva", "mar_Deva", "nno_Latn"]
+_fineweb_2_names = []
+alph = []
+for lang in _fineweb_2_names_raw:
+    lang_code, script = lang.split("_")
+    if script not in alph:
+        alph.append(script)
+        _fineweb_2_names.append(lang)
+
+def display_stat_by_source(stat_by_source: Dict[str, Dict[str, int]]):
+    from rich.console import Console
+    from rich.markdown import Markdown
+    print("Stats by source:")
+    md = "| Source | Chars | Docs | Percentage chars (%) | Percentage bytes (%) | Size (MB) |\n|-|-|-|-|-|-|\n"
+    total_chars = sum(stat["chars"] for stat in stat_by_source.values())
+    total_bytes = sum(stat["bytes"] for stat in stat_by_source.values())
+    sum_per_char = 0
+    sum_per_byte = 0
+    for src, stat in stat_by_source.items():
+        chars = stat["chars"]
+        docs = stat["docs"]
+        bytes_ = stat["bytes"]
+        per_char = chars / total_chars * 100
+        per_byte = bytes_ / total_bytes * 100
+        sum_per_char += per_char
+        sum_per_byte += per_byte
+        md += f"| {src} | {chars:,} | {docs:,} | {per_char:.2f} | {per_byte:.2f} | {bytes_ / 1e6:.2f} |\n"
+    md += f"| Total | {total_chars:,} | {sum(stat['docs'] for stat in stat_by_source.values()):,} | {sum_per_char:.2f} | {sum_per_byte:.2f} | {total_bytes / 1e6:.2f} |\n"
+    Console().print(Markdown(md))
+
 class TokenizerCorpus:
     def __init__(
             self, 
@@ -20,6 +49,7 @@ class TokenizerCorpus:
             random_seed: int = RANDOM_SEED,
             sources: Optional[dict] = None,
             compressed: bool = False,
+            stat_by_source: Optional[Dict[str, Dict[str, int]]] = None,
         ):
         corpus_dir = TokenizerCorpus.init_corpusdir(corpus_dir)
         self.corpus_dir = corpus_dir
@@ -35,6 +65,7 @@ class TokenizerCorpus:
                     source["filter_fn"] = None 
         self.sources = sources 
         self.compressed = compressed
+        self.stat_by_source = stat_by_source
     
     @property
     def meta_path(self):
@@ -85,7 +116,7 @@ class TokenizerCorpus:
         # TODO: fix zstd comp
         compressed = False
         corpus_dir = TokenizerCorpus.init_corpusdir(corpus_dir)
-        char_count, doc_count = write_corpus_sample(
+        char_count, doc_count, stat_by_source = write_corpus_sample(
             sources=sources,
             chars_per_doc=chars_per_doc,
             max_chars=max_chars,
@@ -95,16 +126,25 @@ class TokenizerCorpus:
             shard_size_chars=shard_size_chars,
             compressed=compressed,
         )
+        display_stat_by_source(stat_by_source)
         meta = cls(
             corpus_dir=corpus_dir,
             total_chars=char_count,
             total_docs=doc_count,
             compressed=compressed,
             sources=sources,
+            stat_by_source=stat_by_source,
         )
         meta.save()
         return meta
     
+    def show_stats(self):
+        print(f"Corpus directory: {self.corpus_dir}")
+        print(f"Total chars: {self.total_chars:,}")
+        print(f"Total docs: {self.total_docs:,}")
+        if self.stat_by_source:
+            display_stat_by_source(self.stat_by_source)
+        
     @classmethod
     def from_sources(
             cls,
@@ -216,6 +256,7 @@ def write_corpus_sample(
     total_docs = 0
     shard_index = 0
     shard_chars = 0
+    stat_by_source = { src["name"]: {"chars": 0, "docs": 0, "bytes": 0} for src in sources }
 
     def open_new_shard(idx):
         suffix = ".txt.zst" if compressed else ".txt"
@@ -249,7 +290,7 @@ def write_corpus_sample(
             if src.get("name") == "codeparrot/codeparrot-clean":
                 text = clean_codeparrot_example(text)
 
-            text = text[-chars_per_doc:] # arbitrary truncation
+            text = text[:chars_per_doc] # arbitrary truncation
             if per_dataset_normalizer:
                 text = per_dataset_normalizer(text, dataset_name=src.get("name", src["name"])) # should be function(text, dataset_name) -> text
             
@@ -260,9 +301,12 @@ def write_corpus_sample(
 
             writer.write(encoded.decode("utf-8"))
 
-            total_chars += len(encoded)
-            shard_chars += len(encoded)
+            total_chars += len(text)
+            shard_chars += len(text)
             total_docs += 1
+            stat_by_source[src["name"]]["chars"] += len(text)
+            stat_by_source[src["name"]]["docs"] += 1
+            stat_by_source[src["name"]]["bytes"] += len(encoded)
             pbar.update(len(encoded))
 
             if shard_chars >= shard_size_chars:
@@ -271,4 +315,4 @@ def write_corpus_sample(
                 shard_chars = 0
                 writer = open_new_shard(shard_index)
     writer.close()
-    return total_chars, total_docs
+    return total_chars, total_docs, stat_by_source

@@ -230,7 +230,7 @@ def flash_attn_with_kvcache(
             # alibi_slopes=alibi_slopes
         )
     Tq = q.size(1)
-    print("cache_seqlens:", cache_seqlens)
+    
     cur_pos = cache_seqlens[0].item() # TODO: change for batch support -> efficiently get max cur_pos
     end_pos = cur_pos + Tq
 
