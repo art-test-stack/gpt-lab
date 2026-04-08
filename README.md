@@ -1,13 +1,3 @@
----
-license: mit
-title: gpt-lib
-sdk: gradio
-emoji: 👁
-colorFrom: purple
-colorTo: green
-pinned: false
-short_description: Light-weight LLM training and inference framework
----
 <!-- Template source: See: https://github.com/othneildrew/Best-README-Template -->
 <a id="readme-top"></a>
 
