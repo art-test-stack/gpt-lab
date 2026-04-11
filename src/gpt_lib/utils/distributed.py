@@ -27,10 +27,8 @@ def get_device_type():
         torch.mps.empty_cache()
         torch.mps.set_per_process_memory_fraction(0.)
         device_type = "mps"
-    elif torch.backends.xpu.is_available():
+    elif torch.xpu.is_available():
         device_type = "xpu"
-    elif torch.backends.tpu.is_available():
-        device_type = "tpu"
     else:
         device_type = "cpu"
     

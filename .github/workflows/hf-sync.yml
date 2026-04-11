@@ -1,4 +1,4 @@
-name: Sync to Hugging Face Hub
+name: Sync to llm-factory
 on:
   push:
     branches: [master]
