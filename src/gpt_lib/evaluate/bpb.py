@@ -89,7 +89,7 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info
 
     # Guard against division by zero (e.g., all tokens were special/ignored)
     if total_bytes == 0:
-        return { "bpb": float("inf"), "loss_per_token": total_loss }
+        return { "bpb": float("inf"), "loss": total_loss }
 
     bpb = total_nats / (math.log(2.0) * total_bytes)
-    return { "bpb": bpb, "loss_per_token": total_loss }
+    return { "bpb": bpb, "loss": total_loss }

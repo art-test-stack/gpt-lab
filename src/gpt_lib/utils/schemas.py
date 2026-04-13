@@ -226,6 +226,7 @@ class DatasetConfig(BaseModel):
     shuffle: bool = False
     sorted: bool = True
     max_shards: Optional[int] = None
+    streaming: bool = False
     # source: str
     # split: Literal["train", "validation", "test"]
     # seed: Optional[int]
