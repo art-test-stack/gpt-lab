@@ -22,8 +22,11 @@ IS_TIKTOKEN = False # TODO: parse as arg
 
 SPECIAL_TOKENS = SpecialTokens()
 
-# CACHE_DIR = Path.home() / ".gpt_lib"
-CACHE_DIR = Path(".gpt_lib") # easier for testing; can be overridden by env var or arg
+cache_dir = os.environ.get("GPTLIB_CACHE_DIR", None)
+if cache_dir is not None:
+    CACHE_DIR = Path(cache_dir)
+else:
+    CACHE_DIR = Path.home() / ".cache" / "gpt_lib"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 BOARD_DIR = CACHE_DIR / "runs"
 DATA_DIR = CACHE_DIR / "data"

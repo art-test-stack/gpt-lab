@@ -60,7 +60,7 @@ if __name__ == "__main__":
         prs.add_argument("--model-dir", type=str, default=str(MODELS_FOLDER), help="Cache directory to save model checkpoints and logs.")
         prs.add_argument("--num-steps", type=int, default=-1, help="Number of training steps (overrides num-epochs if > 0).")
         prs.add_argument("--weight-decay", type=float, default=0.28, help="Weight decay for optimizer.")
-        prs.add_argument("--max-seq-len", type=int, default=512, help="Maximum sequence length for training.")
+        prs.add_argument("--max-seq-len", type=int, default=2048, help="Maximum sequence length for training.")
         prs.add_argument("--random-seed", type=int, default=42, help="Random seed for model initialization")
         # TODO: separate random seed for model initialization and training (data shuffling, dropout, etc.)
         # prs.add_argument("--random-seed", type=int, default=42, help="Random seed for model initialization")
@@ -120,7 +120,7 @@ if __name__ == "__main__":
     auto_parser.add_argument("--n-core-tokens", type=int, default=500, help="Examples per task for CORE metric")
     auto_parser.add_argument("--sample-every", type=int, default=2000, help="Sample from model every N steps (-1 = disable)")
     auto_parser.add_argument("--save-every", type=int, default=-1, help="Save checkpoints every N steps (-1 = only at end)")
-    auto_parser.add_argument("--log-every", type=float, default=-1., help="Log metrics every N steps (-1 = only at end)")
+    auto_parser.add_argument("--log-every", type=int, default=-1., help="Log metrics every N steps (-1 = only at end)")
 
     # TODO: Arch-config subparser
     arch_parser = subparsers.add_parser("arch", help="Config model architecture based on model name (eg: gpt2, llama2, mixtral).")

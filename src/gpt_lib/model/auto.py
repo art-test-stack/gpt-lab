@@ -70,7 +70,7 @@ class AutoGPTConfig(BaseModel):
             date = datetime.today().ctime().replace(" ", "_").replace(":", "-")
         
             self.name = f"{self.basename}_{self.depth}_{git_commit}_{date}"
-        if self.vocab_size is not None and self.vocab_size < 256:
+        if self.vocab_size != -1 and self.vocab_size < 256:
             raise ValueError("Vocab size must be at least 256 to ensure all unicode characters are supported.")
         # TODO: check that basename is valid (e.g. no special characters, etc.)
         if self.basename is not None and (not isinstance(self.basename, str) or len(self.basename) == 0):
@@ -158,7 +158,7 @@ class AutoGPTConfig(BaseModel):
             coeff = .2 / (.08 ** power) / (depth * self.aspect_ratio)
             opt_vocab_size = coeff * (n_non_vocab_scaling_params ** power) # V ~ .2 / d_model * (n_scaling_params / 0.08) ^.84
             del _mmodel # free memory
-            print(f"Number of non-vocabulary scaling parameters for depth {depth}: {n_non_vocab_scaling_params:.2e}")
+            print0(f"Number of non-vocabulary scaling parameters for depth {depth}: {n_non_vocab_scaling_params:.2e}")
             if not self.train_tokenizer:
                 _, vocab_size = get_closest_tokenizer_size(opt_vocab_size)
             else:
@@ -173,7 +173,7 @@ class AutoGPTConfig(BaseModel):
         vocab_size = self.vocab_size
         if vocab_size == -1:
             vocab_size = compute_optimal_vocab_size(self.depth)
-            print(f"Optimal vocab size based on scaling law for depth {self.depth}: {vocab_size:,.0f}")
+            print0(f"Optimal vocab size based on scaling law for depth {self.depth}: {vocab_size:,.0f}")
 
         d12_model = build_meta_model_from_depth(12, vocab_size=vocab_size) # reference model for scaling laws
         model = build_meta_model_from_depth(self.depth, vocab_size=vocab_size)
