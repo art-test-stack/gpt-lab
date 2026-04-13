@@ -49,9 +49,9 @@ def print0_dict(title, info):
 
 def get_banner(to_print: bool = False) -> str:
     """Banner made with https://manytools.org/hacker-tools/ascii-banner/"""
-    banner1 = """
+    banner1 = r"""
   .-_'''-.   .-------. ,---------.              .---.    .-./`)  _______    
- '_( )_   \  \  _(`)_ \\\\          \             | ,_|    \ .-.')\  ____  \  
+ '_( )_   \  \  _(`)_ \\          \             | ,_|    \ .-.')\  ____  \  
 |(_ o _)|  ' | (_ o._)| `--.  ,---'           ,-./  )    / `-' \| |    \ |  
 . (_,_)/___| |  (_,_) /    |   \  _ _    _ _  \  '_ '`)   `-'`"`| |____/ /  
 |  |  .-----.|   '-.-'     :_ _: ( ' )--( ' )  > (_)  )   .---. |   _ _ '.  
@@ -70,7 +70,7 @@ def get_banner(to_print: bool = False) -> str:
 # ______/~~\______________________________________________________________
 # """
 #     banner = random.choice([banner1, banner2])
-    banner = banner1 # banner1 looks just
+    banner = banner1 # banner1 looks just fine
     if to_print:
         print0(banner)
     return banner
