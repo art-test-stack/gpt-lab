@@ -9,6 +9,7 @@ from gpt_lib.utils.schemas import DatasetConfig
 import os, yaml
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 import argparse, time
 from typing import List, Tuple, Optional
 
@@ -18,6 +19,17 @@ import pyarrow.parquet as pq
 from datasets import load_dataset, load_dataset_builder
 from huggingface_hub import HfApi, batch_bucket_files
 
+import logging
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
+)
+logger = logging.getLogger("hf_bucket_upload")
+logger.setLevel(logging.INFO)
+
+for lib in ["datasets", "huggingface_hub", "httpx", "urllib3"]:
+    logging.getLogger(lib).setLevel(logging.WARNING)
 
 def read_dataset_config(ds_name: str, config_path: str) -> DatasetConfig:
     with open(config_path, "r") as f:
@@ -55,7 +67,8 @@ def download_ds_and_upload_bucket(
         # NOTE: path in repo is simply shard name for simplicity for now
         shard_name = f"shard_{shard_index:05d}.parquet"
         shard_path = CACHE_DIR / "bucket" / shard_name
-        return str(shard_path), shard_name
+        bucket_path = ds_config.output_dir + shard_name
+        return str(shard_path), bucket_path
     
     def upload_shards_to_hf_bucket(shard_idx: List[int]):
         shard_tuples = [_get_shard_path_and_bucket_path(s_idx) for s_idx in shard_idx]
@@ -73,42 +86,14 @@ def download_ds_and_upload_bucket(
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise
-                time.sleep(retry_timeout)
+                time.sleep(retry_timeout * (2 ** attempt))
     
-    # def _upload_shards_to_hf_bucket(
-    #     shard_idx: List[int],
-    #     shard_path_bucket_path_tuples: Optional[List[Tuple[str, str]]] = None,
-    #     current_retry: int = 0,
-    # ):  
-    #     """Utiliy function to upload a list of shards to HF bucket with retry logic."""
-    #     if shard_path_bucket_path_tuples is None:
-    #         shard_path_bucket_path_tuples = [_get_shard_path_and_bucket_path(s_idx) for s_idx in shard_idx]
-    #     if hf_token and ds_config.upload_name:
-    #         try:
-    #             batch_bucket_files(
-    #                 bucket_id=upload_repo,
-    #                 add=shard_path_bucket_path_tuples,
-    #                 token=hf_token,
-    #             )
-    #             for shard_path, _ in shard_path_bucket_path_tuples:
-    #                 if Path(shard_path).exists():
-    #                     os.remove(shard_path)
-    #                 shard_idx.pop(0) # remove from list once uploaded
-    #         except Exception as e:
-    #             print(f"Error occurred while uploading shard {shard_path}: {e}")
-    #             if current_retry < max_retries:
-    #                 time.sleep(retry_timeout)
-    #                 _upload_shards_to_hf_bucket(
-    #                     shard_idx=shard_idx,
-    #                     shard_path_bucket_path_tuples=shard_path_bucket_path_tuples,
-    #                     current_retry=current_retry + 1
-    #                 )
 
     if ds_config.streaming:
         if ds_config.hfkwargs.get("path") == "nvidia/Nemotron-ClimbMix":
             ndocs = 553_240_576 # hardcoded for simplicity
         else:
-            ds_builder.info.splits[ds_config.hfkwargs.get("split", "train")].num_examples
+            ndocs = ds_builder.info.splits[ds_config.hfkwargs.get("split", "train")].num_examples
         # Special case for nvidia/Nemotron-Corpus which has incorrect num_examples in streaming mode
     else:
         ndocs = len(ds)
@@ -122,19 +107,22 @@ def download_ds_and_upload_bucket(
     shard_idx_to_upload = []
     failed_shard_idx = []
 
+    executor = ThreadPoolExecutor(max_workers=4)
+    failed_lock = Lock()
+    futures = []
+
     def upload_wrapper(shard_idx):
         try:
             upload_shards_to_hf_bucket(shard_idx)
         except Exception as e:
-            print(f"Failed to upload shard index {shard_idx} after {max_retries} attempts: {e}")
-            failed_shard_idx.extend(shard_idx)
-
-    executor = ThreadPoolExecutor(max_workers=4)
-    futures = []
+            logger.exception(f"Failed to upload shard index {', '.join(map(str, shard_idx))}.")
+            with failed_lock:
+                failed_shard_idx.extend(shard_idx)
 
     t0 = time.time()
-    print(f"Starting download and processing of dataset {ds_config.name!r} ({ndocs:,} documents)...")
-    print(" Shard index | Shard docs | Shard chars | Total docs | Elapsed time | Est. remaining time (hr) ")
+
+    logger.info(f"Starting download and processing of dataset {ds_config.name!r} ({ndocs:,} documents)...")
+    logger.info(" Shard index | Shard docs | Shard chars | Total docs | Failed docs | Elapsed time | Est. remaining time (hr) ")
 
     for doc_idx, doc in enumerate(ds):
         if ds_config.max_shards is not None and shard_index >= ds_config.max_shards:
@@ -177,11 +165,12 @@ def download_ds_and_upload_bucket(
             t0 = t1
             total_docs_written += len(shard_docs)
             total_time += shard_time
-
             remaining_docs = ndocs - total_docs_written
+            with failed_lock:
+                n_failed = len(failed_shard_idx)
             avg_time_per_doc = total_time / total_docs_written if total_docs_written > 0 else 0
             est_remaining_time_hour = remaining_docs * avg_time_per_doc / 3600
-            print(f" {shard_index:11d} | {len(shard_docs):10,d} | {shard_chars:11,d} | {total_docs_written:10,d} | {shard_time:11.2f}s | {est_remaining_time_hour:22.2f} ")
+            logger.info(f" {shard_index:11d} | {len(shard_docs):10,d} | {shard_chars:11,d} | {total_docs_written:10,d} | {n_failed:11,d} | {shard_time:11.2f}s | {est_remaining_time_hour:22.2f} ")
             shard_index += 1
             shard_docs = []
             shard_chars = 0
@@ -190,10 +179,49 @@ def download_ds_and_upload_bucket(
     if shard_docs:
         shard_path = bucketdir / f"shard_{shard_index:05d}.parquet"
         shard_table = pa.Table.from_pydict({"text": shard_docs})
-        pq.write_table(shard_table, shard_path)
-        upload_shards_to_hf_bucket(shard_idx=[shard_index])
+        pq.write_table(
+            shard_table, shard_path,
+            row_group_size=row_gp_size,
+            use_dictionary=True,
+            compression="zstd",
+            compression_level=3,
+            write_statistics=False
+        )
+        futures.append(
+            executor.submit(upload_wrapper, [shard_index])
+        )
 
-    print(f"Finished processing dataset {ds_config.name!r}. Total documents written: {total_docs_written:,}. Total time: {total_time/3600:.2f} hr.")
+    for f in futures:
+        f.result()
+    
+    executor.shutdown(wait=True)
+
+    final_attempt = 0
+    while failed_shard_idx and (final_attempt < max_retries):
+        logger.warning(f"Retrying {len(failed_shard_idx)} failed shards...")
+
+        still_failed = []
+
+        for shard_idx in failed_shard_idx:
+            try:
+                upload_shards_to_hf_bucket([shard_idx])
+                logger.info(f"Retry success for shard {shard_idx}")
+            except Exception:
+                logger.exception(f"Retry failed for shard {shard_idx}")
+                still_failed.append(shard_idx)
+
+        failed_shard_idx = list(set(still_failed))
+
+        if failed_shard_idx:
+            logger.warning(f"{len(failed_shard_idx)} shards still failed after retry attempt {final_attempt}.")
+            time.sleep(retry_timeout * (2 ** final_attempt))
+
+            final_attempt += 1
+    
+    if failed_shard_idx:
+        logger.warning(f"{len(failed_shard_idx)} shards permanently failed: {', '.join(map(str, failed_shard_idx))}. Please check logs for details.")
+
+    logger.info(f"Finished processing dataset {ds_config.name!r}. Total documents written: {total_docs_written:,}. Total time: {total_time/3600:.2f} hr.")
 
 if __name__ == "__main__":
     get_banner(to_print=True)
