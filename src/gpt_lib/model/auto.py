@@ -152,7 +152,7 @@ class AutoGPTConfig(BaseModel):
             # we approximate the values from their paper with a simple scaling law for vocab size based on depth and aspect ratio
             # this is a rough estimate and can be tuned based on experiments.
             # we also approximate the vocab size to the closest in the tokenizer cache to maximize reuse of existing tokenizers
-            _mmodel = build_meta_model_from_depth(depth, vocab_size=1)[0]
+            _mmodel = build_meta_model_from_depth(depth, vocab_size=1)
             n_non_vocab_scaling_params = _mmodel.n_params # vocab size = 1, so n_params ~ Nnv
             power = 0.84
             coeff = .2 / (.08 ** power) / (depth * self.aspect_ratio)
