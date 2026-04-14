@@ -4,7 +4,12 @@ import torch
 import torch.distributed as dist
 import os, warnings
 
+# -----------------------------------------------------------
+# dtype detection and management
+# -----------------------------------------------------------
+
 _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+
 def detect_compute_dtype():
     env = os.environ.get("GPTLIB_DTYPE", None)
     if env is not None:
@@ -19,6 +24,11 @@ def detect_compute_dtype():
         # Users can still force fp16 via GPTLIB_DTYPE=float16 if they know what they're doing.
         return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
     return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
+
+# -----------------------------------------------------------
+# distributed utils
+# -----------------------------------------------------------
+
 
 def get_device_type():
     if torch.cuda.is_available():
@@ -36,70 +46,55 @@ def get_device_type():
         warnings.warn(f"Device type {device_type!r} is not fully tested. May exhibit unexpected behavior.")
     return device_type
 
+def is_ddp_requested() -> bool:
+    return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
+
 def is_ddp_initialized() -> bool:
     return dist.is_initialized() and dist.is_available()
- 
-def get_base_dist_info():
 
-    is_initialized = is_ddp_initialized()
-    if is_initialized:
-        assert all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE")), "Environment variables RANK, LOCAL_RANK, WORLD_SIZE, and TP_SIZE must be set for distributed training."
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        local_rank = os.environ["LOCAL_RANK"]
-        # tp_size = int(os.getenv("TP_SIZE", "1")) # No TP support yet
+def get_base_dist_info():
+    is_requested = is_ddp_requested()
+    if is_requested:
+        world_size = int(os.environ["WORLD_SIZE"])
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
     else:
         world_size = 1
         rank = 0
         local_rank = 0
     tp_size = 1 # TODO: implement tensor parallelism support
 
-    return is_initialized, world_size, rank, local_rank, tp_size
+    if is_ddp_initialized():
+        # sanity check that env vars match dist info
+        assert world_size == dist.get_world_size(), f"World size from environment variable WORLD_SIZE={world_size} does not match dist.get_world_size()={dist.get_world_size()}"
+        assert rank == dist.get_rank(), f"Rank from environment variable RANK={rank} does not match dist.get_rank()={dist.get_rank()}"
+        assert torch.cuda.current_device() == local_rank
 
-def get_dist_info(device_type: str | None = None, random_seed: int = 42):
+    return is_requested, world_size, rank, local_rank, tp_size
+
+def get_dist_info(device_type: str | None = None, base_dist_info: tuple | None = None):
     if device_type is None:
         device_type = get_device_type()
+
     assert device_type in ("cuda", "mps", "cpu"), f"Unsupported device type: {device_type!r}."
-    torch.manual_seed(random_seed)
-    if device_type == "cuda":
-        torch.cuda.manual_seed(random_seed)
-    elif device_type == "mps":
-        torch.mps.manual_seed(random_seed)
-    
 
-    if device_type == "cuda":
-        # https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
-        torch.set_float32_matmul_precision("high") 
-    
-    is_initialized, world_size, rank, local_rank, tp_size = get_base_dist_info()
+    is_initialized = is_ddp_initialized()
+    assert (not is_ddp_requested() or is_initialized), "Distributed training requested but process group not initialized. Make sure to call `init_process_group()` before get_dist_info()."
 
-    assert world_size % tp_size == 0
-    dist_groups = dict(device_type=device_type)
-    if is_initialized:
-        dist_groups["device"] = torch.device("cuda", local_rank)
-        torch.cuda.set_device(dist_groups["device"])
-        dist.init_process_group(backend="nccl", device_id=dist_groups["device"])
-        dist.barrier() # synchronize after init
+    if base_dist_info is not None:
+        is_requested, world_size, rank, local_rank, tp_size = base_dist_info
     else:
-        dist_groups["device"] = torch.device(device_type)
+        is_requested, world_size, rank, local_rank, tp_size = get_base_dist_info()
+
+    dist_groups = dict(device_type=device_type)
 
     dist_groups["world_size"] = world_size
-    # dist_groups["tp_size"] = tp_size
-    dist_groups["is_init"] = is_initialized
+    dist_groups["is_ddp_requested"] = is_requested
+    dist_groups["is_ddp_initialized"] = is_initialized
     dist_groups["dp_size"] = world_size // tp_size
-
     dist_groups["rank"] = rank
-
-    # dist_groups["dp_rank"] = dist_groups["rank"] // tp_size
-    # dist_groups["tp_rank"] = dist_groups["rank"] % tp_size
-
-    # dist_groups["tp_group"] = dist.new_group(
-    #     ranks=[dist_groups["dp_rank"] * tp_size + i for i in range(tp_size)]
-    # )
-
-    # dist_groups["dp_group"] = dist.new_group(
-    #     ranks=[i * tp_size + dist_groups["tp_rank"] for i in range(dist_groups["dp_size"])]
-    # )
+    dist_groups["local_rank"] = local_rank
+    dist_groups["device"] = torch.device(device_type, local_rank) if device_type == "cuda" else torch.device(device_type)
 
     if device_type == "cuda":
         dist_groups["device_name"] = torch.cuda.get_device_name(dist_groups["device"])
@@ -116,29 +111,48 @@ def get_dist_info(device_type: str | None = None, random_seed: int = 42):
 
     return dist_groups
 
+
+def init_dist_groups(device_type: str | None = None, random_seed: int = 42):
+    if device_type is None:
+        device_type = get_device_type()
+
+    assert device_type in ("cuda", "mps", "cpu"), f"Unsupported device type: {device_type!r}."
+
+    # Set random seeds for reproducibility
+    torch.manual_seed(random_seed)
+
+    if device_type == "cuda":
+        torch.cuda.manual_seed(random_seed)
+    elif device_type == "mps":
+        torch.mps.manual_seed(random_seed)
+    
+    # Precision
+    if device_type == "cuda":
+        # https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+        torch.set_float32_matmul_precision("high") 
+    
+    # Init dist groups
+    is_requested, world_size, rank, local_rank, tp_size = get_base_dist_info()
+
+    if is_requested:
+        assert all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE")), "Environment variables RANK, LOCAL_RANK, and WORLD_SIZE must be set for ddp training."
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier() # synchronize after init
+        # check that dist groups are set up correctly
+        assert is_ddp_initialized(), "Failed to initialize distributed process group."
+    else:
+        device = torch.device(device_type)
+
+    dist_info = get_dist_info(device_type=device_type, base_dist_info=(is_requested, world_size, rank, local_rank, tp_size))
+
+    return dist_info
+
+
 def cleanup_dist_groups():
     if is_ddp_initialized():
         dist.destroy_process_group()
-
-# def choose_parallelism(world_size: int, tp_size: int) -> str:
-#     # TODO: expand this function for more complex parallelism strategies
-#     is_initialized, world_size, rank, local_rank, tp_size = get_dist_info()
-#     if not is_initialized:
-#         return "single"
-#     config = dict(
-#         world_size=world_size,
-#         tp_size=tp_size,
-#         dp_size=world_size // tp_size,
-        
-#     )
-#     if tp_size > 1 and world_size // tp_size > 1:
-#         return "dp_tp"
-#     elif tp_size > 1:
-#         return "tp"
-#     elif world_size > 1:
-#         return "dp"
-#     else:
-#         return "single"
     
 
 # hardcoded BF16 peak flops for various GPUs

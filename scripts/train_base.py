@@ -41,7 +41,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 from gpt_lib.utils.common import get_banner, print0, print0_dict
 from gpt_lib.utils.default import DATA_DIR, MODELS_FOLDER
-from gpt_lib.utils.distributed import cleanup_dist_groups, get_dist_info, get_device_type
+from gpt_lib.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups
 from gpt_lib.utils.schemas import GPTConfig, TrainingConfig
 from gpt_lib.model.auto import AutoGPTConfig
 from gpt_lib.model.gpt import DenseTransformer
@@ -80,7 +80,7 @@ if __name__ == "__main__":
     ## Tokenizer arguments
     auto_parser.add_argument("--tokenizer-model", type=str, default=None, help="Tokenizer model to use for auto-configured models. If not set, will use vocab size scaling law to determine tokenizer config.")
     auto_parser.add_argument("--vocab-size", type=int, default=-1, help="Vocabulary size for auto-configured models. If not set, will be determined by vocab size scaling law based on model depth.")
-    auto_parser.add_argument("--pat-str", type=str, default=None, help="Split pattern for pre-tokenization if training a new-tokenizer. Options are 'gpt2, 'cl100k_base', or 'o200k_base'. If not set, will default to 'gpt2' pattern.")
+    auto_parser.add_argument("--pat-str", type=str, default=None, help="Split pattern for pre-tokenization if training a new-tokenizer. Options are 'gpt2, 'gpt4', 'cl100k_base', 'o200k_base', or directly the pattern string. If not set, will default to 'gpt2' pattern.")
     auto_parser.add_argument("--train-tokenizer", action="store_true", help="Whether to train a new tokenizer from scratch.")
 
     ## Model arguments
@@ -140,7 +140,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------------
 
     device_type = get_device_type() if args.device == "auto" else args.device
-    dist_info = get_dist_info(device_type=device_type)
+    dist_info = init_dist_groups(device_type=device_type)
     is_master_process = dist_info["rank"] == 0
 
     device = dist_info["device"]

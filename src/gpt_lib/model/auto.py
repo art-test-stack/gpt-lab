@@ -69,7 +69,7 @@ class AutoGPTConfig(BaseModel):
             from datetime import datetime
             date = datetime.today().ctime().replace(" ", "_").replace(":", "-")
         
-            self.name = f"{self.basename}_{self.depth}_{git_commit}_{date}"
+            self.name = f"{self.basename}_d{self.depth}_cmt_{git_commit}_dt_{date}"
         if self.vocab_size != -1 and self.vocab_size < 256:
             raise ValueError("Vocab size must be at least 256 to ensure all unicode characters are supported.")
         # TODO: check that basename is valid (e.g. no special characters, etc.)
