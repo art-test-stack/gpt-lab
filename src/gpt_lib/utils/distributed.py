@@ -59,7 +59,7 @@ def get_base_dist_info():
 def get_dist_info(device_type: str | None = None, random_seed: int = 42):
     if device_type is None:
         device_type = get_device_type()
-    assert device_type in ("cuda", "mps", "xpu", "tpu", "cpu"), f"Unsupported device type: {device_type!r}."
+    assert device_type in ("cuda", "mps", "cpu"), f"Unsupported device type: {device_type!r}."
     torch.manual_seed(random_seed)
     if device_type == "cuda":
         torch.cuda.manual_seed(random_seed)

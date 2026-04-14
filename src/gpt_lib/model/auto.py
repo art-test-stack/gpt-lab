@@ -272,7 +272,7 @@ class AutoGPTConfig(BaseModel):
             tokens_per_iter_per_world = tokens_per_iter_per_rank * self.dist_info["world_size"]
             n_acc_steps = max(1, total_batch_size // tokens_per_iter_per_world)
 
-            assert (n_acc_steps == 1) or (total_batch_size // tokens_per_iter_per_world == 0)
+            assert (n_acc_steps == 1) or (total_batch_size % tokens_per_iter_per_world == 0)
 
         training_config = dict(
             n_steps=n_steps,
