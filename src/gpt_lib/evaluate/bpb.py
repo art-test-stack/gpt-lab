@@ -31,7 +31,7 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info
         - bpb (float): The computed bits-per-byte metric.
         - loss (float): The average loss per token, for debugging.
     """
-    dist_is_init = dist_info["is_init"] if dist_info is not None else dist.is_initialized()
+    dist_is_init = dist_info["is_ddp_initialized"] if dist_info is not None else dist.is_initialized()
     world_size = dist_info["world_size"] if dist_info is not None else 1
     
     device = model.get_device() if hasattr(model, "get_device") else next(model.parameters()).device

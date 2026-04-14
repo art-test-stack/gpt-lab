@@ -347,7 +347,7 @@ class DenseTransformer(BaseTransformer):
                 params=group_params, **optim_config["transformer"]
             ))
 
-        optimizer = OptimizerFactory(param_groups, distributed=config.dist_info["is_init"])
+        optimizer = OptimizerFactory(param_groups, distributed=config.dist_info["is_ddp_initialized"])
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
