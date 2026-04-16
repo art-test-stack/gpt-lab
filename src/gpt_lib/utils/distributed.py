@@ -52,7 +52,6 @@ def get_device_type():
 def is_ddp_requested() -> bool:
     return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
 
-@lru_cache()
 def is_ddp_initialized() -> bool:
     return dist.is_initialized() and dist.is_available()
 
