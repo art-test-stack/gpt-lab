@@ -154,20 +154,23 @@ def forward_model(model, input_ids):
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
     batch_size, seq_len = input_ids.size()
-    
-    outputs = model(input_ids).logits  # (B, Seq, V)
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    # Calculate cross entropy at all positions
-    losses = torch.nn.functional.cross_entropy(
-        outputs.view(batch_size * seq_len, -1),
-        target_ids.view(batch_size * seq_len),
-        reduction='none'
-    ).view(batch_size, seq_len)
+    # outputs = model(input_ids, target_ids, reduction='none').logits # (B, Seq, V)
+    # 
+    # # Calculate cross entropy at all positions
+    # losses = torch.nn.functional.cross_entropy(
+    #     outputs.view(batch_size * seq_len, -1),
+    #     target_ids.view(batch_size * seq_len),
+    #     reduction='none'
+    # ).view(batch_size, seq_len)
+    outputs = model(input_ids, target_ids, reduction='none') # (B, Seq) NATs
+    losses = outputs.loss.view(batch_size, seq_len) # (B, Seq, V)
+
     # Set the last column to be nan because there is no autoregressive loss there
     losses[:, -1] = float('nan')
     # Get the argmax predictions at each position
-    predictions = outputs.argmax(dim=-1)
+    predictions = outputs.logits.argmax(dim=-1)
     return losses, predictions
 
 

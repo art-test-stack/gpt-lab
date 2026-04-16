@@ -214,25 +214,6 @@ if __name__ == "__main__":
         raise ValueError(f"Model initialization mode {args.model_init!r} is not known. Please choose among 'auto', 'custom', etc.")
     
     # ------------------------------------------------------------------------------
-    # INIT BOARD
-    # ------------------------------------------------------------------------------
-
-    from gpt_lib.utils.board import Board, DummyBoard
-
-    if is_master_process:
-        board_args["dirname"] = meta_config["dirname"]
-        board = Board(
-            board_type=args.board,
-            # entity_name=None, # TODO: add option for wandb entity
-            project=f"trainbase_{meta_config['project']}",
-            run=meta_config['name'],
-            config=board_args,
-            board_dir=args.board_dir
-        )
-    else:
-        board = DummyBoard()
-
-    # ------------------------------------------------------------------------------
     # INIT MODEL
     # ------------------------------------------------------------------------------
 
@@ -298,6 +279,25 @@ if __name__ == "__main__":
     print0_dict("Trainer config", trainer_config.model_dump())
 
     optimizers = model.build_optimizer(trainer_config)
+
+    # ------------------------------------------------------------------------------
+    # INIT BOARD
+    # ------------------------------------------------------------------------------
+
+    from gpt_lib.utils.board import Board, DummyBoard
+
+    if is_master_process:
+        board_args["dirname"] = meta_config["dirname"]
+        board = Board(
+            board_type=args.board,
+            # entity_name=None, # TODO: add option for wandb entity
+            project=f"trainbase_{meta_config['project']}",
+            run=meta_config['name'],
+            config=board_args | {"meta_config": meta_config, "training_config": base_training_config, "model_card": model.config.model_dump()},
+            board_dir=args.board_dir,
+        )
+    else:
+        board = DummyBoard()
 
     # ------------------------------------------------------------------------------
     # TRAINER: TRAINING, EVALUATION, CHECKPOINTING LOOPS

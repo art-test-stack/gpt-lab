@@ -271,8 +271,8 @@ class Trainer:
                     "total_training_time": self.state.total_training_time,
                     "val/loss": val_res['loss'],
                     "val/bpb": val_res['bpb'],
-                    "best_val_bpb": self.state.best_val_loss,
-                })
+                    "val/best_bpb": self.state.best_val_loss,
+                }, step=step)
                 _model.train()
 
             # ================================================================
@@ -295,11 +295,10 @@ class Trainer:
                     )
                 print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
                 self.board.log({
-                    "step": step,
                     "total_training_flops": flops_so_far,
-                    "core_metric": results["core_metric"],
-                    "centered_results": results["centered_results"],
-                })
+                    "val/core_metric": results["core_metric"],
+                    "val/centered_results": results["centered_results"],
+                }, step=step)
                 self.model.train()
             
             # ================================================================
@@ -410,8 +409,7 @@ class Trainer:
                 )
                 
                 log_dict = {
-                    "step": step,
-                    "loss": debiased_smooth_loss,
+                    "train/loss": debiased_smooth_loss,
                     "lrm": lrm,
                     "muon_momentum": muon_momentum,
                     "weight_decay": weight_decay,
@@ -429,7 +427,7 @@ class Trainer:
                 self.metrics.throughput_tokens_per_sec.append(tokens_per_sec)
                 self.metrics.time_per_step_ms.append(step_dt * 1000)
                 
-                self.board.log(log_dict)
+                self.board.log(log_dict, step=step)
             
             # ================================================================
             # Checkpointing
