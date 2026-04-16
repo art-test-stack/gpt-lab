@@ -143,7 +143,7 @@ class Trainer:
         self.config = config
         
         self.checkpoint_dir = checkpoint_dir or (MODELS_FOLDER / "checkpoints")
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=False)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Board
         if board is None:
