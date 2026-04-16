@@ -166,68 +166,6 @@ def has_ve(layer_idx: int, n_layers: int) -> bool:
 
 # --------------      Attention utilities      -------------- #
 
-def scaled_dot_product_attention(
-        query: torch.Tensor, 
-        key: torch.Tensor, 
-        value: torch.Tensor, 
-        attn_mask: torch.Tensor | None = None, 
-        dropout_p: float = 0.0,
-        is_causal: bool = False, 
-        scale: Optional[float] = None, 
-        use_gqa: bool = False,
-        return_attn_weights: bool = False,
-        device: Optional[torch.device | str] = None
-    ) -> torch.Tensor:
-    if device is None:
-        device = query.device
-    if isinstance(device, str):
-        device = torch.device(device)
-    assert query.dim() == 4 and key.dim() == 4 and value.dim() == 4, 'Query, Key and Value must be 4D tensors.'
-    assert query.size(-1) == key.size(-1) == value.size(-1), 'Last dimension of Query, Key and Value must be the same'
-    assert query.device == key.device == value.device, f'Query, Key and Value must be on the same device. Got Query device: {query.device}, Key device: {key.device}, Value device: {value.device}.'
-    assert query.device == device, f'Q, K, V devices and specified device must be the same. Got Query device: {query.device}, Key device: {key.device}, Value device: {value.device}, specified device: {device}.'
-
-    assert (not is_causal) or (attn_mask is None), "`is_causal` cannot be True when `attn_mask` is provided. This behavior is given as a imitation of PyTorch's scaled_dot_product_attention."
-
-    if attn_mask is not None:
-        if attn_mask.dim() == 2:
-            attn_mask = attn_mask.unsqueeze(1).unsqueeze(1) # B x 1 x 1 x S
-        elif attn_mask.dim() == 3:
-            attn_mask = attn_mask.unsqueeze(1)  # B x 1 x L x S
-        else:
-            assert attn_mask.size(0) == query.size(0) and attn_mask.size(0) == key.size(0), f'Attention mask batch size must match Query and Key batch size. Got attn_mask size: {attn_mask.size()} (B,...), Query size: {query.size()} (B,...), Key size: {key.size()} (B,...).'
-            assert attn_mask.size(-2) == query.size(-2), f'Attention mask size must match the sequence length of Query. Got attn_mask size: {attn_mask.size()} (B,...,L,S), Query size: {query.size()} (B,...,Hq,L,E), Key size: {key.size()} (B,...,H,S,E).'
-            assert attn_mask.size(-1) == key.size(-2), f'Attention mask size must match the batch size and sequence lengths of Query and Key. Got attn_mask size: {attn_mask.size()} (B,...,L,S), Query size: {query.size()} (B,...,Hq,L,E), Key size: {key.size()} (B,...,H,S,E).'
-
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-
-    attn_bias = torch.zeros((1, 1, L, S), device=device)
-
-    if is_causal:
-        causal = torch.tril(torch.ones(L, S, device=device))
-        attn_bias = attn_bias.masked_fill(causal == 0, float('-inf'))
-
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            attn_bias = attn_bias.masked_fill(~attn_mask, float('-inf'))
-        else:
-            attn_bias = attn_mask
-
-    if use_gqa:
-        if query.size(-3) != key.size(-3):
-            raise ValueError('For GQA, the number of query heads must match the number of key heads.')
-        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
-        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
-
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    attn_weight = F.softmax(attn_weight, dim=-1)
-    attn_weight = F.dropout(attn_weight, dropout_p, training=True)
-    return attn_weight @ value, attn_weight if return_attn_weights else None
-
-
-
 class CausalSelfAttention(Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, d_head: int, 
                  norm_before_attn: bool, use_gqa: bool, dropout: float = .0, 
@@ -447,17 +385,19 @@ class DecoderLayer(Module):
         self.norm = build_norm(normalization, eps=1e-8, torch_impl=True)
 
     def forward(self, x, attn_mask=None, kv_cache=None, rope_cache=None, window_size=None, return_attn_weights=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        
         if self.norm_before_attn:
-            x = self.norm(x)
+            norm_x = self.norm(x)
+        else:
+            norm_x = x
         h, attn_weights = self.attention(
-            x, attn_mask=attn_mask, kv_cache=kv_cache, 
+            norm_x, attn_mask=attn_mask, kv_cache=kv_cache, 
             rope_cache=rope_cache, window_size=window_size, 
             return_attn_weights=return_attn_weights)
+        
         h = x + h
-        h = self.norm(h)
-        h = h + self.ffn(h)
-        if not self.norm_before_attn:
-            h = self.norm(h)
+        h = h + self.ffn(self.norm(h))
+
         if self.training:
             h = F.dropout(h, p=self.dropout_rate, training=True)
         

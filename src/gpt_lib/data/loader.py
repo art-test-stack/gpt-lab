@@ -92,6 +92,9 @@ class DistDataLoader:
         self.cpu = torch.empty(total_tokens, dtype=torch.long, pin_memory=(self.device.type == "cuda"))
         self.gpu = torch.empty(total_tokens, dtype=torch.long, device=self.device)
         self.buffer_size = buffer_size
+        self.gpu_buffer = torch.empty(2 * self.B * self.T, device=self.device, dtype=torch.long)
+        self.inputs = self.gpu_buffer[:self.B*self.T].view(self.B, self.T)
+        self.targets = self.gpu_buffer[self.B*self.T:].view(self.B, self.T)
 
     def _refill(self):
         while len(self.buffer) < self.buffer_size:
@@ -132,9 +135,10 @@ class DistDataLoader:
 
         data = self.gpu.view(B, T + 1)
 
-        inputs = data[:, :-1]
-        targets = data[:, 1:]
-        return inputs, targets, None
+        self.inputs.copy_(data[:, :-1])
+        self.targets.copy_(data[:, 1:])
+
+        return self.inputs, self.targets, None
 
 def build_dataloader(
     dsname: str,

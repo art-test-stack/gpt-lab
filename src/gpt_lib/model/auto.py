@@ -175,6 +175,8 @@ class AutoGPTConfig(BaseModel):
                 
             return vocab_size + len(special_tokens) # add special tokens to vocab size
         
+        # TODO: for more efficient training of the model make 
+        # vocab size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         vocab_size = self.vocab_size
         if vocab_size == -1:
             vocab_size = compute_optimal_vocab_size(self.depth)

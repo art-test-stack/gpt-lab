@@ -444,6 +444,7 @@ class DenseTransformer(BaseTransformer):
         assert logits.is_contiguous(), "Logits should be contiguous for efficient loss computation"
         loss = None
         if labels is not None:
+            assert labels.is_contiguous(), "Labels should be contiguous for efficient loss computation"
             loss = self.loss_fn(logits, labels, reduction=reduction)
 
         output = ModelOutput(

@@ -387,6 +387,8 @@ class Trainer:
             self.state.total_training_time += step_dt
             
             # Log every log_every steps
+            # TODO: consider using wandb.Table for logging metrics
+            # https://wandb.ai/wandb/pytorch-lightning-e2e/reports/W-B-Best-Practices-Guide--VmlldzozNTU1ODY1#tables
             if step % self.config.log_every == 0:
                 pct_done = 100 * step / n_steps
                 
