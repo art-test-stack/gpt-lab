@@ -92,11 +92,11 @@ if __name__ == "__main__":
     ## Model arguments
     auto_parser.add_argument("--depth", type=int, default=12, help="(default: 12) Number of model layers.")
     auto_parser.add_argument("--aspect-ratio", type=float, default=64, help="(default: 64) Aspect ratio for auto-configured models.")
-    auto_parser.add_argument("--d-head", type=int, default=512, help="(default: 512) Dimension of each attention head for auto-configured models. If not set, will be determined by aspect ratio and model depth.")
+    auto_parser.add_argument("--d-head", type=int, default=128, help="(default: 128) Dimension of each attention head for auto-configured models. If not set, will be determined by aspect ratio and model depth.")
     auto_parser.add_argument("--d-kv-head", type=int, default=None, help="(default: None) Dimension of each key/value attention head for enable GQA. If not set, will be set to d_head.")
     auto_parser.add_argument("--window-pattern", type=str, default=None, help="(default: None) Window pattern for sliding attention window. String of 'S' and 'L'. If 'None', will be later set as 'SSSL'.")
     auto_parser.add_argument("--window-size", type=str, default=None, help="(default: None) Window size for pattern smalls (S).")
-    auto_parser.add_argument("--softcap", type=float, default=12.0, help="(default: 12.0) Soft cap for model logits to prevent overflow.")
+    auto_parser.add_argument("--softcap", type=float, default=18.0, help="(default: 12.0) Soft cap for model logits to prevent overflow.")
     auto_parser.add_argument("--attn-softcap", type=float, default=None, help="(default: 12.0) Soft cap for attention scores to prevent overflow.")
     auto_parser.add_argument("--attn-impl", type=str, default="sdpa", help="(default: sdpa) Attention implementation to use for auto-configured models. Options are 'sdpa' and 'fused'. Both shoulf exhibit same results but 'fused' should be slightly faster (if runned under cuda device).")
 

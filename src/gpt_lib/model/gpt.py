@@ -424,7 +424,7 @@ class DenseTransformer(BaseTransformer):
             logits = self.lm_head(x)
         else: 
             logits = self.lm_head(x[:, [-1], :])
-        logits = self.lm_head(x)
+            
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
         

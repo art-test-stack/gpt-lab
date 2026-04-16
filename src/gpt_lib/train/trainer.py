@@ -246,7 +246,7 @@ class Trainer:
             # ================================================================
             if (
                 (self.config.eval_bpb_every == -1 and last_step) or
-                (self.config.eval_bpb_every > 0 and
+                (self.config.eval_bpb_every > 0 and step > 0 and
                 (last_step or step % self.config.eval_bpb_every == 0))
             ):
                 _model.eval()
