@@ -271,6 +271,7 @@ class Tokenizer(_BaseTokenizer):
         self.config = config
         self.bos_token_id = self.encode_special(config.special_tokens.bos)
         self.token_bytes_cache = None
+        self.token_bytes_cache = self.token_bytes
 
     def encode_special(self, token: str) -> int:
         return self.special_tokens[token]

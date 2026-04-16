@@ -5,6 +5,8 @@ import torch.nn.functional as F
 import math 
 from typing import Optional
 
+from gpt_lib.utils.distributed import is_ddp_initialized
+
 @torch.no_grad()
 def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info: Optional[dict]) -> float:
     """
@@ -26,13 +28,13 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info
         - batches: An iterable of yielding batches (x,y).
         - step: Number of batches to evaluate.
         - token_bytes (torch.int64): Tensor of shape (V,) containing the byte lengths of each token in the vocabulary; 0 for special tokens.
-        - dist_info (Optional[dict]): Distributed training information. Should contain "world_size" if using distributed evaluation.
+        - dist_info (Optional[dict]): Distributed training information. Should contain "WORLD_SIZE" if using distributed evaluation.
     Returns:
         - bpb (float): The computed bits-per-byte metric.
         - loss (float): The average loss per token, for debugging.
     """
-    dist_is_init = dist_info["is_ddp_initialized"] if dist_info is not None else dist.is_initialized()
-    world_size = dist_info["world_size"] if dist_info is not None else 1
+    dist_is_init = dist_info["IS_DDP_INITIALIZED"] if dist_info is not None else is_ddp_initialized()
+    world_size = dist_info["WORLD_SIZE"] if dist_info is not None else 1
     
     device = model.get_device() if hasattr(model, "get_device") else next(model.parameters()).device
 

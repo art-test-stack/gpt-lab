@@ -9,8 +9,6 @@ def get_muon_momentum(it):
 # Weight decay scheduler for Muon optimizer (linear to zero over the course of training)
 # def get_weight_decay(it):
 #     return weight_decay_scaled * (1 - it / num_iterations)
-
-
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params,
                     momentum_buffer, second_momentum_buffer,

@@ -19,6 +19,7 @@ import warnings
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 
 from gpt_lib.utils.schemas import TrainingConfig, TrainingMetrics
@@ -27,6 +28,7 @@ from gpt_lib.utils.common import print0, print0_dict
 from gpt_lib.evaluate.bpb import compute_bpb
 from gpt_lib.evaluate.core import evaluate_core
 from gpt_lib.model.gpt import GPTModel
+from gpt_lib.utils.default import CACHE_DIR, MODELS_FOLDER
 
 
 # ============================================================================
@@ -62,6 +64,9 @@ class DummyContext:
     def __init__(self, *args, **kwargs): pass
     def __enter__(self, *args, **kwargs): pass
     def __exit__(self, *args, **kwargs): pass
+    def __call__(self, *args, **kwds):
+        self.__enter__()
+        return self
     
 
 # ============================================================================
@@ -127,7 +132,6 @@ class Trainer:
         self.tokenizer = tokenizer
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else Path("./checkpoints")
         
         # Config
         if config is None:
@@ -137,7 +141,9 @@ class Trainer:
                 "Please provide a TrainingConfig instance."
             )
         self.config = config
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.checkpoint_dir = checkpoint_dir or (MODELS_FOLDER / "checkpoints")
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=False)
         
         # Board
         if board is None:
@@ -178,13 +184,13 @@ class Trainer:
         self.scaler = GradScaler() if self.use_amp else None
         
         # LR and other schedules
-        self.lr_schedule = lr_schedule or config.lr_schedule
+        self.lr_schedule = lr_schedule or config.lr_multiplier_schedule
         self.muon_momentum_schedule = muon_momentum_schedule or config.muon_momentum_schedule
         self.weight_decay_schedule = weight_decay_schedule or config.weight_decay_schedule
 
         # Device config
-        self.device_type = config.dist_info.get("device_type", "cpu")
-        self.device = torch.device(config.dist_info.get("device", "cpu"))
+        self.device_type = config.dist_info.get("DEVICE_TYPE", "cpu")
+        self.device = torch.device(config.dist_info.get("DEVICE", "cpu"))
         self._get_sync_fn()
 
     def _get_sync_fn(self):
@@ -203,7 +209,7 @@ class Trainer:
         Performs gradient accumulation, validation, checkpointing, and logging.
         """
         print0("=" * 70)
-        print0(f"Starting training for {self.config.n_steps:,} steps")
+        print0(f"Starting training for {self.config.n_steps:,} steps -- {self.config.total_batch_size:,} tokens per step.")
         print0("=" * 70)
         
         # Extracte main constants from config
@@ -211,12 +217,15 @@ class Trainer:
         n_steps = self.config.n_steps
         n_flops_per_token = self.config.n_flops_per_token
         total_batch_size = self.config.total_batch_size
+        n_acc_steps = self.config.n_acc_steps
         
         # Compile model if using PyTorch 2.0+
         if torch.__version__ >= "2.0":
             self._model = torch.compile(self.model, dynamic=False)
         _model = self._model
-        train_iter = next(self.train_loader)
+
+        train_iter = iter(self.train_loader)
+        x, y, dataloader_state = next(train_iter) # prefetch
 
         # Prepare for training
         self._model.train()
@@ -224,7 +233,7 @@ class Trainer:
         ema_beta = 0.9
         
         self.state.total_training_time = 0.0
-        step_times = []  # For ETA calculation
+        total_dt = []  # For ETA calculation
         
         while step < n_steps:
             last_step = (step == n_steps - 1)
@@ -236,11 +245,12 @@ class Trainer:
             # Validation on 'val_loader' every 'eval_every' steps
             # ================================================================
             if (
-                self.config.eval_bpb_every > 0 and
-                (step == 0 or step % self.config.eval_bpb_every == 0)
+                (self.config.eval_bpb_every == -1 and last_step) or
+                (self.config.eval_bpb_every > 0 and
+                (last_step or step % self.config.eval_bpb_every == 0))
             ):
                 _model.eval()
-                eval_steps = self.config.n_bpb_tokens // (self.config.device_batch_size * self.model.config.max_context * self.config.dist_info["world_size"])
+                eval_steps = self.config.n_bpb_tokens // (self.config.device_batch_size * self.model.config.max_context * self.config.dist_info["WORLD_SIZE"])
                 with self.val_context(_model):
                     val_res = compute_bpb(
                         _model, 
@@ -271,8 +281,9 @@ class Trainer:
             
             results = {}
             if (
-                self.config.eval_core_every > 0 and 
-                (last_step or (step > 0 and step % self.config.eval_core_every == 0))
+                (self.config.eval_core_every == -1 and last_step) or
+                (self.config.eval_core_every > 0 and (
+                    last_step or (step > 0 and step % self.config.eval_core_every == 0)))
             ):
                 self.model.eval()
                 with self.val_context(self.model):
@@ -296,9 +307,10 @@ class Trainer:
             # ================================================================
 
             if (
-                self.config.sample_every > 0 and 
-                self.config.dist_info["rank"] == 0 and 
-                (last_step or (step > 0 and step % self.config.sample_every == 0))
+                self.config.dist_info["RANK"] == 0 and 
+                ((self.config.sample_every == -1 and last_step) or
+                (self.config.sample_every > 0 and 
+                (last_step or (step > 0 and step % self.config.sample_every == 0))))
             ):
                 self.model.eval()
                 prompts = [
@@ -311,70 +323,68 @@ class Trainer:
                     "If 5*x + 3 = 13, then x is",
                 ]
                 engine = GPTModel(self.model, self.tokenizer) # use orig_model to avoid recompilation
-                for prompt in prompts:
-                    tokens = self.tokenizer(prompt, prepend_bos=True)
-                    with self.val_context(self.model):
-                        sample = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                    print0(self.tokenizer.decode(sample[0]))
+                with self.val_context(self.model):
+                    samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
+                print0(self.tokenizer.decode(samples[0]))
                 self.model.train()
 
             # ================================================================
             # Training step with gradient accumulation
             # ================================================================
             loss_accum = 0.0
-            grad_accum_steps = self.config.gradient_accumulation_steps
             
-            for _ in range(grad_accum_steps):
-                inputs, targets, dataloader_state = next(train_iter)
+            for _ in range(n_acc_steps):
                 self.state.train_loader_state = dataloader_state
                 
                 with self.train_context():
-                    loss = self._compute_loss(inputs, targets)
-                loss = loss / grad_accum_steps
+                    loss = self._compute_loss(x, y)
+                loss = loss / n_acc_steps
 
                 if self.use_amp:
                     self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
-                
-                loss_accum += loss.detach().item()
 
-            self._update_lr(step)
-            
-            # Optimizer step
-            if self.use_amp:
+                loss_accum += loss.detach().item()
+                x, y, dataloader_state = next(train_iter)
+
+            lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
+
+            if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
+                if self.config.dist_info["IS_DDP_INITIALIZED"]:
+                    for g in self.scaler._found_inf__per_device:
+                        dist.all_reduce(g, op=dist.ReduceOp.MAX)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
                 self.optimizer.step()
             
-            self.optimizer.zero_grad(set_to_none=True)
+            _model.zero_grad(set_to_none=True)
             
             # ================================================================
             # Logging and metrics
             # ================================================================
+            
             self.synchronize()
             step_end_time = time.time()
-            step_time = step_end_time - step_start_time
+            step_dt = step_end_time - step_start_time
             
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
             debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
             
             # Calculate throughput
-            total_tokens = (
-                inputs.numel() * grad_accum_steps *
-                (self.config.dist_info.get("world_size", 1) if self.config.dist_info else 1)
+            eff_global_tokens = (
+                x.numel() * n_acc_steps *
+                (self.config.dist_info.get("WORLD_SIZE", 1) if self.config.dist_info else 1)
             )
-            tokens_per_sec = total_tokens / step_time
+            tokens_per_sec = eff_global_tokens / step_dt
             
-            step_times.append(step_time)
+            total_dt.append(step_dt)
             self.state.global_step = step
-            self.state.global_tokens += total_tokens
+            self.state.global_tokens += eff_global_tokens
             self.state.smooth_train_loss = smooth_loss
-            self.state.total_training_time += step_time
+            self.state.total_training_time += step_dt
             
             # Log every log_every steps
             if step % self.config.log_every == 0:
@@ -382,8 +392,8 @@ class Trainer:
                 pct_done = 100 * step / n_steps
                 
                 # ETA calculation
-                if len(step_times) > 10:
-                    avg_step_time = sum(step_times[-10:]) / 10
+                if len(total_dt) > 10:
+                    avg_step_time = sum(total_dt[-10:]) / 10
                     eta_seconds = (n_steps - step) * avg_step_time
                     eta_str = f" | ETA: {eta_seconds/60:.1f}m"
                 else:
@@ -393,7 +403,7 @@ class Trainer:
                     f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
                     f"loss: {debiased_smooth_loss:.6f} | "
                     f"lr: {current_lr:.2e} | "
-                    f"dt: {step_time*1000:.2f}ms | "
+                    f"dt: {step_dt*1000:.2f}ms | "
                     f"tok/s: {tokens_per_sec:,.0f}"
                     f"{eta_str}"
                 )
@@ -401,9 +411,12 @@ class Trainer:
                 log_dict = {
                     "step": step,
                     "loss": debiased_smooth_loss,
-                    "learning_rate": current_lr,
+                    "lr": current_lr,
+                    "lrm": lrm,
+                    "muon_momentum": muon_momentum,
+                    "weight_decay": weight_decay,
                     "tokens_per_sec": tokens_per_sec,
-                    "step_time_ms": step_time * 1000,
+                    "step_time_ms": step_dt * 1000,
                     "epoch": self.state.num_epochs,
                     "total_tokens": self.state.global_tokens,
                 }
@@ -414,7 +427,7 @@ class Trainer:
                 self.metrics.train_loss.append(debiased_smooth_loss)
                 self.metrics.learning_rate.append(current_lr)
                 self.metrics.throughput_tokens_per_sec.append(tokens_per_sec)
-                self.metrics.time_per_step_ms.append(step_time * 1000)
+                self.metrics.time_per_step_ms.append(step_dt * 1000)
                 
                 self.board.log(log_dict)
             
@@ -424,7 +437,7 @@ class Trainer:
             if (self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0):
                 self.save_checkpoint(tag=f"step_{step}")
             
-            if sum(step_times) > self.config.target_time * 60:
+            if (sum(total_dt) > self.config.target_time * 60) and self.config.target_time > 0:
                 print0(f"Reached target time of {self.config.target_time} minutes. Stopping training.")
                 break
             
@@ -451,32 +464,31 @@ class Trainer:
         # Final checkpoint
         self.save_checkpoint(tag="final")
 
-    def _compute_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def _compute_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Compute cross-entropy loss."""
-        output = self._model(inputs, targets)
+        output = self._model(x, y)
         if hasattr(output, "loss"):
             return output.loss
         else:
             B, T, V = output.shape
             return torch.nn.functional.cross_entropy(
                 output.view(B * T, V),
-                targets.view(B * T),
+                y.view(B * T),
             )
 
-    def _update_lr(self, step: int):
+    def _apply_optim_hparam_scheduler(self, step: int):
         """Update learning rate according to schedule."""
-        if not hasattr(self.config, 'get_lr_schedule'):
-            return
-        
-        lr = self.lr_schedule(step)
+
+        lrm = self.lr_schedule(step)
         muon_momentum = self.muon_momentum_schedule(step)
         weight_decay = self.weight_decay_schedule(step)
         
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = param_group["initial_lr"] * lr
+            param_group["lr"] = param_group["initial_lr"] * lrm
             if param_group["type"] == "muon":
                 param_group["momentum"] = muon_momentum
                 param_group["weight_decay"] = weight_decay
+        return lrm, muon_momentum, weight_decay
 
     def save_checkpoint(self, tag: str = "latest"):
         """

@@ -141,7 +141,6 @@ class KVCache:
             dtype = ddp_cache_data[0][0].dtype
             pass # TODO: load from ddp_cache_data
 
-
         self.n_layers = config.n_layers
         self.n_heads = config.n_kv_heads
         self.d_head = config.d_head
@@ -152,13 +151,6 @@ class KVCache:
         # easier to manage B, T, H, D shapes
         self.cur_pos = 0
 
-        # _cache = lambda: torch.zeros(0, 0, self.n_heads, self.d_head, device=device, dtype=dtype)
-
-        # default_cache = [
-        #     [_cache(), _cache()] for _ in range(self.n_layers)
-        # ]
-        # self.cache = ddp_cache_data or default_cache
-        # try with cache fully torch.tensor
         self.cache = torch.empty(
             (self.n_layers, 2, 0, 0, self.n_heads, self.d_head),
             device=device,

@@ -13,7 +13,7 @@ from jinja2 import Template
 import torch
 import torch.distributed as dist
 
-from gpt_lib.utils.default import CACHE_DIR
+from gpt_lib.utils.default import CACHE_DIR, DATA_DIR
 from gpt_lib.utils.common import print0, download_file_with_lock
 from gpt_lib.tokenizer import Tokenizer, TokenizerConfig
 
@@ -154,7 +154,8 @@ def forward_model(model, input_ids):
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
     batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
+    
+    outputs = model(input_ids).logits  # (B, Seq, V)
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
     # Calculate cross entropy at all positions
@@ -312,12 +313,31 @@ def load_hf_model(hf_path: str, device):
     tokenizer = Tokenizer.from_pretrained(config=tokconfig)
     return model, tokenizer
 
+COLS = {
+    "id": 4,
+    "task": 32,
+    "type": 17,
+    "fewshot": 9,
+    "acc": 10,
+    "cacc": 17,
+    "time": 10,
+}
+
+CORE_HEADERS = (
+    f"{'Id':^{COLS['id']}} | "
+    f"{'Task name':^{COLS['task']}} | "
+    f"{'Task type':^{COLS['type']}} | "
+    f"{'Fewshot':^{COLS['fewshot']}} | "
+    f"{'Accuracy':^{COLS['acc']}} | "
+    f"{'Centered accuracy':^{COLS['cacc']}} | "
+    f"{'Time (s)':^{COLS['time']}}"
+)
 
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
 
 def place_eval_bundle(file_path):
     """Unzip eval_bundle.zip and place it in the base directory."""
-    base_dir = CACHE_DIR
+    base_dir = DATA_DIR / "core"
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
@@ -331,7 +351,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
     """
-    base_dir = CACHE_DIR
+    base_dir = DATA_DIR / "core"
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
     # Download the eval bundle if needed
     if not os.path.exists(eval_bundle_dir):
@@ -357,7 +377,10 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     # Evaluate each task
     results = {}
     centered_results = {}
-    for task in tasks:
+    print0(f"Evaluating CORE benchmark with {len(tasks)} tasks...")
+    print0(CORE_HEADERS)
+    print0("-" * len(CORE_HEADERS))
+    for i, task in enumerate(tasks):
         start_time = time.time()
         label = task['label']
         task_meta = {
@@ -366,7 +389,13 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             'num_fewshot': task['num_fewshot'][0],
             'continuation_delimiter': task.get('continuation_delimiter', ' ')
         }
-        print0(f"Evaluating: {label} ({task_meta['num_fewshot']}-shot, type: {task_meta['task_type']})... ", end='')
+        print0(
+            f"{i:^{COLS['id']}} | "
+            f"{label:^{COLS['task']}} | "
+            f"{task_meta['task_type']:^{COLS['type']}} | "
+            f"{(str(task_meta['num_fewshot']) + '-shot'):^{COLS['fewshot']}} |",
+            end=""
+        )
 
         data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
         with open(data_path, 'r', encoding='utf-8') as f:
@@ -384,7 +413,11 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
         elapsed = time.time() - start_time
-        print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
+        print0(
+            f"{accuracy:^{COLS['acc']}.6f} | "
+            f"{centered_result:^{COLS['cacc']}.6f} | "
+            f"{elapsed:^{COLS['time']}.2f}"
+        )
 
     core_metric = sum(centered_results.values()) / len(centered_results)
     out = {

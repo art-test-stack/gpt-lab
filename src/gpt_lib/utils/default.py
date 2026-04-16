@@ -2,6 +2,7 @@ import torch
 import os
 from pathlib import Path
 from typing import Tuple, Dict, Literal
+from functools import lru_cache
 from gpt_lib.utils.special_tokens import SpecialTokens
 
 # ----------- PROCESSOR -----------
@@ -22,11 +23,16 @@ IS_TIKTOKEN = False # TODO: parse as arg
 
 SPECIAL_TOKENS = SpecialTokens()
 
+@lru_cache()
+def get_cache_dir() -> Path:
+    cache_dir = os.environ.get("GPTLIB_CACHE_DIR", None)
+    if cache_dir is not None:
+        return Path(cache_dir).expanduser().resolve()
+    else:
+        return Path.home() / ".cache" / "gpt_lib"
 cache_dir = os.environ.get("GPTLIB_CACHE_DIR", None)
-if cache_dir is not None:
-    CACHE_DIR = Path(cache_dir)
-else:
-    CACHE_DIR = Path.home() / ".cache" / "gpt_lib"
+
+CACHE_DIR = get_cache_dir()
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 BOARD_DIR = CACHE_DIR / "runs"
 DATA_DIR = CACHE_DIR / "data"

@@ -2,7 +2,7 @@ from pathlib import Path
 import os
 import random
 import subprocess
-from .default import CACHE_DIR
+from .default import CACHE_DIR, DATA_DIR
 from filelock import FileLock
 import urllib.request
 
@@ -94,7 +94,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     Downloads a file from a URL to a local path in the base directory.
     Uses a lock file to prevent concurrent downloads among multiple ranks.
     """
-    base_dir = CACHE_DIR
+    base_dir = DATA_DIR / "core"
     file_path = os.path.join(base_dir, filename)
     lock_path = file_path + ".lock"
 

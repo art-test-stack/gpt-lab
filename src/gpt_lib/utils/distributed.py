@@ -3,6 +3,7 @@ from gpt_lib.utils.log import logger
 import torch
 import torch.distributed as dist
 import os, warnings
+from functools import lru_cache
 
 # -----------------------------------------------------------
 # dtype detection and management
@@ -10,6 +11,7 @@ import os, warnings
 
 _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
+@lru_cache()
 def detect_compute_dtype():
     env = os.environ.get("GPTLIB_DTYPE", None)
     if env is not None:
@@ -29,7 +31,7 @@ def detect_compute_dtype():
 # distributed utils
 # -----------------------------------------------------------
 
-
+@lru_cache()
 def get_device_type():
     if torch.cuda.is_available():
         device_type = "cuda"
@@ -46,12 +48,15 @@ def get_device_type():
         warnings.warn(f"Device type {device_type!r} is not fully tested. May exhibit unexpected behavior.")
     return device_type
 
+@lru_cache()
 def is_ddp_requested() -> bool:
     return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
 
+@lru_cache()
 def is_ddp_initialized() -> bool:
     return dist.is_initialized() and dist.is_available()
 
+@lru_cache()
 def get_base_dist_info():
     is_requested = is_ddp_requested()
     if is_requested:
@@ -72,6 +77,7 @@ def get_base_dist_info():
 
     return is_requested, world_size, rank, local_rank, tp_size
 
+@lru_cache()
 def get_dist_info(device_type: str | None = None, base_dist_info: tuple | None = None):
     if device_type is None:
         device_type = get_device_type()
@@ -88,19 +94,19 @@ def get_dist_info(device_type: str | None = None, base_dist_info: tuple | None =
 
     dist_groups = dict(device_type=device_type)
 
-    dist_groups["world_size"] = world_size
-    dist_groups["is_ddp_requested"] = is_requested
-    dist_groups["is_ddp_initialized"] = is_initialized
-    dist_groups["dp_size"] = world_size // tp_size
-    dist_groups["rank"] = rank
-    dist_groups["local_rank"] = local_rank
-    dist_groups["device"] = torch.device(device_type, local_rank) if device_type == "cuda" else torch.device(device_type)
-
+    dist_groups["WORLD_SIZE"] = world_size
+    dist_groups["IS_DDP_REQUESTED"] = is_requested
+    dist_groups["IS_DDP_INITIALIZED"] = is_initialized
+    dist_groups["DP_SIZE"] = world_size // tp_size
+    dist_groups["RANK"] = rank
+    dist_groups["LOCAL_RANK"] = local_rank
+    dist_groups["DEVICE"] = torch.device(device_type, local_rank) if device_type == "cuda" else torch.device(device_type)
+    dist_groups["DEVICE_TYPE"] = device_type
     if device_type == "cuda":
-        dist_groups["device_name"] = torch.cuda.get_device_name(dist_groups["device"])
-        dist_groups["gpu_peak_flops"] = get_peak_flops(dist_groups["device_name"])
+        dist_groups["DEVICE_NAME"] = torch.cuda.get_device_name(dist_groups["DEVICE"])
+        dist_groups["gpu_peak_flops"] = get_peak_flops(dist_groups["DEVICE_NAME"])
     else:
-        dist_groups["device_name"] = None # does not matter
+        dist_groups["DEVICE_NAME"] = None # does not matter
         dist_groups["gpu_peak_flops"] = float('inf') # TODO: implement peak flops estimation for xpu, tpu devices
     if is_initialized and rank == 0:
         logger.info(f"Initialized distributed training. Distributed groups: {'\n'.join(f'{k!r:<15}: {v}' for k, v in dist_groups.items())}")

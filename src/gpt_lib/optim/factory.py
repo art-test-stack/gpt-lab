@@ -112,8 +112,6 @@ class _DistributedBackend:
         self.opt = opt
 
     def step(self, *args, **kwargs):
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
 
         for group in self.opt.param_groups:
             for p in group['params']:

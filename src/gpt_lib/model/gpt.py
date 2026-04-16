@@ -72,7 +72,6 @@ class BaseTransformer(Module):
         self,
     ) -> None:
         super().__init__()
-
     def init_weights(self):
         raise NotImplementedError("init_weights method must be implemented by subclass")
     
@@ -99,6 +98,7 @@ class DenseTransformer(BaseTransformer):
         # self._model_as_meta = True # TODO: thinking about it to automatically handle meta init -> forward path
         self.vocab_size = config.vocab_size
         self.window_sizes = config._window_sizes
+        self.max_seq_len = config.max_context
         # self.bos_token_id = config.bos_id
         # self.eos_token_id = config.eos_id
         
@@ -123,7 +123,7 @@ class DenseTransformer(BaseTransformer):
                 dropout=config.dropout,
                 layer_idx=layer_idx,
                 norm_before_attn=config.norm_before_attn,
-                enable_gqa=config.enable_gqa,
+                use_gqa=config.use_gqa,
                 attn_impl=config.attn_impl,
                 normalization=config.normalization,
             ) 
@@ -347,7 +347,7 @@ class DenseTransformer(BaseTransformer):
                 params=group_params, **optim_config["transformer"]
             ))
 
-        optimizer = OptimizerFactory(param_groups, distributed=config.dist_info["is_ddp_initialized"])
+        optimizer = OptimizerFactory(param_groups, distributed=config.dist_info["IS_DDP_INITIALIZED"])
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -463,7 +463,6 @@ class GPTModel:
         self.main = model
         assert self.main is not None, "Model must be provided"
         assert self.main.vocab_size == self.tokenizer.vocab_size, "Model vocab size must match tokenizer vocab size"
-
         self.vocab_size = self.main.vocab_size
         self.bos_token_id = self.tokenizer.bos_token_id
     
@@ -491,26 +490,13 @@ class GPTModel:
     def __repr__(self) -> str:
         return f"GPTModel(config={str(self.config)}, \nmodel={str(self.main)})"
     
-    
     def update_max_context(self, new_max_context: int) -> None:
         assert new_max_context > 0, "New max context must be positive"
         self.config.model.max_context = new_max_context
         self.attn_mask = self.attn_mask.update_max_context(new_max_context)
 
-    def encode(self, text: str, add_special_tokens: bool = True, return_tensors: TokenizerTensors = "pt") -> List[int]:
-        return self.tokenizer.encode(text, add_special_tokens=add_special_tokens, return_tensors=return_tensors)
-    
-    def encode_batch(self, texts: List[str], add_special_tokens: bool = True, return_tensors: TokenizerTensors = "pt") -> List[List[int]]:
-        # TODO: Change current dummy implementation
-        return self.tokenizer.batch_encode(texts, add_special_tokens=add_special_tokens, return_tensors=return_tensors)
-    
-    def decode_batch(self, token_ids: List[List[int]]) -> List[str]:
-        # TODO: Change current dummy implementation
-        return [self.tokenizer.decode(ids) for ids in token_ids]
-
     def apply_chat_template(self, messages: List[dict], template: str) -> str:
         return self.tokenizer.apply_chat_template(messages, template)
-
 
     def forward(
             self, 
@@ -561,36 +547,32 @@ class GPTModel:
             self,
             input_ids: torch.Tensor,
             ground_truth: Optional[torch.Tensor] = None,
-            # text: str | List[str],
-            # ground_truth: str | List[str] | None = None,
             generation_config: GenerationConfig | None = None,
             assistant_model = None, # TODO: implement assistant model functionality
         ) -> ModelCompletionOutput | Iterator[ModelCompletionOutput]:
         if assistant_model is not None:
             warnings.warn("Assistant model functionality is not yet implemented. Assistant model provided is just ignored.", UserWarning)
         if generation_config is None:
-            warnings.warn("No generation config provided. Using default generation config.", UserWarning)
-            generation_config = GenerationConfig()
+            warnings.warn("No generation config provided. Using default generation config with provided kwargs.", UserWarning)
         if not generation_config.use_cache:
             warnings.warn("GenerationConfig.use_cache is False. Generation may be slow as prefill will be done for each step.", UserWarning)
         if isinstance(generation_config, dict):
             generation_config = GenerationConfig.model_validate(**generation_config)
 
-        input_ids = input_ids.to(self.device)
+        device = self.main.get_device()
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        rng = torch.Generator(device=device).manual_seed(generation_config.seed)
+
+        bos = self.tokenizer.bos_token_id
+
+        input_ids = input_ids.to(device)
 
         if ground_truth is not None:
-            # if isinstance(ground_truth, str):
-            #     ground_truth = [ground_truth]
-            # label_ids = self.tokenizer.encode(ground_truth, add_special_tokens=True, return_tensors="pt")
-            label_ids = label_ids.to(self.device)
-        else:
-            label_ids = None
+            ground_truth = ground_truth.to(device)
 
         kv_cache = None
         if generation_config.use_cache:
-            kv_cache = KVCache(config=self.config.model)
-            # kv_cache = kv_cache.maybe_init()
-
+            kv_cache = KVCache(config=self.main.config)
 
         # Prefill: first forward pass with the full input_ids
         # greedy for now; TODO: implement sampling methods following self.forward method
@@ -605,7 +587,7 @@ class GPTModel:
         batch_size = input_ids.size(0)
         # TODO: dummy implementation for results
         # Initialize with the last token from the first pass
-        results = torch.empty((batch_size, 0), dtype=torch.long, device=self.device)
+        results = torch.empty((batch_size, 0), dtype=torch.long, device=device)
         while True:
             
             # TODO: add row state for stop conditions/more efficient generation
@@ -635,10 +617,36 @@ class GPTModel:
         
         return results.tolist()
 
-    # TODO
-    def generate_batch(self):
-        pass 
-    
+    # TODO # PRIOTITY
+    def generate_batch(self, prompts, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        """
+        Non-streaming batch generation that just returns the final token sequences.
+        Returns a list of token sequences (list of lists of ints).
+        Terminal tokens (assistant_end, bos) are not included in the results.
+        """
+        if isinstance(text, str):
+            text = [text]
+        tokens = self.tokenizer.encode_batch(text, prepend_bos=True)
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        generation_config = GenerationConfig(max_length=max_tokens, temperature=temperature,
+                                             use_cache=True, seed=seed, num_beams=num_samples, top_k=top_k)
+        bos = self.tokenizer.get_bos_token_id()
+        results = [tokens.copy() for _ in range(num_samples)]
+        masks = [[0] * len(tokens) for _ in range(num_samples)]
+        completed = [False] * num_samples
+        for token_column, token_masks in self.generate(tokens, generation_config=generation_config):
+            for i, (token, mask) in enumerate(zip(token_column, token_masks)):
+                if not completed[i]:
+                    if token == assistant_end or token == bos:
+                        completed[i] = True
+                    else:
+                        results[i].append(token)
+                        masks[i].append(mask)
+            # Stop if all rows are completed
+            if all(completed):
+                break
+        return results, masks
+
     @classmethod
     def from_pretrained(
             cls,

@@ -38,6 +38,7 @@ from gpt_lib.utils.types import (
     TpModes,
 )
 from gpt_lib.utils.special_tokens import SpecialTokens
+from gpt_lib.utils.import_utils import is_flash_attn3_available_from_kernel
 
 
 def get_default_device() -> torch.device:
@@ -97,6 +98,7 @@ class TokenizerConfig(BaseModel):
     def model_post_init(self, context: Any) -> None:
         if self.pat_str in PAT_STR.keys():
             self.pat_str = PAT_STR.get(self.pat_str)  # Use predefined pattern if pat_str is a key in PAT_STR
+        
         else:
             warnings.warn(f"Using custom pat_str {self.pat_str!r} without validation." \
                           "Make sure it is a valid regex pattern for tokenization.")
@@ -292,7 +294,7 @@ class TransformerConfig(BaseModel):
     # TODO: padged attention implementation
     attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not recommended : "impl" if return_weights=False.
     # TODO: # layer_types: Optional[List[TParams]] = None  # e.g., ["standard", "standard", "moe", ...] length must be n_layers
-    enable_gqa: bool = False
+    use_gqa: bool = False
     
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
@@ -312,7 +314,12 @@ class TransformerConfig(BaseModel):
         if self.d_head != self.d_model // self.n_heads:
             warnings.warn(f"d_head ({self.d_head}) is not equal to d_model/n_heads ({self.d_model // self.n_heads}). This may lead to unexpected behavior in attention mechanisms.")
         
-        self.n_kv_heads = getattr(self, "n_kv_heads", None) or self.n_heads
+        self.n_kv_heads = self.n_kv_heads or self.n_heads
+        if self.n_kv_heads != self.n_heads:
+            self.use_gqa = True
+        if self.use_gqa and self.attn_impl == "fused" and is_flash_attn3_available_from_kernel():
+            warnings.warn(f"Fused attention implementation does not support GQA. Falling back to standard attention. Got {self.n_heads=} and {self.n_kv_heads=}", UserWarning)
+            self.attn_impl = "sdpa"
         self.attention_dropout = self.attention_dropout if self.attention_dropout is not None else self.dropout
 
         if not self.norm_before_attn:
@@ -378,6 +385,7 @@ class GenerationConfig(BaseModel):
     seed: Optional[int] = None
     stream: bool = False
     use_cache: bool = True
+    num_beams: int = 1
 
     def model_post_init(self, context: Any) -> None:
         if self.max_length <= 0:
@@ -402,7 +410,7 @@ class TrainingConfig(BaseModel):
     n_acc_steps: int = 100
     target_time: float = -1.0 # in seconds, overrides n_steps if > 0
     total_batch_size: int = -1 # Overrides device_batch_size if > 0
-    total_tokens: int = -1 # Overrides n_steps if > 0, calculated as total_batch_size * n_steps
+    n_total_tokens: int = -1 # Overrides n_steps if > 0, calculated as total_batch_size * n_steps
     
     device_batch_size: int = 1 
 
@@ -442,7 +450,7 @@ class TrainingConfig(BaseModel):
     save_every: int = -1 # default: -1 (only at the end)
     log_every: int = -1 # default: -1 (only at the end)
 
-    def lr_schedule(self, step: int) -> float:
+    def lr_multiplier_schedule(self, step: int) -> float:
         n_steps = self.n_steps
         warmup_iters = self.lr_warmup_steps
         warmdown_iters = round(self.lr_warmdown_ratio * n_steps)

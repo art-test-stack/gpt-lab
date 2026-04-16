@@ -245,9 +245,9 @@ def example_distributed_training():
         n_steps=10000,
         eval_every=500,
         dist_info={
-            "rank": rank,
-            "world_size": world_size,
-            "device_type": "cuda",
+            "RANK": rank,
+            "WORLD_SIZE": world_size,
+            "DEVICE_TYPE": "cuda",
         }
     )
     

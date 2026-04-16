@@ -174,7 +174,7 @@ def scaled_dot_product_attention(
         dropout_p: float = 0.0,
         is_causal: bool = False, 
         scale: Optional[float] = None, 
-        enable_gqa: bool = False,
+        use_gqa: bool = False,
         return_attn_weights: bool = False,
         device: Optional[torch.device | str] = None
     ) -> torch.Tensor:
@@ -214,7 +214,7 @@ def scaled_dot_product_attention(
         else:
             attn_bias = attn_mask
 
-    if enable_gqa:
+    if use_gqa:
         if query.size(-3) != key.size(-3):
             raise ValueError('For GQA, the number of query heads must match the number of key heads.')
         key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
@@ -230,7 +230,7 @@ def scaled_dot_product_attention(
 
 class CausalSelfAttention(Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, d_head: int, 
-                 norm_before_attn: bool, enable_gqa: bool, dropout: float = .0, 
+                 norm_before_attn: bool, use_gqa: bool, dropout: float = .0, 
                  normalization: NormalizationTypes = 'rms', norm_eps: float = 1e-8,
                  attn_impl: AttnImplTypes = 'sdpa', layer_idx: int = 0
         ) -> None:
@@ -251,16 +251,11 @@ class CausalSelfAttention(Module):
         self.ve_gate = None # TODO: add gate for value embedding
 
         self.norm = build_norm(normalization, eps=norm_eps, torch_impl=True)
-        # if enable_gqa:
-        #     assert n_heads % 2 == 0, 'Number of heads must be even for GQA.'
-        #     self.n_heads = n_heads // 2
-        #     d_k = d_head
-        # else:
-        #     d_k = d_head * n_heads
         self.attn_impl = attn_impl
         # TODO: try an implementation with separate q, k, v proj
         self.qkv_proj = Linear(d_model, (n_heads + 2 * n_kv_heads) * d_head, bias=False)
         self.o_proj = Linear(d_model, d_model, bias=False)
+
 
     @torch.no_grad()
     def init_weights(self) -> None:
@@ -279,26 +274,22 @@ class CausalSelfAttention(Module):
         Hq, Hk, D = self.n_heads, self.n_kv_heads, self.d_head
         qkv = self.qkv_proj(x)
 
-        # q, k, v = torch.split(_qkv, [Hq * D, Hk * D, Hk * D], dim=-1)
-        # q = q.view(B, Tq, Hq, D)
-        # k = k.view(B, Tq, Hk, D)
-        # v = v.view(B, Tq, Hk, D)
         qkv = qkv.view(B, Tq, Hq + 2 * Hk, D)
-
+        
+        q = qkv[:, :, :Hq, :].clone()
+        k = qkv[:, :, Hq:Hq+Hk, :].clone()
+        v = qkv[:, :, Hq+Hk:, :]
         # TODO: add resformer value embedding here
         if rope_cache is not None:
-            # TODO: handle case to let this done by flash attention?
-            # q = apply_rope(q, rope_cache)
-            # k = apply_rope(k, rope_cache)
-            qkv[:,:,:Hq,:] = apply_rope(qkv[:,:,:Hq,:], rope_cache)
-            qkv[:,:,Hq:Hq+Hk,:] = apply_rope(qkv[:,:,Hq:Hq+Hk,:], rope_cache)
+            q = apply_rope(q, rope_cache)
+            k = apply_rope(k, rope_cache)
 
         if self.norm_before_attn:
-            # q = self.norm(q)
-            # k = self.norm(k)
-            qkv[:, :, :Hq, :] = self.norm(qkv[:, :, :Hq, :])
-            qkv[:, :, Hq:Hq + Hk, :] = self.norm(qkv[:, :, Hq:Hq + Hk, :])
-            # qkv[:, :, :Hq+Hk, :] = self.norm(qkv[:, :, :Hq+Hk, :]) ?
+            q = self.norm(q)
+            k = self.norm(k)
+
+        if (rope_cache is not None) or self.norm_before_attn:
+            qkv = torch.cat([q, k, v], dim=-2)
 
         attn_weights = None
         # interpretability mode - not optimized for memory efficiency
@@ -316,43 +307,36 @@ class CausalSelfAttention(Module):
         
         # inference-efficient mode
         if (not self.training) and (kv_cache is not None):
-            # TODO: Check shapes
-            # k, v = kv_cache.update(k, v)
             q, k, v = self.unfused(qkv)
             k_cache, v_cache = kv_cache.layer(self.layer_idx)
             k_cache, v_cache = k_cache.to(q.device, dtype=q.dtype), v_cache.to(v.device, dtype=q.dtype)
             
             x = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache,
                 k, v,
-                # rotary_cos=None, # for now we do not support rope with flash attention with kv cache
-                # rotary_sin=None,
                 cache_seqlens=kv_cache.seqlens,
-                # block_table=kv_cache.block_table,
                 causal=True,
-                # softmax_scale=None,
                 window_size=window_size if window_size is not None else (-1, -1),
-                # dropout_p=self.dropout_rate if self.training else 0.0 # No dropout during inference
             )
 
         # qkv-fused training mode
         if self.attn_impl == 'fused':
+            assert Hq == Hk, f'Fused attention implementation does not support GQA. Please set attn_impl to "sdpa" if you want to use GQA. Got Hq={Hq}, Hk={Hk}.'
+            qkv = qkv.view(B, Tq, 3, Hq, D).contiguous()  
             x = flash_attn.flash_attn_qkvpacked_func(
                 qkv,
                 dropout_p=self.dropout_rate if self.training else 0.0,
                 window_size=window_size,
+                causal=True
             )
 
         # qkv-unfused training mode
         elif self.attn_impl == 'sdpa':
             q, k, v = self.unfused(qkv)
-            # q, k, v = torch.split(qkv, [Hq, Hk, Hk], dim=-2)
-            # q = q.contiguous()
-            # k = k.contiguous()
-            # v = v.contiguous()
             x = flash_attn.flash_attn_func(
                 q, k, v,
                 dropout_p=self.dropout_rate if self.training else 0.0,
                 window_size=window_size,
+                causal=True
             )
         else:
             raise ValueError(f'Attention implementation {self.attn_impl} is not supported. Supported attention implementations are in {get_args(AttnImplTypes)}.')
@@ -366,12 +350,9 @@ class CausalSelfAttention(Module):
         Hq, Hk, D = self.n_heads, self.n_kv_heads, self.d_head
         q, k, v = torch.split(qkv, [Hq, Hk, Hk], dim=-2)
 
-        # TODO: this is dummy
-        device, dtype = qkv.device, qkv.dtype
-
-        q = q.contiguous().to(device=device, dtype=dtype)
-        k = k.contiguous().to(device=device, dtype=dtype)
-        v = v.contiguous().to(device=device, dtype=dtype)
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
         return q, k, v
     
 # -------------- DenseTransformer layers definitions -------------- #
@@ -436,7 +417,7 @@ class DecoderLayer(Module):
             dropout: float,
             attn_impl: AttnImplTypes = 'sdpa',
             normalization: NormalizationTypes = 'rms',
-            enable_gqa: bool = False,
+            use_gqa: bool = False,
             norm_before_attn: bool = True,
             norm_eps: float = 1e-8,
             layer_idx: int = 0
@@ -451,7 +432,7 @@ class DecoderLayer(Module):
             n_heads=n_heads, 
             n_kv_heads=n_kv_heads,
             d_head=d_head, 
-            enable_gqa=enable_gqa,
+            use_gqa=use_gqa,
             normalization=normalization,
             attn_impl=attn_impl,
             layer_idx=layer_idx, 

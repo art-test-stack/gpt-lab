@@ -1,6 +1,6 @@
 from packaging import version
 from functools import lru_cache
-
+import warnings
 
 @lru_cache()
 def is_flash_attention_installed() -> bool:
@@ -17,7 +17,6 @@ def is_flash_attention3_installed() -> bool:
         return True
     except ImportError:
         return False
-
 
 @lru_cache()
 def is_torch_available() -> bool:
@@ -78,4 +77,8 @@ def is_flash_attn3_available_from_kernel() -> bool:
         flash_attn3 = get_kernel('varunneal/flash-attention-3').flash_attn_interface
         return True
     except:
+        if is_torch_cuda_available():
+            if not is_flash_attn3_available_from_kernel():
+                warnings.warn("FlashAttention 3 is not available. Falling back to standard attention. Computation will be significantly slower.", UserWarning)
+            
         return False

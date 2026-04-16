@@ -78,6 +78,11 @@ class AutoGPTConfig(BaseModel):
         if self.dist_info is None:
             from gpt_lib.utils.distributed import get_dist_info
             self.dist_info = get_dist_info()
+        if self.dirname is None:
+            self.dirname = MODELS_FOLDER
+        if isinstance(self.dirname, str):
+            self.dirname = Path(self.dirname)
+
 
     def generate_gpt_config(self, device) -> GPTConfig:
 
@@ -228,7 +233,7 @@ class AutoGPTConfig(BaseModel):
         d12_bs = 2**19
 
         # optimal batch size (https://arxiv.org/abs/2505.13738)
-        total_batch_size = self.total_batch_size
+        total_batch_size = self.total_batch_size # total batch size = n tokens per step (1 step = (n forwardbackward . world size^-1 n_acc_steps^-1) . world size . n acc_steps))
         if total_batch_size == -1:
             batch_size_ratio = target_tokens / d12_th
             predicted_batch_size = d12_bs * batch_size_ratio ** 0.383
@@ -240,39 +245,49 @@ class AutoGPTConfig(BaseModel):
         batch_ratio = total_batch_size / d12_bs # η ∝ √(B/B_ref)
         if not batch_ratio == 1.0:
             batch_lr_scale = math.sqrt(batch_ratio)
-            print0(f"Scaling learning rate by {batch_lr_scale:.6f} based on batch size scaling law for total batch size {total_batch_size:,} tokens")
+            print0(f"Scaling learning rate by {batch_lr_scale=:.6f} based on batch size scaling law for total batch size {total_batch_size:,} tokens")
         
         # weight decay correction (https://arxiv.org/abs/2405.13698) λ = λ_ref · √(B/B_ref) · (D_ref/D)
         # TODO: https://arxiv.org/abs/2505.13738
         weight_decay_ratio = math.sqrt(total_batch_size / d12_bs) * (d12_th / target_tokens)
         if not weight_decay_ratio == 1.0:
-            print0(f"Scaling weight decay by {weight_decay_ratio:.6f} for depth {self.depth}")
+            print0(f"Scaling weight decay by {weight_decay_ratio=:.6f} for {self.depth=}")
         
         assert self.n_steps > 0 or self.target_param_data_ratio > 0 or self.target_flops > 0 or self.target_time > 0
         if self.n_steps > 0:
             # Override n_steps to a specific value if given
             n_steps = self.n_steps
-            print0(f"Using user-provided number of iterations: {n_steps:,}")
+            print0(f"Using user-provided number of steps: {n_steps:,}. " \
+                   f"Hence, n_total_tokens={total_batch_size * n_steps:=,} and training ignores training horizon based on scaling laws. "\
+                   "Recommended to set n_steps to -1 to automatically calculate the number of " \
+                   "steps based on scaling law targets for training horizon.")
         elif self.target_flops > 0:
-            # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
+            # Calculate the number of steps from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
             n_steps = round(self.target_flops / (n_flops_per_token * total_batch_size))
-            print0(f"Calculated number of iterations from target FLOPs: {n_steps:,}")
+            print0(f"Calculated number of steps from target FLOPs: {n_steps:,}")
         elif self.target_param_data_ratio > 0:
-            # Calculate the number of iterations from the target param data ratio (the most common use case)
+            # Calculate the number of steps from the target param data ratio (the most common use case)
             n_steps = target_tokens // total_batch_size
-            print0(f"Calculated number of iterations from target data:param ratio: {n_steps:,}")
+            print0(f"Calculated number of steps from target data:param ratio: {n_steps:,}")
         else:
             raise ValueError("No training horizon specified")
         
-        total_tokens = total_batch_size * n_steps 
+        n_total_tokens = total_batch_size * n_steps 
         
         n_acc_steps = self.n_acc_steps
-        if n_acc_steps == -1:
-            tokens_per_iter_per_rank = self.device_batch_size * self.max_seq_len
-            tokens_per_iter_per_world = tokens_per_iter_per_rank * self.dist_info["world_size"]
-            n_acc_steps = max(1, total_batch_size // tokens_per_iter_per_world)
+        if n_acc_steps == -1: # recommended
+            tokens_per_accstep_per_rank = self.device_batch_size * self.max_seq_len
+            tokens_per_accstep_per_world = tokens_per_accstep_per_rank * self.dist_info["WORLD_SIZE"]
+            assert total_batch_size % tokens_per_accstep_per_world == 0, f"{total_batch_size:=,} must be divisible by tokens per accstep per world {tokens_per_accstep_per_world:=,} for automatic configuration of gradient accumulation steps."
+            n_acc_steps = total_batch_size // tokens_per_accstep_per_world
+        else:
+            assert n_acc_steps >= 0, f"n_acc_steps must be non-negative (except n_acc_steps=-1 for automatic configuration); got {n_acc_steps=}."
 
-            assert (n_acc_steps == 1) or (total_batch_size % tokens_per_iter_per_world == 0)
+            if self.dist_info["LOCAL_RANK"] == 0:
+                if n_acc_steps == 0:
+                    warnings.warn("Gradient accumulation disabled. Model will be updated every step.")
+                else:
+                    warnings.warn(f"Using user-provided number of gradient accumulation steps: {n_acc_steps}. This may lead to suboptimal training performance if it does not align well with the training horizon and batch size targets based on scaling laws. Recommended to set n_acc_steps to -1 for automatic configuration based on scaling laws.")
 
         training_config = dict(
             n_steps=n_steps,
@@ -283,13 +298,13 @@ class AutoGPTConfig(BaseModel):
             target_tokens=target_tokens,
             target_param_data_ratio=self.target_param_data_ratio,
             n_flops_per_token=n_flops_per_token,
-            total_tokens=total_tokens,
+            n_total_tokens=n_total_tokens,
         )
 
         meta_config = dict(
             project=self.basename,
             name=self.name,
-            dirname=self.dirname,
+            dirname=self.dirname /self.basename / self.name,
             model=model,
             tokenizer=tokenizer,
             training_config=training_config,

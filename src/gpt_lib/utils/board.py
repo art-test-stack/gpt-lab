@@ -19,6 +19,9 @@ class DummyBoard:
     def log(self, *args, **kwargs) -> None:
         pass
 
+    def __call__(self, *args, **kwds):
+        pass
+
     
 class Board:
     def __init__(
@@ -72,7 +75,7 @@ class Board:
             self.main = DummyBoard()
 
     def log(self, data: dict, step: int | None = None) -> None:
-        self.main(data, step)
+        self.main.log(data, step)
 
     def close(self):
         if self.board_type == "tensorboard":
