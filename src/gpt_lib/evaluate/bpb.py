@@ -49,17 +49,13 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info
     for _ in range(steps):
         x, y, _ = next(batch_iter)
 
-        output = model(x) # (B, Seq) NATs
+        output = model(x, y, reduction="none") # (B, Seq) NATs
         try:
+            loss2d = output.loss.view(y.size()) # (B, Seq) NATs
             logits = output.logits
         except:
-            logits = output # Assume output is directly the logits tensor if not wrapped in a ModelOutput-like object. (B, Seq)
-        loss2d = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), 
-            y.view(-1), 
-            reduction='none'
-        ).view(y.size()) # (B, Seq) NATs
-        total_loss += loss2d.detach().sum() # For debugging
+            loss2d = output # Assume output is directly the logits tensor if not wrapped in a ModelOutput-like object. (B, Seq)
+        total_loss += loss2d.detach().mean() # For debugging
         loss2d = loss2d.reshape(-1) # (B*Seq,)
         y = y.reshape(-1) # (B*Seq,)
 

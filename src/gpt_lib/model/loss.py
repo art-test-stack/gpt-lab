@@ -23,23 +23,34 @@ class CrossEntropyLoss(BaseLoss):
         self.ignore_index = ignore_index
         self.reduction = reduction
 
-    def __call__(self, logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ref_output=None):
+    def __call__(self, logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ref_output=None, reduction=None):
         if isinstance(logits, ModelOutput):
             logits = logits.logits
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
             ignore_index=self.ignore_index,
-            reduction=self.reduction,
+            reduction=self.reduction if reduction is None else reduction,
         )
         return loss
+
+def cross_entropy_loss(logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ignore_index=-1, reduction="mean") -> torch.Tensor:
+    if isinstance(logits, ModelOutput):
+        logits = logits.logits
+    loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+        ignore_index=-1,
+        reduction=reduction,
+    )
+    return loss
 
 class CutCrossEntropyLoss(BaseLoss):
     def __init__(self, ignore_index=-1, reduction="mean"):
         self.ignore_index = ignore_index
         self.reduction = reduction
 
-    def __call__(self, logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ref_output=None):
+    def __call__(self, logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ref_output=None, reduction=None):
         raise NotImplementedError("CutCrossEntropyObjective is not yet supported.")
         if isinstance(logits, ModelOutput):
             logits = logits.logits
@@ -48,7 +59,7 @@ class CutCrossEntropyLoss(BaseLoss):
             logits,
             labels,
             ignore_index=self.ignore_index,
-            reduction=self.reduction,
+            reduction=self.reduction if reduction is None else reduction,
             impl="torch_compile"
         )
         return loss
@@ -59,7 +70,7 @@ class KLDivLoss(BaseLoss):
         self.epsilon = epsilon
         self.ignore_index = ignore_index
 
-    def __call__(self, logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ref_output=None):
+    def __call__(self, logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ref_output=None, reduction=None):
         if isinstance(logits, ModelOutput):
             log_probs = logits.log_probs
         else:
@@ -92,10 +103,7 @@ def build_loss(config: Optional[LossConfig] = None) -> "BaseLoss":
     loss_type = config.loss_fn
     loss_kwargs = config.kwargs
     if loss_type == "cross_entropy":
-        return CrossEntropyLoss(
-            ignore_index=loss_kwargs.get("ignore_index", -1),
-            reduction=loss_kwargs.get("reduction", "mean"),
-        )
+        return cross_entropy_loss
     elif loss_type == "kl_divergence":
         return KLDivLoss(
             epsilon=loss_kwargs.get("epsilon", 0.1),

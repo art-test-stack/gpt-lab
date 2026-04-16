@@ -388,7 +388,6 @@ class Trainer:
             
             # Log every log_every steps
             if step % self.config.log_every == 0:
-                current_lr = self.optimizer.param_groups[0]["lr"]
                 pct_done = 100 * step / n_steps
                 
                 # ETA calculation
@@ -402,7 +401,7 @@ class Trainer:
                 print0(
                     f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
                     f"loss: {debiased_smooth_loss:.6f} | "
-                    f"lr: {current_lr:.2e} | "
+                    f"lrm: {lrm:.2e} | "
                     f"dt: {step_dt*1000:.2f}ms | "
                     f"tok/s: {tokens_per_sec:,.0f}"
                     f"{eta_str}"
@@ -411,7 +410,6 @@ class Trainer:
                 log_dict = {
                     "step": step,
                     "loss": debiased_smooth_loss,
-                    "lr": current_lr,
                     "lrm": lrm,
                     "muon_momentum": muon_momentum,
                     "weight_decay": weight_decay,
@@ -425,7 +423,7 @@ class Trainer:
                 self.metrics.tokens.append(self.state.global_tokens)
                 self.metrics.epochs.append(self.state.num_epochs)
                 self.metrics.train_loss.append(debiased_smooth_loss)
-                self.metrics.learning_rate.append(current_lr)
+                self.metrics.learning_rate.append(lrm)
                 self.metrics.throughput_tokens_per_sec.append(tokens_per_sec)
                 self.metrics.time_per_step_ms.append(step_dt * 1000)
                 
@@ -511,7 +509,8 @@ class Trainer:
         
         with open(checkpoint_path / "metrics.pkl", "wb") as f:
             pickle.dump(asdict(self.metrics), f)
-        print0(f"Saved checkpoint to {checkpoint_path!r}.")
+        if tag == "latest":
+            print0(f"Saved checkpoint to {checkpoint_path!r}.")
 
     def load_checkpoint(self, checkpoint_path: Union[Path, str], device: Optional[torch.device] = None):
         """

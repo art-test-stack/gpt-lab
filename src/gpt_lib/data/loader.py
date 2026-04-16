@@ -78,62 +78,63 @@ class DistDataLoader:
         batch_size: int,
         seq_len: int,
         device: str = "cuda",
-        buffer_size: int = 512,
-        min_buffer: int = 64,
+        buffer_size: int = 8192,
     ):
         self.dataset = dataset
         self.B = batch_size
         self.T = seq_len
         self.device = torch.device(device)
-        self.buffer_size = buffer_size
-        self.min_buffer = min_buffer  # refill threshold, not just at batch start
 
-        self.buffer: list[torch.Tensor] = []
         self.iterator = iter(dataset)
+        self.buffer = []
+        total_tokens = batch_size * (seq_len + 1)
 
-        use_pinned = self.device.type == "cuda"
-        self.cpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long,
-                                pin_memory=use_pinned)
-        self.gpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long,
-                                device=self.device)
+        self.cpu = torch.empty(total_tokens, dtype=torch.long, pin_memory=(self.device.type == "cuda"))
+        self.gpu = torch.empty(total_tokens, dtype=torch.long, device=self.device)
+        self.buffer_size = buffer_size
 
     def _refill(self):
         while len(self.buffer) < self.buffer_size:
             try:
                 self.buffer.append(next(self.iterator))
             except StopIteration:
-                if self.dataset.split == "val":
-                    # val dataset loops itself, so this should never happen —
-                    # but guard anyway
+                if getattr(self.dataset, "split", None) == "val":
                     self.iterator = iter(self.dataset)
+                    continue
                 else:
                     return
 
     def __iter__(self):
         return self
-
+    
     def __next__(self):
+        self._refill()
+
         B, T = self.B, self.T
-        for b in range(B):
-            pos = 0
-            while pos < T + 1:
-                # Refill inside the loop so the buffer never runs dry mid-batch
-                if len(self.buffer) < self.min_buffer:
-                    self._refill()
+        total = B * (T + 1)
 
-                doc = self.buffer.pop()
-                remaining = (T + 1) - pos
-                take = min(len(doc), remaining)
-                self.cpu[b, pos:pos + take] = doc[:take]
+        pos = 0
+        while pos < total:
+            if len(self.buffer) == 0:
+                self._refill()
 
-                if take < len(doc):
-                    self.buffer.append(doc[take:])  # remainder back into buffer
+            doc = self.buffer.pop()
 
-                pos += take
+            remaining = total - pos
+            take = min(len(doc), remaining)
+            self.cpu[pos:pos + take] = doc[:take]
 
-        self.gpu.copy_(self.cpu, non_blocking=self.device.type == "cuda")
-        return self.gpu[:, :-1], self.gpu[:, 1:], None
+            if take < len(doc):
+                self.buffer.append(doc[take:])
+            pos += take
 
+        self.gpu.copy_(self.cpu, non_blocking=(self.device.type == "cuda"))
+
+        data = self.gpu.view(B, T + 1)
+
+        inputs = data[:, :-1]
+        targets = data[:, 1:]
+        return inputs, targets, None
 
 def build_dataloader(
     dsname: str,

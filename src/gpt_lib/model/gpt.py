@@ -89,6 +89,7 @@ class DenseTransformer(BaseTransformer):
     def __init__(
             self,
             config: Optional[TransformerConfig] = None,
+            pad_vocab_size_to=64
         ) -> None:
         super().__init__()
         # init the model in meta device first
@@ -103,11 +104,15 @@ class DenseTransformer(BaseTransformer):
         # self.eos_token_id = config.eos_id
         
         self.norm = build_norm(self.config.normalization, eps=self.config.norm_eps, torch_impl=True)
+
+        padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+        if padded_vocab_size != config.vocab_size:
+            print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         
         # TODO: change to customed embedding
         # TODO: add padded_vocab_size for more efficient token embedding resizing
         self.embeds = nn.Embedding(
-            num_embeddings=config.vocab_size, 
+            num_embeddings=padded_vocab_size, 
             embedding_dim=config.d_model, 
             # padding_idx=config.pad_id,
             sparse=False,
@@ -135,11 +140,11 @@ class DenseTransformer(BaseTransformer):
         # TODO: same as karpathy
         # Value embeddings (ResFormer-style): alternating layers, last layer always include
         self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
+            str(i): nn.Embedding(padded_vocab_size, kv_dim)
             for i in range(config.n_layers) if has_ve(i, config.n_layers)
         })
 
-        self.lm_head = Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = Linear(config.d_model, padded_vocab_size, bias=False)
 
         if config.tie_word_embeddings:
             # not sure if this works / maybe have to check dtype - at least
@@ -217,7 +222,7 @@ class DenseTransformer(BaseTransformer):
         device = self.embeds.weight.device
         if self.config.positional_encoding == "rope":
             pe_cache = precompute_rope(
-                seq_len=new_max_context,
+                seq_len=new_max_context * 10,
                 d_head=self.config.d_head,
                 base=self.config.rope_params.get("rope_theta", 10000),
                 # dtype=self.dtype,
@@ -360,6 +365,7 @@ class DenseTransformer(BaseTransformer):
             past_key_values: Any = None,
             return_attentions: bool = False,
             return_hidden_states: bool = False,
+            reduction: str = "mean",
         ) -> ModelOutput:
         assert (past_key_values is None) or (not self.training), "KV cache can not be used during training."
         # assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
@@ -424,7 +430,9 @@ class DenseTransformer(BaseTransformer):
             logits = self.lm_head(x)
         else: 
             logits = self.lm_head(x[:, [-1], :])
-            
+
+        logits = logits[..., :self.config.vocab_size] 
+
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
         
@@ -433,9 +441,10 @@ class DenseTransformer(BaseTransformer):
         if temperature > 0 and not temperature == 1.0:
             logits = logits / temperature
         
+        assert logits.is_contiguous(), "Logits should be contiguous for efficient loss computation"
         loss = None
         if labels is not None:
-            loss = self.loss_fn(logits, labels)
+            loss = self.loss_fn(logits, labels, reduction=reduction)
 
         output = ModelOutput(
             logits=logits,
