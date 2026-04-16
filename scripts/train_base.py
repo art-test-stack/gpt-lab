@@ -292,6 +292,7 @@ if __name__ == "__main__":
         sample_every=args.sample_every,
         save_every=args.save_every,
         log_every=args.log_every,
+        use_amp=args.use_amp,
         **base_training_config
     )
     print0_dict("Trainer config", trainer_config.model_dump())
