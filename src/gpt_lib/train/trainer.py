@@ -169,7 +169,7 @@ class Trainer:
         self.use_amp = config.use_amp
         def amp_context():
             if self.use_amp:
-                return autocast(device=self.config.dist_info["DEVICE"], dtype=torch.bfloat16)
+                return autocast(device_type=self.config.dist_info["DEVICE_TYPE"], dtype=torch.bfloat16)
             else:
                 return DummyContext()
         def disable_fp8_context():
