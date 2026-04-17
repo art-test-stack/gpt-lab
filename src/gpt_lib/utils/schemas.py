@@ -100,7 +100,7 @@ class TokenizerConfig(BaseModel):
             self.pat_str = PAT_STR.get(self.pat_str)  # Use predefined pattern if pat_str is a key in PAT_STR
         
         else:
-            warnings.warn(f"Using custom pat_str {self.pat_str!r} without validation." \
+            warnings.warn(f"Using custom {self.pat_str=!r} without validation." \
                           "Make sure it is a valid regex pattern for tokenization.")
 
         if isinstance(self.dirname, str):

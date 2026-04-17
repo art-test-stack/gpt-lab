@@ -9,8 +9,8 @@ try:
 except:
     tb = None
 from gpt_lib.utils.default import BOARD_DIR
-from gpt_lib.utils.report import get_git_info, get_gpu_info, get_system_info
 import warnings
+
 
 class DummyBoard:
     def __init__(self) -> None:
@@ -21,8 +21,8 @@ class DummyBoard:
 
     def __call__(self, *args, **kwds):
         pass
+ 
 
-    
 class Board:
     def __init__(
             self, 
@@ -35,12 +35,7 @@ class Board:
         self.board_type = board_type
         if board_dir is None:
             board_dir = BOARD_DIR
-        git_info = get_git_info()
-        gpu_info = get_gpu_info()
-        sys_info = get_system_info()
-
-        config = config | {"git_info": git_info, "gpu_info": gpu_info, "sys_info": sys_info}
-
+        config = config
         if self.board_type == "wandb":
             if wandb is None:
                 raise ImportError("wandb is not installed. Please install wandb to use the wandb board.")

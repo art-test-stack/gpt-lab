@@ -42,7 +42,9 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 from gpt_lib.utils.common import get_banner, print0, print0_dict
 from gpt_lib.utils.default import DATA_DIR, MODELS_FOLDER
 from gpt_lib.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups
+from gpt_lib.utils.report import get_git_info, get_gpu_info, get_system_info
 from gpt_lib.utils.schemas import GPTConfig, TrainingConfig
+
 from gpt_lib.model.auto import AutoGPTConfig
 from gpt_lib.model.gpt import DenseTransformer
 
@@ -154,6 +156,16 @@ if __name__ == "__main__":
 
     print0_dict("Environment setup", dist_info)
 
+    git_info = get_git_info()
+    gpu_info = get_gpu_info()
+    sys_info = get_system_info()
+
+    board_args = board_args | {"git_info": git_info, "gpu_info": gpu_info, "sys_info": sys_info}
+
+    print0_dict("Git info", git_info)
+    print0_dict("GPU info", gpu_info)
+    print0_dict("System info", sys_info)
+
     # ------------------------------------------------------------------------------
     # GET MODEL CONFIG
     # ------------------------------------------------------------------------------
@@ -231,7 +243,6 @@ if __name__ == "__main__":
     # init shard manager
     # from gpt_lib.data.sharder import ShardManager
     # shard_manager = ShardManager(data_dir=DATA_DIR, name="base")
-
     # init tokenizing data loaders
     from gpt_lib.data.loader import build_dataloader
 

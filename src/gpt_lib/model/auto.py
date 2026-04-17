@@ -91,6 +91,7 @@ class AutoGPTConfig(BaseModel):
         def _get_tokenizer_pretrained(tname: str, source: str = "tiktoken") -> Tokenizer:
             # TODO: need to be simplified and optimized
             # if a specific tokenizer model is specified, we will use it and ignore the scaling law
+            
             try: 
                 _tconfig = TokenizerConfig(name=tname, source=source, vocab_size=-1, special_tokens=special_tokens, pat_str="")
                 tokenizer = Tokenizer.from_pretrained(_tconfig)

@@ -51,6 +51,10 @@ class _BaseTokenizer:
         self.config = config
         self.special_tokens = None
         self.token_to_id = None
+        try:
+            self.token_bytes = self.get_token_bytes()
+        except Exception as e:
+            warnings.warn(f"Failed to get token bytes during initialization: {e}. This may cause issues with optimizers that rely on token byte lengths. You can try calling get_token_bytes() manually after initialization to see the full error message and debug the issue.")
 
     def get_vocab(self):
         return {**self.token_to_id, **self.special_tokens}
@@ -58,11 +62,10 @@ class _BaseTokenizer:
     @property
     def vocab_size(self):
         return len(self.token_to_id) + len(self.special_tokens)
-    
-    @property       
-    def token_bytes(self):
+         
+    def get_token_bytes(self):
         token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-        if self.token_bytes_cache is not None:
+        if getattr(self, 'token_bytes', None) is not None:
             return self.token_bytes_cache
         
         if token_bytes_path.exists():
@@ -270,11 +273,8 @@ class Tokenizer(_BaseTokenizer):
         self.special_tokens = special_tokens
         self.config = config
         self.bos_token_id = self.encode_special(config.special_tokens.bos)
-        self.token_bytes_cache = None
-        self.token_bytes_cache = self.token_bytes
-
-    def encode_special(self, token: str) -> int:
-        return self.special_tokens[token]
+        if getattr(self, 'token_bytes', None) is None:
+            self.token_bytes = self.get_token_bytes()
 
     @classmethod
     def from_pretrained(cls, config: TokenizerConfig):
@@ -412,33 +412,33 @@ class Tokenizer(_BaseTokenizer):
             tokenizer.save_to_directory()
         return tokenizer
     
-    @property
-    def token_bytes(self):
-        token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-        if self.token_bytes_cache is not None:
-            return self.token_bytes_cache
-        
-        if token_bytes_path.exists():
-            token_bytes = torch.load(token_bytes_path)
-            print(f"Loaded token_bytes from {token_bytes_path}")
-        else:
-            vocab_size = self.vocab_size
-            special_set = set(self.special_tokens)
-            token_strings = [self.decode([token_id]) for token_id in range(vocab_size)]
-            token_bytes = []
-            for token_id in range(vocab_size):
-                token_str = token_strings[token_id] # the Python string representation of this token
-                if token_str in special_set:
-                    token_bytes.append(0) # special characters are not counted
-                else:
-                    id_bytes = len(token_str.encode("utf-8")) # number of bytes that make up this token
-                    token_bytes.append(id_bytes)
-            token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
-            with open(token_bytes_path, "wb") as f:
-                torch.save(token_bytes, f)
-            print(f"Saved token_bytes to {token_bytes_path}")
-        self.token_bytes_cache = token_bytes
-        return token_bytes
+    # def get_token_bytes(self):
+    #     token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
+    #     if getattr(self, 'token_bytes', None) is not None:
+    #         return self.token_bytes
+
+    #     if token_bytes_path.exists():
+    #         token_bytes = torch.load(token_bytes_path)
+    #         print(f"Loaded token_bytes from {token_bytes_path}.")
+    #     else:
+    #         vocab_size = self.vocab_size
+    #         special_set = set(self.special_tokens)
+    #         token_strings = [self.decode([token_id]) for token_id in range(vocab_size)]
+    #         token_bytes = []
+    #         for token_id in range(vocab_size):
+    #             token_str = token_strings[token_id] # the Python string representation of this token
+    #             if token_str in special_set:
+    #                 token_bytes.append(0) # special characters are not counted
+    #             else:
+    #                 id_bytes = len(token_str.encode("utf-8")) # number of bytes that make up this token
+    #                 token_bytes.append(id_bytes)
+    #         token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
+    #         with open(token_bytes_path, "wb") as f:
+    #             torch.save(token_bytes, f)
+    #         print(f"Saved token_bytes to {token_bytes_path}")
+    #     # self.token_bytes_cache = token_bytes
+    #     # self.token_bytes = token_bytes
+    #     return token_bytes
 
     @classmethod
     def from_disk(cls, name: str, cachedir: Optional[Union[str, Path]] = None):
@@ -477,6 +477,8 @@ class Tokenizer(_BaseTokenizer):
         with open(vocab_path, "wb") as vf:
             pickle.dump(self.token_to_id, vf)
 
+    def encode_special(self, token: str) -> int:
+        return self.special_tokens[token]
         
     def encode(
             self, 

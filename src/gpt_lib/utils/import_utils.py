@@ -3,22 +3,6 @@ from functools import lru_cache
 import warnings
 
 @lru_cache()
-def is_flash_attention_installed() -> bool:
-    try:
-        import flash_attn  # noqa: F401
-        return True
-    except ImportError:
-        return False
-    
-@lru_cache()
-def is_flash_attention3_installed() -> bool:
-    try:
-        import flash_attn3  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-@lru_cache()
 def is_torch_available() -> bool:
     try:
         import torch  # noqa: F401
