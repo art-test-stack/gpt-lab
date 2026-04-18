@@ -83,7 +83,7 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info
 
     total_nats = total_nats.item()
     total_bytes = total_bytes.item()
-    total_loss = total_loss.item() / world_size / (steps * x.size(0) * x.size(1))  # Average loss per token, for debugging
+    total_loss = total_loss.item() / world_size / (steps * x.size(0))  # Average loss per token, for debugging
 
     # Guard against division by zero (e.g., all tokens were special/ignored)
     if total_bytes == 0:

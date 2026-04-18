@@ -22,7 +22,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 
-from gpt_lib.utils.schemas import TrainingConfig, TrainingMetrics
+from gpt_lib.utils.schemas import TrainingConfig, TrainingMetrics, EvalMetrics, COREMetrics
 from gpt_lib.utils.board import Board
 from gpt_lib.utils.common import print0, print0_dict
 from gpt_lib.evaluate.bpb import compute_bpb
@@ -46,18 +46,6 @@ class TrainerState:
     smooth_train_loss: float = 0.0
     
     # Dataloader state for resumption
-
-@dataclass
-class TrainingMetrics:
-    """Metrics collected during training."""
-    steps: list = field(default_factory=list)
-    tokens: list = field(default_factory=list)
-    epochs: list = field(default_factory=list)
-    train_loss: list = field(default_factory=list)
-    val_loss: list = field(default_factory=list)
-    learning_rate: list = field(default_factory=list)
-    throughput_tokens_per_sec: list = field(default_factory=list)
-    time_per_step_ms: list = field(default_factory=list)
 
 
 class DummyContext:
@@ -164,6 +152,8 @@ class Trainer:
         # State and metrics
         self.state = TrainerState()
         self.metrics = TrainingMetrics()
+        self.eval_metrics = EvalMetrics()
+        self.core_metrics = COREMetrics()
         
         # Mixed precision
         self.use_amp = config.use_amp
@@ -239,16 +229,17 @@ class Trainer:
             last_step = (step == n_steps - 1)
             flops_so_far = n_flops_per_token * total_batch_size * step
             self.synchronize()
-            step_start_time = time.time()
             
             # ================================================================
             # Validation on 'val_loader' every 'eval_every' steps
             # ================================================================
+            
             if (
-                (self.config.eval_bpb_every == -1 and last_step) or
-                (self.config.eval_bpb_every > 0 and step > 0 and
-                (last_step or step % self.config.eval_bpb_every == 0))
+                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
+                (self.config.eval_bpb_every > 0 and step > 0 and # eval every eval_bpb_every steps except the first step
+                (last_step or step % self.config.eval_bpb_every == 0)) 
             ):
+                start_bpb_eval = time.time()
                 _model.eval()
                 eval_steps = self.config.n_bpb_tokens // (self.config.device_batch_size * self.model.config.max_context * self.config.dist_info["WORLD_SIZE"])
                 with self.val_context(_model):
@@ -261,18 +252,20 @@ class Trainer:
                     )
                 print0(f"Step {step:05d} | Validation bpb: {val_res['bpb']:.6f} | Validation loss: {val_res['loss']:.6f}")
                 
+                dt_bpb_eval = start_bpb_eval - time.time()
+
                 if val_res['bpb'] < self.state.best_val_loss:
                     self.state.best_val_loss = val_res['bpb']
                     self.save_checkpoint(tag="best")
                 
-                self.board.log({
-                    "step": step,
-                    "total_training_flops": flops_so_far,
-                    "total_training_time": self.state.total_training_time,
-                    "val/loss": val_res['loss'],
-                    "val/bpb": val_res['bpb'],
-                    "val/best_bpb": self.state.best_val_loss,
-                }, step=step)
+                log_dict = {
+                    "eval/loss": val_res['loss'],
+                    "eval/bpb": val_res['bpb'],
+                    "eval/best_bpb": self.state.best_val_loss,
+                    "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
+                }
+                self.board.log(log_dict, step=step)
+                self.eval_metrics.append(log_dict, step)
                 _model.train()
 
             # ================================================================
@@ -293,12 +286,19 @@ class Trainer:
                         self.device,
                         max_per_task=self.config.n_core_tokens,
                     )
-                print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-                self.board.log({
-                    "total_training_flops": flops_so_far,
-                    "val/core_metric": results["core_metric"],
-                    "val/centered_results": results["centered_results"],
-                }, step=step)
+                max_throughput = results.get("core/max_per_task", 0) * self.config.dist_info.get("WORLD_SIZE", 1) / results.get("core/step_time_ms", 1e-3) * 1000
+                print0(f"Step {step:05d}/{n_steps:05d} | CORE: {results['core/core']:.4f} | Accuracy: {results['core/accuracy']:.4f} | Max per task: {int(results['core/max_per_task'])} | Step time: {results.get('core/step_time_ms', 0):.2f}ms | Max throughput: {max_throughput:,.0f} tok/s")
+                log_dict = {
+                    "core/core": results["core/core"],
+                    "core/accuracy": results["core/accuracy"],
+                    "core/max_per_task": results["core/max_per_task"],
+                    "core/step_time_ms": results.get("core/step_time_ms", 0),
+                }
+                for task_label, task_results in results.get("all_core_results", {}).items():
+                    for task_metric, task_value in task_results.items():
+                        log_dict[f"core/{task_label}/{task_metric}"] = task_value
+                self.board.log(log_dict, step=step)
+                self.core_metrics.append(results, step=step)
                 self.model.train()
             
             # ================================================================
@@ -330,6 +330,8 @@ class Trainer:
             # ================================================================
             # Training step with gradient accumulation
             # ================================================================
+
+            step_start_time = time.time()
             loss_accum = 0.0
             
             for _ in range(n_acc_steps):
@@ -360,13 +362,14 @@ class Trainer:
                 self.optimizer.step()
             
             _model.zero_grad(set_to_none=True)
+
+            self.synchronize()
+            step_end_time = time.time()
             
             # ================================================================
             # Logging and metrics
             # ================================================================
             
-            self.synchronize()
-            step_end_time = time.time()
             step_dt = step_end_time - step_start_time
             
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
@@ -386,8 +389,6 @@ class Trainer:
             self.state.total_training_time += step_dt
             
             # Log every log_every steps
-            # TODO: consider using wandb.Table for logging metrics
-            # https://wandb.ai/wandb/pytorch-lightning-e2e/reports/W-B-Best-Practices-Guide--VmlldzozNTU1ODY1#tables
             if step % self.config.log_every == 0:
                 pct_done = 100 * step / n_steps
                 
@@ -407,26 +408,22 @@ class Trainer:
                     f"tok/s: {tokens_per_sec:,.0f}"
                     f"{eta_str}"
                 )
-                
                 log_dict = {
+                    "epochs": self.state.num_epochs,
                     "train/loss": debiased_smooth_loss,
+                    "train/raw_loss": loss_accum,
+                    "train/tokens_per_sec": tokens_per_sec,
+                    "train/step_time_ms": step_dt * 1000,
+                    "train/total_tokens": self.state.global_tokens,
                     "lrm": lrm,
                     "muon_momentum": muon_momentum,
                     "weight_decay": weight_decay,
-                    "tokens_per_sec": tokens_per_sec,
-                    "step_time_ms": step_dt * 1000,
-                    "epoch": self.state.num_epochs,
-                    "total_tokens": self.state.global_tokens,
+                    "train/total_training_flops": flops_so_far,
+                    "train/total_training_time": self.state.total_training_time,
+                    "train/eta_seconds": eta_seconds if len(total_dt) > 10 else float("inf"),
                 }
-                
-                self.metrics.steps.append(step)
-                self.metrics.tokens.append(self.state.global_tokens)
-                self.metrics.epochs.append(self.state.num_epochs)
-                self.metrics.train_loss.append(debiased_smooth_loss)
-                self.metrics.learning_rate.append(lrm)
-                self.metrics.throughput_tokens_per_sec.append(tokens_per_sec)
-                self.metrics.time_per_step_ms.append(step_dt * 1000)
-                
+
+                self.metrics.append(log_dict, step)
                 self.board.log(log_dict, step=step)
             
             # ================================================================
@@ -508,7 +505,14 @@ class Trainer:
             pickle.dump(asdict(self.state), f)
         
         with open(checkpoint_path / "metrics.pkl", "wb") as f:
-            pickle.dump(asdict(self.metrics), f)
+            pickle.dump(self.metrics.model_dump(), f)
+        
+        with open(checkpoint_path / "eval_metrics.pkl", "wb") as f:
+            pickle.dump(self.eval_metrics.model_dump(), f)
+        
+        with open(checkpoint_path / "core_metrics.pkl", "wb") as f:
+            pickle.dump(self.core_metrics.model_dump(), f)
+
         if tag == "latest":
             print0(f"Saved checkpoint to {checkpoint_path!r}.")
 
@@ -543,4 +547,16 @@ class Trainer:
             with open(checkpoint_path / "metrics.pkl", "rb") as f:
                 metrics_dict = pickle.load(f)
             self.metrics = TrainingMetrics(**metrics_dict)
+        
+        if (checkpoint_path / "eval_metrics.pkl").exists():
+            with open(checkpoint_path / "eval_metrics.pkl", "rb") as f:
+                eval_metrics_dict = pickle.load(f)
+            self.eval_metrics = EvalMetrics(**eval_metrics_dict)
+
+        if (checkpoint_path / "core_metrics.pkl").exists():
+            with open(checkpoint_path / "core_metrics.pkl", "rb") as f:
+                core_metrics_dict = pickle.load(f)
+            self.core_metrics = COREMetrics(**core_metrics_dict)
+        
+        # TODO: make HUGE warning if loaded checkpoint's git commit does not match current code's git commit
         

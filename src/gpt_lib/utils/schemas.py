@@ -604,36 +604,73 @@ class TrainingState(BaseModel):
     loss_val: List[float] = Field(default_factory=list)
     metrics_train: List[dict] = Field(default_factory=list)
 
-
-class TrainingResults(BaseModel):
-    train_loss: List[float] = Field(default_factory=list)
-    val_loss: List[float] = Field(default_factory=list)
-    steps: List[int] = Field(default_factory=list)
-
-class TrainingMetrics(BaseModel):
+class _BaseMetrics(BaseModel):
     time: List[float] = Field(default_factory=list)
     step: List[int] = Field(default_factory=list)
-    tokens: List[int] = Field(default_factory=list)
-    epochs: List[int] = Field(default_factory=list)
-    accuracy: List[float] = Field(default_factory=list)
+    epochs: List[float] = Field(default_factory=list) # NOTE: useless actually
+
+    def append(self, log_dict: dict, step: int) -> None:        
+        # NOTE: here we may introduce a bug on dist set; not tested yet. need to be investigated.
+        assert not step in self.step, "Step must not already be in the step list before appending CORE metrics."
+        self.time.append(log_dict.get("time", 0))
+        self.step.append(step)
+        self.epochs.append(log_dict.get("epochs", 0))
+
+class EvalMetrics(_BaseMetrics):
+    best_bpb: float = float("inf")
+    bpb: List[float] = Field(default_factory=list)
     loss: List[float] = Field(default_factory=list)
-    val_accuracy: List[float] = Field(default_factory=list)
-    val_loss: List[float] = Field(default_factory=list)
-    best_val_loss: List[float] = Field(default_factory=list)
+    
+    step_time_ms: List[float] = Field(default_factory=list)
+    
+    def append(self, log_dict: dict, step: int) -> None:
+        super().append(log_dict, step)
+        self.step_time_ms.append(log_dict.get("eval/step_time_ms", 0))
+        self.best_bpb = min(self.best_bpb, log_dict.get("eval/bpb", float("inf")))
+        self.bpb.append(log_dict.get("eval/bpb", float("inf")))
+        self.loss.append(log_dict.get("eval/loss", float("inf")))
+
+class COREMetrics(_BaseMetrics):
+    accuracy: List[float] = Field(default_factory=list)
     core: List[float] = Field(default_factory=list)
+    max_per_task: List[float] = Field(default_factory=list)
+    results: List[dict] = Field(default_factory=list)
+    step_time_ms: List[float] = Field(default_factory=list)
+    
+    def append(self, log_dict: dict, step: int) -> None:
+        super().append(log_dict, step)
+        self.accuracy.append(log_dict.get("core/accuracy", 0))
+        self.core.append(log_dict.get("core/core", 0))
+        self.results.append(log_dict.get("all_core_results", {}))
+        self.max_per_task.append(log_dict.get("core/max_per_task", 0))
+        self.step_time_ms.append(log_dict.get("core/step_time_ms", 0))
+        
+class TrainingMetrics(_BaseMetrics):
+    loss: List[float] = Field(default_factory=list)
+    raw_loss: List[float] = Field(default_factory=list)
+    tokens_per_sec: List[float] = Field(default_factory=list)
+    step_time_ms: List[float] = Field(default_factory=list)
+    total_training_flops: List[float] = Field(default_factory=list)
+    total_training_time: List[float] = Field(default_factory=list)
+    eta_sec: List[float] = Field(default_factory=list)
 
-    def append(self, state: TrainingState, elapsed_time: float, tokens_processed: int, accuracy: float, val_accuracy: float, core_usage: float) -> None:
-        self.time.append(elapsed_time)
-        self.step.append(state.step)
-        self.tokens.append(tokens_processed)
-        self.epochs.append(len(state.train_losses))
-        self.accuracy.append(accuracy)
-        self.loss.append(state.train_losses[-1] if state.train_losses else float('nan'))
-        self.val_accuracy.append(val_accuracy)
-        self.val_loss.append(state.val_losses[-1] if state.val_losses else float('nan'))
-        self.best_val_loss.append(state.best_val_loss)
-        self.core.append(core_usage)
+    lrm: List[float] = Field(default_factory=list)
+    muon_momentum: List[float] = Field(default_factory=list)
+    weight_decay: List[float] = Field(default_factory=list)
 
+    def append(self, log_dict: dict, step: int) -> None:
+        super().append(log_dict, step)
+        self.loss.append(log_dict.get("train/loss", float('nan')))
+        self.raw_loss.append(log_dict.get("train/raw_loss", float('nan')))
+        self.tokens_per_sec.append(log_dict.get("train/tokens_per_sec", 0))
+        self.step_time_ms.append(log_dict.get("train/step_time_ms", 0))
+        self.total_training_flops.append(log_dict.get("train/total_training_flops", 0))
+        self.total_training_time.append(log_dict.get("train/total_training_time", 0))
+        self.eta_sec.append(log_dict.get("train/eta_sec", 0))
+
+        self.lrm.append(log_dict.get("lrm", 0))
+        self.muon_momentum.append(log_dict.get("muon_momentum", 0))
+        self.weight_decay.append(log_dict.get("weight_decay", 0))
 
 # This is dummy
 def get_config_from_huggingface(model_name: str) -> TransformerConfig:

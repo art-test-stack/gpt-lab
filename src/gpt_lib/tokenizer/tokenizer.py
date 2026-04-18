@@ -5,7 +5,7 @@ import torch
 from typing import Callable, Iterable, List, Optional, Union, Tuple
 import pickle
 from pathlib import Path
-import random, warnings, json, os
+import random, warnings, json, os, csv
 from gpt_lib.utils.default import TOKENIZERS_FOLDER
 from gpt_lib.utils.special_tokens import SpecialTokens
 
@@ -18,17 +18,29 @@ from tokenizers import Tokenizer as HFTokenizer
     
 def get_closest_tokenizer_size(vocab_size: int) -> Tuple[str, int]:
     """Get the closest tokenizer size from the cache based on the provided vocab size."""
-    tiktoken_encs = { name: len(tiktoken.get_encoding(name)._mergeable_ranks) for name in ("gpt2", "cl100k_base", "o200k_base") }
+    # TODO: i removed tokenizer cache manager in a previous commit
+    # have to make it back in order to make this works with new tokenizers
+    tiktoken_encs = { 
+        name: len(tiktoken.get_encoding(name)._mergeable_ranks) 
+        for name in ("gpt2", "cl100k_base", "o200k_base") 
+    }
     tokenizer_cache = TOKENIZERS_FOLDER / "tokenizers.csv"
+    df_tok_cache = {}
     if tokenizer_cache.exists():
-        import pandas as pd
-        df_tok_cache = pd.read_csv(tokenizer_cache)[["name", "vocab_size"]].drop_duplicates()
-        df_tok_cache = {row["name"]: row["vocab_size"] for _, row in df_tok_cache.iterrows()}
-    else:
-        df_tok_cache = {}
+        # make a cache for this
+        with open(tokenizer_cache, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = row.get("name")
+                vocab = row.get("vocab_size")
+                if ncame and vocab:
+                    df_tok_cache[name] = int(vocab) 
+        
     tokenizer_sizes = {**tiktoken_encs, **df_tok_cache}
-    tok_name, closest_size = min(tokenizer_sizes.items(), key=lambda x: abs(x[1] - vocab_size))
-
+    tok_name, closest_size = min(
+        tokenizer_sizes.items(), 
+        key=lambda x: abs(x[1] - vocab_size)
+    )
     return tok_name, closest_size
      
 def build_tokenizer(config: TokenizerConfig) -> Callable:
@@ -112,7 +124,7 @@ class DummyTokenizer(_BaseTokenizer):
         self.token_to_id = { bytes([i]): i for i in range(min(256, n_merges)) }
         
         if n_merges > 256:
-            for i in range(256, n_merges):
+            for i in range(256, n_merges): # make merges deterministic at least lol
                 merge1 = bytes([i // 256])
                 merge2 = bytes([i % 256])
                 self.token_to_id[merge1+merge2] = i

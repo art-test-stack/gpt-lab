@@ -411,7 +411,6 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             data = data[:max_per_task]
 
         accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
-        results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
@@ -421,14 +420,25 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             f"{centered_result:^{COLS['cacc']}.6f} | "
             f"{elapsed:^{COLS['time']}.2f}"
         )
+        results[label] = dict(
+            accuracy=accuracy, 
+            num_examples=len(data), 
+            random_baseline=random_baseline,
+            centered_result=centered_result,
+            elapsed_time=elapsed,
+        )
+        if os.getenv("DEVELOPMENT", "0") == "1":
+            break
 
-    core_metric = sum(centered_results.values()) / len(centered_results)
-    out = {
-        "results": results,
-        "centered_results": centered_results,
-        "core_metric": core_metric
-    }
-    return out
+    accuracy = sum(r['accuracy'] for r in results.values()) / len(results)
+    time_elapsed = sum(r['elapsed_time'] for r in results.values())
+    log_dict = {}
+    log_dict["core/accuracy"] = accuracy
+    log_dict["core/core"] = sum(centered_results.values()) / len(centered_results)
+    log_dict["core/max_per_task"] = max_per_task
+    log_dict["all_core_results"] = results
+    log_dict["core/step_time_ms"] = time_elapsed * 1000
+    return log_dict
 
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")

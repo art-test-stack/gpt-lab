@@ -108,8 +108,10 @@ def get_dist_info(device_type: str | None = None, base_dist_info: tuple | None =
         dist_groups["DEVICE_NAME"] = None # does not matter
         dist_groups["gpu_peak_flops"] = float('inf') # TODO: implement peak flops estimation for xpu, tpu devices
     if is_initialized and rank == 0:
-        logger.info(f"Initialized distributed training. Distributed groups: {'\n'.join(f'{k!r:<15}: {v}' for k, v in dist_groups.items())}")
-
+        logger.info(
+            "Initialized distributed training. Distributed groups:\n%s",
+            "\n".join(f"{k!r:<15}: {v}" for k, v in dist_groups.items())
+        )
     compute_dtype, compute_dtype_reason = detect_compute_dtype()
     dist_groups["compute_dtype"] = compute_dtype
     dist_groups["compute_dtype_reason"] = compute_dtype_reason

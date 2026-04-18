@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from gpt_lib.utils.schemas import ModelOutput, LossConfig 
 
-from cut_cross_entropy import linear_cross_entropy
+# TODO: from cut_cross_entropy import linear_cross_entropy
 
 class BaseLoss(ABC):
     @abstractmethod
@@ -45,24 +45,24 @@ def cross_entropy_loss(logits: Union[torch.Tensor, ModelOutput], labels: torch.T
     )
     return loss
 
-class CutCrossEntropyLoss(BaseLoss):
-    def __init__(self, ignore_index=-1, reduction="mean"):
-        self.ignore_index = ignore_index
-        self.reduction = reduction
+# class CutCrossEntropyLoss(BaseLoss):
+#     def __init__(self, ignore_index=-1, reduction="mean"):
+#         self.ignore_index = ignore_index
+#         self.reduction = reduction
 
-    def __call__(self, logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ref_output=None, reduction=None):
-        raise NotImplementedError("CutCrossEntropyObjective is not yet supported.")
-        if isinstance(logits, ModelOutput):
-            logits = logits.logits
+#     def __call__(self, logits: Union[torch.Tensor, ModelOutput], labels: torch.Tensor, ref_output=None, reduction=None):
+#         raise NotImplementedError("CutCrossEntropyObjective is not yet supported.")
+#         if isinstance(logits, ModelOutput):
+#             logits = logits.logits
 
-        loss = linear_cross_entropy(
-            logits,
-            labels,
-            ignore_index=self.ignore_index,
-            reduction=self.reduction if reduction is None else reduction,
-            impl="torch_compile"
-        )
-        return loss
+#         loss = linear_cross_entropy(
+#             logits,
+#             labels,
+#             ignore_index=self.ignore_index,
+#             reduction=self.reduction if reduction is None else reduction,
+#             impl="torch_compile"
+#         )
+#         return loss
 
 
 class KLDivLoss(BaseLoss):
