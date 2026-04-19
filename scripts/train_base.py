@@ -39,14 +39,14 @@ Please cite this work if the code is helpful to you.
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
-from gpt_lib.utils.common import get_banner, print0, print0_dict
-from gpt_lib.utils.default import DATA_DIR, MODELS_FOLDER
-from gpt_lib.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups
-from gpt_lib.utils.report import get_git_info, get_gpu_info, get_system_info
-from gpt_lib.utils.schemas import GPTConfig, TrainingConfig
+from gpt_lab.utils.common import get_banner, print0, print0_dict
+from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER
+from gpt_lab.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups
+from gpt_lab.utils.report import get_git_info, get_gpu_info, get_system_info
+from gpt_lab.utils.schemas import GPTConfig, TrainingConfig
 
-from gpt_lib.model.auto import AutoGPTConfig
-from gpt_lib.model.gpt import DenseTransformer
+from gpt_lab.model.auto import AutoGPTConfig
+from gpt_lab.model.gpt import DenseTransformer
 
 from argparse import ArgumentParser
 
@@ -242,10 +242,10 @@ if __name__ == "__main__":
     # TODO: 
     # manage datasets
     # init shard manager
-    # from gpt_lib.data.sharder import ShardManager
+    # from gpt_lab.data.sharder import ShardManager
     # shard_manager = ShardManager(data_dir=DATA_DIR, name="base")
     # init tokenizing data loaders
-    from gpt_lib.data.loader import build_dataloader
+    from gpt_lab.data.loader import build_dataloader
 
     loader_common_kwargs = dict(
         dsname=args.ds_name,
@@ -297,7 +297,7 @@ if __name__ == "__main__":
     # INIT BOARD
     # ------------------------------------------------------------------------------
 
-    from gpt_lib.utils.board import Board, DummyBoard
+    from gpt_lab.utils.board import Board, DummyBoard
 
     if is_master_process:
         board_args["dirname"] = meta_config["dirname"]
@@ -316,7 +316,7 @@ if __name__ == "__main__":
     # TRAINER: TRAINING, EVALUATION, CHECKPOINTING LOOPS
     # ------------------------------------------------------------------------------
 
-    from gpt_lib.train.trainer import Trainer
+    from gpt_lab.train.trainer import Trainer
     trainer = Trainer(
         model=model, tokenizer=tokenizer, optimizer=optimizers, 
         train_loader=train_loader, val_loader=val_loader,
@@ -328,7 +328,7 @@ if __name__ == "__main__":
     # LOG REPORT
     # ------------------------------------------------------------------------------
 
-    from gpt_lib.utils.report import get_report
+    from gpt_lab.utils.report import get_report
 
     # get_report().log(section="Base model training", data=[
     #     board_args, # CLI args

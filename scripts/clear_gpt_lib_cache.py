@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 import shutil
-from gpt_lib.utils.default import CACHE_DIR, TOKENIZERS_FOLDER, DATA_DIR
+from gpt_lab.utils.default import CACHE_DIR, TOKENIZERS_FOLDER, DATA_DIR
 
 paths = {
     "tokenizer": TOKENIZERS_FOLDER,

@@ -1,7 +1,7 @@
-from gpt_lib.tokenizer.tokenizer import Tokenizer
-from gpt_lib.utils.schemas import TokenizerTrainerConfig
-from gpt_lib.tokenizer.corpus import TokenizerCorpus
-from gpt_lib.utils.default import PAT_STR_GPT2, PAT_STR_GPT4, PAT_STR_punct, PAT_STR_cl100k_base, PAT_STR_o200k_base, TOKENIZERS_FOLDER, DATA_DIR
+from gpt_lab.tokenizer.tokenizer import Tokenizer
+from gpt_lab.utils.schemas import TokenizerTrainerConfig
+from gpt_lab.tokenizer.corpus import TokenizerCorpus
+from gpt_lab.utils.default import PAT_STR_GPT2, PAT_STR_GPT4, PAT_STR_punct, PAT_STR_cl100k_base, PAT_STR_o200k_base, TOKENIZERS_FOLDER, DATA_DIR
 
 from pathlib import Path
 import argparse, pickle, zipfile

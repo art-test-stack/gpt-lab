@@ -2,8 +2,8 @@ import pytest
 import random
 import string
 
-from gpt_lib.tokenizer import Tokenizer, TokenizerConfig
-from gpt_lib.utils.special_tokens import SpecialTokens
+from gpt_lab.tokenizer import Tokenizer, TokenizerConfig
+from gpt_lab.utils.special_tokens import SpecialTokens
 
 def make_dummy_dataset(size: int, max_seq_len: int):
     """Creates a dummy dataset of random token sequences for testing purposes.

@@ -1,10 +1,10 @@
 if not __name__ == "__main__":
     raise ImportError("This script is intended to be run as a standalone program.")
 
-from gpt_lib.tokenizer.tokenizer import Tokenizer
-from gpt_lib.tokenizer.bpe import bpe, bpe_fast
-from gpt_lib.utils.schemas import TokenizerTrainerConfig
-from gpt_lib.tokenizer.corpus import TokenizerCorpus
+from gpt_lab.tokenizer.tokenizer import Tokenizer
+from gpt_lab.tokenizer.bpe import bpe, bpe_fast
+from gpt_lab.utils.schemas import TokenizerTrainerConfig
+from gpt_lab.tokenizer.corpus import TokenizerCorpus
 from typing import Union, Generator
 
 

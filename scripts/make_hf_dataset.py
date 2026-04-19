@@ -5,9 +5,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import os
-from gpt_lib.utils.common import get_banner
-from gpt_lib.utils.default import DATA_DIR
-from gpt_lib.utils.schemas import DatasetConfig
+from gpt_lab.utils.common import get_banner
+from gpt_lab.utils.default import DATA_DIR
+from gpt_lab.utils.schemas import DatasetConfig
 from huggingface_hub import HfApi
 
 def read_dataset_config(ds_name: str, config_path: str) -> DatasetConfig:

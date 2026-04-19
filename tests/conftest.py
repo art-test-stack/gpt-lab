@@ -19,7 +19,7 @@ def device(request):
     return torch.device(request.param)
 
 def pytest_report_header(config):
-    from gpt_lib.utils.report import (
+    from gpt_lab.utils.report import (
         get_banner, 
         get_git_info, 
         get_gpu_info, 

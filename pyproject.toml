@@ -1,5 +1,5 @@
 [project]
-name = "gpt-lib"
+name = "gpt-lab"
 version = "0.1.0"
 description = "This project is the implementation of a small library to manage LLM training and inference from-scratch. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotly."
 readme = "README.md"
@@ -27,8 +27,8 @@ dependencies = [
 ]
 
 [project.urls]
-homepage = "https://github.com/art-test-stack/gpt-lib"
-repository = "https://github.com/art-test-stack/gpt-lib"
+homepage = "https://github.com/art-test-stack/gpt-lab"
+repository = "https://github.com/art-test-stack/gpt-lab"
 
 [dependency-groups]
 dev = [

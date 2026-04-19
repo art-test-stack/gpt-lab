@@ -15,10 +15,10 @@ This file contains fully working examples demonstrating:
 
 def example_basic_training():
     """Minimal working example for training."""
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.loader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.loader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
     
     # Configuration
     train_config = TrainingConfig(
@@ -36,8 +36,8 @@ def example_basic_training():
         buffer_size=1000,
     )
     # Initialize model and tokenizer
-    from gpt_lib.model.gpt import DenseTransformer
-    from gpt_lib.tokenizer import Tokenizer
+    from gpt_lab.model.gpt import DenseTransformer
+    from gpt_lab.tokenizer import Tokenizer
 
     model = DenseTransformer()
     tokenizer = Tokenizer.from_pretrained("gpt2")
@@ -68,10 +68,10 @@ def example_basic_training():
 
 def example_with_download():
     """Example with dataset download before training."""
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
     
     # Initialize ShardManager
     shard_manager = ShardManager(
@@ -120,10 +120,10 @@ def example_with_download():
 
 def example_resumption():
     """Example of saving and resuming from checkpoints."""
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
     from pathlib import Path
     
     # Training configuration
@@ -193,10 +193,10 @@ def example_distributed_training():
     """Example with Distributed Data Parallel (DDP)."""
     import os
     import torch.distributed as dist
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
     
     # Initialize DDP (assumes torch.distributed.launch or equivalent)
     dist.init_process_group(backend="nccl")
@@ -274,10 +274,10 @@ def example_distributed_training():
 def example_custom_lr_schedule():
     """Example with custom learning rate schedule."""
     import math
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
     
     # Define custom LR schedule (warmup + cosine decay)
     def lr_schedule(step: int, base_lr: float) -> float:
@@ -325,10 +325,10 @@ def example_custom_lr_schedule():
 
 def example_memory_optimized():
     """Example tuned for GPUs with limited memory (e.g., 24GB)."""
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
     
     # Reduce batch size and sequence length
     loader_config = DataLoaderConfig(
@@ -370,10 +370,10 @@ def example_memory_optimized():
 
 def example_throughput_optimized():
     """Example tuned for maximum throughput (large GPU cluster)."""
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
     
     # Large batch, large sequence, aggressive buffering
     loader_config = DataLoaderConfig(
@@ -416,8 +416,8 @@ def example_throughput_optimized():
 
 def example_manual_iteration():
     """Example of manually iterating through shards without Trainer."""
-    from gpt_lib.data.sharder import ShardManager, ShardIterationState
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.data.sharder import ShardManager, ShardIterationState
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
     
     # Manual control over iteration
     shard_manager = ShardManager(data_dir="./data")
@@ -472,11 +472,11 @@ def example_manual_iteration():
 def example_with_wandb():
     """Example with W&B logging integration."""
     import wandb
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
-    from gpt_lib.utils.board import Board
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
+    from gpt_lab.utils.board import Board
     
     # Initialize W&B
     wandb.init(
@@ -531,11 +531,11 @@ def example_production_setup():
     import torch.distributed as dist
     from pathlib import Path
     
-    from gpt_lib.data.sharder import ShardManager
-    from gpt_lib.data.dataloader import DataLoader, DataLoaderConfig
-    from gpt_lib.train.trainer import Trainer
-    from gpt_lib.utils.schemas import TrainingConfig
-    from gpt_lib.utils.board import Board
+    from gpt_lab.data.sharder import ShardManager
+    from gpt_lab.data.dataloader import DataLoader, DataLoaderConfig
+    from gpt_lab.train.trainer import Trainer
+    from gpt_lab.utils.schemas import TrainingConfig
+    from gpt_lab.utils.board import Board
     
     # ================================================================
     # 1. Initialize Distributed Training
@@ -558,8 +558,8 @@ def example_production_setup():
     # ================================================================
     # 3. Load Model and Tokenizer
     # ================================================================
-    from gpt_lib.model.gpt import GPTModel
-    from gpt_lib.tokenizer import Tokenizer
+    from gpt_lab.model.gpt import GPTModel
+    from gpt_lab.tokenizer import Tokenizer
     
     model = GPTModel.from_pretrained("gpt-3-small").to(device)
     tokenizer = Tokenizer.from_pretrained("gpt-3")

@@ -15,8 +15,8 @@ set -e
 apt-get update && apt-get install -y git curl
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-git clone https://github.com/art-test-stack/gpt-lib.git
-cd gpt-lib
+git clone https://github.com/art-test-stack/gpt-lab.git
+cd gpt-lab
 export $export HF_HUB_DISABLE_PROGRESS_BARS=1
 ~/.local/bin/uv sync
 ~/.local/bin/uv run python -m scripts.make_hf_bucket --streaming --upload-every 32
@@ -28,9 +28,9 @@ Clean bucket memory with:
 hf buckets rm $HF_ID/$HF_BUCKET_NAME --recursive --include "*.parquet"
 ```
 """
-from gpt_lib.utils.common import get_banner
-from gpt_lib.utils.default import DATA_DIR, CACHE_DIR
-from gpt_lib.utils.schemas import DatasetConfig
+from gpt_lab.utils.common import get_banner
+from gpt_lab.utils.default import DATA_DIR, CACHE_DIR
+from gpt_lab.utils.schemas import DatasetConfig
 
 import os, yaml
 from pathlib import Path

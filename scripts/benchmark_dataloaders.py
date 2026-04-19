@@ -44,7 +44,7 @@ from collections import defaultdict
 import torch
 import numpy as np
 
-from gpt_lib.data.loader import PackedDataLoader, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from gpt_lab.data.loader import PackedDataLoader, tokenizing_distributed_data_loader_with_state_bos_bestfit
 
 # ─────────────────────────────────────────────
 # Synthetic data helpers
@@ -82,7 +82,7 @@ class SyntheticPretokenizedDataset:
 # ─────────────────────────────────────────────
 # Inline copies of both loaders
 # (avoids hard import dependency so the script
-#  can run even if gpt_lib / nanochat are absent)
+#  can run even if gpt_lab / nanochat are absent)
 # ─────────────────────────────────────────────
 
 from bisect import bisect_right, insort
@@ -403,7 +403,7 @@ def main():
             sys.exit("--mode real requires --bin and --idx arguments.")
         # import real dataset class
         try:
-            from gpt_lib.data.loader import PretokenizedDataset   # adjust import path as needed
+            from gpt_lab.data.loader import PretokenizedDataset   # adjust import path as needed
         except ImportError:
             sys.exit("Could not import PretokenizedDataset. "
                      "Make sure dataloader.py is on sys.path.")

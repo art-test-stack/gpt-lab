@@ -157,8 +157,7 @@ msgpack_python==0.5.6
 mtrand==0.1
 multiset==3.2.0
 munkres==1.1.4
-my_gpt==0.1.0
-my_gpt.egg==info
+gpt_lab==0.1.0
 natten==0.21.6
 nbformat==5.10.4
 neptune==1.14.0.post2

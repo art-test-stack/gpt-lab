@@ -1,9 +1,9 @@
 import pytest
 import torch
-from gpt_lib.model.gpt import GPTModel
-from gpt_lib.train.trainer import Trainer
+from gpt_lab.model.gpt import GPTModel
+from gpt_lab.train.trainer import Trainer
 
-from gpt_lib.utils.schemas import (
+from gpt_lab.utils.schemas import (
     GPTConfig, 
     LossConfig, 
     TokenizerConfig, 

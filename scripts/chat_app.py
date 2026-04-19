@@ -1,22 +1,22 @@
 import sys, os, load_dotenv
 load_dotenv.load_dotenv()
 try:
-    import gpt_lib
+    import gpt_lab
 except ImportError as e:
     print("Import Error:", e)
-    if os.environ["ENV"] == "development":
+    if os.environ["DEVELOPMENT"] == "1":
         print("Development environment detected. Attempting to adjust sys.path.")
         current_dir = os.path.dirname(os.path.abspath(__file__))
         parent_dir = os.path.dirname(os.path.dirname(current_dir))
         sys.path.append(parent_dir)
         print("Updated System Path:", sys.path)
-        import gpt_lib
+        import gpt_lab
     else:
         raise e
 
-from gpt_lib.interface.chat import chatapp_interface
-from gpt_lib.interface.benchmark import benchmark_interface
-from gpt_lib.utils.common import get_banner
+from gpt_lab.interface.chat import chatapp_interface
+from gpt_lab.interface.benchmark import benchmark_interface
+from gpt_lab.utils.common import get_banner
 import gradio as gr
 from pydantic import BaseModel
 

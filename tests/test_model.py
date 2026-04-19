@@ -1,9 +1,9 @@
 import pytest
 import torch
-from gpt_lib.model.gpt import GPTModel
-from gpt_lib.model.utils import KVCache
+from gpt_lab.model.gpt import GPTModel
+from gpt_lab.model.utils import KVCache
 
-from gpt_lib.utils.schemas import (
+from gpt_lab.utils.schemas import (
     GPTConfig, 
     LossConfig, 
     TokenizerConfig, 
@@ -290,7 +290,7 @@ class TestGPTModel:
             self.config.model.d_head
         )
         kv_state = KVCache(config=self.config.model)
-        from gpt_lib.utils.default import DEVICE
+        from gpt_lab.utils.default import DEVICE
         kv_state.check_sizes(B, T, DEVICE, torch.float32)
 
         k = torch.randn(L, B, T, H, D)
