@@ -95,7 +95,140 @@ This project has been developed and tested with Python 3.12. To manage dependenc
 
 # Usage
 
-There is many layers in the library, and many components that can be used and customized. 
+There is many layers in the library, and many components that can be used and customized. The main ones are the following:
+
+
+## Data
+
+We can do whatever we want with Pytorch, maths, etc, but the core component of any Machine Learning system is the data (**IMO**). 
+
+The data processing pipeline is quite split into two main components: the tokenization process, and the training data loading process.
+
+The main focus is on the training and optimization of the models, and the tokenization process. That being said, I encourage you to check the code in `gpt_lab.data` and propose improvements via pull requests.
+
+## Tokenization
+
+The tokenization details are located in `gpt_lab.tokenizer`. The code only includes BPE tokenization for now (include sentencepiece is a TODO). The tokenizer training is only supported by huggingface implementation for now. For inference, the tiktoken implementation is the default one, as it is much faster than the huggingface one. The custom BPE implementation is still under development, and may not be fully functional yet.
+
+### Training a tokenizer
+
+### Using a pre-trained tokenizer
+
+### Which tokenizer implementation to choose?
+
+The tokenizer training script is located in `scripts/train_tokenizer.py`. It allows you to train a BPE tokenizer on a custom corpus, using different implementations (tiktoken, HuggingFace, or custom BPE implementations). You can also choose to write the corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus.
+
+Training time benchmarks for different implementations and configurations. All the tokenizers were trained on corpus generated from `gpt_lab.tokenizer.corpus.TokenizerCorpus()` with default settings, tuned with variable `vocab_size`.
+
+Implementation | Vocabulary size | Num proc | Corpus size | Training time
+--- | --- | --- | --- | ---
+huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds 
+<!-- | 0.27 -->
+
+
+## Training a model
+
+## Optimization
+
+> [!NOTE]
+> This is maybe the most critical part of the library, and sadly, this is where I used too much LLM for code writing, because my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in `gpt_lab.optim.factory` and `gpt_lab.train.trainer` and propose improvements via pull requests. 
+
+### Pre training
+
+The pre-training script is located in `scripts/train_base.py`. It allows you to pre-train a GPT model from scratch on a defined corpus, using different configurations (model architecture, training hyperparameters, optimizer, etc.). You can also choose to write the corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus.
+
+> [!WARNING]
+> There are two sub-arguments for this script `auto` and `custom`. For now, only `auto` is implemented, which allows you to automatically load a configuration based on main (`depth`, `aspect_ratio`, `n_heads`, etc.) arguments and compute optimal training parameters, as optimal `vocab_size` if not provided. The script can then train a new tokenizer with `--train-tokenizer` flag. The `custom` argument is intended to allow you to directly pass the configuration as command-line arguments, without the need for a YAML file. This feature is under development and will be implemented in the future.
+
+Main arguments: 
+Argument | Description
+--- | ---
+`--config-name` | Name of the configuration file located in `configs/` (without the `.yaml` extension). For example, `base_125M.yaml`.
+`--resume`
+
+Otherwise, if you download the package, and want to try a new model architecture, you can instantiate a new model based on `gpt_lab.model.layers`. 
+
+```python
+from torch import nn
+from gpt_lab.model.layers import DecoderLayer, CausalSelfAttention, SwigLUFeedForward, build_norm
+from gpt_lab.model.utils import precompute_rope
+
+class CustomGPT(nn.Module):
+    # Simplfied example of a GPT model with custom architecture.
+    def __init__(self, config):
+        super().__init__()
+        self.embeds = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.blocks = nn.ModuleList([
+            DecoderLayer(config) 
+            for _ in range(config.depth)])
+        self.norm = build_norm("rms", 1e-8)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        rope_cache = self.precompute_rope()
+        self.register_buffer("rope_cache", rope_cache, persistent=False)
+    
+    def forward(self, x):
+        x = self.embeds(x)
+        for layer in self.blocks:
+            x = layer(x)
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        return logits
+```
+
+Note that there are some key components that have to be implemented to make the other objects to work. Those are the following:
+
+```python
+class CustomGPT(nn.Module):
+    def __init__(self, config):
+      pass 
+
+    def forward(self, x):
+      pass
+
+    @torch.no_grad()
+    def init_weights(self) -> None:
+      "Initialize the weights of the model. This method is called before training starts, and can be used to apply custom initialization schemes."
+
+    @property
+    def n_params(self) -> int:
+      "Return the number of parameters of the model. This property is used to compute the optimal training parameters based on the model size."
+    
+    def n_params_per_layer(self) -> int:
+      "Return the number of parameters per layer of the model. This method is used to compute the optimal training parameters based on the model size."
+
+    def n_scaling_params(self) -> int:
+      "Return the number of scaling parameters of the model. This method is used to compute the optimal training parameters based on the model size."
+
+    def estimate_flops(self) -> float:
+      "Return the estimated number of FLOPs for a forward pass of the model. This method is used to compute the optimal training parameters based on the model size."
+
+    def build_optimizer(self, training_config) -> List[torch.optim.Optimizer]:
+      "Return the optimizer for the model based on the provided configuration. This method is used to build the optimizer for training."
+```
+
+Note that if you instantiate your new class based on `gpt_lab.model.gpt.DenseTransformer`, you will only need to implement the `build_optimizer` method, as the other methods are already implemented in the base class. However, you will need to make sure your component implementation names (e.g., transformer blocks, head, etc.) are compatible with the base class implementation.
+
+Vizualize the training progress in the board of your choice (Tensorboard, Weights & Biases, or Trackio). You can also log to a dummy board that does not log anything, for faster training without logging overhead. 
+
+<!-- <iframe src="https://abidlabs-trackio-1234.hf.space/?project=my-project&metrics=train_loss,train_accuracy&sidebar=hidden" style="width:1600px; height:500px; border:0;"></iframe> -->
+
+## Chat with the model
+
+In this section, you will find instructions to run the chat interface with different models.
+
+Under development environment (`DEVELOPMENT='1'` in `.env`), you can run the chat interface with auto-reloading, use the following command:
+```sh
+uv run gradio scripts/chat_app.py --demo-name=app
+```
+
+Otherwise, if you don't want auto-reloading, use:
+```sh
+uv run python -m scripts.chat_app
+```
+
+Then, open your browser and go to [`http://127.0.0.1:7860/`](http://127.0.0.1:7860/). It is quite straightforward to use. You can select different models (local or remote), choose some hyperparameters for inference, and chat with the model.
+
 
 # Development Notes
 
@@ -117,9 +250,6 @@ and propose improvements via pull requests.
 
 ## Some bibliography
 
-1. [Attention is all you need](https://arxiv.org/pdf/1706.03762)
-4. [Training Compute-Optimal Large Language Models](https://arxiv.org/abs/2203.15556)
-5. [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
 
 > [!NOTE]
 > All of the literature ressources below all participated in some way to the development of the library. I have probably forgotten some, and I apologize for that. If you think some important papers are missing please feel free to add one (or suggest one) via pull request. 
@@ -231,7 +361,7 @@ Project Link: [https://github.com/art-test-stack/gpt-lab](https://github.com/art
 
 If you use this work in your research, *please* consider citing the following:
 ```
-@misc{gpt_lib_2026,
+@misc{gptlab2026,
   author={Testard, Arthur},
   title={gpt-lab: A light-weight library for fast-ablation studies on GPT-like LMs},
   year={2026},
