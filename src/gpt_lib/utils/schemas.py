@@ -434,6 +434,7 @@ class TrainingConfig(BaseModel):
 
     # Loggin settings
     n_flops_per_token: Optional[float] = None 
+    monitor_grad_norms: bool = False
     
     # Dtype settings
     use_amp: bool = False

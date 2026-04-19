@@ -182,6 +182,7 @@ class Trainer:
         self.device_type = config.dist_info.get("DEVICE_TYPE", "cpu")
         self.device = torch.device(config.dist_info.get("DEVICE", "cpu"))
         self._get_sync_fn()
+        self._add_model_hook_for_grad_monitoring()
 
     def _get_sync_fn(self):
         """Set up device synchronization function."""
@@ -191,6 +192,23 @@ class Trainer:
         else:
             self.synchronize = lambda: None
             self.get_max_memory = lambda: 0
+
+    def _add_model_hook_for_grad_monitoring(self):
+        """Add backward hooks to model parameters to monitor gradient norms."""
+        if self.config.monitor_grad_norms and not getattr(self, "_hooked", False):
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    param.register_hook(
+                        lambda grad, name=name: self.board.log({
+                            f"grad_norm/{name.replace('.', '/').replace('/weight', '')}": grad.norm().mean().item()}, 
+                            step=self.state.global_step))
+        self._hooked = True # avoid hooking multiple times
+
+    def _rm_model_hooks(self):
+        """Remove all hooks from model parameters."""
+        for param in self.model.parameters():
+            param._backward_hooks = {}
+        self._hooked = False
 
     def train(self):
         """
@@ -226,6 +244,7 @@ class Trainer:
         total_dt = []  # For ETA calculation
         
         while step < n_steps:
+            self.state.global_step = step
             last_step = (step == n_steps - 1)
             flops_so_far = n_flops_per_token * total_batch_size * step
             self.synchronize()
@@ -383,7 +402,6 @@ class Trainer:
             tokens_per_sec = eff_global_tokens / step_dt
             
             total_dt.append(step_dt)
-            self.state.global_step = step
             self.state.global_tokens += eff_global_tokens
             self.state.smooth_train_loss = smooth_loss
             self.state.total_training_time += step_dt
@@ -478,11 +496,7 @@ class Trainer:
         muon_momentum = self.muon_momentum_schedule(step)
         weight_decay = self.weight_decay_schedule(step)
         
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = param_group["initial_lr"] * lrm
-            if param_group["type"] == "muon":
-                param_group["momentum"] = muon_momentum
-                param_group["weight_decay"] = weight_decay
+        self.optimizer.update_hyperparams(lrm=lrm, muon_momentum=muon_momentum, weight_decay=weight_decay)
         return lrm, muon_momentum, weight_decay
 
     def save_checkpoint(self, tag: str = "latest"):

@@ -20,12 +20,10 @@ from gpt_lib.utils.schemas import (
     GPTConfig, 
     ModelOutput, 
     ModelCompletionOutput,
-    TokenizerConfig,
     TrainingConfig,
     TransformerConfig, 
     TransformerOutput
 )
-from gpt_lib.utils.types import Dtypes, Devices, TokenizerTensors
 from gpt_lib.utils.default import MODELS_FOLDER, DEVICE
 from gpt_lib.utils.common import print0, print0_dict
 
@@ -279,12 +277,12 @@ class DenseTransformer(BaseTransformer):
     def build_optimizer(self, config: TrainingConfig, optim_config_path: Optional[str] = None) -> torch.optim.Optimizer:
         # default config, overriden by optim_config_path if provided
         optim_config = {
-            "embeddings":       dict(type='adamw', lr=config.lr_embeddings,       betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            "head":             dict(type='adamw', lr=config.lr_head,             betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
-            "residual_hiddens": dict(type='adamw', lr=config.lr_residuals * 0.01, betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
-            "residual_inputs":  dict(type='adamw', lr=config.lr_residuals,        betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            "value_embeds":     dict(type='adamw', lr=config.lr_embeddings * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),                    
-            "transformer":      dict(type='muon',  lr=config.lr_transformer,      momentum=0.95, ns_steps=5, beta=.9, weight_decay=config.weight_decay),
+            "embeddings":       dict(opt='adamw', lr=config.lr_embeddings,       betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+            "head":             dict(opt='adamw', lr=config.lr_head,             betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
+            "residual_hiddens": dict(opt='adamw', lr=config.lr_residuals * 0.01, betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
+            "residual_inputs":  dict(opt='adamw', lr=config.lr_residuals,        betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            "value_embeds":     dict(opt='adamw', lr=config.lr_embeddings * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),                    
+            "transformer":      dict(opt='muon',  lr=config.lr_transformer,      momentum=0.95, ns_steps=5, beta=.9, weight_decay=config.weight_decay),
         }
         optim_config_path = optim_config_path or config.optim_config_path # one or another; idc for now
         

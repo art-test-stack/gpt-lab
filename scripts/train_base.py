@@ -130,6 +130,7 @@ if __name__ == "__main__":
     auto_parser.add_argument("--sample-every", type=int, default=0, help="(default: 2000) Sample from model every N steps (-1 = last, 0 = disable, N > 0 = every N steps).")
     auto_parser.add_argument("--save-every", type=int, default=-1, help="(default: -1) Save checkpoints every N steps (-1 = last, 0 = disable, N > 0 = every N steps).")
     auto_parser.add_argument("--log-every", type=int, default=250, help="(default: -1) Log metrics every N steps (-1 = last, 0 = disable, N > 0 = every N steps).")
+    auto_parser.add_argument("--monitor-grad-norms", action="store_true", help="(default: False) Whether to monitor gradient norms during training. If set, will log the norm of the gradients of each parameter to the board at each training step.")
 
     # TODO: Arch-config subparser
     arch_parser = subparsers.add_parser("arch", help="Config model architecture based on model name (eg: gpt2, llama2, mixtral).")
@@ -285,6 +286,7 @@ if __name__ == "__main__":
         save_every=args.save_every,
         log_every=args.log_every,
         use_amp=args.use_amp,
+        monitor_grad_norms=args.monitor_grad_norms,
         **base_training_config
     )
     print0_dict("Trainer config", trainer_config.model_dump())

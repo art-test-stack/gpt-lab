@@ -156,11 +156,9 @@ def init_dist_groups(device_type: str | None = None, random_seed: int = 42):
 
     return dist_info
 
-
 def cleanup_dist_groups():
     if is_ddp_initialized():
         dist.destroy_process_group()
-    
 
 # hardcoded BF16 peak flops for various GPUs
 # adapted from: https://github.com/karpathy/nanochat/blob/master/nanochat/common.py
