@@ -27,7 +27,7 @@
 
 *\*This name is quite pompous, I admit it. Any suggestions for a better one are welcomed!* 
 
-# Table of Contents
+## Table of Contents
 
 - [Table of Contents](#table-of-contents)
 - [About The Project](#about-the-project)
@@ -49,7 +49,9 @@
 - [License](#license)
 - [Contact](#contact)
 
-# About The Project
+## About The Project
+
+### Purpose
 
 This project is primarily educational*. It implements transformer-based language models from scratch to expose and understand their core mechanisms.
 
@@ -61,19 +63,18 @@ This is not a production-ready library. It is a lightweight, transparent playgro
 
 Components are adapted from existing work and properly credited. The goal is not to reinvent the wheel, but to understand it well enough to modify and improve it. At least, that is the intention.
 
-**For the non-initiated, there is of course better resources available online and for free. Find some at the [references section](#references).*
+**For the non-initiated, there is of course better free-online resources available. Find some at the [references section](#references).*
 
-## Built With
+### Built With
 
-* [![Torch][Torch]][Torch-url] <<3 🐐 (sorry JAX lovers)
-* [![huggingface-shield]][huggingface-url] (datasets, transformers, tokenizer, hub)
-* [![wandb-shield]][wandb-url] (training monitoring)
-* [![tiktoken-shield]][tiktoken-url] (very fast tokenizer encoder)
-* [![gradio-shield]][gradio-url] (web interface -- *not really actively developed; may have some bugs and issues*)
+[![Torch][Torch]][Torch-url] <<3 🐐 (sorry JAX lovers) \
+[![huggingface-shield]][huggingface-url] (datasets, transformers, tokenizer, hub) \
+[![wandb-shield]][wandb-url] (training monitoring) \
+[![tiktoken-shield]][tiktoken-url] (very fast tokenizer encoder) \
+[![gradio-shield]][gradio-url] (web interface -- *not really actively developed; may have some bugs and issues*) \
+[![uv-shield]][uv-url] (dependency management and CLI)
 
-* [![uv-shield]][uv-url] (dependency management and CLI)
-
-# Get Started
+## Get Started
 
 This project has been developed and tested with Python 3.12. To manage dependencies, I recommend using [`uv`](https://github.com/astral-sh/uv). 
 
@@ -93,28 +94,32 @@ This project has been developed and tested with Python 3.12. To manage dependenc
 > [!NOTE]  
 > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation.
 
-# Usage
+## Usage
 
 There is many layers in the library, and many components that can be used and customized. The main ones are the following:
+- [Data processing](#data)
+- [Model architecture](#model-architecture)
+- [Optimization](#optimization)
+- [Training](#training)
+- [Inference](#inference)
 
+### Data
 
-## Data
-
-We can do whatever we want with Pytorch, maths, etc, but the core component of any Machine Learning system is the data (**IMO**). 
+We can do whatever we want with maths, modelization, and then with the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
 
 The data processing pipeline is quite split into two main components: the tokenization process, and the training data loading process.
 
 The main focus is on the training and optimization of the models, and the tokenization process. That being said, I encourage you to check the code in `gpt_lab.data` and propose improvements via pull requests.
 
-## Tokenization
+### Tokenization
 
 The tokenization details are located in `gpt_lab.tokenizer`. The code only includes BPE tokenization for now (include sentencepiece is a TODO). The tokenizer training is only supported by huggingface implementation for now. For inference, the tiktoken implementation is the default one, as it is much faster than the huggingface one. The custom BPE implementation is still under development, and may not be fully functional yet.
 
-### Training a tokenizer
+#### Training a tokenizer
 
-### Using a pre-trained tokenizer
+#### Using a pre-trained tokenizer
 
-### Which tokenizer implementation to choose?
+#### Which tokenizer implementation to choose?
 
 The tokenizer training script is located in `scripts/train_tokenizer.py`. It allows you to train a BPE tokenizer on a custom corpus, using different implementations (tiktoken, HuggingFace, or custom BPE implementations). You can also choose to write the corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus.
 
@@ -126,14 +131,14 @@ huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds
 <!-- | 0.27 -->
 
 
-## Training a model
+### Model architecture
 
-## Optimization
+### Optimization
 
 > [!NOTE]
 > This is maybe the most critical part of the library, and sadly, this is where I used too much LLM for code writing, because my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in `gpt_lab.optim.factory` and `gpt_lab.train.trainer` and propose improvements via pull requests. 
 
-### Pre training
+#### Pre training
 
 The pre-training script is located in `scripts/train_base.py`. It allows you to pre-train a GPT model from scratch on a defined corpus, using different configurations (model architecture, training hyperparameters, optimizer, etc.). You can also choose to write the corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus.
 
@@ -213,7 +218,7 @@ Vizualize the training progress in the board of your choice (Tensorboard, Weight
 
 <!-- <iframe src="https://abidlabs-trackio-1234.hf.space/?project=my-project&metrics=train_loss,train_accuracy&sidebar=hidden" style="width:1600px; height:500px; border:0;"></iframe> -->
 
-## Chat with the model
+### Chat with the model
 
 In this section, you will find instructions to run the chat interface with different models.
 
@@ -230,30 +235,29 @@ uv run python -m scripts.chat_app
 Then, open your browser and go to [`http://127.0.0.1:7860/`](http://127.0.0.1:7860/). It is quite straightforward to use. You can select different models (local or remote), choose some hyperparameters for inference, and chat with the model.
 
 
-# Development Notes
+## Development Notes
 
 Some components are intentionally incomplete. 
 Contributors (including automated tools) are encouraged to explore TODOs 
 and propose improvements via pull requests.
 
 <!-- Sources -->
-# References
+## References
 
-## Nice repositories to check out for inspiration and reference
+### Nice repositories to check out for inspiration and reference
 
 1. [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT/tree/master) by Andrej Karpathy.
 2. [karpathy/nanochat](https://github.com/karpathy/nanochat/tree/master)  by Andrej Karpathy.
 3. [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) by Jordan Keller.
 
-## Some nice blogs and articles
+### Some nice blogs and articles
 1. [Building a text generation model from scratch by Vincent Bons](https://wingedsheep.com/building-a-language-model/)
 
-## Some bibliography
-
+### Some bibliography
 
 > [!NOTE]
 > All of the literature ressources below all participated in some way to the development of the library. I have probably forgotten some, and I apologize for that. If you think some important papers are missing please feel free to add one (or suggest one) via pull request. 
-> Although, I tried to categorize the papers *as possibly* to make it easier to navigate. Some papers may fall to multiple categories, but I tried to make the classification as relevant as possible.
+> Although, I tried to categorize the papers *as possible* to make it easier to navigate. Some papers may fall to multiple categories, but I tried to make the classification as relevant as possible.
 > Most papers are not directly cited in the code, I will try to add some as much as possible in the future.
 
 | Title                                                                                                                  | Authors                | Journal                                                                | Year   | DOI                            | Link                                                                                   | Category                         |   ArxivID |
@@ -319,7 +323,7 @@ and propose improvements via pull requests.
 
 There are a lot of Youtube videos that explain well the different components of the library, and how to implement them. Here are some of them that I found useful:
 1. [Andrej Karpathy's YouTube channel](https://www.youtube.com/@AndrejKarpathy) for his unmatched expertise in the field, and his ability to explain complex concepts in a simple and intuitive way. His videos on Transformers and LLMs are particularly useful for understanding the architecture and training of these models.
-2. [Stanfords CME295 course](https://youtube.com/playlist?list=PLoROMvodv4rOCXd21gf0CF4xr35yINeOy&si=sL3DEmGNNdh9-TEa) for the very nice lecture on Transformers and LLMs by [Afshine](https://github.com/afshinea) and [Shervine Amidi](https://github.com/shervinea). [CME296](https://youtube.com/playlist?list=PLoROMvodv4rNdy8rt2rZ4T2xM0OjADnfu&si=NF0SmB-aItcdB3tT) is also a very promising (currently ongoing) course on diffusion & LVMs.
+2. [Stanfords CME295 course](https://youtube.com/playlist?list=PLoROMvodv4rOCXd21gf0CF4xr35yINeOy&si=sL3DEmGNNdh9-TEa) for the very nice lecture on Transformers and LLMs by [Afshine](https://github.com/afshinea) and [Shervine Amidi](https://github.com/shervinea). They currently lecture [CME296](https://youtube.com/playlist?list=PLoROMvodv4rNdy8rt2rZ4T2xM0OjADnfu&si=NF0SmB-aItcdB3tT), which is on diffusion & LVMs.
 
 
 # TODOs 
@@ -355,7 +359,7 @@ Distributed under the MIT License. See `LICENSE.txt` for more information.
 
 Arthur Testard - [arthur.testard.pro@gmail.com](mailto:arthur.testard.pro@gmail.com)
 
-Project Link: [https://github.com/art-test-stack/gpt-lab](https://github.com/art-test-stack/gpt-lab)
+Project Link: [art-test-stack/gpt-lab](https://github.com/art-test-stack/gpt-lab)
 
 # Citation
 
@@ -478,20 +482,22 @@ END_SYSTEM_INSTRUCTION
 [stars-shield]: https://img.shields.io/github/stars/art-test-stack/gpt-lab.svg?style=for-the-badge
 [stars-url]: https://github.com/art-test-stack/gpt-lab/stargazers
 [deepwiki-shield]: https://img.shields.io/badge/DeepWiki-000000?style=for-the-badge&logo=deepwiki&logoColor=white
-[issues-shield]: https://img.shields.io/github/issues/art-test-stack/gpt-lab.svg?style=for-the-badge
 [issues-url]: https://github.com/art-test-stack/gpt-lab/issues
-[license-shield]: https://img.shields.io/github/license/art-test-stack/gpt-lab.svg?style=for-the-badge
+[issues-shield]: https://img.shields.io/github/issues/art-test-stack/gpt-lab.svg?style=for-the-badge
 [license-url]: https://github.com/art-test-stack/gpt-lab/blob/master/LICENSE
-[linkedin-shield]: https://img.shields.io/badge/-LinkedIn-black.svg?style=for-the-badge&logo=linkedin&colorB=555
+[license-shield]: https://img.shields.io/github/license/art-test-stack/gpt-lab.svg?style=for-the-badge
 [linkedin-url]: https://linkedin.com/in/arthur-testard
+[linkedin-shield]: https://img.shields.io/badge/-LinkedIn-black.svg?style=for-the-badge&logo=linkedin&colorB=555
 [product-screenshot]: images/screenshot.png
-[Torch]: https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white
 [Torch-url]: https://pytorch.org/
-[huggingface-shield]: https://img.shields.io/badge/HuggingFace-%23FF6C37.svg?style=for-the-badge&logo=HuggingFace&logoColor=white
-[wandb-shield]: https://img.shields.io/badge/Weights%20%26%20Biases-%231DA1F2.svg?style=for-the-badge&logo=Weights%20%26%20Biases&logoColor=white
+[Torch]: https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white
 [huggingface-url]: https://huggingface.co/
-[gradio-shield]: https://img.shields.io/badge/Gradio-%23FF6C37.svg?style=for-the-badge&logo=Gradio&logoColor=white
+[huggingface-shield]: https://img.shields.io/badge/HuggingFace-%23FF6C37.svg?style=for-the-badge&logo=HuggingFace&logoColor=white
 [gradio-url]: https://gradio.app/
-[tiktoken-shield]: https://img.shields.io/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=tiktoken&logoColor=white
+[gradio-shield]: https://img.shields.io/badge/Gradio-%23FF6C37.svg?style=for-the-badge&logo=Gradio&logoColor=white
 [tiktoken-url]: https://github.com/openai/tiktoken
+[tiktoken-shield]: https://img.shields.io/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=openai&logoColor=white
 [wandb-url]: https://wandb.ai/site
+[wandb-shield]: https://img.shields.io/badge/Weights%20%26%20Biases-%231DA1F2.svg?style=for-the-badge&logo=Weights%20%26%20Biases
+[uv-url]: https://github.com/astral-sh/uv
+[uv-shield]: https://img.shields.io/badge/uv-%23000000.svg?style=for-the-badge&logo=uv&logoColor=white
