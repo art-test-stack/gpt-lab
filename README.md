@@ -67,7 +67,7 @@ Components are adapted from existing work and properly credited. The goal is not
 
 ### Built With
 
-[![Torch][Torch]][Torch-url] <<3 🐐 (sorry JAX lovers) \
+[![Torch][Torch]][Torch-url] <<3 🐐 (sorry JAX-ers) \
 [![huggingface-shield]][huggingface-url] (datasets, transformers, tokenizer, hub) \
 [![wandb-shield]][wandb-url] (training monitoring) \
 [![tiktoken-shield]][tiktoken-url] (very fast tokenizer encoder) \
@@ -86,28 +86,39 @@ This project has been developed and tested with Python 3.12. To manage dependenc
    ```sh
     uv sync
    ```
-   If running on Linux with CUDA available, you can install the GPU version of PyTorch by running:
-    ```sh
-    uv sync --extra cuda
-     ```
 
 > [!NOTE]  
-> Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation.
+> Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation. Default mode uses `kernels` implementation, making the installation easier.
 
 ## Usage
 
 There is many layers in the library, and many components that can be used and customized. The main ones are the following:
 - [Data processing](#data)
+- [Tokenization](#tokenization)
 - [Model architecture](#model-architecture)
 - [Optimization](#optimization)
 - [Training](#training)
 - [Inference](#inference)
 
+I recommend to check out the [deepwiki](https://deepwiki.com/art-test-stack/gpt-lab) for more detailed documentation and explanations on the different components of the library. The sketchs generated explain well the interaction between the different modules. 
+
 ### Data
 
 We can do whatever we want with maths, modelization, and then with the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
 
-The data processing pipeline is quite split into two main components: the tokenization process, and the training data loading process.
+The data processing has roughly two folds. One for tokenization, one for model training.
+
+#### Tokenization data
+
+The tokenization data is used to train the tokenizer. It is located in `gpt_lab.tokenizer.corpus`. The main class is `TokenizerCorpus`, which allows you to write a corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus. The corpus is then used to train the tokenizer, and can be saved in a binary format for faster loading in the future.
+
+#### Model Dataloader
+
+For now, only a DataLoader for pretraining is implemented, located in `gpt_lab.data.loader`. It works on large dataset that are split into multiple shards (in parquet format). Here a small benchmark to compare the loading time of different implementations for a dataset of 1 million samples (1.5 GB):
+
+Implementation | Num proc | Loading time
+--- | --- | ---
+
 
 The main focus is on the training and optimization of the models, and the tokenization process. That being said, I encourage you to check the code in `gpt_lab.data` and propose improvements via pull requests.
 
@@ -136,7 +147,7 @@ huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds
 ### Optimization
 
 > [!NOTE]
-> This is maybe the most critical part of the library, and sadly, this is where I used too much LLM for code writing, because my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in `gpt_lab.optim.factory` and `gpt_lab.train.trainer` and propose improvements via pull requests. 
+> This is maybe the most critical part of the library, regarding model training, and it is also the part that I have less implemented myself. I used a lot of external repositories for code baseline, and used LLMs back and fourth to enhance it. My goal was to make it work, while being more modular. However, my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in `gpt_lab.optim.factory` and the corresponding subfolders for the different optimizers.
 
 #### Pre training
 
@@ -260,61 +271,58 @@ and propose improvements via pull requests.
 > Although, I tried to categorize the papers *as possible* to make it easier to navigate. Some papers may fall to multiple categories, but I tried to make the classification as relevant as possible.
 > Most papers are not directly cited in the code, I will try to add some as much as possible in the future.
 
-| Title                                                                                                                  | Authors                | Journal                                                                | Year   | DOI                            | Link                                                                                   | Category                         |   ArxivID |
-|:-----------------------------------------------------------------------------------------------------------------------|:-----------------------|:-----------------------------------------------------------------------|:-------|:-------------------------------|:---------------------------------------------------------------------------------------|:---------------------------------|----------:|
-| dLLM: Simple Diffusion Language Modeling                                                                               | Zhou et al.            | arXiv                                                                  | 2026   | [10.48550/arXiv.2602.22661]    | https://arxiv.org/abs/2602.22661                                                       | Diffusion                        |   2602.23 |
-| Denoising Diffusion Probabilistic Models                                                                               | Ho et al.              | NeurIPS                                                                | 2020   | [2006.11239]                   | https://arxiv.org/abs/2006.11239                                                       | Diffusion                        |           |
-| Energy-Based Transformers are Scalable Learners and Thinkers                                                           | Gladstone et al.       | arXiv                                                                  | 2025   | [10.48550/arXiv.2507.02092]    | https://arxiv.org/abs/2507.02092                                                       | Energy-Based Models              |   2507.02 |
-| HELMET: How to Evaluate Long-Context Language Models Effectively and Thoroughly                                        | Yen et al.             | arXiv                                                                  | 2024   | [10.48550/arXiv.2410.02694]    | https://arxiv.org/abs/2410.02694                                                       | Energy-Based Models              |   2410.03 |
-| How to Train Your Energy-Based Models                                                                                  | Song et al.            | arXiv                                                                  | 2021   | [10.48550/arXiv.2101.03288]    | https://arxiv.org/abs/2101.03288                                                       | Energy-Based Models              |   2101.03 |
-| Your Classifier is Secretly an Energy Based Model and You Should Treat it Like One                                     | Grathwohl et al.       | arXiv                                                                  | 2019   | [10.48550/arXiv.1912.03263]    | https://arxiv.org/abs/1912.03263                                                       | Energy-Based Models              |   1912.03 |
-| A tutorial on Energy-Based Learning                                                                                    | LeCun et al.           | MIT Press                                                              | 2006   | [eb-learning]                  | https://www.researchgate.net/publication/200744586_A_tutorial_on_energy-based_learning | Energy-Based Models              |           |
-| Building Bridges between Regression, Clustering, and Classification                                                    | Stewart et al.         | arXiv                                                                  | 2025   | [2502.02996]                   | https://arxiv.org/abs/2502.02996                                                       | General Machine Learning         |   2502.03 |
-| Representation Learning: A Review and New Perspectives                                                                 | Bengio et al.          | arXiv                                                                  | 2012   | [1206.5538]                    | https://arxiv.org/abs/1206.5538                                                        | General Machine Learning         |   1206.55 |
-| StarCoder 2 and The Stack v2: The Next Generation                                                                      | Lozhkov et al.         | arXiv                                                                  | 2024   | [10.48550/arXiv.2402.19173]    | https://arxiv.org/abs/2402.19173                                                       | LLM Datasets                     |   2402.19 |
-| SQUAD: 100,000+ Questions for Machine Comprehension of Text                                                            | Rajpurkar et al.       | arXiv                                                                  | 2016   | [10.48550/arXiv.1606.05250]    | https://arxiv.org/abs/1606.05250                                                       | LLM Datasets                     |   1606.05 |
-| Power Lines: Scaling Laws for Weight Decay and Batch Size in LLM Pre-training                                          | Bergsma et al.         | arXiv                                                                  | 2025   | [2505.13738]                   | https://arxiv.org/abs/2505.13738                                                       | LLM Scaling Laws                 |   2505.14 |
-| Scaling Laws with Vocabulary: Larger Models Deserve Larger Vocabularies                                                | Tao et al.             | arXiv                                                                  | 2024   | [2407.13623]                   | https://arxiv.org/abs/2407.13623                                                       | LLM Scaling Laws                 |   2407.14 |
-| ResidualTransformer: Residual Low-Rank Learning with Weight-Sharing for Transformer Layers                             | Wang and Li            | arXiv                                                                  | 2023   | [2310.02489]                   | https://arxiv.org/abs/2310.02489                                                       | LLM shared blocks                |   2310.02 |
-| Block-Recurrent Transformers                                                                                           | Hutchins et al.        | arXiv                                                                  | 2022   | [2203.07852]                   | https://arxiv.org/abs/2203.07852                                                       | LLM shared blocks                |   2203.08 |
-| Muon is Scalable for LLM Training                                                                                      | Liu et al.             | 2025                                                                   | arXiv  | [2502.16982]                   | https://arxiv.org/abs/2502.16982                                                       | LLMs Basics                      |           |
-| KIMI K2: OPEN AGENTIC INTELLIGENCE                                                                                     | Kimi Team              | arXiv                                                                  | 2025   | [10.48550/arXiv.2507.20534]    | https://arxiv.org/abs/2507.20534                                                       | LLMs Basics                      |   2507.21 |
-| Recursive Language Models                                                                                              | Zhang et al.           | arXiv                                                                  | 2025   | [2512.24601]                   | https://arxiv.org/abs/2512.24601                                                       | LLMs Basics                      |   2512.25 |
-| Gated Attention for Large Language Models: Non-linearity, Sparsity, and Attention-Sink-Free                            | Qiu et al.             | arXiv                                                                  | 2025   | [2505.06708]                   | https://arxiv.org/abs/2505.06708                                                       | LLMs Basics                      |   2505.07 |
-| How to Train Long-Context Language Models (Effectively)                                                                | Gao et al.             | arXiv                                                                  | 2024   | [10.48550/arXiv.2410.02660]    | https://arxiv.org/abs/2410.02660                                                       | LLMs Basics                      |   2410.03 |
-| The Zamba2 Suite: Technical Report                                                                                     | Glorion et al.         | arXiv                                                                  | 2024   | [10.48550/arXiv.2411.15242]    | https://arxiv.org/abs/2411.15242                                                       | LLMs Basics                      |   2411.15 |
-| Fewer Truncations Improve Language Modeling                                                                            | Ding et al.            | arXiv                                                                  | 2024   | [2404.10830]                   | https://arxiv.org/abs/2404.10830                                                       | LLMs Basics                      |   2404.11 |
-| QLoRA: Efficient Finetuning of Quantized LLMs                                                                          | Dettmers et al.        | arXiv                                                                  | 2023   | [10.48550/arXiv.2305.14314]    | https://arxiv.org/abs/                                                                 | LLMs Basics                      |   2305.14 |
-| FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning                                       | Dao                    | arXiv                                                                  | 2023   | [10.48550/arXiv.2307.08691]    | https://arxiv.org/abs/2307.08691                                                       | LLMs Basics                      |   2307.09 |
-| YaRN: Efficient Context Window Extension of Large Language Models                                                      | Peng et al.            | arXiv                                                                  | 2023   | [10.48550/arXiv.2309.00071]    | https://arxiv.org/abs/2309.00071                                                       | LLMs Basics                      |   2309    |
-| Effective Long-Context Scaling of Foundation Models                                                                    | Xiong et al.           | arXiv                                                                  | 2023   | [10.48550/arXiv.2309.16039]    | https://arxiv.org/abs/2309.16039                                                       | LLMs Basics                      |   2309.16 |
-| Mistral 7B                                                                                                             | Jiang et al.           | arXiv                                                                  | 2023   | [10.48550/arXiv.2310.06825]    | https://arxiv.org/abs/2310.06825                                                       | LLMs Basics                      |   2310.07 |
-| Mamba: Linear-Time Sequence Modeling with Selective State Spaces                                                       | Dao                    | NeurIPS                                                                | 2023   | [2312.00752]                   | https://arxiv.org/abs/2312.00752                                                       | LLMs Basics                      |           |
-| Training Compute-Optimal Large Language Models                                                                         | Hoffmann et al.        | arXiv                                                                  | 2022   | [10.48550/arXiv.2203.15556]    | https://arxiv.org/abs/2203.15556                                                       | LLMs Basics                      |   2203.16 |
-| PaLM: Scaling Language Modeling with Pathways                                                                          | Chowdhery et al.       | arXiv                                                                  | 2022   | [10.48550/arXiv.2204.02311]    | https://arxiv.org/abs/2204.02311                                                       | LLMs Basics                      |   2204.02 |
-| FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness                                            | Dao et al.             | NeurIPS                                                                | 2022   | [2205.14135]                   | https://arxiv.org/abs/2205.14135                                                       | LLMs Basics                      |           |
-| Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity                           | Fedus et al.           | ICML                                                                   | 2021   | [2101.03961]                   | https://arxiv.org/abs/2101.03961                                                       | LLMs Basics                      |           |
-| RoFormer: Enhanced Transformer with Rotary Position Embedding                                                          | Su et al.              | arXiv                                                                  | 2021   | [10.48550/arXiv.2104.09864]    | https://arxiv.org/abs/2104.09864                                                       | LLMs Basics                      |   2104.1  |
-| LoRA: Low-Rank Adaptation of Large Language Models                                                                     | Hu et al.              | ICLR                                                                   | 2021   | [2106.09685]                   | https://arxiv.org/abs/2106.09685                                                       | LLMs Basics                      |           |
-| Knowledge distillation: A good teacher is patient and consistent                                                       | Beyer et al.           | arXiv                                                                  | 2021   | [2106.05237]                   | https://arxiv.org/abs/2106.05237                                                       | LLMs Basics                      |   2106.05 |
-| Language Models are Few-Shot Learners                                                                                  | Brown et al.           | arXiv                                                                  | 2020   | [10.48550/arXiv.2005.14165]    | https://arxiv.org/abs/2005.14165                                                       | LLMs Basics                      |   2005.14 |
-| Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention                                          | Katharopoulos et al.   | arXiv                                                                  | 2020   | [10.48550/arXiv.2006.16236]    | https://arxiv.org/abs/2006.16236                                                       | LLMs Basics                      |   2006.16 |
-| Efficient Transformers: A Survey                                                                                       | Tay et al.             | LLMs BasicsarXiv                                                       | 2020   | [10.48550/arXiv.2009.06732]    | https://arxiv.org/abs/2009.06732                                                       | LLMs Basics                      |   2009.07 |
-| Language models are unsupervised multitask learners                                                                    | Radford et al.         | OpenAI                                                                 | 2019   | [unsupervised-multitask]       | https://storage.prod.researchhub.com/uploads/papers/2020/06/01/language-models.pdf     | LLMs Basics                      |           |
-| Shampoo: Preconditioned Stochastic Tensor Optimization                                                                 | Gupta et al.           | arXiv                                                                  | 2018   | [10.48550/arXiv.1802.09568]    | https://arxiv.org/abs/1802.09568                                                       | LLMs Basics                      |   1802.1  |
-| BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding                                       | Devlin et al.          | arXiv                                                                  | 2018   | [10.48550/arXiv.1810.04805]    | https://arxiv.org/abs/1810.04805                                                       | LLMs Basics                      |   1810.05 |
-| Attention is all you need                                                                                              | Vaswani et al.         | arXiv                                                                  | 2017   | [10.48550/arXiv.1706.03762]    | https://arxiv.org/abs/1706.03762                                                       | LLMs Basics                      |   1706.04 |
-| Accelerating Newton-Schulz Iteration for Orthogonalization via Chebyshev-type Polynomials                              | Grishina et al.        | arXiv                                                                  | 2025   | [2506.10935]                   | https://arxiv.org/abs/2506.10935                                                       | ML Optimizers                    |   2506.11 |
-| Fantastic Pretraining Optimizers and Where to Find Them                                                                | Wen et al.             | arXiv                                                                  | 2025   | [2509.02046]                   | https://arxiv.org/abs/2509.02046                                                       | ML Optimizers                    |   2509.02 |
-| Statistical optimal transport                                                                                          | Chewi et al.           | arXiv                                                                  | 2024   | [2407.18163]                   | https://arxiv.org/abs/2407.18163                                                       | Optimal Transport                |   2407.18 |
-| Tokenization Is More Than Compression                                                                                  |                        | nan                                                                    | nan    | [nan]                          | https://aclanthology.org/2024.emnlp-main.40.pdf                                        | Tokenization                     |           |
-| How Good is Your Tokenizer? On the Monolingual Performance of Multilingual Language Models                             |                        | nan                                                                    | nan    | [nan]                          | https://aclanthology.org/2021.acl-long.243.pdf                                         | Tokenization                     |           |
-| Observational Scaling Laws and the Predictability of Language Model Performance                                        | Ruan et al.            | arXiv                                                                  | 2024   | [10.48550/arXiv.2405.10938]    | https://arxiv.org/abs/2405.10938                                                       | alignment                        |   2405.11 |
-| Deep learning                                                                                                          | LeCun et al.           | Y LeCun, Y Bengio, G Hinton - nature, 2015 - nature.com                | 20     | [nan]                          | https://www.nature.com/articles/nature14539                                            | deep learning                    |           |
-| Deep learning                                                                                                          | Bengio et al.          | Y Bengio, I Goodfellow, A Courville - 2017 - academia.edu              | 20     | [nan]                          | https://www.academia.edu/download/62266271/Deep_Learning20200303-80130-1s42zvt.pdf     | deep learning                    |           |
-| Attention Residuals                                                                                                    | Kimi Team              | arXiv                                                                  | 2026   | [10.48550/arXiv.2603.15031]    | https://arxiv.org/abs/2603.15031                                                       | llm basics                       |   2603.15 |
-| SlimPajama-DC: Understanding Data Combinations for LLM Training                                                        | Shen et al.            | arXiv                                                                  | 2023   | [2309.10818]                   | https://arxiv.org/abs/2309.10818                                                       | llm datasets                     |   2309.11 |
-| DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning                                     | DeepSeek-AI et al.     | Nature volume 645, pages 633-638 (2025)                                | 2025   | [10.1038/s41586-025-09422-z]   | https://arxiv.org/abs/2501.12948                                                       | llms basics                      |           |
+| Title                                                                                                                  | Authors                | Journal                                                                | Year   | DOI                                  |
+|:-----------------------------------------------------------------------------------------------------------------------|:-----------------------|:-----------------------------------------------------------------------|:-------|:-------------------------------------|
+| How Good is Your Tokenizer? On the Monolingual Performance of Multilingual Language Models                             |                        | nan                                                                    | nan    | [nan]                                |
+| Tokenization Is More Than Compression                                                                                  |                        | nan                                                                    | nan    | [nan]                                |
+| Practical Efficiency of Muon for Pretraining                                                                           | AI et al.              | arXiv                                                                  | 2025   | [2505.02222]                         |
+| The Potential of Second-Order Optimization for LLMs: A Study with Full Gauss-Newton                                    | Abreu et al.           | arXiv                                                                  | 2025   | [2510.09378]                         |
+| Power Lines: Scaling Laws for Weight Decay and Batch Size in LLM Pre-training                                          | Bergsma et al.         | arXiv                                                                  | 2025   | [2505.13738]                         |
+| Knowledge distillation: A good teacher is patient and consistent                                                       | Beyer et al.           | arXiv                                                                  | 2021   | [2106.05237]                         |
+| Language Models are Few-Shot Learners                                                                                  | Brown et al.           | arXiv                                                                  | 2020   | [10.48550/arXiv.2005.14165]          |
+| PaLM: Scaling Language Modeling with Pathways                                                                          | Chowdhery et al.       | arXiv                                                                  | 2022   | [10.48550/arXiv.2204.02311]          |
+| FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness                                            | Dao et al.             | NeurIPS                                                                | 2022   | [2205.14135]                         |
+| FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning                                       | Dao                    | arXiv                                                                  | 2023   | [10.48550/arXiv.2307.08691]          |
+| DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning                                     | DeepSeek-AI et al.     | Nature volume 645, pages 633-638 (2025)                                | 2025   | [10.1038/s41586-025-09422-z]         |
+| QLoRA: Efficient Finetuning of Quantized LLMs                                                                          | Dettmers et al.        | arXiv                                                                  | 2023   | [10.48550/arXiv.2305.14314]          |
+| BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding                                       | Devlin et al.          | arXiv                                                                  | 2018   | [10.48550/arXiv.1810.04805]          |
+| Fewer Truncations Improve Language Modeling                                                                            | Ding et al.            | arXiv                                                                  | 2024   | [2404.10830]                         |
+| Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity                           | Fedus et al.           | ICML                                                                   | 2021   | [2101.03961]                         |
+| How to Train Long-Context Language Models (Effectively)                                                                | Gao et al.             | arXiv                                                                  | 2024   | [10.48550/arXiv.2410.02660]          |
+| Accelerating Newton-Schulz Iteration for Orthogonalization via Chebyshev-type Polynomials                              | Grishina et al.        | arXiv                                                                  | 2025   | [2506.10935]                         |
+| Shampoo: Preconditioned Stochastic Tensor Optimization                                                                 | Gupta et al.           | arXiv                                                                  | 2018   | [10.48550/arXiv.1802.09568]          |
+| Training Compute-Optimal Large Language Models                                                                         | Hoffmann et al.        | arXiv                                                                  | 2022   | [10.48550/arXiv.2203.15556]          |
+| LoRA: Low-Rank Adaptation of Large Language Models                                                                     | Hu et al.              | ICLR                                                                   | 2021   | [2106.09685]                         |
+| Block-Recurrent Transformers                                                                                           | Hutchins et al.        | arXiv                                                                  | 2022   | [2203.07852]                         |
+| Mistral 7B                                                                                                             | Jiang et al.           | arXiv                                                                  | 2023   | [10.48550/arXiv.2310.06825]          |
+| Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention                                          | Katharopoulos et al.   | arXiv                                                                  | 2020   | [10.48550/arXiv.2006.16236]          |
+| KellerJordan/Muon                                                                                                      | KellerJordan           | GitHub                                                                 | 2024   | [github:kellerjordan/muon]           |
+| KellerJordan/modded-nanogpt                                                                                            | KellerJordan           | GitHub                                                                 | 2024   | [github:kellerjordan/modded-nanogpt] |
+| KIMI K2: OPEN AGENTIC INTELLIGENCE                                                                                     | Kimi Team              | arXiv                                                                  | 2025   | [10.48550/arXiv.2507.20534]          |
+| Attention Residuals                                                                                                    | Kimi Team              | arXiv                                                                  | 2026   | [10.48550/arXiv.2603.15031]          |
+| Decoding-time Realignment of Language Models                                                                           | Liu et al.             | arXiv                                                                  | 2024   | [2402.02992]                         |
+| Muon is Scalable for LLM Training                                                                                      | Liu et al.             | 2025                                                                   | arXiv  | [2502.16982]                         |
+| StarCoder 2 and The Stack v2: The Next Generation                                                                      | Lozhkov et al.         | arXiv                                                                  | 2024   | [10.48550/arXiv.2402.19173]          |
+| YaRN: Efficient Context Window Extension of Large Language Models                                                      | Peng et al.            | arXiv                                                                  | 2023   | [10.48550/arXiv.2309.00071]          |
+| Gated Attention for Large Language Models: Non-linearity, Sparsity, and Attention-Sink-Free                            | Qiu et al.             | arXiv                                                                  | 2025   | [2505.06708]                         |
+| Language models are unsupervised multitask learners                                                                    | Radford et al.         | OpenAI                                                                 | 2019   | [unsupervised-multitask]             |
+| SQUAD: 100,000+ Questions for Machine Comprehension of Text                                                            | Rajpurkar et al.       | arXiv                                                                  | 2016   | [10.48550/arXiv.1606.05250]          |
+| Observational Scaling Laws and the Predictability of Language Model Performance                                        | Ruan et al.            | arXiv                                                                  | 2024   | [10.48550/arXiv.2405.10938]          |
+| Observational Scaling Laws and the Predictability of Language Model Performance                                        | Ruan et al.            | arXiv                                                                  | 2024   | [2405.10938]                         |
+| SlimPajama-DC: Understanding Data Combinations for LLM Training                                                        | Shen et al.            | arXiv                                                                  | 2023   | [2309.10818]                         |
+| How to Train Your Energy-Based Models                                                                                  | Song et al.            | arXiv                                                                  | 2021   | [10.48550/arXiv.2101.03288]          |
+| Building Bridges between Regression, Clustering, and Classification                                                    | Stewart et al.         | arXiv                                                                  | 2025   | [2502.02996]                         |
+| RoFormer: Enhanced Transformer with Rotary Position Embedding                                                          | Su et al.              | arXiv                                                                  | 2021   | [10.48550/arXiv.2104.09864]          |
+| Scaling Laws with Vocabulary: Larger Models Deserve Larger Vocabularies                                                | Tao et al.             | arXiv                                                                  | 2024   | [2407.13623]                         |
+| Efficient Transformers: A Survey                                                                                       | Tay et al.             | LLMs BasicsarXiv                                                       | 2020   | [10.48550/arXiv.2009.06732]          |
+| Attention is all you need                                                                                              | Vaswani et al.         | arXiv                                                                  | 2017   | [10.48550/arXiv.1706.03762]          |
+| ResidualTransformer: Residual Low-Rank Learning with Weight-Sharing for Transformer Layers                             | Wang and Li            | arXiv                                                                  | 2023   | [2310.02489]                         |
+| Fantastic Pretraining Optimizers and Where to Find Them                                                                | Wen et al.             | arXiv                                                                  | 2025   | [2509.02046]                         |
+| Unified Training of Universal Time Series Forecasting Transformers                                                     | Woo et al.             | arXiv                                                                  | 2024   | [2402.02592]                         |
+| Effective Long-Context Scaling of Foundation Models                                                                    | Xiong et al.           | arXiv                                                                  | 2023   | [10.48550/arXiv.2309.16039]          |
+| HELMET: How to Evaluate Long-Context Language Models Effectively and Thoroughly                                        | Yen et al.             | arXiv                                                                  | 2024   | [10.48550/arXiv.2410.02694]          |
+| Recursive Language Models                                                                                              | Zhang et al.           | arXiv                                                                  | 2025   | [2512.24601]                         |
+| dLLM: Simple Diffusion Language Modeling                                                                               | Zhou et al.            | arXiv                                                                  | 2026   | [10.48550/arXiv.2602.22661]          |
 
 
 *Bibliography made with [art-test-stack/MyBible](https://github.com/art-test-stack/MyBible).*
@@ -332,7 +340,7 @@ Here a non-exhaustive list of features that I aim to implement. Stars correspond
 * Tokenization ⭐️
   - BPE implementation in Python 
   - Rust implementation 
-* Architecture ⭐️⭐️
+* Architecture ⭐️⭐️⭐️
   - Alibi 
   - MoE
   - Mixture of Depths 
@@ -345,7 +353,7 @@ Here a non-exhaustive list of features that I aim to implement. Stars correspond
 * Training ⭐️⭐️⭐️
   - fine-tuning / intruction tuning 
   - grpo 
-* Cross-lib features ⭐️⭐️⭐️
+* Cross-lib features ⭐️⭐️
   - HuggingFace integration (model loading, tokenizers, etc.)
   - vLLM, DeepSpeed, Megatron-LM, etc. integration 
 
@@ -481,7 +489,7 @@ END_SYSTEM_INSTRUCTION
 [forks-url]: https://github.com/art-test-stack/gpt-lab/network/members
 [stars-shield]: https://img.shields.io/github/stars/art-test-stack/gpt-lab.svg?style=for-the-badge
 [stars-url]: https://github.com/art-test-stack/gpt-lab/stargazers
-[deepwiki-shield]: https://img.shields.io/badge/DeepWiki-000000?style=for-the-badge&logo=deepwiki&logoColor=white
+[deepwiki-shield]: https://img.shields.io/badge/Deep-Wiki-blue.svg?style=for-the-badge
 [issues-url]: https://github.com/art-test-stack/gpt-lab/issues
 [issues-shield]: https://img.shields.io/github/issues/art-test-stack/gpt-lab.svg?style=for-the-badge
 [license-url]: https://github.com/art-test-stack/gpt-lab/blob/master/LICENSE
@@ -496,8 +504,80 @@ END_SYSTEM_INSTRUCTION
 [gradio-url]: https://gradio.app/
 [gradio-shield]: https://img.shields.io/badge/Gradio-%23FF6C37.svg?style=for-the-badge&logo=Gradio&logoColor=white
 [tiktoken-url]: https://github.com/openai/tiktoken
-[tiktoken-shield]: https://img.shields.io/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=openai&logoColor=white
+<!-- [tiktoken-shield]: https://img.shields.io/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=ChatGPT&logoColor=white -->
+[tiktoken-shield]: https://custom-icon-badges.demolab.com/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=openai&logoColor=white
 [wandb-url]: https://wandb.ai/site
-[wandb-shield]: https://img.shields.io/badge/Weights%20%26%20Biases-%231DA1F2.svg?style=for-the-badge&logo=Weights%20%26%20Biases
+[wandb-shield]: https://img.shields.io/badge/Weights_&_Biases-black?style=for-the-badge&logo=WeightsAndBiases&logoColor=FFCC33
 [uv-url]: https://github.com/astral-sh/uv
 [uv-shield]: https://img.shields.io/badge/uv-%23000000.svg?style=for-the-badge&logo=uv&logoColor=white
+
+[10.1038/s41586-025-09422-z]: https://arxiv.org/abs/2501.12948
+[10.1109/ISTM54910.2022.00016]: https://ieeexplore.ieee.org/document/9923796
+[10.48550/arXiv.1606.05250]: https://arxiv.org/abs/1606.05250
+[10.48550/arXiv.1706.03762]: https://arxiv.org/abs/1706.03762
+[10.48550/arXiv.1802.09568]: https://arxiv.org/abs/1802.09568
+[10.48550/arXiv.1804.01508]: https://arxiv.org/abs/1804.01508
+[10.48550/arXiv.1810.04805]: https://arxiv.org/abs/1810.04805
+[10.48550/arXiv.1912.03263]: https://arxiv.org/abs/1912.03263
+[10.48550/arXiv.1912.09363]: https://arxiv.org/abs/1912.09363
+[10.48550/arXiv.2005.14165]: https://arxiv.org/abs/2005.14165
+[10.48550/arXiv.2006.16236]: https://arxiv.org/abs/2006.16236
+[10.48550/arXiv.2009.06732]: https://arxiv.org/abs/2009.06732
+[10.48550/arXiv.2101.03288]: https://arxiv.org/abs/2101.03288
+[10.48550/arXiv.2104.09864]: https://arxiv.org/abs/2104.09864
+[10.48550/arXiv.2201.12886]: https://arxiv.org/abs/2201.12886
+[10.48550/arXiv.2203.15556]: https://arxiv.org/abs/2203.15556
+[10.48550/arXiv.2204.02311]: https://arxiv.org/abs/2204.02311
+[10.48550/arXiv.2302.02591]: https://arxiv.org/abs/2302.02591
+[10.48550/arXiv.2305.14314]: https://arxiv.org/abs/2305.14314
+[10.48550/arXiv.2307.08691]: https://arxiv.org/abs/2307.08691
+[10.48550/arXiv.2309.00071]: https://arxiv.org/abs/2309.00071
+[10.48550/arXiv.2309.16039]: https://arxiv.org/abs/2309.16039
+[10.48550/arXiv.2310.06825]: https://arxiv.org/abs/2310.06825
+[10.48550/arXiv.2402.19173]: https://arxiv.org/abs/2402.19173
+[10.48550/arXiv.2405.10938]: https://arxiv.org/abs/2405.10938
+[10.48550/arXiv.2410.02660]: https://arxiv.org/abs/2410.02660
+[10.48550/arXiv.2410.02694]: https://arxiv.org/abs/2410.02694
+[10.48550/arXiv.2411.15242]: https://arxiv.org/abs/2411.15242
+[10.48550/arXiv.2507.02092]: https://arxiv.org/abs/2507.02092
+[10.48550/arXiv.2507.20534]: https://arxiv.org/abs/2507.20534
+[10.48550/arXiv.2602.22661]: https://arxiv.org/abs/2602.22661
+[10.48550/arXiv.2603.15031]: https://arxiv.org/abs/2603.15031
+[1206.5538]: https://arxiv.org/abs/1206.5538
+[2006.11239]: https://arxiv.org/abs/2006.11239
+[2101.03961]: https://arxiv.org/abs/2101.03961
+[2106.05237]: https://arxiv.org/abs/2106.05237
+[2106.09685]: https://arxiv.org/abs/2106.09685
+[2107.07511]: https://arxiv.org/abs/2107.07511
+[2203.07852]: https://arxiv.org/abs/2203.07852
+[2205.14135]: https://arxiv.org/abs/2205.14135
+[2309.10818]: https://arxiv.org/abs/2309.10818
+[2310.02489]: https://arxiv.org/abs/2310.02489
+[2310.10688]: https://arxiv.org/abs/2310.10688
+[2312.00752]: https://arxiv.org/abs/2312.00752
+[2402.02592]: https://arxiv.org/abs/2402.02592
+[2402.02992]: https://arxiv.org/abs/2402.02992
+[2404.10830]: https://arxiv.org/abs/2404.10830
+[2405.10938]: https://arxiv.org/abs/2405.10938
+[2405.18765]: https://arxiv.org/abs/2405.18765
+[2407.13623]: https://arxiv.org/abs/2407.13623
+[2407.18163]: https://arxiv.org/abs/2407.18163
+[2502.02996]: https://arxiv.org/abs/2502.02996
+[2502.16982]: https://arxiv.org/abs/2502.16982
+[2505.02222]: https://arxiv.org/abs/2505.02222
+[2505.06708]: https://arxiv.org/abs/2505.06708
+[2505.13738]: https://arxiv.org/abs/2505.13738
+[2506.10935]: https://arxiv.org/abs/2506.10935
+[2509.02046]: https://arxiv.org/abs/2509.02046
+[2510.09378]: https://arxiv.org/abs/2510.09378
+[2510.15821]: https://arxiv.org/abs/2510.15821
+[2511.11698]: https://arxiv.org/abs/2511.11698
+[2512.24601]: https://arxiv.org/abs/2512.24601
+[eb-learning]: https://www.researchgate.net/publication/200744586_A_tutorial_on_energy-based_learning
+[github:kellerjordan/modded-nanogpt]: https://github.com/KellerJordan/modded-nanogpt
+[github:kellerjordan/muon]: https://github.com/KellerJordan/Muon
+[nan]: https://www.nature.com/articles/nature14539
+[nan]: https://aclanthology.org/2024.emnlp-main.40.pdf
+[nan]: https://aclanthology.org/2021.acl-long.243.pdf
+[nan]: https://www.academia.edu/download/62266271/Deep_Learning20200303-80130-1s42zvt.pdf
+[unsupervised-multitask]: https://storage.prod.researchhub.com/uploads/papers/2020/06/01/language-models.pdf
