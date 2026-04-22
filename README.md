@@ -104,23 +104,33 @@ I recommend to check out the [deepwiki](https://deepwiki.com/art-test-stack/gpt-
 
 ### Data
 
-We can do whatever we want with maths, modelization, and then with the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
+We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
 
-The data processing has roughly two folds. One for tokenization, one for model training.
+The data processing has roughly three folds. One for train a tokenizer (see [Tokenization](#tokenization)), one for model training and one for model evaluation. We focus here on model training/evaluation. 
 
-#### Tokenization data
+The data pipeline basically works with for any dataset available on internet, stored into `.parquet` shards. Any good starting point, are [`karpathy/climbmix-400b-shuffle`](karpathy/climbmix-400b-shuffle) or [`HuggingFaceFW/fineweb-edu`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu).
 
-The tokenization data is used to train the tokenizer. It is located in `gpt_lab.tokenizer.corpus`. The main class is `TokenizerCorpus`, which allows you to write a corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus. The corpus is then used to train the tokenizer, and can be saved in a binary format for faster loading in the future.
+You would probably need to download the dataset. You can use the following code snippet to do so.
 
-#### Model Dataloader
+```python
+from gpt_lab.data.sharder import ShardManager
 
-For now, only a DataLoader for pretraining is implemented, located in `gpt_lab.data.loader`. It works on large dataset that are split into multiple shards (in parquet format). Here a small benchmark to compare the loading time of different implementations for a dataset of 1 million samples (1.5 GB):
+ds_name = "karpathy/climbmix-400b-shuffle"
+shard_manager = ShardManager(ds_name)
+```
 
-Implementation | Num proc | Loading time
---- | --- | ---
+<!-- 
+#### Distributed data loading
 
+For now, only pretraining DataLoader is implemented (`gpt_lab.data.DistDataLoader`). It works for DDP setups that are split into multiple shards (in parquet format). Here a small benchmark to compare the loading time of different implementations for a dataset of 1 million samples (1.5 GB): -->
 
-The main focus is on the training and optimization of the models, and the tokenization process. That being said, I encourage you to check the code in `gpt_lab.data` and propose improvements via pull requests.
+<!-- Implementation | Num proc | Loading time
+--- | --- | --- -->
+
+The data loader is accessible from `gpt_lab.data.DistDataLoader`. It creates cpu and gpu buffers to pre-load the data in contiguous memory, stream the data from local shards downloaded from the given dataset, and feed the model with the data in an efficient way. It also supports distributed training setups, and can be used with DDP or other distributed training frameworks.
+
+The critical point regarding model training, is that we must make sure to have a good balance between loader time and model forward/backward time to avoid bottlenecks from the data loading process. Given that constraint, the implementated data loader is satisfying. 
+
 
 ### Tokenization
 
@@ -143,6 +153,8 @@ huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds
 
 
 ### Model architecture
+
+Regarding the model architecture, the library includes a basic implementation of a DenseTransformer in which the different components are modular and can e
 
 ### Optimization
 
@@ -219,7 +231,7 @@ class CustomGPT(nn.Module):
     def estimate_flops(self) -> float:
       "Return the estimated number of FLOPs for a forward pass of the model. This method is used to compute the optimal training parameters based on the model size."
 
-    def build_optimizer(self, training_config) -> List[torch.optim.Optimizer]:
+    def build_optimizer(self, training_config) -> gpt_lab.optim.OptimizerFactory:
       "Return the optimizer for the model based on the provided configuration. This method is used to build the optimizer for training."
 ```
 
@@ -245,7 +257,6 @@ uv run python -m scripts.chat_app
 
 Then, open your browser and go to [`http://127.0.0.1:7860/`](http://127.0.0.1:7860/). It is quite straightforward to use. You can select different models (local or remote), choose some hyperparameters for inference, and chat with the model.
 
-
 ## Development Notes
 
 Some components are intentionally incomplete. 
@@ -263,13 +274,21 @@ and propose improvements via pull requests.
 
 ### Some nice blogs and articles
 1. [Building a text generation model from scratch by Vincent Bons](https://wingedsheep.com/building-a-language-model/)
+## Some nice blogs and web-articles
+
+1. Huggingface or nanotron playbooks. All of them are very good. It takes days to read them all, and more to diggest, but they are worth it.
+    - [The Ultra-Scale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook?section=high-level_overview): 
+    - [The Smol Training Playbook](https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook): this is just a gold mine.
+    - [The LLM Evaluation Guidebook](https://huggingface.co/spaces/OpenEvals/evaluation-guidebook#what-is-model-evaluation-about)
+2. [frontier model training methodologies](https://djdumpling.github.io/2026/01/31/frontier_training.html) by [Alex Wa (DJ Dumpling)](https://github.com/djdumpling). Quite compact compared with the HuggingFace playbooks, but still very informative and insightful (it is quite a condensed version of it). 
+3. [Making Deep Learning Go Brrrr From First Principles](https://horace.io/brrr_intro.html) by Horace He (PyTorch). Very nice intro on basics of GPU computation for deep learning.
+4. [Tokenizers by Karparthy](https://www.fast.ai/posts/2025-10-16-karpathy-tokenizers.html) for a very nice overview of tokenization for LLMs.
 
 ### Some bibliography
 
 > [!NOTE]
 > All of the literature ressources below all participated in some way to the development of the library. I have probably forgotten some, and I apologize for that. If you think some important papers are missing please feel free to add one (or suggest one) via pull request. 
-> Although, I tried to categorize the papers *as possible* to make it easier to navigate. Some papers may fall to multiple categories, but I tried to make the classification as relevant as possible.
-> Most papers are not directly cited in the code, I will try to add some as much as possible in the future.
+> Some papers are not directly cited in the code, I will try to add some as much as possible in the future.
 
 | Title                                                                                                                  | Authors                | Journal                                                                | Year   | DOI                                  |
 |:-----------------------------------------------------------------------------------------------------------------------|:-----------------------|:-----------------------------------------------------------------------|:-------|:-------------------------------------|
@@ -327,9 +346,9 @@ and propose improvements via pull requests.
 
 *Bibliography made with [art-test-stack/MyBible](https://github.com/art-test-stack/MyBible).*
 
-## For the lazy ones
+## Some video ressources
 
-There are a lot of Youtube videos that explain well the different components of the library, and how to implement them. Here are some of them that I found useful:
+For the laziest (😛), there are also a lot of Youtube videos that explain well the different components of the library, and how to implement them. Here are some of them that I found useful:
 1. [Andrej Karpathy's YouTube channel](https://www.youtube.com/@AndrejKarpathy) for his unmatched expertise in the field, and his ability to explain complex concepts in a simple and intuitive way. His videos on Transformers and LLMs are particularly useful for understanding the architecture and training of these models.
 2. [Stanfords CME295 course](https://youtube.com/playlist?list=PLoROMvodv4rOCXd21gf0CF4xr35yINeOy&si=sL3DEmGNNdh9-TEa) for the very nice lecture on Transformers and LLMs by [Afshine](https://github.com/afshinea) and [Shervine Amidi](https://github.com/shervinea). They currently lecture [CME296](https://youtube.com/playlist?list=PLoROMvodv4rNdy8rt2rZ4T2xM0OjADnfu&si=NF0SmB-aItcdB3tT), which is on diffusion & LVMs.
 
@@ -505,7 +524,7 @@ END_SYSTEM_INSTRUCTION
 [gradio-shield]: https://img.shields.io/badge/Gradio-%23FF6C37.svg?style=for-the-badge&logo=Gradio&logoColor=white
 [tiktoken-url]: https://github.com/openai/tiktoken
 <!-- [tiktoken-shield]: https://img.shields.io/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=ChatGPT&logoColor=white -->
-[tiktoken-shield]: https://custom-icon-badges.demolab.com/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=openai&logoColor=white
+[tiktoken-shield]: https://custom-icon-badges.demolab.com/badge/tiktoken-black.svg?style=for-the-badge&logo=openai&logoColor=black
 [wandb-url]: https://wandb.ai/site
 [wandb-shield]: https://img.shields.io/badge/Weights_&_Biases-black?style=for-the-badge&logo=WeightsAndBiases&logoColor=FFCC33
 [uv-url]: https://github.com/astral-sh/uv
