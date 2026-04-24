@@ -248,12 +248,15 @@ if __name__ == "__main__":
     from gpt_lab.data.loader import build_dataloader
 
     loader_common_kwargs = dict(
-        dsname=args.ds_name,
+        name=args.ds_name,
         tokenizer=tokenizer,
+        column="text",
         seq_len=model.config.max_context,
+        base_url=None, # no downloading here, just load local shards
+        shard_limit=None,
+        max_shards=None, # TODO: configured based on configs/data.yaml
         batch_size=base_training_config.get("device_batch_size", args.device_batch_size),
-        rank=dist_info["RANK"],
-        world_size=dist_info["WORLD_SIZE"],
+        dist_info=dist_info,
         device=device,
     )
     # TODO: add option to configure buffer size

@@ -1,4 +1,6 @@
 from gpt_lab.utils.default import DATA_DIR
+from gpt_lab.utils.distributed import get_dist_info
+from gpt_lab.data.sharder import ShardManager, ShardIterationState
 from pathlib import Path
 from typing import List, Optional, Callable, Iterator, Union
 
@@ -14,62 +16,54 @@ def list_shards(data_dir: Path, limit: Optional[int] = None) -> List[Path]:
         raise RuntimeError(f"No shards found in {data_dir}")
     return shards
 
-
-class StreamingParquetDataset:
+class ShardedDataset:
     def __init__(
         self,
-        dsname: str,
-        column: str = "text",
-        split: str = "train",
+        name: str,
         tokenizer: Optional[Callable] = None,
+        split: str = "train",
+        start_state: Optional[ShardIterationState] = None,
+        base_url: Optional[str] = None,
+        column: str = "text",
         shard_limit: Optional[int] = None,
-        rank: int = 0,
-        world_size: int = 1,
-        cachedir: Optional[Union[str, Path]] = None,
-    ):
+        max_shards: Optional[int] = None,
+        cachedir: Union[str, Path] = DATA_DIR,
+        dist_info: Optional[dict] = None,
+    ):  
         if cachedir is None:
-            cachedir = DATA_DIR 
+            cachedir = DATA_DIR
         if isinstance(cachedir, str):
             cachedir = Path(cachedir)
-        datadir = cachedir / dsname 
-        all_shards = list_shards(Path(datadir), shard_limit)
 
-        # Shard-level DDP split: each rank owns a disjdoint slice of files.
-        # Avoids reading the whole dataset on every rank.
-        # Falls back to doc-level interleaving if there are fewer shards than ranks.
-        if len(all_shards) >= world_size:
-            self.paths = all_shards[rank::world_size]
-        else:
-            # too few shards to split — keep all and interleave at doc level
-            self.paths = all_shards
-            self._doc_rank = rank
-            self._doc_world_size = world_size
+        if not dist_info:
+            dist_info = get_dist_info()
+        self.sm = ShardManager(
+            name=name,
+            cachedir=cachedir,
+            split=split,
+            base_url=base_url or "",
+            column_name=column,
+            shard_limit=shard_limit,
+            max_shards=max_shards,
+            dist_info=dist_info,
+        )
 
-        self.column = column
         self.tokenizer = tokenizer
-        self._shard_split = len(all_shards) >= world_size
+        self.split = split
+        self.start_state = start_state
 
     def __iter__(self) -> Iterator[torch.Tensor]:
-        doc_idx = 0
-        for path in self.paths:
-            pf = pq.ParquetFile(path)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx, columns=[self.column])
-                data = rg.column(self.column)
-                for i in range(len(data)):
-                    # doc-level interleave only used when shards < world_size
-                    if not self._shard_split:
-                        if doc_idx % self._doc_world_size != self._doc_rank:
-                            doc_idx += 1
-                            continue
-                    doc_idx += 1
-
-                    x = data[i].as_py()
-
-                    if self.tokenizer is not None:
-                        x = self.tokenizer(x, prepend_bos=True)
-                    yield torch.tensor(x, dtype=torch.long)
-
+        iterator = self.sm.iterate(
+            start_state=self.start_state,
+        )
+        for texts, state in iterator:
+            # texts = list[str] from a row group
+            for txt in texts:
+                if self.tokenizer is not None:
+                    tokens = self.tokenizer(txt, prepend_bos=True)
+                else:
+                    tokens = txt # assume already tokenized as list[int]
+                yield tokens, state
 
 class DistDataLoader:
     def __init__(
@@ -95,6 +89,7 @@ class DistDataLoader:
         self.gpu_buffer = torch.empty(2 * self.B * self.T, device=self.device, dtype=torch.long)
         self.inputs = self.gpu_buffer[:self.B*self.T].view(self.B, self.T)
         self.targets = self.gpu_buffer[self.B*self.T:].view(self.B, self.T)
+        self.last_state = None
 
     def _refill(self):
         while len(self.buffer) < self.buffer_size:
@@ -121,14 +116,15 @@ class DistDataLoader:
             if len(self.buffer) == 0:
                 self._refill()
 
-            doc = self.buffer.pop()
+            doc, state = self.buffer.pop()
+            self.last_state = state
 
             remaining = total - pos
             take = min(len(doc), remaining)
-            self.cpu[pos:pos + take] = doc[:take]
+            self.cpu[pos:pos + take] = torch.tensor(doc[:take], dtype=torch.long)
 
             if take < len(doc):
-                self.buffer.append(doc[take:])
+                self.buffer.append((doc[take:], state))
             pos += take
 
         self.gpu.copy_(self.cpu, non_blocking=(self.device.type == "cuda"))
@@ -138,32 +134,38 @@ class DistDataLoader:
         self.inputs.copy_(data[:, :-1])
         self.targets.copy_(data[:, 1:])
 
-        return self.inputs, self.targets, None
+        return self.inputs, self.targets, self.last_state
 
 def build_dataloader(
-    dsname: str,
+    name: str,
     batch_size: int,
+    column: str,
     seq_len: int,
     tokenizer: Optional[Callable] = None,
     split: str = "train",
+    base_url: Optional[str] = None,
     shard_limit: Optional[int] = None,
-    rank: int = 0,
-    world_size: int = 1,
+    max_shards: Optional[int] = None,
     device: str = "cuda",
     buffer_size: Optional[int] = None,
     cachedir: Optional[Union[str, Path]] = None,
+    start_state: Optional[ShardIterationState] = None,
+    dist_info: Optional[dict] = None,
 ) -> DistDataLoader:
     
     if buffer_size is None:
         buffer_size = batch_size * seq_len * 16  # heuristic default
-    ds = StreamingParquetDataset(
-        dsname=dsname,
+    ds = ShardedDataset(
+        name=name,
         tokenizer=tokenizer,
         split=split,
+        column=column,
+        base_url=base_url, # no downloading in this function, just load local shards
         shard_limit=shard_limit,
-        rank=rank,
-        world_size=world_size,
+        max_shards=max_shards,
         cachedir=cachedir,
+        start_state=start_state,
+        dist_info=dist_info,
     )
     return DistDataLoader(
         ds,
