@@ -108,15 +108,25 @@ We can do whatever we want with maths, modelization, the implementation in PyTor
 
 The data processing has roughly three folds. One for train a tokenizer (see [Tokenization](#tokenization)), one for model training and one for model evaluation. We focus here on model training/evaluation. 
 
-The data pipeline basically works with for any dataset available on internet, stored into `.parquet` shards. Any good starting point, are [`karpathy/climbmix-400b-shuffle`](karpathy/climbmix-400b-shuffle) or [`HuggingFaceFW/fineweb-edu`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu).
+The data pipeline basically works with for any dataset available on internet, stored into `.parquet` shards. Any good starting point, are [`karpathy/climbmix-400b-shuffle`](karpathy/climbmix-400b-shuffle) or [`HuggingFaceFW/fineweb-edu`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (but needs to be re-sharded! see (`scripts/reshard_dataset.py`)).
 
-You would probably need to download the dataset. You can use the following code snippet to do so.
+[!WARNING]
+The data loadder inside the library assumes a specific structure for the dataset: it needs to be split into shard files with names in the format `shard_{:05d}.parquet`, where the ids are contiguous integers. If shard names do not follow this format under `'base_url'`, they would be simply ignored by the downloader.
 
+The dataloader are easily called with the following code snippet.
 ```python
-from gpt_lab.data.sharder import ShardManager
+from gpt_lab.data.loader import build_dataloader
 
-ds_name = "karpathy/climbmix-400b-shuffle"
-shard_manager = ShardManager(ds_name)
+data_loader = build_dataloader(
+    name="climbix-base,
+    tokenizer=tokenizer,
+    column="text",
+    split="train",
+    seq_len=model.config.max_context,
+    batch_size=32,
+    base_url="karpathy/climbmix-400b-shuffle",
+    max_shards=6542 # last shard id 
+) 
 ```
 
 <!-- 
