@@ -19,6 +19,7 @@ SHARD_FILENAME_TEMPLATE = "shard_{:05d}.parquet"
 class ShardIterationState:
     """Tracks position in shard iteration for resumption."""
     shard_idx: int = 0
+    global_shard_idx: Optional[int] = None # for debugging - we keep track of original shard idx
     row_group_idx: int = 0
     offset_in_row_group: int = 0
     epoch: int = 1
@@ -213,6 +214,7 @@ class ShardManager:
             assert len(self.shard_idx) == len(self.shard_paths), f"Expected {self.target_shard} shards but found {len(self.shard_idx)}. Got {self.shard_idx=}, {local_shard_paths=}."
         else:
             assert len(self.shard_paths) == 1 and self.shard_idx[0] == self.target_shard, f"Expected exactly 1 validation shard but found {len(self.shard_paths)}. Got {self.shard_paths=}."
+    
     def download(
         self,
         shard_indices: List[int],
@@ -255,21 +257,23 @@ class ShardManager:
         batch_size: int = 128,
     ) -> Iterator[Tuple[List[str], ShardIterationState]]:
         is_resuming = start_state is not None
-        if self.split == "train":
-            state = start_state or ShardIterationState()
-        else:
-            state = ShardIterationState(shard_idx=self.shard_idx[0])
+        state = start_state or ShardIterationState()
+
         while True:
-            while state.shard_idx < max(self.shard_idx) + 1:
-                shard_path = self.get_shard_path(state.shard_idx)
+            while state.shard_idx < len(self.shard_paths):
+                shard_path = self.shard_paths[state.shard_idx]
+                state.global_shard_idx = int(shard_path.stem.split("_")[1]) # for debugging - we keep track of original shard idx
+
                 pf = pq.ParquetFile(shard_path)
 
                 if is_resuming:
-                    state.row_group_idx = (state.row_group_idx // self.world_size + 1) * self.world_size + self.ddp_rank
+                    base = state.row_group_idx // self.world_size
+                    state.row_group_idx = (base + 1) * self.world_size + self.ddp_rank      
                     if state.row_group_idx >= pf.num_row_groups:
-                        state.shard_idx += 1
+                        state.shard_idx += 1 # go to resuming shard id
+                        state.row_group_idx = self.ddp_rank # start at the first row group for the next shard
+                        state.offset_in_row_group = 0
                         continue
-                    is_resuming = False  # only do this once
                 else:
                     state.row_group_idx = self.ddp_rank
 
@@ -277,19 +281,23 @@ class ShardManager:
                     rg = pf.read_row_group(state.row_group_idx)
                     batch = rg.column(self.column_name).to_pylist()
                     for i in range(0, len(batch), batch_size):
-                        if is_resuming and i <= state.offset_in_row_group:
+                        if is_resuming and i < state.offset_in_row_group:
                             continue
-                        is_resuming = False  # only do this once
+                        if is_resuming:
+                            is_resuming = False  # only do this once
                         yield batch[i:i+batch_size], ShardIterationState(
-                            shard_idx=state.shard_idx,
+                            shard_idx=state.shard_idx,                            
+                            global_shard_idx=state.global_shard_idx, # for debbugging - we keep track of original shard idx
                             row_group_idx=state.row_group_idx,
-                            offset_in_row_group=i + batch_size,
+                            offset_in_row_group=i,
                             epoch=state.epoch,
                         )
+                    state.offset_in_row_group = 0
                     state.row_group_idx += self.world_size
                 state.shard_idx += 1
                 state.row_group_idx = self.ddp_rank
     
-            state.shard_idx = self.shard_idx[0]
-            state.row_group_idx = 0
+            state.shard_idx = 0
+            state.row_group_idx = self.ddp_rank
+            state.offset_in_row_group = 0
             state.epoch += 1
