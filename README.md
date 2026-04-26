@@ -63,6 +63,13 @@ This is not a production-ready library. It is a lightweight, transparent playgro
 
 Components are adapted from existing work and properly credited. The goal is not to reinvent the wheel, but to understand it well enough to modify and improve it. At least, that is the intention.
 
+A simple but important question would be: Why this repo exists (vs nanoGPT / HF Trainer). Here are some of the motivations:
+- modular training instrumentation for ablations
+- pluggable optimizer + architecture factory
+- distributed streaming dataloaders designed for throughput balance
+- tokenizer experimentation pipeline
+- built-in evaluation / inference interface
+
 **For the non-initiated, there is of course better free-online resources available. Find some at the [references section](#references).*
 
 ### Built With
@@ -100,44 +107,45 @@ There is many layers in the library, and many components that can be used and cu
 - [Training](#training)
 - [Inference](#inference)
 
-I recommend to check out the [deepwiki](https://deepwiki.com/art-test-stack/gpt-lab) for more detailed documentation and explanations on the different components of the library. The sketchs generated explain well the interaction between the different modules. 
+I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-test-stack/gpt-lab) for more detailed documentation and explanations on the different components of the library. The sketchs generated explain well the interaction between the different modules. 
 
 ### Data
 
-We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
+**TLDR;** The dataloader are easily called with the following code snippet. It employs the following strategies:
+- Streaming (not mmap, not in-memory)
+- Packed (not padded batching)
+- Distributed (not replicated dataset)
+- Lazy (not pre-tokenized)
 
-The data processing has roughly three folds. One for train a tokenizer (see [Tokenization](#tokenization)), one for model training and one for model evaluation. We focus here on model training/evaluation. 
-
-The data pipeline basically works with for any dataset available on internet, stored into `.parquet` shards. Any good starting point, are [`karpathy/climbmix-400b-shuffle`](karpathy/climbmix-400b-shuffle) or [`HuggingFaceFW/fineweb-edu`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (but needs to be re-sharded! see (`scripts/reshard_dataset.py`)).
-
-[!WARNING]
-The data loadder inside the library assumes a specific structure for the dataset: it needs to be split into shard files with names in the format `shard_{:05d}.parquet`, where the ids are contiguous integers. If shard names do not follow this format under `'base_url'`, they would be simply ignored by the downloader.
-
-The dataloader are easily called with the following code snippet.
 ```python
-from gpt_lab.data.loader import build_dataloader
+from gpt_lab.data.loader import build_dataloader, DistDataLoader
 
-data_loader = build_dataloader(
-    name="climbix-base,
+data_loader: DistDataLoader = build_dataloader(
+    name="climbix-base",
     tokenizer=tokenizer,
     column="text",
     split="train",
     seq_len=model.config.max_context,
     batch_size=32,
-    base_url="karpathy/climbmix-400b-shuffle",
+    base_url="karpathy/climbmix-400b-shuffle", # for starting point
     max_shards=6542 # last shard id 
 ) 
 ```
 
-<!-- 
-#### Distributed data loading
+We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
 
-For now, only pretraining DataLoader is implemented (`gpt_lab.data.DistDataLoader`). It works for DDP setups that are split into multiple shards (in parquet format). Here a small benchmark to compare the loading time of different implementations for a dataset of 1 million samples (1.5 GB): -->
+The data processing has roughly three folds. One for train a tokenizer (see [Tokenization](#tokenization)), one for model training and one for model evaluation. We focus here on model training/evaluation. 
 
-<!-- Implementation | Num proc | Loading time
---- | --- | --- -->
+The data pipeline basically works with for any dataset available on internet that can be reshaped into contiguous Parquet shards. Any good starting point, are [`karpathy/climbmix-400b-shuffle`](karpathy/climbmix-400b-shuffle) or [`HuggingFaceFW/fineweb-edu`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (but needs to be re-sharded! see (`scripts/reshard_dataset.py`)).
 
-The data loader is accessible from `gpt_lab.data.DistDataLoader`. It creates cpu and gpu buffers to pre-load the data in contiguous memory, stream the data from local shards downloaded from the given dataset, and feed the model with the data in an efficient way. It also supports distributed training setups, and can be used with DDP or other distributed training frameworks.
+> [!WARNING]
+> The data loadder inside the library assumes a specific structure for the dataset: it needs to be split into shard files with names in the format `shard_{:05d}.parquet`, where the ids are contiguous integers. If shard names do not follow this format under `base_url`, they would be simply ignored by the downloader.
+
+
+![sequence packing](./assets/sequence_packing.png)
+Fig. 1: Sequence packing strategy. From [The Smol Training Playbook](https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook).
+
+The `build_dataloader` function the data loader, which is accessible from `gpt_lab.data.DistDataLoader`. It employs a distributed streaming data pipeline over Parquet shards with on-the-fly tokenization and greedy document packing into fixed-length sequences. It creates cpu and gpu buffers to pre-load the data in contiguous memory, stream the data from local shards downloaded from the given dataset, and feed the model with the data with a packing strategy, to maximize the throughput of the training loop by avoiding the use of padding tokens. It also supports distributed training setups, and can be used with DDP or other distributed training frameworks.
 
 The critical point regarding model training, is that we must make sure to have a good balance between loader time and model forward/backward time to avoid bottlenecks from the data loading process. Given that constraint, the implementated data loader is satisfying. 
 
@@ -168,7 +176,7 @@ Regarding the model architecture, the library includes a basic implementation of
 
 ### Optimization
 
-> [!NOTE]
+> [!WARNING]
 > This is maybe the most critical part of the library, regarding model training, and it is also the part that I have less implemented myself. I used a lot of external repositories for code baseline, and used LLMs back and fourth to enhance it. My goal was to make it work, while being more modular. However, my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in `gpt_lab.optim.factory` and the corresponding subfolders for the different optimizers.
 
 #### Pre training
