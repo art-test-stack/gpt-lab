@@ -215,8 +215,7 @@ class AutoGPTConfig(BaseModel):
                 random_seed=self.random_seed,
             )
             _tok_trainer = TokenizerTrainerConfig(
-                name=_tname, dirname=self.dirname, 
-                vocab_size=int(vocab_size), max_context=self.max_seq_len, 
+                name=_tname, dirname=self.dirname, vocab_size=int(vocab_size),
                 pat_str=PAT_STR.get(pat_str, "gpt2"), special_tokens=special_tokens
             )
             tokenizer = Tokenizer.train_from_iterator(_tok_trainer, iterator=corpus.iterator())

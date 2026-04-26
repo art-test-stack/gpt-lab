@@ -25,7 +25,7 @@
   </p>
 </div>
 
-*\*This name is quite pompous, I admit it. Any suggestions for a better one are welcomed!* 
+*\*This name is quite pompous and vague, I admit it. Any suggestions for a better one are welcomed!* 
 
 ## Table of Contents
 
@@ -34,12 +34,12 @@
 - [Built With](#built-with)
 - [Get Started](#get-started)
 - [Usage](#usage)
-  - [1. Tokenization](#tokenization)
-    - [a. Training a tokenizer](#training-a-tokenizer)
-    - [b. Using a pre-trained tokenizer](#using-a-pre-trained-tokenizer)
-    - [c. Which tokenizer implementation to choose?](#which-tokenizer-implementation-to-choose)
-  - [2. Training a model](#training-a-model)
-    - [a. Pre-training](#pre-training)
+  - [Data](#data)
+  - [Automatic configuration](#automatic-configuration)
+  - [Tokenization](#tokenization)
+  - [Model architecture](#model-architecture)
+  - [Optimization](#optimization)
+  - [Training a model](#training-a-model)
 - [Development Notes](#development-notes)
 - [References](#references)
   - [Nice repositories to check out for inspiration and reference](#nice-repositories-to-check-out-for-inspiration-and-reference)
@@ -61,7 +61,9 @@ While modern LLMs can generate strong implementations, true understanding comes 
 
 This is not a production-ready library. It is a lightweight, transparent playground for training small models, running experiments, ablation studies, and exploring architectural ideas.
 
-Components are adapted from existing work and properly credited. The goal is not to reinvent the wheel, but to understand it well enough to modify and improve it. At least, that is the intention.
+Components are often adapted from existing work and properly credited. The goal is not to reinvent the wheel, but to understand it well enough to modify and improve it. At least, that is the intention.
+
+gpt-lab supports distributed training on at most a single GPU node. It is not optimized for large-scale training, but it is designed to be modular and extensible.
 
 A simple but important question would be: Why this repo exists (vs nanoGPT / HF Trainer). Here are some of the motivations:
 - modular training instrumentation for ablations
@@ -83,16 +85,27 @@ A simple but important question would be: Why this repo exists (vs nanoGPT / HF 
 
 ## Get Started
 
-This project has been developed and tested with Python 3.12. To manage dependencies, I recommend using [`uv`](https://github.com/astral-sh/uv). 
+### Setup requirements 
 
-1. Clone the repo
+This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`](https://github.com/astral-sh/uv) to manage dependencies. 
+
+- Clone the repo
    ```sh
    git clone git@github.com:art-test-stack/gpt-lab.git
    ```
-2. Install dependencies
-   ```sh
-    uv sync
-   ```
+
+- Install dependencies for CUDA device:
+  ```bash
+  uv sync --extra gpu
+  ```
+  or install dependencies for CPU/MPS device:
+  ```bash
+  uv sync --extra cpu
+  ```
+- Install dependencies for development (optional, but recommended if you want to contribute):
+  ```bash
+  uv sync --group=dev
+  ```
 
 > [!NOTE]  
 > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation. Default mode uses `kernels` implementation, making the installation easier.
@@ -101,17 +114,18 @@ This project has been developed and tested with Python 3.12. To manage dependenc
 
 There is many layers in the library, and many components that can be used and customized. The main ones are the following:
 - [Data processing](#data)
+- [Automatic configuration](#automatic-configuration)
 - [Tokenization](#tokenization)
 - [Model architecture](#model-architecture)
 - [Optimization](#optimization)
 - [Training](#training)
-- [Inference](#inference)
+- [Chat with the model](#chat-with-the-model)
 
 I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-test-stack/gpt-lab) for more detailed documentation and explanations on the different components of the library. The sketchs generated explain well the interaction between the different modules. 
 
 ### Data
 
-**TLDR;** The dataloader are easily called with the following code snippet. It employs the following strategies:
+**TLDR;** The dataloader is easily built with the following code snippet. It employs the following strategies:
 - Streaming (not mmap, not in-memory)
 - Packed (not padded batching)
 - Distributed (not replicated dataset)
@@ -128,7 +142,7 @@ data_loader: DistDataLoader = build_dataloader(
     seq_len=model.config.max_context,
     batch_size=32,
     base_url="karpathy/climbmix-400b-shuffle", # for starting point
-    max_shards=6542 # last shard id 
+    max_shards=6542 # last shard id for the given dataset (if not provided, it will be computed by probing the server, which can take a while)
 ) 
 ```
 
@@ -136,27 +150,92 @@ We can do whatever we want with maths, modelization, the implementation in PyTor
 
 The data processing has roughly three folds. One for train a tokenizer (see [Tokenization](#tokenization)), one for model training and one for model evaluation. We focus here on model training/evaluation. 
 
-The data pipeline basically works with for any dataset available on internet that can be reshaped into contiguous Parquet shards. Any good starting point, are [`karpathy/climbmix-400b-shuffle`](karpathy/climbmix-400b-shuffle) or [`HuggingFaceFW/fineweb-edu`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (but needs to be re-sharded! see (`scripts/reshard_dataset.py`)).
+The data pipeline basically works with for any dataset available on internet that can be reshaped into contiguous Parquet shards. Any good starting point, are [`karpathy/climbmix-400b-shuffle`](karpathy/climbmix-400b-shuffle) or [`HuggingFaceFW/fineweb-edu`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (but needs to be re-sharded! see ([`scripts/reshard_dataset.py`](./scripts/reshard_dataset.py))).
 
 > [!WARNING]
-> The data loadder inside the library assumes a specific structure for the dataset: it needs to be split into shard files with names in the format `shard_{:05d}.parquet`, where the ids are contiguous integers. If shard names do not follow this format under `base_url`, they would be simply ignored by the downloader.
+> The data loader inside the library assumes a specific structure for the dataset: it needs to be split into shard files with names in the format `shard_{:05d}.parquet`, where the ids are contiguous integers. If shard names do not follow this format under `base_url`, they would be simply ignored by the downloader.
 
 
 ![sequence packing](./assets/sequence_packing.png)
-Fig. 1: Sequence packing strategy. From [The Smol Training Playbook](https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook).
+Sequence packing strategy. From [The Smol Training Playbook](https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook).
 
-The `build_dataloader` function the data loader, which is accessible from `gpt_lab.data.DistDataLoader`. It employs a distributed streaming data pipeline over Parquet shards with on-the-fly tokenization and greedy document packing into fixed-length sequences. It creates cpu and gpu buffers to pre-load the data in contiguous memory, stream the data from local shards downloaded from the given dataset, and feed the model with the data with a packing strategy, to maximize the throughput of the training loop by avoiding the use of padding tokens. It also supports distributed training setups, and can be used with DDP or other distributed training frameworks.
+The `build_dataloader` function the data loader, which is accessible from [`gpt_lab.data.DistDataLoader`](./src/gpt_lab/data/loader.py). It employs a distributed streaming data pipeline over Parquet shards with on-the-fly tokenization and greedy document packing into fixed-length sequences. It creates cpu and gpu buffers to pre-load the data in contiguous memory, stream the data from local shards downloaded from the given dataset, and feed the model with the data with a packing strategy, to maximize the throughput of the training loop by avoiding the use of padding tokens. It also supports distributed training setups, and can be used with DDP or other distributed training frameworks.
 
 The critical point regarding model training, is that we must make sure to have a good balance between loader time and model forward/backward time to avoid bottlenecks from the data loading process. Given that constraint, the implementated data loader is satisfying. 
 
 
+### Automatic configuration
+
+The library provides a minimalistic automatic configuration system that computes optimal model architecture, tokenizer settings, and training hyperparameters using scaling laws.
+
+The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used in [`scripts/train_base.py`](./scripts/train_base.py) via the --auto flag.
+
+It automatically determines:
+- model depth scaling
+- width / aspect ratio expansion
+- vocabulary size (scaling-law driven or tokenizer-based)
+- batch size and gradient accumulation
+- training horizon (steps / FLOPs / data ratio)
+
+```python
+from gpt_lab.model.auto import AutoConfig
+
+# Automatic full training configuration
+cfg = AutoConfig(
+    basename="ic1-125M",
+    depth=12,
+    aspect_ratio=16,
+)
+
+meta_config = cfg.generate_gpt_config(device="cuda")
+
+model = meta_config["model"]
+tokenizer = meta_config["tokenizer"]
+training_config = meta_config["training_config"]
+```
+
+> [!NOTE]
+> Setting `vocab_size = -1` enables automatic scaling-law vocabulary selection. \
+> Setting `training_time`, `n_steps`, `target_flops`, or `target_param_data_ratio` controls training horizon priority. \
+> The system automatically builds a reference model (12-layer baseline) to normalize scaling-law computations.
+
+Next sections detail the different generated components.
+
 ### Tokenization
 
-The tokenization details are located in `gpt_lab.tokenizer`. The code only includes BPE tokenization for now (include sentencepiece is a TODO). The tokenizer training is only supported by huggingface implementation for now. For inference, the tiktoken implementation is the default one, as it is much faster than the huggingface one. The custom BPE implementation is still under development, and may not be fully functional yet.
+The tokenization implementation are located in [`gpt_lab.tokenizer`](./src/gpt_lab/tokenizer/tokenizer.py). The code only includes BPE tokenization for now (include sentencepiece is a TODO). The tokenizer training is only supported by huggingface implementation for now. For inference, the tiktoken implementation is the default one, as it is much faster than the huggingface one. The custom BPE implementation is still under development, and is not functional yet.
 
 #### Training a tokenizer
 
+```python
+from gpt_lab.tokenizer import Tokenizer
+from gpt_lab.tokenizer.corpus import TokenizerCorpus
+from gpt_lab.utils.schemas import TokenizerTrainerConfig
+
+# uses default corpus settings (mixture of HuggingFaceFW/fineweb-edu, HuggingFaceFW/fineweb-2, HuggingFaceTB/finemath and codeparrot/codeparrot-clean)
+corpus = TokenizerCorpus.from_sources(random_seed=42)
+cfg = TokenizerTrainerConfig(
+    name="my_tokenizer",
+    vocab_size=32_000,
+    pat_str="gpt2", # pattern for pre-tokenization (e.g., "gpt2", "cl100k-base", etc., or regex pattern for custom pre-tokenization)
+)
+tokenizer = Tokenizer.train_from_iterator(cfg, iterator=corpus.iterator())
+```
+
 #### Using a pre-trained tokenizer
+
+```python
+from gpt_lab.tokenizer import Tokenizer
+from gpt_lab.utils.schemas import TokenizerConfig
+
+cfg = TokenizerConfig(
+    name="cl100k-base",
+    source="tiktoken", # may be "tiktoken", "huggingface", or "local" (for custom trained tokenizers)
+    vocab_size=32_000, # Not used for pre-trained tokenizers, but required for custom trained tokenizers. 
+    pat_str="cl100k-base",
+)
+tokenizer = Tokenizer.from_pretrained(cfg)
+```
 
 #### Which tokenizer implementation to choose?
 
@@ -167,17 +246,71 @@ Training time benchmarks for different implementations and configurations. All t
 Implementation | Vocabulary size | Num proc | Corpus size | Training time
 --- | --- | --- | --- | ---
 huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds 
-<!-- | 0.27 -->
-
 
 ### Model architecture
 
-Regarding the model architecture, the library includes a basic implementation of a DenseTransformer in which the different components are modular and can e
+The library provides a modular implementation of a GPT-style DenseTransformer, where architectural components (attention, feedforward blocks, normalization, and positional encoding) are fully decoupled and configurable. The core model is defined in [`gpt_lab.model.gpt`](./src/gpt_lab/model/gpt.py), while reusable layer primitives are implemented in [`gpt_lab.model.layers`](./src/gpt_lab/model/layers.py). Model behavior is controlled via a Pydantic configuration class (`TransformerConfig`) defined in `gpt_lab.utils.schemas` (but also accessible under `gpt_lab.model.gpt`), enabling structured extension of architectural variants and hyperparameters.
+
+Here a simple example to produce a Llama-like architecture:
+```python
+from gpt_lab.model.gpt import TransformerConfig, DenseTransformer
+
+cfg = TransformerConfig(
+    vocab_size=32_000,
+    max_context=2048,
+    d_model=512,
+    n_heads=8,
+    n_kv_heads=8,
+    n_layers=6,
+    d_ffn=2048,
+    attn_impl="flash_attention",
+    act_func="swiglu",
+    normalization="rms",
+)
+model = DenseTransformer(cfg)
+```
 
 ### Optimization
 
+In the `Trainer` class (available in [`gpt_lab.train.trainer`](./src/gpt_lab/train/trainer.py)), the optimizer is built from `DenseTransformer.build_optimizer` method, which is implemented in the `DenseTransformer` class (available in [`gpt_lab.model.gpt`](./src/gpt_lab/model/gpt.py)). This design allows for a high degree of flexibility and modularity in the optimization process. Moreover, the optimizer is initiated based on [`configs/optim.yaml`](./configs/optim.yaml) configuration file, which can be easily modified to include new optimizers or adjust existing ones.
+```yaml
+default:
+  opt: "adamw"
+  eps: 1e-10
+  weight_decay: 1e-3
+embeddings: 
+  opt: "adamw"
+  lr: .3
+  betas: [.8, .995]
+  eps: 1e-10
+  weight_decay: 1e-3
+transformer:
+  opt: "muon"
+  lr: 2e-2
+  momentum: .95
+  ns_steps: 5
+  beta: .9
+  weight_decay: .28
+...
+```
+
+The optimization process is decoupled from the model architecture, and is implemented as a separate component that can be easily swapped and customized. The optimizer is built based on the model configuration and the training configuration, using a factory pattern. The optimizer implementations are located in [`gpt_lab.optim.factory`](./src/gpt_lab/optim/factory.py) and the corresponding subfolders for the different optimizers.
+
+```python
+from gpt_lab.optim import OptimizerFactory
+
+model = ...
+optim_cfg = ... # dict of optimizer hyperparameters, e.g., {"opt": "adamw", "lr": 1e-3, ...}
+param_groups = [
+    {"params": model.embeddings.parameters(), **optim_cfg["embeddings"]},
+    {"params": model.blocks.parameters(), **optim_cfg["blocks"]},
+    ...
+]
+optimizer = OptimizerFactory.build_optimizer(param_groups)
+```
+
 > [!WARNING]
-> This is maybe the most critical part of the library, regarding model training, and it is also the part that I have less implemented myself. I used a lot of external repositories for code baseline, and used LLMs back and fourth to enhance it. My goal was to make it work, while being more modular. However, my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in `gpt_lab.optim.factory` and the corresponding subfolders for the different optimizers.
+> This is maybe the most critical part of the library, regarding model training, and it is also the part that I have less implemented myself. I used a lot of external repositories for code baseline, and used LLMs back and fourth to enhance it. My goal was to make it work, while being more modular. However, my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in [`gpt_lab.optim.factory`](./src/gpt_lab/optim/factory.py) and the corresponding subfolders for the different optimizers.
 
 #### Pre training
 
@@ -186,13 +319,13 @@ The pre-training script is located in `scripts/train_base.py`. It allows you to 
 > [!WARNING]
 > There are two sub-arguments for this script `auto` and `custom`. For now, only `auto` is implemented, which allows you to automatically load a configuration based on main (`depth`, `aspect_ratio`, `n_heads`, etc.) arguments and compute optimal training parameters, as optimal `vocab_size` if not provided. The script can then train a new tokenizer with `--train-tokenizer` flag. The `custom` argument is intended to allow you to directly pass the configuration as command-line arguments, without the need for a YAML file. This feature is under development and will be implemented in the future.
 
-Main arguments: 
+<!-- Main arguments: 
 Argument | Description
 --- | ---
 `--config-name` | Name of the configuration file located in `configs/` (without the `.yaml` extension). For example, `base_125M.yaml`.
-`--resume`
+`--resume` -->
 
-Otherwise, if you download the package, and want to try a new model architecture, you can instantiate a new model based on `gpt_lab.model.layers`. 
+<!-- Otherwise, if you download the package, and want to try a new model architecture, you can instantiate a new model based on `gpt_lab.model.layers`. 
 
 ```python
 from torch import nn
@@ -253,7 +386,9 @@ class CustomGPT(nn.Module):
       "Return the optimizer for the model based on the provided configuration. This method is used to build the optimizer for training."
 ```
 
-Note that if you instantiate your new class based on `gpt_lab.model.gpt.DenseTransformer`, you will only need to implement the `build_optimizer` method, as the other methods are already implemented in the base class. However, you will need to make sure your component implementation names (e.g., transformer blocks, head, etc.) are compatible with the base class implementation.
+Note that if you instantiate your new class based on `gpt_lab.model.gpt.DenseTransformer`, you will only need to implement the `build_optimizer` method, as the other methods are already implemented in the base class. However, you will need to make sure your component implementation names (e.g., transformer blocks, head, etc.) are compatible with the base class implementation.  -->
+
+### Board 
 
 Vizualize the training progress in the board of your choice (Tensorboard, Weights & Biases, or Trackio). You can also log to a dummy board that does not log anything, for faster training without logging overhead. 
 
@@ -368,7 +503,7 @@ and propose improvements via pull requests.
 
 For the laziest (😛), there are also a lot of Youtube videos that explain well the different components of the library, and how to implement them. Here are some of them that I found useful:
 1. [Andrej Karpathy's YouTube channel](https://www.youtube.com/@AndrejKarpathy) for his unmatched expertise in the field, and his ability to explain complex concepts in a simple and intuitive way. His videos on Transformers and LLMs are particularly useful for understanding the architecture and training of these models.
-2. [Stanfords CME295 course](https://youtube.com/playlist?list=PLoROMvodv4rOCXd21gf0CF4xr35yINeOy&si=sL3DEmGNNdh9-TEa) for the very nice lecture on Transformers and LLMs by [Afshine](https://github.com/afshinea) and [Shervine Amidi](https://github.com/shervinea). They currently lecture [CME296](https://youtube.com/playlist?list=PLoROMvodv4rNdy8rt2rZ4T2xM0OjADnfu&si=NF0SmB-aItcdB3tT), which is on diffusion & LVMs.
+2. [Stanfords CME295 course](https://youtube.com/playlist?list=PLoROMvodv4rOCXd21gf0CF4xr35yINeOy&si=sL3DEmGNNdh9-TEa) for the very nice lecture on Transformers and LLMs by [Afshine](https://github.com/afshinea) and [Shervine Amidi](https://github.com/shervinea). They currently releasing lectures of [CME296](https://youtube.com/playlist?list=PLoROMvodv4rNdy8rt2rZ4T2xM0OjADnfu&si=NF0SmB-aItcdB3tT), which is on diffusion & LVMs.
 
 
 # TODOs 
@@ -546,7 +681,8 @@ END_SYSTEM_INSTRUCTION
 [wandb-url]: https://wandb.ai/site
 [wandb-shield]: https://img.shields.io/badge/Weights_&_Biases-black?style=for-the-badge&logo=WeightsAndBiases&logoColor=FFCC33
 [uv-url]: https://github.com/astral-sh/uv
-[uv-shield]: https://img.shields.io/badge/uv-%23000000.svg?style=for-the-badge&logo=uv&logoColor=white
+[uv-shield]: https://img.shields.io/badge/uv-261230.svg?style=for-the-badge&logo=uv&logoColor=#de5fe9
+https://img.shields.io/badge/uv-4B32C3?style=for-the-badge&logo=python&logoColor=4B32C3
 
 [10.1038/s41586-025-09422-z]: https://arxiv.org/abs/2501.12948
 [10.1109/ISTM54910.2022.00016]: https://ieeexplore.ieee.org/document/9923796
