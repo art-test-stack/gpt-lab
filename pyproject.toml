@@ -1,50 +1,60 @@
 [project]
 name = "gpt-lab"
 version = "0.1.0"
-description = "This project is the implementation of a small library to manage LLM training and inference from-scratch. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotly."
+description = "Library for training and serving LLMs from scratch, with local and Hugging Face interfaces."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
+
 dependencies = [
-    "datasets>=4.4.2",
-    "gradio>=3.18.0",
-    "huggingface-hub>=0.36.0",
-    "jinja2>=3.1.6",
-    "kernels>=0.11.7",
-    "matplotlib>=3.10.8",
-    "numpy>=2.4.3",
-    "psutil>=7.2.2",
-    "pydantic>=2.12.5",
-    "requests>=2.32.5",
-    "rich>=14.2.0",
-    "tiktoken>=0.12.0",
-    "tokenizers>=0.22.1",
-    "torch>=2.9.1",
-    "tqdm>=4.67.1",
-    "transformers>=4.57.3",
-    "urllib3>=2.6.2",
-    "uvicorn>=0.40.0",
-    "wandb>=0.25.1",
+    "gradio==3.18.0",
+    "jinja2==3.1.6",
+    "kernels==0.11.7",
+    "numpy==2.4.3",
+    "psutil==7.2.2",
+    "pydantic==2.12.5",
+    "requests==2.32.5",
+    "rich==14.2.0",
+    "tiktoken==0.12.0",
+    "tokenizers==0.22.1",
+    "torch==2.9.1",
+    "tqdm==4.67.1",
+    "transformers==4.57.3",
+    "urllib3==2.6.2",
+    "uvicorn==0.40.0",
+    "wandb==0.25.1",
 ]
 
 [project.urls]
 homepage = "https://github.com/art-test-stack/gpt-lab"
 repository = "https://github.com/art-test-stack/gpt-lab"
 
+[project.optional-dependencies]
+cpu = [
+    "torch==2.9.1",
+]
+gpu = [
+    "torch==2.9.1",
+]
+
 [dependency-groups]
 dev = [
-    "pytest",
+    "pytest==8.0",
+    "datasets==4.4.2",
+    "huggingface-hub==0.36.0",
+    "matplotlib==3.10.8",
 ]
 
-[project.optional-dependencies]
-cuda = [
-    "flash-attn>=2.6.0; platform_system == 'Linux'",
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
-azure = [
-    "azure-mgmt-resource>=0.1.0",
-]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
 
 [tool.setuptools]
-package-dir = {"" = "./src/"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -52,3 +62,27 @@ where = ["src"]
 [tool.uv]
 managed = true
 package = true
+default-groups = []
+
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "gpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

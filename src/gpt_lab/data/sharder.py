@@ -95,7 +95,7 @@ class ShardManager:
         assert shard_limit is None or shard_limit >= 2, f"shard_limit must be None or >= 2 for having at least one training shard and one validation shard. Got {shard_limit=}."
         self.shard_limit = shard_limit # shard limit is dynamic -> not in metadata
         self.max_shards = max_shards or self.get_num_remote_shards()
-        self.target_shard = ((self.shard_limit or self.max_shards) if self.split == "train" else (self.max_shards or self.shard_limit)) - 1 # shards are 0, ..., max_shards-1
+        self.target_shard = (self.shard_limit or self.max_shards) if self.split == "train" else (self.max_shards or self.shard_limit) # shards are 0, ..., max_shards
         self.shard_idx = list(range(self.target_shard)) if self.split == "train" else [self.target_shard] # always reserve last shard for val
         print("ShardManager initialized with the following settings:")
         print(f"  - Split: {self.split}")
@@ -157,7 +157,7 @@ class ShardManager:
     
     def get_num_remote_shards(self, max_probe: int = 1_000_000):
         if not self.base_url:
-            return len(self.list_local_shards())
+            return len(self.list_local_shards()) - 1
         if self.ddp_rank == 0:
             warnings.warn("Starting to probe number of remote shards. This may take a while if there are many shards and the server is slow to respond. " \
                           "\nYOUR REMOTE SHARDS NEED TO BE IN THE FORMAT 'shard_{:05d}.parquet'. " \
