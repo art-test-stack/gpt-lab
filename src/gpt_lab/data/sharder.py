@@ -113,7 +113,7 @@ class ShardManager:
                 "name": name,
                 "base_url": base_url,
                 "column_name": column_name,
-                "max_shards": max_shards,
+                "max_shards": self.max_shards,
             })
 
     def save_metadata(self, metadata: dict):
