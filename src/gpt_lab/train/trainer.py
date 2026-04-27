@@ -393,7 +393,7 @@ class Trainer:
                     loss = self._compute_loss(x, y)
                 loss = loss / n_acc_steps
 
-                if self.use_amp:
+                if self.scaler is not None:
                     self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
