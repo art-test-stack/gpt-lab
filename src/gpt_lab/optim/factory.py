@@ -62,113 +62,113 @@ class _BaseFactory(torch.optim.Optimizer):
             group.setdefault("initial_lr", group["lr"])
 
         super().__init__(param_groups, defaults={})
-        self._init_adamw_scalars()
+        # self._init_adamw_scalars()
 
     # ------------------------------------------------------------------
     # Persistent CPU scalar tensors for AdamW.
     # Re-used every step via .fill_() — avoids re-allocation and keeps
     # the torch.compile graph stable (same tensor identity every call).
     # ------------------------------------------------------------------
-    def _init_adamw_scalars(self) -> None:
-        self._adamw_step_t  = torch.tensor(0.0, device="cpu")
-        self._adamw_lr_t    = torch.tensor(0.0, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, device="cpu")
-        self._adamw_eps_t   = torch.tensor(0.0, device="cpu")
-        self._adamw_wd_t    = torch.tensor(0.0, device="cpu")
+    # def _init_adamw_scalars(self) -> None:
+    #     self._adamw_step_t  = torch.tensor(0.0, device="cpu")
+    #     self._adamw_lr_t    = torch.tensor(0.0, device="cpu")
+    #     self._adamw_beta1_t = torch.tensor(0.0, device="cpu")
+    #     self._adamw_beta2_t = torch.tensor(0.0, device="cpu")
+    #     self._adamw_eps_t   = torch.tensor(0.0, device="cpu")
+    #     self._adamw_wd_t    = torch.tensor(0.0, device="cpu")
     
-    def _init_muon_scalars(self) -> None:
-        self._muon_momentum_t = torch.tensor(0.0, device="cpu")
-        self._muon_lr_t       = torch.tensor(0.0, device="cpu")
-        self._muon_wd_t       = torch.tensor(0.0, device="cpu")
-        self._muon_beta2_t    = torch.tensor(0.0, device="cpu")
+    # def _init_muon_scalars(self) -> None:
+    #     self._muon_momentum_t = torch.tensor(0.0, device="cpu")
+    #     self._muon_lr_t       = torch.tensor(0.0, device="cpu")
+    #     self._muon_wd_t       = torch.tensor(0.0, device="cpu")
+    #     self._muon_beta2_t    = torch.tensor(0.0, device="cpu")
 
-    # ──────────────────────────────────────────────────────────────────
-    # AdamW local step
-    # ──────────────────────────────────────────────────────────────────
-    def _step_adamw_local(self, group: dict) -> None:
-        for p in group["params"]:
-            if p.grad is None:
-                continue
+    # # ──────────────────────────────────────────────────────────────────
+    # # AdamW local step
+    # # ──────────────────────────────────────────────────────────────────
+    # def _step_adamw_local(self, group: dict) -> None:
+    #     for p in group["params"]:
+    #         if p.grad is None:
+    #             continue
 
-            state = self.state[p]
-            if not state:
-                state["step"]       = 0
-                state["exp_avg"]    = torch.zeros_like(p)
-                state["exp_avg_sq"] = torch.zeros_like(p)
+    #         state = self.state[p]
+    #         if not state:
+    #             state["step"]       = 0
+    #             state["exp_avg"]    = torch.zeros_like(p)
+    #             state["exp_avg_sq"] = torch.zeros_like(p)
 
-            state["step"] += 1
+    #         state["step"] += 1
 
-            self._adamw_step_t .fill_(state["step"])
-            self._adamw_lr_t   .fill_(group["lr"])
-            self._adamw_beta1_t.fill_(group["betas"][0])
-            self._adamw_beta2_t.fill_(group["betas"][1])
-            self._adamw_eps_t  .fill_(group["eps"])
-            self._adamw_wd_t   .fill_(group["weight_decay"])
+    #         self._adamw_step_t .fill_(state["step"])
+    #         self._adamw_lr_t   .fill_(group["lr"])
+    #         self._adamw_beta1_t.fill_(group["betas"][0])
+    #         self._adamw_beta2_t.fill_(group["betas"][1])
+    #         self._adamw_eps_t  .fill_(group["eps"])
+    #         self._adamw_wd_t   .fill_(group["weight_decay"])
 
-            adamw_step(
-                p, p.grad,
-                state["exp_avg"], state["exp_avg_sq"],
-                self._adamw_step_t, self._adamw_lr_t,
-                self._adamw_beta1_t, self._adamw_beta2_t,
-                self._adamw_eps_t, self._adamw_wd_t,
-            )
+    #         adamw_step(
+    #             p, p.grad,
+    #             state["exp_avg"], state["exp_avg_sq"],
+    #             self._adamw_step_t, self._adamw_lr_t,
+    #             self._adamw_beta1_t, self._adamw_beta2_t,
+    #             self._adamw_eps_t, self._adamw_wd_t,
+    #         )
 
-    # ──────────────────────────────────────────────────────────────────
-    # Muon local step
-    #
-    # build_optimizer() creates one group per unique weight shape
-    # (shape bucketing). Each group gets its own _muon_state on first
-    # call, so N buckets → N independent momentum/second-moment buffers.
-    # ──────────────────────────────────────────────────────────────────
-    def _step_muon_local(self, group: dict) -> None:
-        params = [p for p in group["params"] if p.grad is not None]
-        if not params:
-            return
+    # # ──────────────────────────────────────────────────────────────────
+    # # Muon local step
+    # #
+    # # build_optimizer() creates one group per unique weight shape
+    # # (shape bucketing). Each group gets its own _muon_state on first
+    # # call, so N buckets → N independent momentum/second-moment buffers.
+    # # ──────────────────────────────────────────────────────────────────
+    # def _step_muon_local(self, group: dict) -> None:
+    #     params = [p for p in group["params"] if p.grad is not None]
+    #     if not params:
+    #         return
 
-        p = params[0]  # any param will do, since all share the same
-        state = self.state[p]
-        n_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
+    #     p = params[0]  # any param will do, since all share the same
+    #     state = self.state[p]
+    #     n_params = len(params)
+    #     shape, device, dtype = p.shape, p.device, p.dtype
 
-        # State is stored on the group dict, not per-parameter, because Muon
-        # maintains a single batched buffer across all params in the bucket.
-        state = group.setdefault("_muon_state", {})
-        if "momentum_buf" not in state:
-            state["momentum_buf"] = torch.zeros_like(n_params, *shape, dtype=dtype, device=device)  # (B, m, n)
-        momentum_buffer = state["momentum_buf"]
-        if "second_buf" not in state:   
-            state_shape = (n_params, shape[-2], 1) if shape[-2] >= shape[-1] else (n_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        second_momentum_buffer = state["second_momentum_buffer"]
+    #     # State is stored on the group dict, not per-parameter, because Muon
+    #     # maintains a single batched buffer across all params in the bucket.
+    #     state = group.setdefault("_muon_state", {})
+    #     if "momentum_buf" not in state:
+    #         state["momentum_buf"] = torch.zeros_like(n_params, *shape, dtype=dtype, device=device)  # (B, m, n)
+    #     momentum_buffer = state["momentum_buf"]
+    #     if "second_buf" not in state:   
+    #         state_shape = (n_params, shape[-2], 1) if shape[-2] >= shape[-1] else (n_params, 1, shape[-1])
+    #         state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+    #     second_momentum_buffer = state["second_momentum_buffer"]
         
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
+    #     red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-        # Stack grads and params (NOTE: this assumes all params have the same shape)
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
+    #     # Stack grads and params (NOTE: this assumes all params have the same shape)
+    #     stacked_grads = torch.stack([p.grad for p in params])
+    #     stacked_params = torch.stack(params)
 
-        # Fill all the 0-D tensors with current values
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
+    #     # Fill all the 0-D tensors with current values
+    #     self._muon_momentum_t.fill_(group["momentum"])
+    #     self._muon_beta2_t.fill_(group["beta"] if group["beta"] is not None else 0.0)
+    #     self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+    #     self._muon_wd_t.fill_(group["weight_decay"])
 
-        muon_step(
-            stacked_grads,
-            stacked_params,
-            momentum_buffer,
-            second_momentum_buffer,
-            self._muon_momentum_t,
-            self._muon_lr_t,
-            self._muon_wd_t,
-            self._muon_beta2_t,
-            group["ns_steps"],   # Python int — unrolled at compile time
-            red_dim,
-            dtype,
-        )
+    #     muon_step(
+    #         stacked_grads,
+    #         stacked_params,
+    #         momentum_buffer,
+    #         second_momentum_buffer,
+    #         self._muon_momentum_t,
+    #         self._muon_lr_t,
+    #         self._muon_wd_t,
+    #         self._muon_beta2_t,
+    #         group["ns_steps"],   # Python int — unrolled at compile time
+    #         red_dim,
+    #         dtype,
+    #     )
 
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+    #     torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKENDS
