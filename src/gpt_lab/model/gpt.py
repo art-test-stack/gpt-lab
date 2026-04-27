@@ -9,6 +9,7 @@ from gpt_lab.model.layers import (
 from gpt_lab.model.loss import build_loss
 from gpt_lab.model.utils import (
     KVCache,
+    has_ve,
     precompute_rope, 
     precompute_positional_encoding
 )
@@ -60,9 +61,6 @@ def build_model_from_config(
     
     model.to_empty(device=config.device)
     return model
-
-def has_ve(layer_idx: int, n_layer: int):
-    return layer_idx % 2 == (n_layer - 1) % 2
 
 
 class BaseTransformer(Module):
@@ -117,19 +115,7 @@ class DenseTransformer(BaseTransformer):
         )
 
         self.blocks: nn.ModuleList[DecoderLayer] = nn.ModuleList([
-            DecoderLayer(
-                dim_model=config.d_model,
-                dim_ffn=config.d_ffn, 
-                n_heads=config.n_heads, 
-                n_kv_heads=config.n_kv_heads,
-                d_head=config.d_head, 
-                dropout=config.dropout,
-                layer_idx=layer_idx,
-                norm_before_attn=config.norm_before_attn,
-                use_gqa=config.use_gqa,
-                attn_impl=config.attn_impl,
-                normalization=config.normalization,
-            ) 
+            DecoderLayer(config, layer_idx=layer_idx) 
             for layer_idx in range(config.n_layers)
         ])
 
@@ -138,8 +124,8 @@ class DenseTransformer(BaseTransformer):
         # TODO: same as karpathy
         # Value embeddings (ResFormer-style): alternating layers, last layer always include
         self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(padded_vocab_size, kv_dim)
-            for i in range(config.n_layers) if has_ve(i, config.n_layers)
+            str(layer_idx): nn.Embedding(padded_vocab_size, kv_dim)
+            for layer_idx in range(config.n_layers) if has_ve(layer_idx, config.n_layers)
         })
 
         self.lm_head = Linear(config.d_model, padded_vocab_size, bias=False)
@@ -407,13 +393,11 @@ class DenseTransformer(BaseTransformer):
             # TODO: not return attn yet
             return_attn = return_attentions and (i == len(self.blocks) - 1) and False
             x = self.res_h[i] * x + self.res_x0[i] * x0
-            x, attn = layer(x, attn_mask=attn_mask,
-                rope_cache=rope_cache,
-                kv_cache=past_key_values, 
-                return_attn_weights=return_attn,
-                # TODO: return_attn in special cases only -> interpretability
-                # return_attentions=return_attn 
-            )
+            ve = None
+            if str(i) in self.value_embeds:
+                ve = self.value_embeds[str(i)](input_ids).to(x.dtype)
+            x, attn = layer(x, value_embeds=ve, rope_cache=rope_cache, window_size=self.window_sizes[i],
+                            kv_cache=past_key_values, attn_mask=attn_mask, return_attn_weights=return_attn)
             if return_attn:
                 attentions.append(attn)
             if return_hidden_states:

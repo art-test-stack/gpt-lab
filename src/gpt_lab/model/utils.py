@@ -8,6 +8,11 @@ from gpt_lab.utils.schemas import TransformerConfig
 from typing import Iterable, Optional
 
 
+# --------------  Value Embedding utilities -------------- 
+
+def has_ve(layer_idx: int, n_layer: int):
+    return layer_idx % 2 == (n_layer - 1) % 2
+
 # -------------- Positional Encoding utilities -------------- #
 
 def precompute_rope(seq_len: int, d_head: int, base: int = 10000, dtype: torch.dtype = torch.float32, device: Optional[torch.device] = None) -> torch.Tensor:

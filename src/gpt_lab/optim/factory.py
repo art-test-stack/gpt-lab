@@ -384,7 +384,6 @@ class MuonAdamW(torch.optim.Optimizer):
             red_dim,
             dtype
         )
-
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
@@ -485,7 +484,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:
                 # Large params: reduce_scatter
-                assert grad is not None, f"AdamW params must have gradients for reduce_scatter. Check for None grads for group {group['name']}"
+                assert grad is not None, f"AdamW params must have gradients for reduce_scatter. Check for None grads for group {group['name']!r}."
                 assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])

@@ -1,22 +1,16 @@
 from gpt_lab.utils.common import print0
-from gpt_lab.utils.schemas import (
-    TransformerConfig
-)
+from gpt_lab.utils.schemas import TransformerConfig
 from gpt_lab.model.flash_attn import flash_attn, scaled_dot_product_attention
-from gpt_lab.model.utils import apply_rope
+from gpt_lab.model.utils import apply_rope, has_ve
 from gpt_lab.utils.types import AttnImplTypes, NormalizationTypes
-from gpt_lab.utils.default import DEVICE, DEVICE_NAME
-# from gpt_lab.utils.import_utils import is_torch_cuda_available, is_flash_attn3_available_from_kernel
-import math
+from gpt_lab.utils.default import DEVICE
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from typing import Literal, Tuple, Optional, Union, Callable, get_args
+from typing import Tuple, Optional, Callable, get_args
 import warnings
-
-
 
 def apply_rms_norm(x: torch.Tensor, eps: float = 1e-8, torch_impl: bool = True) -> torch.Tensor:
     if torch_impl:
@@ -150,49 +144,33 @@ class TPLinear(Linear):
         dist.all_reduce(out, group=self.tp_spec.tp_group)
         return out
 
-# --------------  Value Embedding utilities -------------- #
-
-def has_ve(layer_idx: int, n_layers: int) -> bool:
-    '''Determine if a layer should have value embeddings (ResFormer-style).
-    Value embeddings are applied to alternating layers, with the last layer always included.
-    '''
-    # TODO: Make value embeddings 
-    # https://arxiv.org/abs/2212.00776
-    return False
-    if layer_idx == n_layers - 1:
-        return True
-    return layer_idx % 2 == 0
-
 
 # --------------      Attention utilities      -------------- #
 
 class CausalSelfAttention(Module):
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, d_head: int, 
-                 norm_before_attn: bool, use_gqa: bool, dropout: float = .0, 
-                 normalization: NormalizationTypes = 'rms', norm_eps: float = 1e-8,
-                 attn_impl: AttnImplTypes = 'sdpa', layer_idx: int = 0
-        ) -> None:
+    def __init__(self, config: TransformerConfig, layer_idx: int = 0) -> None:
         super().__init__()
-        assert d_model == d_head * n_heads, f'Dimensions are not correct. dim_model must be equal to d_head * n_heads. Got dim_model={d_model}, d_head={d_head}, n_heads={n_heads}'
-        assert attn_impl in get_args(AttnImplTypes), f'Attention implementation {attn_impl} is not supported. Supported attention implementations are in {get_args(AttnImplTypes)}.'
-        assert normalization in get_args(NormalizationTypes), f'Normalization {normalization} is not supported. Supported normalizations are in {get_args(NormalizationTypes)}.'
-        assert n_heads % n_kv_heads == 0, f'Number of heads must be divisible by number of key-value heads. Got n_heads={n_heads}, n_kv_heads={n_kv_heads}.'
+        assert config.d_model == config.d_head * config.n_heads, f'Dimensions are not correct. dim_model must be equal to d_head * n_heads. Got dim_model={config.d_model}, d_head={config.d_head}, n_heads={config.n_heads}'
+        assert config.attn_impl in get_args(AttnImplTypes), f'Attention implementation {config.attn_impl} is not supported. Supported attention implementations are in {get_args(AttnImplTypes)}.'
+        assert config.normalization in get_args(NormalizationTypes), f'Normalization {config.normalization} is not supported. Supported normalizations are in {get_args(NormalizationTypes)}.'
+        assert config.n_heads % config.n_kv_heads == 0, f'Number of heads must be divisible by number of key-value heads. Got n_heads={config.n_heads}, n_kv_heads={config.n_kv_heads}.'
         
-        self.d_model = d_model
+        self.d_model = config.d_model
         self.layer_idx = layer_idx
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.d_head = d_head
-        self.norm_before_attn = norm_before_attn
-        self.dropout_rate = dropout
+        self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads
+        self.d_head = config.d_head
+        self.norm_before_attn = config.norm_before_attn
+        self.dropout_rate = config.dropout
 
-        self.ve_gate = None # TODO: add gate for value embedding
-
-        self.norm = build_norm(normalization, eps=norm_eps, torch_impl=True)
-        self.attn_impl = attn_impl
+        self.norm = build_norm(config.normalization, eps=config.norm_eps, torch_impl=True)
+        self.attn_impl = config.attn_impl
         # TODO: try an implementation with separate q, k, v proj
-        self.qkv_proj = Linear(d_model, (n_heads + 2 * n_kv_heads) * d_head, bias=False)
-        self.o_proj = Linear(d_model, d_model, bias=False)
+        self.qkv_proj = Linear(config.d_model, (config.n_heads + 2 * config.n_kv_heads) * config.d_head, bias=False)
+        self.o_proj = Linear(config.d_model, config.d_model, bias=False)
+
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_heads, bias=False) if has_ve(layer_idx, config.n_layers) else None
 
 
     @torch.no_grad()
@@ -202,8 +180,8 @@ class CausalSelfAttention(Module):
         torch.nn.init.uniform_(self.qkv_proj.weight, -std, std) # weights use Uniform to avoid outliers
         torch.nn.init.zeros_(self.o_proj.weight) # projections are zero
 
-    def forward(self, x: torch.Tensor, rope_cache=None, attn_mask=None, 
-                kv_cache=None, window_size=None, return_attn_weights: bool = False
+    def forward(self, x: torch.Tensor, value_embeds=None, rope_cache=None,  window_size=None, 
+                kv_cache=None, attn_mask=None, return_attn_weights: bool = False
         ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         B, Tq, E = x.size()
         if kv_cache is not None:
@@ -217,7 +195,15 @@ class CausalSelfAttention(Module):
         q = qkv[:, :, :Hq, :].clone()
         k = qkv[:, :, Hq:Hq+Hk, :].clone()
         v = qkv[:, :, Hq+Hk:, :]
-        # TODO: add resformer value embedding here
+        
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        if value_embeds is not None:
+            value_embeds = value_embeds.view(B, Tq, self.n_kv_heads, self.d_head)
+            print(f"Value embeds shape: {value_embeds.shape}")
+            print(f"Gate input shape: {self.ve_gate}")
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head)
+            v = v + gate.unsqueeze(-1) * value_embeds
+
         if rope_cache is not None:
             q = apply_rope(q, rope_cache)
             k = apply_rope(k, rope_cache)
@@ -345,55 +331,30 @@ class SwigLUFeedForward(Module):
     
 class DecoderLayer(Module):
     '''Decoder layer'''
-    def __init__(
-            self, 
-            dim_model: int, 
-            dim_ffn: int, 
-            n_heads: int, 
-            n_kv_heads: int,
-            d_head: int, 
-            dropout: float,
-            attn_impl: AttnImplTypes = 'sdpa',
-            normalization: NormalizationTypes = 'rms',
-            use_gqa: bool = False,
-            norm_before_attn: bool = True,
-            norm_eps: float = 1e-8,
-            layer_idx: int = 0
-        ) -> None:
+    def __init__(self, config: TransformerConfig, layer_idx: int = 0) -> None:
         super().__init__()
-        if not norm_before_attn:
+        if not config.norm_before_attn:
             warnings.warn('Using "norm_before_attn=False" is not recommended and may lead to training instability.', UserWarning)
-        self.norm_before_attn = norm_before_attn
-        self.norm = build_norm(normalization, eps=norm_eps, torch_impl=True)
-        self.attention = CausalSelfAttention(
-            d_model=dim_model, 
-            n_heads=n_heads, 
-            n_kv_heads=n_kv_heads,
-            d_head=d_head, 
-            use_gqa=use_gqa,
-            normalization=normalization,
-            attn_impl=attn_impl,
-            layer_idx=layer_idx, 
-            norm_before_attn=norm_before_attn   
-        ) # TODO: pass config instead? for simplicity
+        self.norm_before_attn = config.norm_before_attn
+        self.norm = build_norm(config.normalization, eps=config.norm_eps, torch_impl=True)
+        self.attention = CausalSelfAttention(config=config, layer_idx=layer_idx) 
         
         # self.ffn = FeedForward(d_in=dim_model, d_latent=dim_ffn, dropout=dropout)
         # TODO: try SwigLU + make it configurable
-        self.ffn = SwigLUFeedForward(d_in=dim_model, d_latent=dim_ffn, dropout=dropout) 
-        self.dropout_rate = dropout
+        self.ffn = SwigLUFeedForward(d_in=config.d_model, d_latent=config.d_ffn, dropout=config.dropout) 
+        self.dropout_rate = config.dropout
 
-        self.norm = build_norm(normalization, eps=1e-8, torch_impl=True)
+        self.norm = build_norm(config.normalization, eps=1e-8, torch_impl=True)
 
-    def forward(self, x, attn_mask=None, kv_cache=None, rope_cache=None, window_size=None, return_attn_weights=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x, value_embeds=None, kv_cache=None, rope_cache=None, attn_mask=None, window_size=None, return_attn_weights=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         
         if self.norm_before_attn:
             norm_x = self.norm(x)
         else:
             norm_x = x
-        h, attn_weights = self.attention(
-            norm_x, attn_mask=attn_mask, kv_cache=kv_cache, 
-            rope_cache=rope_cache, window_size=window_size, 
-            return_attn_weights=return_attn_weights)
+        h, attn_weights = self.attention(norm_x, 
+            value_embeds=value_embeds, rope_cache=rope_cache, window_size=window_size, 
+            kv_cache=kv_cache, attn_mask=attn_mask, return_attn_weights=return_attn_weights)
         
         h = x + h
         h = h + self.ffn(self.norm(h))
