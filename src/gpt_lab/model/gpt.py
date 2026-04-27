@@ -337,17 +337,17 @@ class DenseTransformer(BaseTransformer):
 
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
-            dict(params=embedding_params, **optim_config["embeddings"]),
-            dict(params=lm_head_params, **optim_config["head"]),
-            dict(params=value_embeds_params, **optim_config["value_embeds"]),
-            dict(params=residual_h_params, **optim_config["residual_hiddens"]),
-            dict(params=residual_x0_params, **optim_config["residual_inputs"]),
+            dict(name="embeddings", params=embedding_params, **optim_config["embeddings"]),
+            dict(name="head", params=lm_head_params, **optim_config["head"]),
+            dict(name="value_embeds", params=value_embeds_params, **optim_config["value_embeds"]),
+            dict(name="residual_hiddens", params=residual_h_params, **optim_config["residual_hiddens"]),
+            dict(name="residual_inputs", params=residual_x0_params, **optim_config["residual_inputs"]),
         ]
 
         for shape in sorted({p.shape for p in blocks_params}):
             group_params = [p for p in blocks_params if p.shape == shape]
             param_groups.append(dict(
-                params=group_params, **optim_config["transformer"]
+                name=f"block.{shape}", params=group_params, **optim_config["transformer"]
             ))
 
         optimizer = OptimizerFactory(param_groups, dist_info=config.dist_info)
