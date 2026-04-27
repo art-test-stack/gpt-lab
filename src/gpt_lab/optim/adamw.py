@@ -1,32 +1,33 @@
 import torch
-
+from torch import Tensor
 
 @torch.compile(dynamic=False, fullgraph=True)
-def adamw_step(
-    p:           torch.Tensor,   # parameter
-    grad:        torch.Tensor,   # gradient
-    exp_avg:     torch.Tensor,   # m_t  — first  moment buffer
-    exp_avg_sq:  torch.Tensor,   # v_t  — second moment buffer
-    step_t:      torch.Tensor,   # scalar: current step (1-indexed)
-    lr_t:        torch.Tensor,   # scalar: learning rate
-    beta1_t:     torch.Tensor,   # scalar: β₁
-    beta2_t:     torch.Tensor,   # scalar: β₂
-    eps_t:       torch.Tensor,   # scalar: ε
-    wd_t:        torch.Tensor,   # scalar: weight decay λ
+def adamw_step_fused(
+    p: Tensor,              # (32768, 768) - parameter tensor
+    grad: Tensor,           # (32768, 768) - gradient, same shape as p
+    exp_avg: Tensor,        # (32768, 768) - first moment, same shape as p
+    exp_avg_sq: Tensor,     # (32768, 768) - second moment, same shape as p
+    step_t: Tensor,         # () - 0-D CPU tensor, step count
+    lr_t: Tensor,           # () - 0-D CPU tensor, learning rate
+    beta1_t: Tensor,        # () - 0-D CPU tensor, beta1
+    beta2_t: Tensor,        # () - 0-D CPU tensor, beta2
+    eps_t: Tensor,          # () - 0-D CPU tensor, epsilon
+    wd_t: Tensor,           # () - 0-D CPU tensor, weight decay
 ) -> None:
-    # 1. Decoupled weight decay: p ← p · (1 - lr·λ)
+    """
+    Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
+    All in one compiled graph to eliminate Python overhead between ops.
+    The 0-D CPU tensors avoid recompilation when hyperparameter values change.
+    """
+    # Weight decay (decoupled, applied before the update)
     p.mul_(1 - lr_t * wd_t)
-
-    # 2. Moment EMA updates
-    exp_avg.lerp_(grad, 1 - beta1_t)           # m_t = β₁·m_{t-1} + (1-β₁)·g
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)  # v_t = β₂·v_{t-1} + (1-β₂)·g²
-
-    # 3. Bias correction
-    bias1 = 1 - beta1_t ** step_t              # 1 - β₁ᵗ
-    bias2 = 1 - beta2_t ** step_t              # 1 - β₂ᵗ
-    m_hat = exp_avg / bias1                    # m̂_t
-    v_hat = exp_avg_sq / bias2                 # v̂_t
-
-    # 4. Adam update — all tensor ops, no .item() needed for fullgraph
-    #    p ← p - lr · m̂ / (√v̂ + ε)
-    p.sub_(lr_t * m_hat / (v_hat.sqrt() + eps_t))
+    # Update running averages (lerp_ is cleaner and fuses well)
+    exp_avg.lerp_(grad, 1 - beta1_t)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    # Bias corrections
+    bias1 = 1 - beta1_t ** step_t
+    bias2 = 1 - beta2_t ** step_t
+    # Compute update and apply
+    denom = (exp_avg_sq / bias2).sqrt() + eps_t
+    step_size = lr_t / bias1
+    p.add_(exp_avg / denom, alpha=-step_size)

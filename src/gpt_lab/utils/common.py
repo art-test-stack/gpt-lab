@@ -32,12 +32,10 @@ def format_value(value):
         return "True" if value else "False"
     elif isinstance(value, int):
         return f"{value:,}"
-    elif isinstance(value, float) and abs(value) < 1e-3:
-        return f"{value:.2f}"
+    elif isinstance(value, float) and (abs(value) < 1e-3 or abs(value) >= 1e7):
+        return f"{value:.2e}"
     elif isinstance(value, float) and abs(value) < 1e7:
         return f"{value:,.2f}"
-    elif isinstance(value, float) and abs(value) >= 1e7:
-        return f"{value:.2e}"
     else:
         return str(value)
     
