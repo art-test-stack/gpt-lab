@@ -23,13 +23,14 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 
-from gpt_lab.utils.schemas import TrainingConfig, TrainingMetrics, EvalMetrics, COREMetrics
 from gpt_lab.utils.board import Board
+from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
+from gpt_lab.utils.distributed import _DTYPE_MAP
 from gpt_lab.utils.common import print0, print0_dict
+from gpt_lab.utils.schemas import TrainingConfig, TrainingMetrics, EvalMetrics, COREMetrics
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
 from gpt_lab.model.gpt import GPTModel
-from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
 
 
 # ============================================================================
@@ -157,12 +158,17 @@ class Trainer:
         self.core_metrics = COREMetrics()
         
         # Mixed precision
-        self.use_amp = config.use_amp
+        self.dtype = self.config.dist_info["COMPUTE_DTYPE"]
+        self.use_amp = self.dtype in ["float16", "bfloat16"]
         def amp_context():
             if self.use_amp:
-                return autocast(device_type=self.config.dist_info["DEVICE_TYPE"], dtype=torch.bfloat16)
+                return autocast(
+                    device_type=self.config.dist_info["DEVICE_TYPE"],
+                    dtype=_DTYPE_MAP[self.dtype]
+                )
             else:
                 return DummyContext()
+            
         def disable_fp8_context():
             if self.config.fp8:
                 # TODO: this is a placeholder impl.
@@ -170,9 +176,9 @@ class Trainer:
                 return DisableFP8
             else:
                 return DummyContext
-        self.train_context = amp_context()
+        self.train_context = amp_context
         self.val_context = disable_fp8_context()
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = GradScaler() if self.dtype == "float16" else None
         
         # LR and other schedules
         self.lr_schedule = lr_schedule or config.lr_multiplier_schedule
@@ -401,7 +407,7 @@ class Trainer:
                     print0("Model targets shape:", y.shape)
                     print0("Model targets:", y)
                     torch.save(x, CACHE_DIR / "bad_batch.pt")
-                    raise ValueError(f"Loss is NaN or Inf at step {step}, acc_loss: {loss_accum}")
+                    raise ValueError(f"Loss is NaN or Inf at {step=}, {loss_accum=}")
                 x, y, dataloader_state = next(train_iter)
 
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)

@@ -506,7 +506,7 @@ For the laziest (😛), there are also a lot of Youtube videos that explain well
 2. [Stanfords CME295 course](https://youtube.com/playlist?list=PLoROMvodv4rOCXd21gf0CF4xr35yINeOy&si=sL3DEmGNNdh9-TEa) for the very nice lecture on Transformers and LLMs by [Afshine](https://github.com/afshinea) and [Shervine Amidi](https://github.com/shervinea). They currently releasing lectures of [CME296](https://youtube.com/playlist?list=PLoROMvodv4rNdy8rt2rZ4T2xM0OjADnfu&si=NF0SmB-aItcdB3tT), which is on diffusion & LVMs.
 
 
-# TODOs 
+## TODOs 
 
 Here a non-exhaustive list of features that I aim to implement. Stars correspond to the priority level. Contributions are welcome!
 * Tokenization ⭐️
@@ -530,18 +530,18 @@ Here a non-exhaustive list of features that I aim to implement. Stars correspond
   - vLLM, DeepSpeed, Megatron-LM, etc. integration 
 
 <!-- LICENSE -->
-# License
+## License
 
 Distributed under the MIT License. See `LICENSE.txt` for more information.
 
 <!-- CONTACT -->
-# Contact
+## Contact
 
 Arthur Testard - [arthur.testard.pro@gmail.com](mailto:arthur.testard.pro@gmail.com)
 
 Project Link: [art-test-stack/gpt-lab](https://github.com/art-test-stack/gpt-lab)
 
-# Citation
+## Citation
 
 If you use this work in your research, *please* consider citing the following:
 ```
@@ -682,7 +682,6 @@ END_SYSTEM_INSTRUCTION
 [wandb-shield]: https://img.shields.io/badge/Weights_&_Biases-black?style=for-the-badge&logo=WeightsAndBiases&logoColor=FFCC33
 [uv-url]: https://github.com/astral-sh/uv
 [uv-shield]: https://img.shields.io/badge/uv-261230.svg?style=for-the-badge&logo=uv&logoColor=#de5fe9
-https://img.shields.io/badge/uv-4B32C3?style=for-the-badge&logo=python&logoColor=4B32C3
 
 [10.1038/s41586-025-09422-z]: https://arxiv.org/abs/2501.12948
 [10.1109/ISTM54910.2022.00016]: https://ieeexplore.ieee.org/document/9923796

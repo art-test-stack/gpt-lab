@@ -116,7 +116,7 @@ class DistDataLoader:
             if len(self.buffer) == 0:
                 self._refill()
 
-            doc, state = self.buffer.pop()
+            doc, state = self.buffer.pop(0)
             self.last_state = state
 
             remaining = total - pos
