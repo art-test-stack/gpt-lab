@@ -394,9 +394,14 @@ class Trainer:
 
                 loss_accum += loss.detach().item()
                 if math.isnan(loss_accum) or math.isinf(loss_accum):
-                    print("BAD ACC STEP DETECTED")
-                    print(dataloader_state.__dict__)
-                    torch.save(x, "bad_batch.pt")
+                    print0("BAD ACC STEP DETECTED")
+                    print0("Dataloader state:", dataloader_state.__dict__)
+                    print0("Model inputs shape:", x.shape)
+                    print0("Model inputs:", x)
+                    print0("Model targets shape:", y.shape)
+                    print0("Model targets:", y)
+                    torch.save(x, CACHE_DIR / "bad_batch.pt")
+                    raise ValueError(f"Loss is NaN or Inf at step {step}, acc_loss: {loss_accum}")
                 x, y, dataloader_state = next(train_iter)
 
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
