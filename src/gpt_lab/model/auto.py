@@ -67,7 +67,7 @@ class AutoGPTConfig(BaseModel):
             from gpt_lab.utils.report import run_command
             git_commit = run_command("git rev-parse --short HEAD") or "unkcommit"
             from datetime import datetime
-            date = datetime.today().ctime().replace(" ", "_").replace(":", "-")
+            date = datetime.now().split(".")[0].replace(" ", "_").replace(":", "-")
         
             self.name = f"{self.basename}_d{self.depth}_cmt_{git_commit}_dt_{date}"
         if self.vocab_size != -1 and self.vocab_size < 256:
@@ -129,7 +129,6 @@ class AutoGPTConfig(BaseModel):
                 n_layers=depth, n_heads=n_heads, n_kv_heads=self.d_kv_head or n_heads, d_head=d_head, 
                 window_pattern=window_pattern, window_size=window_size, attn_impl=attn_impl, softcap=softcap
             )
-
             return build_meta_model(config)
 
         def compute_optimal_vocab_size(depth: int) -> int:

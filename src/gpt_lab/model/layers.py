@@ -172,7 +172,6 @@ class CausalSelfAttention(Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_heads, bias=False) if has_ve(layer_idx, config.n_layers) else None
 
-
     @torch.no_grad()
     def init_weights(self) -> None:
         d_model = self.n_heads * self.d_head
