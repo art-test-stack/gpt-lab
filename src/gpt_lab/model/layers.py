@@ -199,8 +199,6 @@ class CausalSelfAttention(Module):
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if value_embeds is not None:
             value_embeds = value_embeds.view(B, Tq, self.n_kv_heads, self.d_head)
-            print(f"Value embeds shape: {value_embeds.shape}")
-            print(f"Gate input shape: {self.ve_gate}")
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head)
             v = v + gate.unsqueeze(-1) * value_embeds
 

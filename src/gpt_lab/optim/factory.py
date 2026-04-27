@@ -8,7 +8,7 @@ from typing import Any, Optional
 from gpt_lab.optim.adamw import adamw_step_fused as adamw_step
 from gpt_lab.optim.muon  import muon_step_fused as muon_step
 from gpt_lab.utils.distributed import get_dist_info
-
+from gpt_lab.utils.common import print0
 
 # ── Required keys per optimizer type ──────────────────────────────────────────
 # Validated at construction so misconfigured YAML groups fail immediately
@@ -486,7 +486,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 # Large params: reduce_scatter
                 assert grad is not None, f"AdamW params must have gradients for reduce_scatter. Check for None grads for group {group['name']!r}."
                 if p.shape[0] % world_size != 0:
-                    print0(f"[ BAD PARAM:", p.shape, world_size, group.get("name"))
+                    print0(f"[BAD PARAM:", p.shape, world_size, group.get("name"))
                 assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
