@@ -485,6 +485,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
             else:
                 # Large params: reduce_scatter
                 assert grad is not None, f"AdamW params must have gradients for reduce_scatter. Check for None grads for group {group['name']!r}."
+                if p.shape[0] % world_size != 0:
+                    print0(f"[ BAD PARAM:", p.shape, world_size, group.get("name"))
                 assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])

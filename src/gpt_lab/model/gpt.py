@@ -387,7 +387,6 @@ class DenseTransformer(BaseTransformer):
         x0 = x # .clone()
         attentions = []
         hidden_states = [("emb", x)] if return_hidden_states else None
-        # assert not torch.isnan(x).any(), "..."
         
         for i, layer in enumerate(self.blocks, 0):
             # TODO: not return attn yet
