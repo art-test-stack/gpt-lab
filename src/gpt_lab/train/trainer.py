@@ -158,7 +158,7 @@ class Trainer:
         self.core_metrics = COREMetrics()
         
         # Mixed precision
-        self.dtype = self.config.dist_info["COMPUTE_DTYPE"]
+        self.dtype = self.config.dist_info["compute_dtype"]
         self.use_amp = self.dtype in ["float16", "bfloat16"]
         def amp_context():
             if self.use_amp:
