@@ -20,7 +20,7 @@ import warnings
 
 def apply_rms_norm(x: torch.Tensor, eps: float = 1e-8, torch_impl: bool = True) -> torch.Tensor:
     if torch_impl:
-        return torch.rms_norm(x, normalized_shape=(x.size(-1),), eps=eps)
+        return torch.rms_norm(x, normalized_shape=(x.size(-1),))
     else:
         rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
         return x / rms

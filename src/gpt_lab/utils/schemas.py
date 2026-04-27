@@ -288,7 +288,7 @@ class TransformerConfig(BaseModel):
 
     norm_before_attn: bool = True
     normalization: NormalizationTypes = "rms"  # Options: "rms", "layer"
-    norm_eps: float = 1e-8
+    norm_eps: float = 1e-5
     act_func: str = "swiglu" # TODO: make it compatible with model.DenseTransformer implementation
 
     # TODO: padged attention implementation
@@ -423,7 +423,7 @@ class TrainingConfig(BaseModel):
     weight_decay: float = 0.28
     adamw_weight_decay: Optional[float] = None # ignored for now
     muon_weight_decay: Optional[float] = None # ignored for now
-    lr_warmup_steps: int = 40
+    lr_warmup_steps: int = 4
     lr_warmdown_ratio: float = 0.65
     final_lr_ratio: float = 0.05
     batch_lr_scale: float = 1.0
