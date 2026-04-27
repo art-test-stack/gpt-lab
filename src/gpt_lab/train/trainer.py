@@ -16,6 +16,7 @@ import time
 import pickle
 import gc
 import warnings
+import math
 
 import torch
 import torch.nn as nn
@@ -392,6 +393,10 @@ class Trainer:
                     loss.backward()
 
                 loss_accum += loss.detach().item()
+                if math.isnan(loss_accum) or math.isinf(loss_accum):
+                    print("BAD ACC STEP DETECTED")
+                    print(dataloader_state.__dict__)
+                    torch.save(x, "bad_batch.pt")
                 x, y, dataloader_state = next(train_iter)
 
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
@@ -446,7 +451,7 @@ class Trainer:
                     eta_str = f" | ETA: {eta_seconds/60:.1f}m"
                 else:
                     eta_str = ""
-                
+                assert not math.isnan(debiased_smooth_loss), f"Expected debiased_smooth_loss to be a float, got {debiased_smooth_loss=}"
                 print0(
                     f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
                     f"loss: {debiased_smooth_loss:.6f} | "
