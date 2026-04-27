@@ -97,14 +97,7 @@ class ShardManager:
         self.max_shards = max_shards or self.get_num_remote_shards()
         self.target_shard = (self.shard_limit or self.max_shards) if self.split == "train" else (self.max_shards or self.shard_limit) # shards are 0, ..., max_shards
         self.shard_idx = list(range(self.target_shard)) if self.split == "train" else [self.target_shard] # always reserve last shard for val
-        print("ShardManager initialized with the following settings:")
-        print(f"  - Split: {self.split}")
-        print(f"  - Base URL: {self.base_url}")
-        print(f"  - Column Name: {self.column_name}")
-        print(f"  - Shard Limit: {self.shard_limit}")
-        print(f"  - Max Shards: {self.max_shards}")
-        print(f"  - Target Shard: {self.target_shard}")
-        print(f"  - Shard Indices: {self.shard_idx}")
+        
         self.refresh_interval = refresh_interval
         self.download_poll_interval = download_poll_interval
         self._stop = False

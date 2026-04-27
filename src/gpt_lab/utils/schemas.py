@@ -423,7 +423,7 @@ class TrainingConfig(BaseModel):
     weight_decay: float = 0.28
     adamw_weight_decay: Optional[float] = None # ignored for now
     muon_weight_decay: Optional[float] = None # ignored for now
-    lr_warmup_steps: int = WARMUP_ITERS
+    lr_warmup_steps: int = 40
     lr_warmdown_ratio: float = 0.65
     final_lr_ratio: float = 0.05
     batch_lr_scale: float = 1.0

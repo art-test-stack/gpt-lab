@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: |
           uv venv
-          uv sync
+          uv sync group dev
 
       - name: Run tests
         run: |
