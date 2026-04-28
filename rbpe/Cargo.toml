@@ -1,0 +1,11 @@
+[package]
+name = "rbpe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py38"] }
+memmap2 = "0.9"

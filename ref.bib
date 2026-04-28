@@ -1,0 +1,88 @@
+% -------------------- TOKENIZATION -------------------------
+
+@inproceedings{sennrich-etal-2016-neural,
+  title = "Neural Machine Translation of Rare Words with Subword Units",
+  author = "Sennrich, Rico  and
+    Haddow, Barry  and
+    Birch, Alexandra",
+  editor = "Erk, Katrin  and
+    Smith, Noah A.",
+  booktitle = "Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)",
+  month = aug,
+  year = "2016",
+  address = "Berlin, Germany",
+  publisher = "Association for Computational Linguistics",
+  url = "https://aclanthology.org/P16-1162/",
+  doi = "10.18653/v1/P16-1162",
+  pages = "1715--1725"
+}
+@misc{kudo2018sentencepiecesimplelanguageindependent,
+  title={SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing}, 
+  author={Taku Kudo and John Richardson},
+  year={2018},
+  eprint={1808.06226},
+  archivePrefix={arXiv},
+  primaryClass={cs.CL},
+  url={https://arxiv.org/abs/1808.06226}, 
+}
+@inproceedings{rust-etal-2021-good,
+  title = "How Good is Your Tokenizer? On the Monolingual Performance of Multilingual Language Models",
+  author = "Rust, Phillip  and
+    Pfeiffer, Jonas  and
+    Vuli{\'c}, Ivan  and
+    Ruder, Sebastian  and
+    Gurevych, Iryna",
+  editor = "Zong, Chengqing  and
+    Xia, Fei  and
+    Li, Wenjie  and
+    Navigli, Roberto",
+  booktitle = "Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers)",
+  month = aug,
+  year = "2021",
+  address = "Online",
+  publisher = "Association for Computational Linguistics",
+  url = "https://aclanthology.org/2021.acl-long.243/",
+  doi = "10.18653/v1/2021.acl-long.243",
+  pages = "3118--3135",
+  abstract = "In this work, we provide a systematic and comprehensive empirical comparison of pretrained multilingual language models versus their monolingual counterparts with regard to their monolingual task performance. We study a set of nine typologically diverse languages with readily available pretrained monolingual models on a set of five diverse monolingual downstream tasks. We first aim to establish, via fair and controlled comparisons, if a gap between the multilingual and the corresponding monolingual representation of that language exists, and subsequently investigate the reason for any performance difference. To disentangle conflating factors, we train new monolingual models on the same data, with monolingually and multilingually trained tokenizers. We find that while the pretraining data size is an important factor, a designated monolingual tokenizer plays an equally important role in the downstream performance. Our results show that languages that are adequately represented in the multilingual model{'}s vocabulary exhibit negligible performance decreases over their monolingual counterparts. We further find that replacing the original multilingual tokenizer with the specialized monolingual tokenizer improves the downstream performance of the multilingual model for almost every task and language."
+}
+@misc{dagan2024gettingtokenizerpretrainingdomain,
+  title={Getting the most out of your tokenizer for pre-training and domain adaptation}, 
+  author={Gautier Dagan and Gabriel Synnaeve and Baptiste Rozière},
+  year={2024},
+  eprint={2402.01035},
+  archivePrefix={arXiv},
+  primaryClass={cs.CL},
+  url={https://arxiv.org/abs/2402.01035}, 
+}
+@article{tao2024scaling,
+  title={Scaling laws with vocabulary: Larger models deserve larger vocabularies},
+  author={Tao, Chaofan and Liu, Qian and Dou, Longxu and Muennighoff, Niklas and Wan, Zhongwei and Luo, Ping and Lin, Min and Wong, Ngai},
+  journal={Advances in Neural Information Processing Systems},
+  volume={37},
+  pages={114147--114179},
+  year={2024},
+  url={https://arxiv.org/abs/2407.13623}, 
+}
+% -------------------- SCALING LAWS -------------------------
+
+% -------------------- FOUNDATIONAL MODELS -------------------------
+@misc{touvron2023llamaopenefficientfoundation,
+      title={LLaMA: Open and Efficient Foundation Language Models}, 
+      author={Hugo Touvron and Thibaut Lavril and Gautier Izacard and Xavier Martinet and Marie-Anne Lachaux and Timothée Lacroix and Baptiste Rozière and Naman Goyal and Eric Hambro and Faisal Azhar and Aurelien Rodriguez and Armand Joulin and Edouard Grave and Guillaume Lample},
+      year={2023},
+      eprint={2302.13971},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2302.13971}, 
+}
+
+% -------------------- REPOSITORIES -------------------------
+@misc{modded_nanogpt_2024,
+  author       = {Keller Jordan and Jeremy Bernstein and Brendan Rappazzo and
+                  @fernbear.bsky.social and Boza Vlado and You Jiacheng and
+                  Franz Cesista and Braden Koszarsky and @Grad62304977},
+  title        = {modded-nanogpt: Speedrunning the NanoGPT baseline},
+  year         = {2024},
+  url          = {https://github.com/KellerJordan/modded-nanogpt}
+}
