@@ -24,6 +24,17 @@ class ShardIterationState:
     offset_in_row_group: int = 0
     epoch: int = 1
 
+def list_parquet_files(data_dir=None):
+    """Looks into a data dir and returns full paths to all parquet files."""
+    if data_dir is None:
+        data_dir = DATA_DIR
+    if isinstance(data_dir, str):
+        data_dir = Path(data_dir).resolve()
+
+    return list(sorted(
+        p for p in data_dir.iterdir()
+        if p.suffix == ".parquet"
+    ))
 
 class ShardManager:
     """

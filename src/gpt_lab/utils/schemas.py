@@ -400,7 +400,7 @@ class GenerationConfig(BaseModel):
             self.seed = 42  # Ensure seed is within valid range for torch.manual_seed
 
 class TrainingConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    # model_config = ConfigDict(frozen=True)
 
     # Training settings
     dist_info: dict = Field(default_factory=dict) # Used for distributed training, populated by get_dist_info()
@@ -451,6 +451,15 @@ class TrainingConfig(BaseModel):
     save_every: int = -1 # default: -1 (only at the end)
     log_every: int = -1 # default: -1 (only at the end)
 
+    def model_post_init(self, context: Any) -> None:
+        if self.adamw_weight_decay is None:
+            self.adamw_weight_decay = self.weight_decay 
+
+        if self.muon_weight_decay is None:
+            self.muon_weight_decay = self.weight_decay
+
+        self.model_config["frozen"] = True
+
     def lr_multiplier_schedule(self, step: int) -> float:
         n_steps = self.n_steps
         warmup_iters = self.lr_warmup_steps
@@ -476,7 +485,7 @@ class TrainingConfig(BaseModel):
             return progress * 1.0 + (1 - progress) * self.final_lr_ratio
     
     def weight_decay_schedule(self, step: int) -> float:
-        return self.weight_decay_scale *  0.5 * (1 + math.cos(math.pi * step / self.n_steps))
+        return self.weight_decay_scale * 0.5 * (1 + math.cos(math.pi * step / self.n_steps))
 
 class GPTConfig(BaseModel):
     """
