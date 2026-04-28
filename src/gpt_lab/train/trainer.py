@@ -299,7 +299,7 @@ class Trainer:
                 with self.val_context(_model):
                     val_res = compute_bpb(
                         _model, 
-                        self.val_loader, 
+                        self.val_loader(), 
                         eval_steps,
                         dist_info=self.config.dist_info,
                         token_bytes=self.tokenizer.token_bytes
@@ -390,7 +390,11 @@ class Trainer:
             
             for _ in range(n_acc_steps):
                 self.state.train_loader_state = dataloader_state
-                self.state.num_epochs = dataloader_state.epoch
+                if dataloader_state is not None:
+                    if isinstance(dataloader_state, ShardIterationState):
+                        self.state.num_epochs = dataloader_state.epoch
+                    else:
+                        self.state.num_epochs = dataloader_state.get("epoch", 0)
                 
                 with self.train_context():
                     loss = self._compute_loss(x, y)

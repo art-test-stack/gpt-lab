@@ -132,6 +132,9 @@ if __name__ == "__main__":
     auto_parser.add_argument("--log-every", type=int, default=250, help="(default: -1) Log metrics every N steps (-1 = last, 0 = disable, N > 0 = every N steps).")
     auto_parser.add_argument("--monitor-grad-norms", action="store_true", help="(default: False) Whether to monitor gradient norms during training. If set, will log the norm of the gradients of each parameter to the board at each training step.")
 
+    # For tests
+    auto_parser.add_argument("--use-nanochat-dataloader", action="store_true", help="(default: False) Whether to use the nanochat dataloader instead of the default dataloader.")
+
     # TODO: Arch-config subparser
     arch_parser = subparsers.add_parser("arch", help="Config model architecture based on model name (eg: gpt2, llama2, mixtral).")
     arch_parser = get_common_arguments(arch_parser)
@@ -257,6 +260,7 @@ if __name__ == "__main__":
         max_shards=None, # TODO: configured based on configs/data.yaml
         batch_size=base_training_config.get("device_batch_size", args.device_batch_size),
         dist_info=dist_info,
+        use_nanochat=args.use_nanochat_dataloader,
     )
     # TODO: add option to configure buffer size
     train_loader = build_dataloader(split="train", **loader_common_kwargs)
