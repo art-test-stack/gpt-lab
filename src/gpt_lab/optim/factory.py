@@ -317,7 +317,7 @@ class MuonAdamW(torch.optim.Optimizer):
             exp_avg = state['exp_avg']
             exp_avg_sq = state['exp_avg_sq']
             state['step'] += 1
-
+            
             # Fill 0-D tensors with current values
             self._adamw_step_t.fill_(state['step'])
             self._adamw_lr_t.fill_(group['lr'])
@@ -536,7 +536,6 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 state['exp_avg'] = torch.zeros_like(p_slice)
                 state['exp_avg_sq'] = torch.zeros_like(p_slice)
             state['step'] += 1
-
             # Fill 0-D tensors and run fused kernel
             self._adamw_step_t.fill_(state['step'])
             self._adamw_lr_t.fill_(group['lr'])

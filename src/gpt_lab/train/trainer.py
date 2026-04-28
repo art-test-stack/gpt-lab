@@ -31,6 +31,7 @@ from gpt_lab.utils.schemas import TrainingConfig, TrainingMetrics, EvalMetrics, 
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
 from gpt_lab.model.gpt import GPTModel
+from gpt_lab.data.sharder import ShardIterationState
 
 
 # ============================================================================
@@ -46,6 +47,7 @@ class TrainerState:
     best_val_loss: float = float('inf')
     total_training_time: float = 0.0
     smooth_train_loss: float = 0.0
+    train_loader_state: Optional[ShardIterationState] = None
     
     # Dataloader state for resumption
 
@@ -388,6 +390,7 @@ class Trainer:
             
             for _ in range(n_acc_steps):
                 self.state.train_loader_state = dataloader_state
+                self.state.num_epochs = dataloader_state.epoch
                 
                 with self.train_context():
                     loss = self._compute_loss(x, y)
@@ -409,7 +412,7 @@ class Trainer:
                     torch.save(x, CACHE_DIR / "bad_batch.pt")
                     raise ValueError(f"Loss is NaN or Inf at {step=}, {loss_accum=}")
                 x, y, dataloader_state = next(train_iter)
-
+                
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
 
             if self.config.monitor_grad_norms and self.config.dist_info["RANK"] == 0:
