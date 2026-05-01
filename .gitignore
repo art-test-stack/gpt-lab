@@ -14,6 +14,7 @@ archive/
 # work in progress, not ready for sharing yet
 dumas.py 
 draft.md
+_dumas.py
 
 # C extensions
 *.so

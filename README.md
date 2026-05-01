@@ -106,6 +106,10 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
   ```bash
   uv sync --group=dev
   ```
+- To use the library in jupyter notebooks:
+  ```bash
+  uv sync --group=notebook
+  ```
 
 > [!NOTE]  
 > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation. Default mode uses `kernels` implementation, making the installation easier.
@@ -144,6 +148,25 @@ data_loader: DistDataLoader = build_dataloader(
     base_url="karpathy/climbmix-400b-shuffle", # for starting point
     max_shards=6542 # last shard id for the given dataset (if not provided, it will be computed by probing the server, which can take a while)
 ) 
+```
+
+Notice that if you use split `val`, you will get a simple function that returns a dataloader; which permits to ensure the same validation set across different training runs, steps, etc.
+
+```python
+from gpt_lab.data.loader import build_dataloader
+
+val_loader_fn = build_dataloader(
+    name="climbix-base",
+    tokenizer=tokenizer,
+    column="text",
+    split="val", # same config except here
+    seq_len=model.config.max_context,
+    batch_size=32,
+    base_url="karpathy/climbmix-400b-shuffle", 
+    max_shards=6542 
+) 
+
+val_loader = val_loader_fn() # called as a function to get the dataloader instance in trainer
 ```
 
 We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
@@ -419,8 +442,6 @@ and propose improvements via pull requests.
 2. [karpathy/nanochat](https://github.com/karpathy/nanochat/tree/master)  by Andrej Karpathy.
 3. [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) by Jordan Keller.
 
-### Some nice blogs and articles
-1. [Building a text generation model from scratch by Vincent Bons](https://wingedsheep.com/building-a-language-model/)
 ## Some nice blogs and web-articles
 
 1. Huggingface or nanotron playbooks. All of them are very good. It takes days to read them all, and more to diggest, but they are worth it.
@@ -543,6 +564,7 @@ If you use this work in your research, *please* consider citing the following:
   author={Testard, Arthur},
   title={gpt-lab: A light-weight library for fast-ablation studies on GPT-like LMs},
   year={2026},
+  publisher = {GitHub},
   url={https://github.com/art-test-stack/gpt-lab}
 }
 ```

@@ -289,18 +289,19 @@ class Tokenizer(_BaseTokenizer):
             self.token_bytes = self.get_token_bytes()
 
     @classmethod
-    def from_pretrained(cls, name: str, source: Optional[str] = None):
+    def from_pretrained(cls, name: str, source: Optional[str] = None, special_tokens: Optional[SpecialTokens] = None):
+        if special_tokens is None:
+            special_tokens = SpecialTokens()
         if source is None:
             for source in ("tiktoken", "huggingface", "local"):
                 try:
-                    return cls.from_pretrained(name, source=source)
+                    return cls.from_pretrained(name, source=source, special_tokens=special_tokens)
                 except Exception as e:
                     print(f"Failed to load tokenizer from source {source} with error: {e}. Trying next source...")
             raise ValueError(f"Failed to load tokenizer {name} from all sources.")
         elif source == "tiktoken":
             enc = tiktoken.get_encoding(name)
             mergeable_ranks = enc._mergeable_ranks
-            special_tokens = enc._special_tokens
             pat_str = enc._pat_str
             config = TokenizerConfig(
                 name=name,
@@ -309,7 +310,7 @@ class Tokenizer(_BaseTokenizer):
                 pat_str=pat_str,
                 special_tokens=special_tokens
             )
-            return cls(enc, mergeable_ranks, special_tokens, config)
+            return cls(mergeable_ranks, special_tokens.list(), config)
         elif source == "huggingface":
             return HuggingFaceTokenizerWrapper.from_pretrained(name)
         elif source == "local":
