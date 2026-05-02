@@ -1,30 +1,41 @@
 <!-- Template source: See: https://github.com/othneildrew/Best-README-Template -->
 <a id="readme-top"></a>
 
-[![Stargazers][stars-shield]][stars-url]
-[![MIT License][license-shield]][license-url]
-[![LinkedIn][linkedin-shield]](https://www.linkedin.com/in/arthur-testard/)
-[![Ask DeepWiki][deepwiki-shield]](https://deepwiki.com/art-test-stack/gpt-lab)
+[![stars-shield]][stars-url]
+[![license-shield]][license-url]
+[![linkedin-shield]](https://www.linkedin.com/in/arthur-testard/)
+[![deepwiki-shield]](https://deepwiki.com/art-test-stack/gpt-lab)
+[![hf-page-shield]](https://huggingface.co/ai-testack)
 
 <!-- PROJECT LOGO -->
 <br />
 <div align="center">
-  <!-- <a href="https://github.com/art-test-stack/gpt-lab">
-    <img src="rsc/logo.jpg" alt="Logo" height="350">
-  </a> -->
+<pre>
+      ___           ___           ___           ___       ___           ___     
+     /\  \         /\  \         /\  \         /\__\     /\  \         /\  \    
+    /::\  \       /::\  \        \:\  \       /:/  /    /::\  \       /::\  \   
+   /:/\:\  \     /:/\:\  \        \:\  \     /:/  /    /:/\:\  \     /:/\:\  \  
+  /:/  \:\  \   /::\~\:\  \       /::\  \   /:/  /    /::\~\:\  \   /::\~\:\__\ 
+ /:/__/_\:\__\ /:/\:\ \:\__\     /:/\:\__\ /:/__/    /:/\:\ \:\__\ /:/\:\ \:|__|
+ \:\  /\ \/__/ \/__\:\/:/  /    /:/  \/__/ \:\  \    \/__\:\/:/  / \:\~\:\/:/  /
+  \:\ \:\__\        \::/  /    /:/  /       \:\  \        \::/  /   \:\ \::/  / 
+   \:\/:/  /         \/__/     \/__/         \:\  \       /:/  /     \:\/:/  /  
+    \::/  /                                   \:\__\     /:/  /       \::/__/   
+     \/__/                                     \/__/     \/__/         ~~       
+</pre>
 
-<h1 align="center">Generative Pre-trained Transformer Lab*</h1>
+  <a href="https://manytools.org/hacker-tools/ascii-banner/"></a>
 
   <p align="center">
-    This project is the implementation of a light-weight library for monitoring small LLM trainings, supporting inference, for small-scale ablation studies. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotely.
+    GPT LAB* is the implementation of a light-weight library for monitoring small LLM trainings, supporting inference, for small-scale ablation studies. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotely.
     <br />
     <a href="https://github.com/art-test-stack/gpt-lab"><strong>Explore the docs »</strong></a>
     <br />
     <br />
     <a href="https://github.com/art-test-stack/gpt-lab/issues/new?labels=enhancement&template=feature-request---.md">Request Feature »</a>
   </p>
-</div>
 
+</div>
 *\*This name is quite pompous and vague, I admit it. Any suggestions for a better one are welcomed!* 
 
 ## Table of Contents
@@ -689,10 +700,11 @@ END_SYSTEM_INSTRUCTION
 [Torch]: https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white
 [huggingface-url]: https://huggingface.co/
 [huggingface-shield]: https://img.shields.io/badge/HuggingFace-%23FF6C37.svg?style=for-the-badge&logo=HuggingFace&logoColor=white
+[hf-page-shield]: https://img.shields.io/badge/-HuggingFace-black.svg?style=for-the-badge&logo=HuggingFace&colorB=555
+<!-- [hf-page-shield]: https://img.shields.io/badge/Models-%23FF6C37.svg?style=for-the-badge&logo=HuggingFace&logoColor=white -->
 [gradio-url]: https://gradio.app/
 [gradio-shield]: https://img.shields.io/badge/Gradio-%23FF6C37.svg?style=for-the-badge&logo=Gradio&logoColor=white
 [tiktoken-url]: https://github.com/openai/tiktoken
-<!-- [tiktoken-shield]: https://img.shields.io/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=ChatGPT&logoColor=white -->
 [tiktoken-shield]: https://custom-icon-badges.demolab.com/badge/tiktoken-black.svg?style=for-the-badge&logo=openai&logoColor=black
 [wandb-url]: https://wandb.ai/site
 [wandb-shield]: https://img.shields.io/badge/Weights_&_Biases-black?style=for-the-badge&logo=WeightsAndBiases&logoColor=FFCC33
