@@ -1,13 +1,16 @@
 <!-- Template source: See: https://github.com/othneildrew/Best-README-Template -->
 <a id="readme-top"></a>
 
+<!-- PROJECT HEADER -->
+<div align="center">
+
 [![stars-shield]][stars-url]
 [![license-shield]][license-url]
-[![linkedin-shield]](https://www.linkedin.com/in/arthur-testard/)
 [![deepwiki-shield]](https://deepwiki.com/art-test-stack/gpt-lab)
 [![hf-page-shield]](https://huggingface.co/ai-testack)
+[![linkedin-shield]](https://www.linkedin.com/in/arthur-testard/)
+</div>
 
-<!-- PROJECT LOGO -->
 <br />
 <div align="center">
 <pre>
@@ -23,11 +26,10 @@
     \::/  /                                   \:\__\     /:/  /       \::/__/   
      \/__/                                     \/__/     \/__/         ~~       
 </pre>
-
-  <a href="https://manytools.org/hacker-tools/ascii-banner/"></a>
+</div>
 
   <p align="center">
-    GPT LAB* is the implementation of a light-weight library for monitoring small LLM trainings, supporting inference, for small-scale ablation studies. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotely.
+  GPT LAB* is a light-weight library for monitoring small LLM trainings, supporting inference, for small-scale ablation studies. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotely.
     <br />
     <a href="https://github.com/art-test-stack/gpt-lab"><strong>Explore the docs »</strong></a>
     <br />
@@ -35,7 +37,6 @@
     <a href="https://github.com/art-test-stack/gpt-lab/issues/new?labels=enhancement&template=feature-request---.md">Request Feature »</a>
   </p>
 
-</div>
 *\*This name is quite pompous and vague, I admit it. Any suggestions for a better one are welcomed!* 
 
 ## Table of Contents
