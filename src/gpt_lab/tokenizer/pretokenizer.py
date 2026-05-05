@@ -6,6 +6,7 @@ from tokenizers import NormalizedString, PreTokenizedString
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+# derived from https://github.com/angeluriot/Language_model/blob/41b10ef/dimgpt/data/pretokenizer.py
 class SimplePreTokenizer:
     def __init__(self, config: TokenizerConfig):
         self.split_pattern = config.pat_str

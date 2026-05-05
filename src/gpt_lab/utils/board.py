@@ -10,18 +10,20 @@ except:
     tb = None
 from gpt_lab.utils.default import BOARD_DIR
 import warnings
+from gpt_lab.utils.logging import error
+import logging
 
+logger = logging.getLogger(__name__)
 
 class DummyBoard:
-    def __init__(self) -> None:
+    def __init__(self):
         pass
-
-    def log(self, *args, **kwargs) -> None:
+    def log(self, *args, **kwargs):
         pass
-
-    def __call__(self, *args, **kwds):
+    def init(self, *args, **kwargs):
         pass
- 
+    def finish(self, *args, **kwargs):
+        pass
 
 class Board:
     def __init__(
@@ -47,20 +49,24 @@ class Board:
             )
             
         elif self.board_type == "trackio":
-            import trackio
-            self.main = trackio.init(
-                project=project,
-                name=run,
-                dir=board_dir, # TODO
-                config=config,
-            )
+            try:
+                import trackio
+                self.main = trackio.init(
+                    project=project,
+                    name=run,
+                    dir=board_dir, # TODO
+                    config=config,
+                )
+            except ImportError:
+                error("trackio is not installed. Please install trackio to use the trackio board. Falling back to dummy board.", logger=logger)
+                self.main = DummyBoard()
+
         elif self.board_type == "tensorboard":
             if tb is None:
-                raise ImportError("tensorboard is not installed. Please install tensorboard to use the tensorboard board.")
+                raise logger.critical("tensorboard is not installed. Please install tensorboard to use the tensorboard board.")
             self.main = tb.SummaryWriter(
                 log_dir=board_dir
             ) # TODO
-            print("config: ", config)
             for key, value in config.items():
                 import torch
                 if not type(value) in [str, int, float, bool, torch.Tensor]:

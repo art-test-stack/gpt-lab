@@ -563,7 +563,7 @@ def main():
             print0(f"CORE metric: {core_results['core_metric']:.4f}")
 
     # --- Log to report ---
-    from gpt_lab.utils.report import get_report
+    from gpt_lab.utils.system import get_report
     report_data = [{"model": model_name}]
 
     if core_results:

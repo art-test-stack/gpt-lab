@@ -6,7 +6,8 @@ import torch
 
 from gpt_lab.utils.default import DATA_DIR
 from gpt_lab.utils.distributed import get_dist_info
-from gpt_lab.data.sharder import ShardManager, ShardIterationState
+from gpt_lab.utils.schemas import DataLoaderState
+from gpt_lab.data.sharder import ShardManager
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -26,13 +27,14 @@ class ShardedDataset:
         name: str,
         tokenizer: Optional[Callable] = None,
         split: str = "train",
-        start_state: Optional[ShardIterationState] = None,
+        start_state: Optional[DataLoaderState] = None,
         base_url: Optional[str] = None,
         column: str = "text",
         shard_limit: Optional[int] = None,
         max_shards: Optional[int] = None,
         cachedir: Union[str, Path] = DATA_DIR,
         dist_info: Optional[dict] = None,
+        tokenizer_threads: int = 4,
     ):
         if isinstance(cachedir, str):
             cachedir = Path(cachedir)
@@ -47,17 +49,18 @@ class ShardedDataset:
             column_name=column,
             shard_limit=shard_limit,
             max_shards=max_shards,
-            dist_info=dist_info,
+            dist_info=dist_info
         )
         self.tokenizer = tokenizer
         self.split = split
         self.start_state = start_state
+        self.tokenizer_threads = tokenizer_threads
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, ShardIterationState]]:
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, DataLoaderState]]:
         for texts, state in self.sm.iterate(start_state=self.start_state):
             for txt in texts:
                 tokens = (
-                    self.tokenizer(txt, prepend_bos=True)
+                    self.tokenizer(txt, prepend_bos=True, threads=self.tokenizer_threads)
                     if self.tokenizer is not None
                     else txt
                 )
@@ -88,8 +91,8 @@ class DistDataLoader:
       thousands of documents and consume gigabytes of memory before the
       first batch.
 
-    * Documents are separated by an explicit EOS token so the model always
-      sees clean boundaries: …doc_N_last [EOS] [BOS] doc_N+1_first…
+    * Documents are separated by an explicit BOS token so the model always
+      sees clean boundaries: …doc_N_last [BOS] doc_N+1_first…
       Without this, cross-document targets are silently trained on,
       which is especially harmful for value-embedding architectures where
       BOS is the per-document anchor.
@@ -122,9 +125,9 @@ class DistDataLoader:
         self.token_buffer_size = buffer_size or (batch_size * seq_len * 16)
 
         self.iterator = iter(dataset)
-        self.buffer: deque[Tuple[torch.Tensor, ShardIterationState]] = deque()
+        self.buffer: deque[Tuple[torch.Tensor, DataLoaderState]] = deque()
         self._buffered_tokens: int = 0
-        self.last_state: Optional[ShardIterationState] = None
+        self.last_state: Optional[DataLoaderState] = None
 
         total = batch_size * (seq_len + 1)
 
@@ -140,8 +143,8 @@ class DistDataLoader:
         _out = torch.empty(
             2 * batch_size * seq_len, dtype=torch.long, device=self.device
         )
-        self.inputs  = _out[: batch_size * seq_len].view(batch_size, seq_len)
-        self.targets = _out[batch_size * seq_len :].view(batch_size, seq_len)
+        self.inputs  = _out[:batch_size * seq_len].view(batch_size, seq_len)
+        self.targets = _out[batch_size * seq_len:].view(batch_size, seq_len)
 
     def _refill(self) -> None:
         """Pull documents from the dataset until the token budget is met."""
@@ -157,20 +160,13 @@ class DistDataLoader:
                 # reaching here means something went wrong upstream.
                 break
 
-            # Append EOS so the model sees an explicit document boundary.
-            # The next document's BOS (prepended by the tokenizer) will
-            # immediately follow, giving the sequence:
-            #   …last_tok [EOS] [BOS] first_tok…
-            if self.eos_token_id is not None:
-                tokens = torch.cat([tokens, tokens.new_tensor([self.eos_token_id])])
-
             self.buffer.append((tokens, state))
             self._buffered_tokens += len(tokens)
 
     def __iter__(self):
         return self
 
-    def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, ShardIterationState]:
+    def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
         self._refill()
         B, T = self.B, self.T
         total = B * (T + 1)
@@ -377,7 +373,10 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
 
-        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+        # state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+        # replaced the line above with the line below to return a state object consistent with the rest of the codebase
+        # offset in row group is not tracked in nanochat dataloader
+        state_dict = DataLoaderState(shard_idx=pq_idx, row_group_idx=rg_idx, epoch=epoch)
 
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
@@ -401,8 +400,10 @@ def build_dataloader(
     max_shards: Optional[int] = None,
     buffer_size: Optional[int] = None,
     cachedir: Optional[Union[str, Path]] = None,
-    start_state: Optional[ShardIterationState] = None,
+    datadir: Optional[Union[str, Path]] = None,
+    resume_state: Optional[DataLoaderState] = None,
     dist_info: Optional[dict] = None,
+    tokenizer_threads: int = 4,
     use_nanochat: bool = False,
 ) -> DistDataLoader:
     if dist_info is None:
@@ -410,17 +411,25 @@ def build_dataloader(
     if use_nanochat:
         # This is the original dataloader from nanochat, from which I derived the pipeline for gpt-lab.
         # So it is based on the same underlying data loading and on-the-fly tokenization
+        if resume_state is not None:
+            resume_state_dict = dict(
+                pq_idx=resume_state.shard_idx,
+                rg_idx=resume_state.row_group_idx,
+                epoch=resume_state.epoch
+            )
+        else:
+            resume_state_dict = None
         dataloader = lambda: tokenizing_distributed_data_loader_with_state_bos_bestfit(
             tokenizer=tokenizer,
             B=batch_size,
             T=seq_len,
             split=split,
-            tokenizer_threads=4,
+            tokenizer_threads=tokenizer_threads,
             tokenizer_batch_size=128,
             device=dist_info["DEVICE"],
-            resume_state_dict=start_state._asdict() if start_state is not None else None,
+            resume_state_dict=resume_state_dict,
             buffer_size=buffer_size or (batch_size * seq_len * 16),
-            base_path=DATA_DIR / name
+            base_path=datadir / name
         )
     else:
         ds = ShardedDataset(
@@ -432,7 +441,7 @@ def build_dataloader(
             shard_limit=shard_limit,
             max_shards=max_shards,
             cachedir=cachedir,
-            start_state=start_state,
+            start_state=resume_state,
             dist_info=dist_info,
         )
         dataloader = lambda: DistDataLoader(

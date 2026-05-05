@@ -39,17 +39,21 @@ Please cite this work if the code is helpful to you.
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
-from gpt_lab.utils.common import get_banner, print0, print0_dict
+from gpt_lab.utils.common import get_banner, print0_dict
+from gpt_lab.utils.logging import init_logger, log0
 from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER
 from gpt_lab.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups
-from gpt_lab.utils.report import get_git_info, get_gpu_info, get_system_info
-from gpt_lab.utils.schemas import GPTConfig, TrainingConfig
+from gpt_lab.utils.system import get_git_info, get_gpu_info, get_system_info
+from gpt_lab.utils.schemas import GPTConfig, TrainerConfig
 
 from gpt_lab.model.auto import AutoGPTConfig
 from gpt_lab.model.gpt import DenseTransformer
+from gpt_lab.model.checkpoint import load_meta_config, load_model_from_dir
 
 from argparse import ArgumentParser
-
+import logging
+init_logger()
+logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     get_banner(to_print=True)
@@ -59,19 +63,19 @@ if __name__ == "__main__":
     # Common arguments
     def get_common_arguments(prs: ArgumentParser):
         prs.add_argument("--model-name", type=str, default="ic1", help="Model name")
+        prs.add_argument("--model-tag", type=str, default=None, help="(default: None) Model tag for checkpointing and logging. If not set, will be set as <device>_d<depth>_cmt_<git_commit>_dt_<datetime.now()>. Highly recommended to set for --resume mode to work properly.")
         prs.add_argument("--model-dir", type=str, default=str(MODELS_FOLDER), help="Cache directory to save model checkpoints and logs.")
-        prs.add_argument("--weight-decay", type=float, default=0.28, help="(default: 0.28) Weight decay for optimizer.")
         prs.add_argument("--max-seq-len", type=int, default=2048, help="(default: 2048) Maximum sequence length for training.")
         prs.add_argument("--random-seed", type=int, default=42, help="(default: 42) Random seed for model initialization")
         # TODO: separate random seed for model initialization and training (data shuffling, dropout, etc.)
         # prs.add_argument("--random-seed", type=int, default=42, help="(default: 42) Random seed for model initialization")
         prs.add_argument("--optim-config-path", type=str, default=None, help="(default: None) Path to optimizer config file. If not set, will use default config based on model size.")
-        prs.add_argument("--device", type=str, default="auto", help="(default: auto) Device to train on. If 'auto', will detect best device available.")
+        prs.add_argument("--device", type=str, default="auto", help="(default: auto) Device to train on. If 'auto', will detect best device available. Recommended to keep as 'auto' unless you have specific needs.")
         prs.add_argument("--board", default="wandb", type=str, choices=("tensorboard", "wandb", "dummy"), help="(default: wandb) Board log directory (options: 'tensorboard', 'wandb', 'dummy').")
         prs.add_argument("--board-dir", type=str, default=None, help="(default: None) Directory to save board logs. If not set, will use default cache directory.")
         prs.add_argument("--ds-config-path", type=str, default="configs/data.yaml", help="(default: configs/data.yaml) Path to datasets config file. If not set, will use default config.")
         prs.add_argument("--ds-name", type=str, default="climbmix-base", help="(default: climbmix-base) Name of the dataset to train on (must be in config YAML file).")
-        prs.add_argument("--resume-from-ckpt", type=str, default=None, help="(default: None) Path to checkpoint to resume training from. If not set, will train from scratch.")
+
         return prs
     
     # Auto-config subparser
@@ -90,6 +94,7 @@ if __name__ == "__main__":
     auto_parser.add_argument("--vocab-size", type=int, default=-1, help="(default: -1) Vocabulary size for auto-configured models. If not set, will be determined by vocab size scaling law based on model depth.")
     auto_parser.add_argument("--pat-str", type=str, default=None, help="(default: None) Split pattern for pre-tokenization if training a new-tokenizer. Options are 'gpt2, 'gpt4', 'cl100k_base', 'o200k_base', or directly the pattern string. If not set, will default to 'gpt2' pattern.")
     auto_parser.add_argument("--train-tokenizer", action="store_true", help="(default: False) Whether to train a new tokenizer from scratch.")
+    auto_parser.add_argument("--clamp-tokenizer", action="store_true", help="(default: False) Whether to clamp tokenizer values.")
 
     ## Model arguments
     auto_parser.add_argument("--depth", type=int, default=12, help="(default: 12) Number of model layers.")
@@ -107,7 +112,6 @@ if __name__ == "__main__":
     auto_parser.add_argument("--target-flops", type=float, default=-1., help="(default: -1.) Target FLOPS for auto-configured models.")
     auto_parser.add_argument("--target-param-data-ratio", type=float, default=11., help="(default: 11.) Target parameter-to-data ratio for auto-configured models.")
     auto_parser.add_argument("--target-time", type=float, default=-1., help="(default: -1.) Target training time in seconds for auto-configured models. This parameter overrides num-steps. (Default: -1, meaning not used)")
-    auto_parser.add_argument("--use-amp", action="store_true", help="(default: False) Whether to use automatic mixed precision (AMP) during training for auto-configured models.")
     auto_parser.add_argument("--fp8", action="store_true", help="(default: False) Whether to use FP8 precision for auto-configured models. This is an experimental feature and may not be stable. Use with caution.")
 
     ## Optimization
@@ -120,6 +124,7 @@ if __name__ == "__main__":
     auto_parser.add_argument("--lr-residuals", type=float, default=.5, help="(default: 0.5) Learning rate for residual connections for auto-configured models.")
     auto_parser.add_argument("--warmup-steps", type=int, default=40, help="(default: 40) Number of warmup steps for learning rate scheduler.")
     auto_parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="(default: 0.65) Ratio of training steps to warm down the learning rate at the end of training for auto-configured models.")
+    auto_parser.add_argument("--weight-decay", type=float, default=0.28, help="(default: 0.28) Weight decay for optimizer.")
     auto_parser.add_argument("--final-lr-frac", type=float, default=0.05, help="(default: 0.05) Final learning rate as a fraction of the initial learning rate for auto-configured models.")
 
     ## Evaluation
@@ -135,18 +140,26 @@ if __name__ == "__main__":
     # For tests
     auto_parser.add_argument("--use-nanochat-dataloader", action="store_true", help="(default: False) Whether to use the nanochat dataloader instead of the default dataloader.")
 
+    # Resume training from checkpoint
+    resume_parser = subparsers.add_parser("resume", help="Resume training from checkpoint. Skip model and optimizer initialization and load from checkpoint path specified by '--checkpoint-path' argument or automatically determined from 'model-dir', 'model-name' and 'model-tag' if not set.")
+    resume_parser = get_common_arguments(resume_parser)
+    resume_parser.add_argument("--checkpoint-step", type=str, default=None, help="(default: -1) Step of checkpoint to resume from. If not set, will try to resume from the latest checkpoint in checkpoint directory. Otherwise, with -1, -2, etc., will try to resume from the last, second to last, etc. checkpoint in checkpoint directory.")
+    resume_parser.add_argument("--checkpoint-dir", type=str, default=None, help="(default: None) Path to checkpoint to resume from. If not set, will try to automatically determine checkpoint path from 'model-dir', 'model-name', 'model-tag' and 'checkpoint-step' arguments. It is recommended to let the system automatically determine the checkpoint path by setting this argument to None, as long as your checkpoints are organized in the default way by the training script (ie: <model_dir>/<model_tag>/source/<checkpoint_dir>/checkpoint files).")
+
+    # every other parameters are given by the checkpoint config
+
     # TODO: Arch-config subparser
     arch_parser = subparsers.add_parser("arch", help="Config model architecture based on model name (eg: gpt2, llama2, mixtral).")
     arch_parser = get_common_arguments(arch_parser)
 
     # TODO: Custom-config subparser
-    custom_parser = subparsers.add_parser("cust", help="Custom-config model with specified parameters.")
+    custom_parser = subparsers.add_parser("cust", help="Custom-config model with specified parameters (heavy).")
     custom_parser = get_common_arguments(custom_parser)
-    custom_parser.add_argument("--batch-size", type=int, default=-1, help="(default: -1) Batch size for training.")
-    custom_parser.add_argument("--learning-rate", type=float, default=1e-4, help="(default: 1e-4) Learning rate for optimizer.")
-    
+
     args = parser.parse_args()
     board_args = vars(args).copy()
+
+    log0(f"Initializing model base training on mode {args.model_init!r}", logger=logger)
 
     # ------------------------------------------------------------------------------
     # SETUP ENVIRONEMENT
@@ -175,19 +188,20 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------------
 
     if args.model_init == "auto":
-        mconfig = AutoGPTConfig(
+        meta_config = AutoGPTConfig(
             # metadata
-            basename=args.model_name,
+            name=args.model_name,
+            model_tag=args.model_tag,
             dirname=args.model_dir,
             random_seed=args.random_seed,
             dist_info=dist_info,
+            max_seq_len=args.max_seq_len,
             # tokenizer
             tokenizer_model="auto" if args.train_tokenizer else args.tokenizer_model,
             vocab_size=args.vocab_size,
             # model architecture
             depth=args.depth,
             aspect_ratio=args.aspect_ratio,
-            max_seq_len=args.max_seq_len,
             d_head=args.d_head,
             d_kv_head=args.d_kv_head,
             window_pattern=args.window_pattern,
@@ -203,19 +217,26 @@ if __name__ == "__main__":
             n_acc_steps=args.n_acc_steps,
             device_batch_size=args.device_batch_size,
             total_batch_size=args.total_batch_size,
-        )
-        meta_config = mconfig.generate_gpt_config(device)
+        ).generate_gpt_config(device)
         model: DenseTransformer = meta_config["model"]
         tokenizer = meta_config["tokenizer"]
-        base_training_config = meta_config["training_config"]
+        base_training_config = meta_config["training_base_config"]
 
+    elif args.model_init == "resume":
+        # load config from checkpoint and override with CLI args if specified
+        meta_config = load_meta_config(name=args.model_name, 
+            model_tag=args.model_tag, model_cachedir=args.model_dir)
+        model: DenseTransformer = meta_config["model"]
+        tokenizer = meta_config["tokenizer"]
+        base_training_config = {} # this will be loaded from checkpoint later, for now just set as empty dict
+    
     elif args.model_init == "arch":
         raise NotImplementedError("Arch-model configuration is not implemented yet. Please use 'auto' mode for now.")
     
     elif args.model_init == "cust":
         raise NotImplementedError("Custom model configuration is not implemented yet. Please use 'auto' mode for now.")
         gpt_config = GPTConfig(
-            basename=args.model_name,
+            name=args.model_name,
             dirname=args.model_dir,
             n_steps=args.num_steps,
             batch_size=args.batch_size,
@@ -234,21 +255,31 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------------
 
     # TODO: add option to resume training from checkpoint
-    model = model.to_empty(device=device)    
-    model.init_weights()
+    if not args.model_init == "resume":
+        model = model.to_empty(device=device)    
+        model.init_weights()
+    else:
+        log0("Resuming training from checkpoint.", logger=logger)
+        model, tokenizer, _ = load_model_from_dir(
+            model_name=meta_config["name"],
+            model_tag=meta_config["model_tag"],
+            step=args.checkpoint_step,
+            phase="train",
+            model_cachedir=args.model_dir,
+            dist_info=dist_info,
+        )
+
     assert model.embeds.weight.device.type == dist_info["DEVICE_TYPE"], "Model parameters are not on the correct device after initialization."
 
     # ------------------------------------------------------------------------------
     # DATASET, DATALOADERS
     # ------------------------------------------------------------------------------
 
-    # TODO: 
-    # manage datasets
-    # init shard manager
-    # from gpt_lab.data.sharder import ShardManager
-    # shard_manager = ShardManager(data_dir=DATA_DIR, name="base")
-    # init tokenizing data loaders
     from gpt_lab.data.loader import build_dataloader
+
+    resume_state = None
+    if args.model_init == "resume":
+        resume_state = ...
 
     loader_common_kwargs = dict(
         name=args.ds_name,
@@ -263,7 +294,7 @@ if __name__ == "__main__":
         use_nanochat=args.use_nanochat_dataloader,
     )
     # TODO: add option to configure buffer size
-    train_loader = build_dataloader(split="train", **loader_common_kwargs)
+    train_loader = build_dataloader(split="train", resume_state=resume_state, **loader_common_kwargs)
     val_loader = build_dataloader(split="val", **loader_common_kwargs)
 
     # ------------------------------------------------------------------------------
@@ -272,7 +303,7 @@ if __name__ == "__main__":
 
     lr_scale = base_training_config.get("batch_lr_scale", 1.0)
     weight_decay_scale = base_training_config.get("weight_decay_scale", 1.0)
-    trainer_config = TrainingConfig(
+    trainer_config = TrainerConfig(
         lr_embeddings=args.lr_embeddings * lr_scale,
         lr_transformer=args.lr_transformer * lr_scale,
         lr_head=args.lr_head * lr_scale,
@@ -291,11 +322,13 @@ if __name__ == "__main__":
         sample_every=args.sample_every,
         save_every=args.save_every,
         log_every=args.log_every,
-        use_amp=args.use_amp,
         monitor_grad_norms=args.monitor_grad_norms,
+        # training horizon args from meta config
         **base_training_config
     )
     print0_dict("Trainer config", trainer_config.model_dump())
+    if args.model_init == "resume":
+        trainer_config = ...
 
     optimizers = model.build_optimizer(trainer_config)
 
@@ -310,8 +343,8 @@ if __name__ == "__main__":
         board = Board(
             board_type=args.board,
             # entity_name=None, # TODO: add option for wandb entity
-            project=f"trainbase_{meta_config['project']}",
-            run=meta_config['name'],
+            project=f"trainbase_{meta_config['name']}",
+            run=meta_config['model_tag'],
             config=board_args | {"meta_config": meta_config, "training_config": base_training_config, "model_card": model.config.model_dump()},
             board_dir=args.board_dir,
         )
@@ -323,18 +356,25 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------------
 
     from gpt_lab.train.trainer import Trainer
-    trainer = Trainer(
-        model=model, tokenizer=tokenizer, optimizer=optimizers, 
-        train_loader=train_loader, val_loader=val_loader,
-        config=trainer_config, board=board, checkpoint_dir=meta_config["dirname"] 
-    )
+
+    if args.model_init != "resume":
+        trainer = Trainer(
+            model=model, tokenizer=tokenizer, optimizer=optimizers, 
+            train_loader=train_loader, val_loader=val_loader,
+            config=trainer_config, board=board, checkpoint_dir=meta_config["dirname"] 
+        )
+    else:
+        # TODO
+        trainer = Trainer.resume_from_step(
+            
+        )
     trainer.train()
 
     # ------------------------------------------------------------------------------
     # LOG REPORT
     # ------------------------------------------------------------------------------
 
-    from gpt_lab.utils.report import get_report
+    from gpt_lab.utils.system import get_report
 
     # get_report().log(section="Base model training", data=[
     #     board_args, # CLI args

@@ -21,12 +21,13 @@ from gpt_lab.utils.schemas import (
     GPTConfig, 
     ModelOutput, 
     ModelCompletionOutput,
-    TrainingConfig,
+    TrainerConfig,
     TransformerConfig, 
     TransformerOutput
 )
 from gpt_lab.utils.default import MODELS_FOLDER, DEVICE
 from gpt_lab.utils.common import print0, print0_dict
+from gpt_lab.utils.logging import log0
 
 from gpt_lab.tokenizer.tokenizer import Tokenizer
 
@@ -39,28 +40,9 @@ import torch.nn.functional as F
 import math
 from pathlib import Path
 
-import warnings
+import logging
 
-
-def build_meta_model(config: TransformerConfig) -> "DenseTransformer":
-    with torch.device("meta"):
-        model = DenseTransformer(config=config)
-    return model
-
-def build_model_from_config(
-        config: GPTConfig,
-    ) -> "DenseTransformer":
-    model = build_meta_model(config.model)
-    model = model.to_empty(device=config.device)
-    model.init_weights()
-    try:
-        pe_cache = model._precompute_pos_enc()
-        model.pe_cache = pe_cache
-    except Exception as e:
-        warnings.warn(f"Precomputation of positional encodings failed: {str(e)}", UserWarning)
-    
-    model.to_empty(device=config.device)
-    return model
+logger = logging.getLogger(__name__)
 
 
 class BaseTransformer(Module):
@@ -103,6 +85,7 @@ class DenseTransformer(BaseTransformer):
 
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
+
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         
         # TODO: change to customed embedding
@@ -260,7 +243,7 @@ class DenseTransformer(BaseTransformer):
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token
     
-    def build_optimizer(self, config: TrainingConfig, optim_config_path: Optional[str] = None) -> torch.optim.Optimizer:
+    def build_optimizer(self, config: TrainerConfig, optim_config_path: Optional[str] = None) -> torch.optim.Optimizer:
         # default config, overriden by optim_config_path if provided
         optim_config = {
             "embeddings":       dict(opt='adamw', lr=config.lr_embeddings,       betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
@@ -335,7 +318,6 @@ class DenseTransformer(BaseTransformer):
             param_groups.append(dict(
                 name=f"block.{shape}", params=group_params, **optim_config["transformer"]
             ))
-
         optimizer = OptimizerFactory(param_groups, dist_info=config.dist_info)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
@@ -355,7 +337,9 @@ class DenseTransformer(BaseTransformer):
         # assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
         if input_ids.shape[-1] > self.config.max_context:
-            warnings.warn(f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}. May cause unexpected behavior if model was initialized with a different max context.")
+            log0(f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}. "
+                 f"May cause unexpected behavior if model was initialized with a different max context.", 
+                 level="warning", logger=logger)
 
         if input_ids.dtype != torch.long:
             input_ids = input_ids.long()
@@ -542,11 +526,16 @@ class GPTModel:
             assistant_model = None, # TODO: implement assistant model functionality
         ) -> ModelCompletionOutput | Iterator[ModelCompletionOutput]:
         if assistant_model is not None:
-            warnings.warn("Assistant model functionality is not yet implemented. Assistant model provided is just ignored.", UserWarning)
+            log0("Assistant model functionality is not yet implemented. "
+                 "Assistant model provided is just ignored.", 
+                 level="warning", logger=logger)
         if generation_config is None:
-            warnings.warn("No generation config provided. Using default generation config with provided kwargs.", UserWarning)
+            log0("No generation config provided. Using default generation "
+                 "config with provided kwargs.", level="warning", logger=logger)
         if not generation_config.use_cache:
-            warnings.warn("GenerationConfig.use_cache is False. Generation may be slow as prefill will be done for each step.", UserWarning)
+            log0("GenerationConfig.use_cache is False. "
+                 "Generation may be slow as prefill will be done for each step.", 
+                 level="warning", logger=logger)
         if isinstance(generation_config, dict):
             generation_config = GenerationConfig.model_validate(**generation_config)
 
@@ -695,7 +684,8 @@ class GPTModel:
         ) -> "GPTModel":
         # TODO: Implement conversion from Huggingface models for compatibility
         from gpt_lab.model.wrapper import init_mistral_model
-        warnings.warn("Loading from Huggingface is experimental and may not work as expected. Only works with Mistral model for now.", UserWarning)
+        log0(f"Loading model from Huggingface: {model_name}. This is experimental and may not work as expected. " 
+             "Only works with Mistral model for now.", level="warning", logger=logger)
         model, tokenizer, config = init_mistral_model(model_name)
         gpt = cls(
             model=model,

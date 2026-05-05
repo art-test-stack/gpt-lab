@@ -9,14 +9,19 @@ Key responsibilities:
 - Device management and memory optimization
 """
 
-from typing import Optional, Callable, Union
+from typing import Optional, Callable, Union, Literal, Dict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+
+import random
+import numpy as np
+
 import time
 import pickle
 import gc
 import warnings
 import math
+import logging
 
 import torch
 import torch.nn as nn
@@ -27,30 +32,39 @@ from gpt_lab.utils.board import Board
 from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
 from gpt_lab.utils.distributed import _DTYPE_MAP
 from gpt_lab.utils.common import print0, print0_dict
-from gpt_lab.utils.schemas import TrainingConfig, TrainingMetrics, EvalMetrics, COREMetrics
+from gpt_lab.utils.logging import log_error, log_critical, log0
+from gpt_lab.utils.schemas import (
+    CheckpointState,
+    COREMetrics,
+    DataLoaderState,
+    EvalMetrics, 
+    TrainerConfig, 
+    TrainerMetrics, 
+    TrainerState
+)
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
 from gpt_lab.model.gpt import GPTModel
-from gpt_lab.data.sharder import ShardIterationState
+from gpt_lab.model.checkpoint import save_checkpoint, load_checkpoint
 
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Configuration & State
 # ============================================================================
 
-@dataclass
-class TrainerState:
-    """Complete state for trainer resumption."""
-    global_step: int = 0
-    global_tokens: int = 0
-    num_epochs: int = 0
-    best_val_loss: float = float('inf')
-    total_training_time: float = 0.0
-    smooth_train_loss: float = 0.0
-    train_loader_state: Optional[ShardIterationState] = None
+# @dataclass
+# class TrainerState:
+#     """Complete state for trainer resumption."""
+#     global_step: int = 0
+#     global_tokens: int = 0
+#     num_epochs: int = 0
+#     best_val_loss: float = float('inf')
+#     total_training_time: float = 0.0
+#     smooth_train_loss: float = 0.0
+#     train_loader_state: Optional[DataLoaderState] = None
     
     # Dataloader state for resumption
-
 
 class DummyContext:
     def __init__(self, *args, **kwargs): pass
@@ -59,7 +73,6 @@ class DummyContext:
     def __call__(self, *args, **kwds):
         self.__enter__()
         return self
-    
 
 # ============================================================================
 # Trainer
@@ -77,8 +90,9 @@ class Trainer:
     - Validation and evaluation loops
     - Comprehensive metrics tracking
     - Memory optimization with gc management
-    ```python
+
     Example:
+    ```python
         trainer = Trainer(
             model=model,
             tokenizer=tokenizer,
@@ -89,20 +103,22 @@ class Trainer:
         trainer.train()
     ```
     """
-
     def __init__(
         self,
         model: nn.Module,
         tokenizer,
         train_loader,
         val_loader,
-        config: Optional[TrainingConfig] = None,
+        config: Optional[TrainerConfig] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         board: Optional[Board] = None,
         checkpoint_dir: Optional[Path] = None,
         lr_schedule: Optional[Callable] = None,
         muon_momentum_schedule: Optional[Callable] = None,
-        weight_decay_schedule: Optional[Callable] = None
+        weight_decay_schedule: Optional[Callable] = None,
+        scaler: Optional[GradScaler] = None, # only used if config.compute_dtype is float16 and for resume training
+        resume_state: Optional[TrainerState] = None,
+        best_state: Optional[CheckpointState] = None,
     ):
         """
         Initialize Trainer.
@@ -116,10 +132,12 @@ class Trainer:
             optimizer: Optimizer (or None to use model.build_optimizer())
             board: Logging board (wandb, tensorboard, etc.)
             checkpoint_dir: Where to save checkpoints
-            lr_schedule: Learning rate schedule function (step -> lr multiplier). Default: TrainingConfig.lr_schedule
-            muon_momentum_schedule: Momentum schedule for Muon optimizer (step -> momentum multiplier). Default: TrainingConfig.muon_momentum_schedule
-            weight_decay_schedule: Weight decay schedule for Muon optimizer (step -> weight decay multiplier). Default: TrainingConfig.weight_decay_schedule
+            lr_schedule: Learning rate schedule function (step -> lr multiplier). Default: TrainerConfig.lr_schedule
+            muon_momentum_schedule: Momentum schedule for Muon optimizer (step -> momentum multiplier). Default: TrainerConfig.muon_momentum_schedule
+            weight_decay_schedule: Weight decay schedule for Muon optimizer (step -> weight decay multiplier). Default: TrainerConfig.weight_decay_schedule
+            scaler: Gradient scaler for mixed precision training. Default: None (will be created if config.compute_dtype is float16)
         """
+        self.training_type = "base" # for now we only have base training, TODO: extend to sft, grpo, etc.
         self.model = model
         self.tokenizer = tokenizer
         self.train_loader = train_loader
@@ -127,15 +145,16 @@ class Trainer:
         
         # Config
         if config is None:
-            config = TrainingConfig(n_steps=1)
-            warnings.warn(
+            config = TrainerConfig(n_steps=1)
+            log0(
                 "No training config provided. Using default config with 1 step. "
-                "Please provide a TrainingConfig instance."
+                "Please provide a TrainerConfig instance.", level="warning", logger=logger
             )
         self.config = config
         
-        self.checkpoint_dir = checkpoint_dir or (MODELS_FOLDER / "checkpoints")
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.dirname = (checkpoint_dir or (MODELS_FOLDER / "checkpoints")) / self.training_type
+        # TODO: make an error if dir exists and training is not resuming
+        self.dirname.mkdir(parents=True, exist_ok=True)
         
         # Board
         if board is None:
@@ -154,10 +173,11 @@ class Trainer:
         self.optimizer = optimizer
         
         # State and metrics
-        self.state = TrainerState()
-        self.metrics = TrainingMetrics()
-        self.eval_metrics = EvalMetrics()
-        self.core_metrics = COREMetrics()
+        self.state = resume_state or TrainerState()
+        self.ckpt_state = best_state or CheckpointState()
+        self.metrics = TrainerMetrics()     # TODO
+        self.eval_metrics = EvalMetrics()   # TODO
+        self.core_metrics = COREMetrics()   # TODO
         
         # Mixed precision
         self.dtype = self.config.dist_info["compute_dtype"]
@@ -180,7 +200,12 @@ class Trainer:
                 return DummyContext
         self.train_context = amp_context
         self.val_context = disable_fp8_context()
-        self.scaler = GradScaler() if self.dtype == "float16" else None
+
+        self.scaler = None
+        if scaler is not None:
+            self.scaler = scaler
+        elif self.dtype == "float16":
+            self.scaler = GradScaler()
         
         # LR and other schedules
         self.lr_schedule = lr_schedule or config.lr_multiplier_schedule
@@ -242,7 +267,7 @@ class Trainer:
             logs[f"grad_mean/{name}"] = stats["mean"].item()
             logs[f"grad_abs_mean/{name}"] = stats["abs_mean"].item()
 
-        self.board.log(logs, step=self.state.global_step)
+        self.board.log(logs, step=self.state.step)
         self._grad_stats.clear()  # important: reset for next step
 
     def train(self):
@@ -256,7 +281,7 @@ class Trainer:
         print0("=" * 70)
         
         # Extracte main constants from config
-        step = self.state.global_step
+        step = self.state.step
         n_steps = self.config.n_steps
         n_flops_per_token = self.config.n_flops_per_token
         total_batch_size = self.config.total_batch_size
@@ -275,11 +300,10 @@ class Trainer:
         smooth_loss = self.state.smooth_train_loss
         ema_beta = 0.9
         
-        self.state.total_training_time = 0.0
         total_dt = []  # For ETA calculation
         
         while step < n_steps:
-            self.state.global_step = step
+            self.state.step = step
             last_step = (step == n_steps - 1)
             flops_so_far = n_flops_per_token * total_batch_size * step
             self.synchronize()
@@ -304,22 +328,28 @@ class Trainer:
                         dist_info=self.config.dist_info,
                         token_bytes=self.tokenizer.token_bytes
                     )
-                print0(f"Step {step:05d} | Validation bpb: {val_res['bpb']:.6f} | Validation loss: {val_res['loss']:.6f}")
+                print0(f"Step {step:05d} | "\
+                       f"Validation bpb: {val_res['bpb']:.6f} | "\
+                    f"Validation loss: {val_res['loss']:.6f}")
                 
                 dt_bpb_eval = start_bpb_eval - time.time()
 
-                if val_res['bpb'] < self.state.best_val_loss:
-                    self.state.best_val_loss = val_res['bpb']
-                    self.save_checkpoint(tag="best")
+                if (
+                    (self.ckpt_state.best_eval_value is None) or 
+                    (val_res['bpb'] < self.ckpt_state.best_eval_value)
+                ):
+                    self.ckpt_state.best_eval_value = val_res['bpb']
+                    self.ckpt_state.best_eval_step = step
+                    self.save_checkpoint()
                 
                 log_dict = {
                     "eval/loss": val_res['loss'],
                     "eval/bpb": val_res['bpb'],
-                    "eval/best_bpb": self.state.best_val_loss,
+                    "eval/best_bpb": self.ckpt_state.best_eval_value,
                     "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
                 }
                 self.board.log(log_dict, step=step)
-                self.eval_metrics.append(log_dict, step)
+                self.eval_metrics.append(log_dict, step=step)
                 _model.train()
 
             # ================================================================
@@ -330,7 +360,7 @@ class Trainer:
             if (
                 (self.config.eval_core_every == -1 and last_step) or
                 (self.config.eval_core_every > 0 and (
-                    last_step or (step > 0 and step % self.config.eval_core_every == 0)))
+                last_step or (step > 0 and step % self.config.eval_core_every == 0)))
             ):
                 self.model.eval()
                 with self.val_context(self.model):
@@ -341,7 +371,12 @@ class Trainer:
                         max_per_task=self.config.n_core_tokens,
                     )
                 max_throughput = results.get("core/max_per_task", 0) * self.config.dist_info.get("WORLD_SIZE", 1) / results.get("core/step_time_ms", 1e-3) * 1000
-                print0(f"Step {step:05d}/{n_steps:05d} | CORE: {results['core/core']:.4f} | Accuracy: {results['core/accuracy']:.4f} | Max per task: {int(results['core/max_per_task'])} | Step time: {results.get('core/step_time_ms', 0):.2f}ms | Max throughput: {max_throughput:,.0f} tok/s")
+                print0(f"Step {step:05d}/{n_steps:05d} | "
+                       f"CORE: {results['core/core']:.4f} | "
+                       f"Accuracy: {results['core/accuracy']:.4f} | "
+                       f"Max per task: {int(results['core/max_per_task'])} | "
+                       f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
+                       f"Max throughput: {max_throughput:,.0f} tok/s")
                 log_dict = {
                     "core/core": results["core/core"],
                     "core/accuracy": results["core/accuracy"],
@@ -351,6 +386,12 @@ class Trainer:
                 for task_label, task_results in results.get("all_core_results", {}).items():
                     for task_metric, task_value in task_results.items():
                         log_dict[f"core/{task_label}/{task_metric}"] = task_value
+                if (
+                    (self.ckpt_state.best_core_value is None) or 
+                    (results["core/core"] > self.ckpt_state.best_core_value)
+                ):
+                    self.ckpt_state.best_core_value = results["core/core"]
+                    self.ckpt_state.best_core_step = step
                 self.board.log(log_dict, step=step)
                 self.core_metrics.append(results, step=step)
                 self.model.train()
@@ -391,10 +432,10 @@ class Trainer:
             for _ in range(n_acc_steps):
                 self.state.train_loader_state = dataloader_state
                 if dataloader_state is not None:
-                    if isinstance(dataloader_state, ShardIterationState):
-                        self.state.num_epochs = dataloader_state.epoch
+                    if isinstance(dataloader_state, DataLoaderState):
+                        self.state.n_epochs = dataloader_state.epoch
                     else:
-                        self.state.num_epochs = dataloader_state.get("epoch", 0)
+                        self.state.n_epochs = dataloader_state.get("epoch", 0)
                 
                 with self.train_context():
                     loss = self._compute_loss(x, y)
@@ -407,14 +448,15 @@ class Trainer:
 
                 loss_accum += loss.detach().item()
                 if math.isnan(loss_accum) or math.isinf(loss_accum):
-                    print0("BAD ACC STEP DETECTED")
-                    print0("Dataloader state:", dataloader_state.__dict__)
-                    print0("Model inputs shape:", x.shape)
-                    print0("Model inputs:", x)
-                    print0("Model targets shape:", y.shape)
-                    print0("Model targets:", y)
-                    torch.save(x, CACHE_DIR / "bad_batch.pt")
-                    raise ValueError(f"Loss is NaN or Inf at {step=}, {loss_accum=}")
+                    torch.save(x, self.dirname / "bad_batch.pt")
+                    log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
+                        f"Loss is NaN or Inf at {step=}.\n" \
+                        f"Dataloader state: {dataloader_state.__dict__}.\n" \
+                        f"Model inputs shape: {x.shape}, values: {x}\n" \
+                        f"Model targets shape: {y.shape}, values: {y}\n" \
+                        f"Accumulated loss: {loss_accum}",
+                        error_type=ValueError, logger=logger  
+                    )
                 x, y, dataloader_state = next(train_iter)
                 
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
@@ -445,6 +487,7 @@ class Trainer:
             
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
             debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
+
             
             # Calculate throughput
             eff_global_tokens = (
@@ -452,9 +495,12 @@ class Trainer:
                 (self.config.dist_info.get("WORLD_SIZE", 1) if self.config.dist_info else 1)
             )
             tokens_per_sec = eff_global_tokens / step_dt
+
+            step_flops_per_sec = n_flops_per_token * tokens_per_sec
+            mfu = step_flops_per_sec / self.config.dist_info["gpu_peak_flops"] * 100
             
             total_dt.append(step_dt)
-            self.state.global_tokens += eff_global_tokens
+            self.state.n_tokens += eff_global_tokens
             self.state.smooth_train_loss = smooth_loss
             self.state.total_training_time += step_dt
             
@@ -469,7 +515,10 @@ class Trainer:
                     eta_str = f" | ETA: {eta_seconds/60:.1f}m"
                 else:
                     eta_str = ""
-                assert not math.isnan(debiased_smooth_loss), f"Expected debiased_smooth_loss to be a float, got {debiased_smooth_loss=}"
+
+                if math.isnan(debiased_smooth_loss) or math.isinf(debiased_smooth_loss):
+                    log_error(f"Loss is NaN or Inf at {step=}, {debiased_smooth_loss=}. Check previous logs for details.", error_type=ValueError, logger=logger)
+                
                 print0(
                     f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
                     f"loss: {debiased_smooth_loss:.6f} | "
@@ -479,12 +528,14 @@ class Trainer:
                     f"{eta_str}"
                 )
                 log_dict = {
-                    "epochs": self.state.num_epochs,
+                    "epochs": self.state.n_epochs,
                     "train/loss": debiased_smooth_loss,
                     "train/raw_loss": loss_accum,
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/step_time_ms": step_dt * 1000,
-                    "train/total_tokens": self.state.global_tokens,
+                    "train/total_tokens": self.state.n_tokens,
+                    "train/flops_per_sec": step_flops_per_sec,
+                    "train/mfu": mfu,
                     "lrm": lrm,
                     "muon_momentum": muon_momentum,
                     "weight_decay": weight_decay,
@@ -522,7 +573,7 @@ class Trainer:
         
         print0("=" * 70)
         print0(f"Training completed!")
-        print0(f"Total tokens: {self.state.global_tokens:,}")
+        print0(f"Total tokens: {self.state.n_tokens:,}")
         print0(f"Total time: {self.state.total_training_time/60:.1f} minutes")
         print0("=" * 70)
         
@@ -558,29 +609,46 @@ class Trainer:
         Args:
             tag: Identifier for this checkpoint (e.g., "latest", "best", "step_1000")
         """
-        checkpoint_path = self.checkpoint_dir / f"checkpoint_{tag}"
-        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        if not self.config.dist_info.get("RANK", 1) == 0:
+            return # Only master process saves checkpoints
         
-        torch.save(self.model.state_dict(), checkpoint_path / "model.pt")
-        torch.save(self.optimizer.state_dict(), checkpoint_path / "optimizer.pt")
+        # NOTE: maybe " / self.training_type / " is dummy as is
+        checkpoint_path = self.dirname / f"checkpoint_{tag}"
+
+        # there shouldn't already be a checkpoint at this path, to avoid accidental overwrites, except for "best"
+        # TODO: should we allow overwriting other tags? 
+        # - maybe add an "overwrite" flag instead of hardcoding "best" and "latest"?
+        # - or save in different subdirs for each re-run to avoid conflicts?
+        checkpoint_path.mkdir(parents=True, exist_ok=tag in ("best", "latest")) 
+        save_checkpoint(
+            checkpoint_dir=checkpoint_path,
+            trainer_state=self.state,
+            checkpoint_state=self.ckpt_state,
+            model_data=self.model.state_dict(),
+            optimizer_data=self.optimizer.state_dict(),
+            scaler_state=self.scaler.state_dict() if self.scaler is not None else None,
+            mode="ddp",
+            dist_info=self.config.dist_info,
+        )
+        # TODO: save metrics
+        # training_state = dict(
+        #     state=self.state.model_dump(), # should include dataloader state?
+        #     config=self.config.model_dump(),
+        # ) 
+        # with open(checkpoint_path / "metrics.pkl", "wb") as f:
+        #     pickle.dump(metrics, f)
         
-        if self.scaler is not None:
-            torch.save(self.scaler.state_dict(), checkpoint_path / "scaler.pt")
-        
-        with open(checkpoint_path / "state.pkl", "wb") as f:
-            pickle.dump(asdict(self.state), f)
-        
-        with open(checkpoint_path / "metrics.pkl", "wb") as f:
-            pickle.dump(self.metrics.model_dump(), f)
-        
-        with open(checkpoint_path / "eval_metrics.pkl", "wb") as f:
-            pickle.dump(self.eval_metrics.model_dump(), f)
-        
-        with open(checkpoint_path / "core_metrics.pkl", "wb") as f:
-            pickle.dump(self.core_metrics.model_dump(), f)
+        # rng_state = {
+        #     "torch": torch.random.get_rng_state(),
+        #     "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        #     "numpy": np.random.get_state(),
+        #     "python": random.getstate(),
+        # }
+
+        # torch.save(rng_state, checkpoint_path / "rng.pt")
 
         if tag == "latest":
-            print0(f"Saved checkpoint to {checkpoint_path!r}.")
+            log0(f"Saved checkpoint to {checkpoint_path!r}.", logger=logger)
 
     def load_checkpoint(self, checkpoint_path: Union[Path, str], device: Optional[torch.device] = None):
         """
@@ -591,9 +659,9 @@ class Trainer:
             device: Device to load checkpoint onto (defaults to trainer's device)
         """
         if isinstance(checkpoint_path, str):
-            checkpoint_path = Path(checkpoint_path)
+            checkpoint_path = Path(checkpoint_path) / self.training_type
         if not checkpoint_path.exists():
-            print0(f"Checkpoint path {checkpoint_path!r} does not exist. Starting fresh.")
+            log0(f"Checkpoint path {checkpoint_path!r} does not exist. Starting fresh.", logger=logger)
             return
         device = device or self.device
         
@@ -603,8 +671,8 @@ class Trainer:
         if self.scaler is not None and (checkpoint_path / "scaler.pt").exists():
             self.scaler.load_state_dict(torch.load(checkpoint_path / "scaler.pt", map_location=device))
         
-        if (checkpoint_path / "state.pkl").exists():
-            with open(checkpoint_path / "state.pkl", "rb") as f:
+        if (checkpoint_path / "trainer_state.pkl").exists():
+            with open(checkpoint_path / "trainer_state.pkl", "rb") as f:
                 state_dict = pickle.load(f)
             self.state = TrainerState(**state_dict)
             print0_dict(asdict(self.state), title=f"Loaded checkpoint from {checkpoint_path!r}.")
@@ -612,7 +680,7 @@ class Trainer:
         if (checkpoint_path / "metrics.pkl").exists():
             with open(checkpoint_path / "metrics.pkl", "rb") as f:
                 metrics_dict = pickle.load(f)
-            self.metrics = TrainingMetrics(**metrics_dict)
+            self.metrics = TrainerMetrics(**metrics_dict)
         
         if (checkpoint_path / "eval_metrics.pkl").exists():
             with open(checkpoint_path / "eval_metrics.pkl", "rb") as f:
@@ -623,6 +691,80 @@ class Trainer:
             with open(checkpoint_path / "core_metrics.pkl", "rb") as f:
                 core_metrics_dict = pickle.load(f)
             self.core_metrics = COREMetrics(**core_metrics_dict)
+
+        rng_path = checkpoint_path / "rng.pt"
+        if rng_path.exists():
+            rng_state = torch.load(rng_path, map_location="cpu")
+
+            torch.random.set_rng_state(rng_state["torch"])
+            
+            if torch.cuda.is_available() and rng_state["cuda"] is not None:
+                torch.cuda.set_rng_state_all(rng_state["cuda"])
+
+            np.random.set_state(rng_state["numpy"])
+            random.setstate(rng_state["python"])
         
         # TODO: make HUGE warning if loaded checkpoint's git commit does not match current code's git commit
+    
+    @classmethod
+    def resume_from_step(
+        cls, 
+        model_name: str,
+        checkpoint_dir: Union[str, Path],
+        train_loader,
+        val_loader,
+        tokenizer,
+        config: Optional[TrainerConfig] = None,
+        cache_dir: Optional[Union[str, Path]] = None,
+        lr_schedule: Optional[Callable] = None,
+        muon_momentum_schedule: Optional[Callable] = None,
+        weight_decay_schedule: Optional[Callable] = None,
+        board: Optional[Board] = None,
+        step: Union[int, str] = "latest", 
+        mode: Literal["ddp", "shard"] = "ddp",
+        dist_info: Optional[Dict] = None,
+    ):
+        """
+        Create Trainer instance from checkpoint at specific step.
         
+        Args:
+            checkpoint_dir: Directory where checkpoints are saved
+            step: Step number to load
+            device: Device to load checkpoint onto (defaults to CPU)
+            load_optimizer: Whether to load optimizer state
+            mode: Checkpointing mode ("ddp" or "shard") to determine optimizer filename
+            dist_info: Distributed training info dict (if None, will be obtained from get_dist_info())
+        """
+        device = device or torch.device("cpu")
+        
+        model_data, optimizer_data, meta_data = load_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            step=step,
+            device=device,
+            load_optimizer=True,
+            mode=mode,
+            dist_info=dist_info,
+        )
+        # TODO: check for custom lr_schedule, muon_momentum_schedule, weight_decay_schedule 
+        # in trainer meta data and pass to constructor if they exist, instead of using defaults or user-provided ones
+        model = model_data["model"]
+        trainer_config = meta_data.get("config")
+        tokenizer = model_data.get("tokenizer")  # TODO
+        trainer_state = meta_data.get("trainer_state")
+
+
+
+        return cls(
+            model=model,
+            tokenizer=tokenizer,                        # tokenizer may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            train_loader=train_loader,                  # train_loader cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            val_loader=val_loader,                      # val_loader cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            config=trainer_config,                      # config may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            optimizer=optimizer_data.get("optimizer"),  # optimizer may not be loaded if load_optimizer=False
+            board=board,                                # board cannot be saved in checkpoint
+            checkpoint_dir=checkpoint_dir,
+            lr_schedule=lr_schedule,                    # lr_schedule cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            muon_momentum_schedule=muon_momentum_schedule, 
+            weight_decay_schedule=weight_decay_schedule,
+            resume_state=trainer_state,
+        )

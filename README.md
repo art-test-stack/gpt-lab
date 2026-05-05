@@ -29,7 +29,7 @@
 </div>
 
   <p align="center">
-  GPT LAB* is a light-weight library for monitoring small LLM trainings, supporting inference, for small-scale ablation studies. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotely.
+  gpt-lab* is a light-weight library for monitoring small LLM trainings, supporting inference, for small-scale ablation studies. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotely.
     <br />
     <a href="https://github.com/art-test-stack/gpt-lab"><strong>Explore the docs »</strong></a>
     <br />
@@ -450,11 +450,11 @@ and propose improvements via pull requests.
 
 ### Nice repositories to check out for inspiration and reference
 
-1. [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT/tree/master) by Andrej Karpathy.
-2. [karpathy/nanochat](https://github.com/karpathy/nanochat/tree/master)  by Andrej Karpathy.
-3. [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) by Jordan Keller.
+1. [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT/tree/master) by Andrej Karpathy for pretraining code  .
+2. [karpathy/nanochat](https://github.com/karpathy/nanochat/tree/master) by Andrej Karpathy for full training (base, sft, grpo) and inference pipeline.
+3. [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) by Jordan Keller for speedrunner implementation and optimization techniques.
 
-## Some nice blogs and web-articles
+### Some nice blogs and web-articles
 
 1. Huggingface or nanotron playbooks. All of them are very good. It takes days to read them all, and more to diggest, but they are worth it.
     - [The Ultra-Scale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook?section=high-level_overview): 
@@ -526,11 +526,15 @@ and propose improvements via pull requests.
 
 *Bibliography made with [art-test-stack/MyBible](https://github.com/art-test-stack/MyBible).*
 
-## Some video ressources
+### Some video ressources
 
 For the laziest (😛), there are also a lot of Youtube videos that explain well the different components of the library, and how to implement them. Here are some of them that I found useful:
 1. [Andrej Karpathy's YouTube channel](https://www.youtube.com/@AndrejKarpathy) for his unmatched expertise in the field, and his ability to explain complex concepts in a simple and intuitive way. His videos on Transformers and LLMs are particularly useful for understanding the architecture and training of these models.
 2. [Stanfords CME295 course](https://youtube.com/playlist?list=PLoROMvodv4rOCXd21gf0CF4xr35yINeOy&si=sL3DEmGNNdh9-TEa) for the very nice lecture on Transformers and LLMs by [Afshine](https://github.com/afshinea) and [Shervine Amidi](https://github.com/shervinea). They currently releasing lectures of [CME296](https://youtube.com/playlist?list=PLoROMvodv4rNdy8rt2rZ4T2xM0OjADnfu&si=NF0SmB-aItcdB3tT), which is on diffusion & LVMs.
+
+### Extra
+
+1. Banner made with: [hacker-tools/ascii-banner](https://manytools.org/hacker-tools/ascii-banner/)
 
 
 ## TODOs 
@@ -576,7 +580,7 @@ If you use this work in your research, *please* consider citing the following:
   author={Testard, Arthur},
   title={gpt-lab: A light-weight library for fast-ablation studies on GPT-like LMs},
   year={2026},
-  publisher = {GitHub},
+  publisher={GitHub},
   url={https://github.com/art-test-stack/gpt-lab}
 }
 ```

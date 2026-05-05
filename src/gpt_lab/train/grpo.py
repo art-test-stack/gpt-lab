@@ -1,6 +1,6 @@
 from gpt_lab.train.base import BaseTrainer
 from gpt_lab.model.gpt import GPTModel
-from gpt_lab.utils.schemas import TrainingConfig
+from gpt_lab.utils.schemas import TrainerConfig
 from gpt_lab.utils.default import DEVICE
 
 import torch
@@ -14,7 +14,7 @@ class GRPOTrainer(BaseTrainer):
         train_dataset: Iterable,
         val_dataset: Iterable,
         test_dataset: Iterable,
-        config: TrainingConfig,
+        config: TrainerConfig,
         device: torch.device = DEVICE,
         dtype: torch.dtype = torch.float32,
     ):

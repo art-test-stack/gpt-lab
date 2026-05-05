@@ -1,30 +1,18 @@
 from pathlib import Path
-import os
-import random
-import subprocess
+import os, subprocess, logging
+import random, re
 from .default import CACHE_DIR, DATA_DIR
 from filelock import FileLock
 import urllib.request
+from functools import lru_cache
 
-def slugify(text: str) -> str:
-    """Convert text to a slug suitable for filenames and URLs."""
-    return "".join(c if c.isalnum() else "_" for c in text.replace(" ", "-")).lower()
+@lru_cache()
+def get_rank():
+    return int(os.environ.get("RANK", 0))
 
-def get_repo_dir():
-    if os.getenv("GPT_LIB_BASE_DIR"):
-        return Path(os.getenv("GPT_LIB_BASE_DIR"))
-    
-    else:
-        home_dir = Path.home()
-        cache_dir = home_dir / ".gpt_lab"
-        repo_dir = cache_dir / "gpt-lab"
-        return repo_dir
-    
-def print0(*values, **kwargs):
-    """Print message only if on global rank 0"""
-    rank = int(os.getenv("RANK", 0))
-    if rank == 0:
-        print(*values, **kwargs)
+@lru_cache()
+def is_rank0():
+    return get_rank() == 0
 
 def format_value(value):
     """Format a value for display, adding commas to numbers and limiting floats to 4 decimal places."""
@@ -38,12 +26,32 @@ def format_value(value):
         return f"{value:,.2f}"
     else:
         return str(value)
-    
+
+def print0(*values, **kwargs):
+    """Print message only if on global rank 0"""
+    if is_rank0():
+        print(*values, **kwargs)
+
 def print0_dict(title, info):
     lines = [f"{title}:"]
     for k, v in info.items():
         lines.append(f"\t{k:<25}: {format_value(v):<60}")
     print0("\n".join(lines), end="\n\n")
+
+
+def slugify(text: str) -> str:
+    """Convert text to a slug suitable for filenames and URLs."""
+    return "".join(c if c.isalnum() else "_" for c in text.replace(" ", "-")).lower()
+
+def get_repo_dir():
+    if os.getenv("GPT_LIB_BASE_DIR"):
+        return Path(os.getenv("GPT_LIB_BASE_DIR"))
+    else:
+        home_dir = Path.home()
+        cache_dir = home_dir / ".gpt_lab"
+        repo_dir = cache_dir / "gpt-lab"
+        return repo_dir
+    
 
 def get_banner(to_print: bool = False) -> str:
     """Banner made with https://manytools.org/hacker-tools/ascii-banner/"""
@@ -59,6 +67,7 @@ def get_banner(to_print: bool = False) -> str:
    `'-...-'  `---'         '---'                `--------` '.(_,_).' /_______.'                                                                  
 """
     banner2 = r"""
+      ___           ___           ___           ___       ___           ___     
      /\  \         /\  \         /\  \         /\__\     /\  \         /\  \    
     /::\  \       /::\  \        \:\  \       /:/  /    /::\  \       /::\  \   
    /:/\:\  \     /:/\:\  \        \:\  \     /:/  /    /:/\:\  \     /:/\:\  \  
@@ -68,13 +77,12 @@ def get_banner(to_print: bool = False) -> str:
   \:\ \:\__\        \::/  /    /:/  /       \:\  \        \::/  /   \:\ \::/  / 
    \:\/:/  /         \/__/     \/__/         \:\  \       /:/  /     \:\/:/  /  
     \::/  /                                   \:\__\     /:/  /       \::/__/   
-     \/__/                                     \/__/     \/__/         ~~       
+     \/__/                                     \/__/     \/__/         ~~      
 """
     banner = random.choice([banner1, banner2])
     if to_print:
         print0(banner)
     return banner
-
 
 def run_command(cmd):
     """Run a shell command and return output, or None if it fails."""
@@ -124,13 +132,3 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
             postprocess_fn(file_path)
 
     return file_path
-
-class DummyWandb:
-    def __init__(self):
-        pass
-    def log(self, *args, **kwargs):
-        pass
-    def init(self, *args, **kwargs):
-        pass
-    def finish(self, *args, **kwargs):
-        pass
