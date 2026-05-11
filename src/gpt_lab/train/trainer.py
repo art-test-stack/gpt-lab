@@ -45,7 +45,7 @@ from gpt_lab.utils.schemas import (
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
 from gpt_lab.model.gpt import GPTModel
-from gpt_lab.model.checkpoint import save_checkpoint, load_checkpoint
+from gpt_lab.model.checkpoint import CheckpointManager, save_checkpoint, load_checkpoint, make_default_run_name
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ class Trainer:
         config: Optional[TrainerConfig] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         board: Optional[Board] = None,
-        checkpoint_dir: Optional[Path] = None,
+        checkpoint_manager: Optional[CheckpointManager] = None,
         lr_schedule: Optional[Callable] = None,
         muon_momentum_schedule: Optional[Callable] = None,
         weight_decay_schedule: Optional[Callable] = None,
@@ -152,7 +152,19 @@ class Trainer:
             )
         self.config = config
         
-        self.dirname = (checkpoint_dir or (MODELS_FOLDER / "checkpoints")) / self.training_type
+        if checkpoint_manager is None:
+            model_name = self.model.__class__.__name__
+            depth = getattr(self.model.config, "n_layers", "unknown")
+            model_run = make_default_run_name(model_name, depth, self.config.dist_info)
+            checkpoint_manager = CheckpointManager(
+                model_name=self.model.__class__.__name__,
+                model_run=model_run,
+                source=self.training_type, 
+                dist_info=self.config.dist_info,
+                mode="shard" if self.config.dist_info.get("IS_DDP_INITIALIZED", False) else "ddp", # naming is a bit dummy
+            )
+        self.ckpt_manager = checkpoint_manager 
+        self.dirname = self.ckpt_manager.source_dir
         # TODO: make an error if dir exists and training is not resuming
         self.dirname.mkdir(parents=True, exist_ok=True)
         
@@ -340,7 +352,11 @@ class Trainer:
                 ):
                     self.ckpt_state.best_eval_value = val_res['bpb']
                     self.ckpt_state.best_eval_step = step
-                    self.save_checkpoint()
+                    if (
+                        self.config.save_on_best and 
+                        not ((self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0)) # already saving this step
+                        ):
+                        self.save_checkpoint()
                 
                 log_dict = {
                     "eval/loss": val_res['loss'],
@@ -487,7 +503,6 @@ class Trainer:
             
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
             debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
-
             
             # Calculate throughput
             eff_global_tokens = (
@@ -551,7 +566,7 @@ class Trainer:
             # Checkpointing
             # ================================================================
             if (self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0):
-                self.save_checkpoint(tag=f"step_{step}")
+                self.save_checkpoint()
             
             if (sum(total_dt) > self.config.target_time * 60) and self.config.target_time > 0:
                 print0(f"Reached target time of {self.config.target_time} minutes. Stopping training.")
@@ -602,7 +617,7 @@ class Trainer:
         self.optimizer.update_hyperparams(lrm=lrm, muon_momentum=muon_momentum, weight_decay=weight_decay)
         return lrm, muon_momentum, weight_decay
 
-    def save_checkpoint(self, tag: str = "latest"):
+    def save_checkpoint(self):
         """
         Save checkpoint with model, optimizer, and state.
         
@@ -612,100 +627,8 @@ class Trainer:
         if not self.config.dist_info.get("RANK", 1) == 0:
             return # Only master process saves checkpoints
         
-        # NOTE: maybe " / self.training_type / " is dummy as is
-        checkpoint_path = self.dirname / f"checkpoint_{tag}"
+        self.ckpt_manager.save(step=self.state.step, model=self.model, optimizer=self.optimizer, scaler=self.scaler, trainer_state=self.state)
 
-        # there shouldn't already be a checkpoint at this path, to avoid accidental overwrites, except for "best"
-        # TODO: should we allow overwriting other tags? 
-        # - maybe add an "overwrite" flag instead of hardcoding "best" and "latest"?
-        # - or save in different subdirs for each re-run to avoid conflicts?
-        checkpoint_path.mkdir(parents=True, exist_ok=tag in ("best", "latest")) 
-        save_checkpoint(
-            checkpoint_dir=checkpoint_path,
-            trainer_state=self.state,
-            checkpoint_state=self.ckpt_state,
-            model_data=self.model.state_dict(),
-            optimizer_data=self.optimizer.state_dict(),
-            scaler_state=self.scaler.state_dict() if self.scaler is not None else None,
-            mode="ddp",
-            dist_info=self.config.dist_info,
-        )
-        # TODO: save metrics
-        # training_state = dict(
-        #     state=self.state.model_dump(), # should include dataloader state?
-        #     config=self.config.model_dump(),
-        # ) 
-        # with open(checkpoint_path / "metrics.pkl", "wb") as f:
-        #     pickle.dump(metrics, f)
-        
-        # rng_state = {
-        #     "torch": torch.random.get_rng_state(),
-        #     "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        #     "numpy": np.random.get_state(),
-        #     "python": random.getstate(),
-        # }
-
-        # torch.save(rng_state, checkpoint_path / "rng.pt")
-
-        if tag == "latest":
-            log0(f"Saved checkpoint to {checkpoint_path!r}.", logger=logger)
-
-    def load_checkpoint(self, checkpoint_path: Union[Path, str], device: Optional[torch.device] = None):
-        """
-        Load checkpoint and resume training.
-        
-        Args:
-            checkpoint_path: Path to checkpoint directory
-            device: Device to load checkpoint onto (defaults to trainer's device)
-        """
-        if isinstance(checkpoint_path, str):
-            checkpoint_path = Path(checkpoint_path) / self.training_type
-        if not checkpoint_path.exists():
-            log0(f"Checkpoint path {checkpoint_path!r} does not exist. Starting fresh.", logger=logger)
-            return
-        device = device or self.device
-        
-        self.model.load_state_dict(torch.load(checkpoint_path / "model.pt", map_location=device))
-        self.optimizer.load_state_dict(torch.load(checkpoint_path / "optimizer.pt", map_location=device))
-        
-        if self.scaler is not None and (checkpoint_path / "scaler.pt").exists():
-            self.scaler.load_state_dict(torch.load(checkpoint_path / "scaler.pt", map_location=device))
-        
-        if (checkpoint_path / "trainer_state.pkl").exists():
-            with open(checkpoint_path / "trainer_state.pkl", "rb") as f:
-                state_dict = pickle.load(f)
-            self.state = TrainerState(**state_dict)
-            print0_dict(asdict(self.state), title=f"Loaded checkpoint from {checkpoint_path!r}.")
-        
-        if (checkpoint_path / "metrics.pkl").exists():
-            with open(checkpoint_path / "metrics.pkl", "rb") as f:
-                metrics_dict = pickle.load(f)
-            self.metrics = TrainerMetrics(**metrics_dict)
-        
-        if (checkpoint_path / "eval_metrics.pkl").exists():
-            with open(checkpoint_path / "eval_metrics.pkl", "rb") as f:
-                eval_metrics_dict = pickle.load(f)
-            self.eval_metrics = EvalMetrics(**eval_metrics_dict)
-
-        if (checkpoint_path / "core_metrics.pkl").exists():
-            with open(checkpoint_path / "core_metrics.pkl", "rb") as f:
-                core_metrics_dict = pickle.load(f)
-            self.core_metrics = COREMetrics(**core_metrics_dict)
-
-        rng_path = checkpoint_path / "rng.pt"
-        if rng_path.exists():
-            rng_state = torch.load(rng_path, map_location="cpu")
-
-            torch.random.set_rng_state(rng_state["torch"])
-            
-            if torch.cuda.is_available() and rng_state["cuda"] is not None:
-                torch.cuda.set_rng_state_all(rng_state["cuda"])
-
-            np.random.set_state(rng_state["numpy"])
-            random.setstate(rng_state["python"])
-        
-        # TODO: make HUGE warning if loaded checkpoint's git commit does not match current code's git commit
-    
     @classmethod
     def resume_from_step(
         cls, 
@@ -752,8 +675,6 @@ class Trainer:
         tokenizer = model_data.get("tokenizer")  # TODO
         trainer_state = meta_data.get("trainer_state")
 
-
-
         return cls(
             model=model,
             tokenizer=tokenizer,                        # tokenizer may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
@@ -768,3 +689,61 @@ class Trainer:
             weight_decay_schedule=weight_decay_schedule,
             resume_state=trainer_state,
         )
+    
+    @classmethod
+    def from_checkpoint(
+        cls,
+        ckpt_manager,
+        model,
+        optimizer,
+        train_loader,
+        val_loader,
+        tokenizer,
+        config,
+        board=None,
+        step="latest",
+    ):
+        """
+        Build Trainer from checkpoint using CheckpointManager.
+        """
+
+        # resolve step
+        if step == "latest":
+            step = ckpt_manager.latest_step()
+        elif step == "best":
+            step = ckpt_manager._state.best_step
+        else:
+            step = int(step)
+
+        assert step is not None, "No checkpoint found to resume from"
+
+        # load weights + states
+        trainer_state = ckpt_manager.load(
+            step=step,
+            model=model,
+            optimizer=optimizer,
+        )
+
+        # build trainer
+        trainer = cls(
+            model=model,
+            tokenizer=tokenizer,                        # tokenizer may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            train_loader=train_loader,                  # train_loader cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            val_loader=val_loader,                      # val_loader cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            config=trainer_config,                      # config may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            optimizer=optimizer_data.get("optimizer"),  # optimizer may not be loaded if load_optimizer=False
+            board=board,                                # board cannot be saved in checkpoint
+            checkpoint_dir=checkpoint_dir,
+            lr_schedule=lr_schedule,                    # lr_schedule cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
+            muon_momentum_schedule=muon_momentum_schedule, 
+            weight_decay_schedule=weight_decay_schedule,
+            resume_state=trainer_state,
+        )
+
+        # restore internal state
+        if trainer_state is not None:
+            trainer.load_state(trainer_state)
+
+        trainer.step = step
+
+        return trainer

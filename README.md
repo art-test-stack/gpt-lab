@@ -129,15 +129,22 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
 ## Usage
 
 There is many layers in the library, and many components that can be used and customized. The main ones are the following:
+- [Scripts](#scripts)
 - [Data processing](#data)
 - [Automatic configuration](#automatic-configuration)
 - [Tokenization](#tokenization)
 - [Model architecture](#model-architecture)
 - [Optimization](#optimization)
 - [Training](#training)
+- [Checkpointing](#checkpointing)
+- [Board](#board)
 - [Chat with the model](#chat-with-the-model)
 
 I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-test-stack/gpt-lab) for more detailed documentation and explanations on the different components of the library. The sketchs generated explain well the interaction between the different modules. 
+
+### Scripts
+
+The library includes some scripts for training, evaluation, and inference. They are located in the `scripts/` folder. The main ones are the following:
 
 ### Data
 
@@ -416,6 +423,31 @@ class CustomGPT(nn.Module):
 ```
 
 Note that if you instantiate your new class based on `gpt_lab.model.gpt.DenseTransformer`, you will only need to implement the `build_optimizer` method, as the other methods are already implemented in the base class. However, you will need to make sure your component implementation names (e.g., transformer blocks, head, etc.) are compatible with the base class implementation.  -->
+
+### Checkpointing
+
+The framework provides a simple checkpointing system that is integrated with the training loop. The checkpointing system is implemented in the `CheckpointManager` class (available in [`gpt_lab.model.checkpoint`](./src/gpt_lab/model/checkpoint.py)) and allows you to save and load model checkpoints during training. Models should be saved in the following directory structure:
+
+```
+<CACHE_DIR>/
+└── models/
+    └── <model_name>/                          # e.g., "ic1", "gpt2-small", "llama2"
+        └── <run_name>/
+            ├── meta.pskl                      # immutable (model, tokenizer, git)
+            └── <source>/                      # base / sft / rl
+                ├── training_config.pkl        # per-phase config
+                ├── checkpoint_state.pkl       # best bpb/core steps and values
+                ├── checkpoint_step_000000/
+                │   ├── model.pt
+                │   ├── optim_rank0.pt         # optimizer state dict (optim_rank{rank}.pt if sharded, otherwise optim.pt)
+                │   ├── optim_rank1.pt
+                │   ├── ...                    # more optimizer shards if needed
+                │   ├── trainer_state.pkl      # training state, rng state, data state, best bpb/core steps
+                │   └── metrics.pkl
+                ├── checkpoint_step_000100/
+                │   └── ...
+                └── ...
+```
 
 ### Board 
 

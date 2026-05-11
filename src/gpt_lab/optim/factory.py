@@ -654,6 +654,14 @@ class OptimizerFactory(_BaseFactory):
         # self.backend = _DistributedBackend(self) if dist_info["IS_DDP_INITIALIZED"] else _LocalBackend(self)
         self.backend = DistMuonAdamW(param_groups) if dist_info["IS_DDP_INITIALIZED"] else MuonAdamW(param_groups)
 
+    def state_dict(self) -> dict:
+        # We can just return the factory state dict, since the backend doesn't have any additional state.
+        return super().state_dict()
+    
+    def load_state_dict(self, state_dict: dict) -> None:
+        # We can just load the factory state dict, since the backend doesn't have any additional state.
+        super().load_state_dict(state_dict)
+        
     @torch.no_grad()
     def step(self, closure=None):
         loss = None

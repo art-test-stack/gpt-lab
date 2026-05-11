@@ -44,8 +44,8 @@ def slugify(text: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in text.replace(" ", "-")).lower()
 
 def get_repo_dir():
-    if os.getenv("GPT_LIB_BASE_DIR"):
-        return Path(os.getenv("GPT_LIB_BASE_DIR"))
+    if os.getenv("GPTLAB_BASE_DIR"):
+        return Path(os.getenv("GPTLAB_BASE_DIR"))
     else:
         home_dir = Path.home()
         cache_dir = home_dir / ".gpt_lab"

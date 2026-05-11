@@ -166,6 +166,10 @@ class DenseTransformer(BaseTransformer):
         # Rotary/positional embeddings
         self.pe_cache = self._precompute_pos_enc()
 
+    def precompute_pos_enc(self, new_max_context: Optional[int] = None) -> torch.Tensor:
+        self.pe_cache = self._precompute_pos_enc(new_max_context)
+        return self.pe_cache 
+
     def resize_token_embeddings(self, new_size: int, resize_head: bool = True) -> None:
         # TODO: Dummy implementation, to be improved
         weights = self.embeds.weight

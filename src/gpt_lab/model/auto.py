@@ -2,13 +2,14 @@ import math, json
 
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 import warnings
 
 from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, TOKENIZERS_FOLDER, PAT_STR
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.schemas import (
     GPTConfig, 
+    MetaConfig,
     TokenizerConfig, 
     TransformerConfig, AttnImplTypes
 )
@@ -16,7 +17,7 @@ from gpt_lab.utils.common import print0, print0_dict
 from gpt_lab.utils.logging import log_dict, log0, error, log_error
 from gpt_lab.tokenizer.tokenizer import get_closest_tokenizer_size, Tokenizer
 from gpt_lab.model.gpt import DenseTransformer
-from gpt_lab.model.checkpoint import build_meta_model, save_meta_config
+from gpt_lab.model.checkpoint import build_meta_model, save_meta_config, make_default_run_name
 from gpt_lab.utils.system import get_git_info, get_gpu_info, get_system_info
 
 import logging
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 class AutoGPTConfig(BaseModel):
     name: str = "ic1" # useless actually lol
     dirname: str | Path = MODELS_FOLDER
-    model_tag: Optional[str] = None # if None, will be set to {device_name}_{basename}_{depth}_{git_commit}_{date} in model_post_init
+    run_name: Optional[str] = None # if None, will be set to {device_name}_{basename}_{depth}_{git_commit}_{date} in model_post_init
     random_seed: int = 42
     dist_info: Optional[dict] = None # if None, will be initialized in model_post_init based on the current distributed environment
 
@@ -65,20 +66,8 @@ class AutoGPTConfig(BaseModel):
         if self.dist_info is None:
             from gpt_lab.utils.distributed import get_dist_info
             self.dist_info = get_dist_info()
-        if self.model_tag is None:
-            # try:
-            #     import subprocess
-            #     git_commit = subprocess.run(["git", "log", "-n", "1"], capture_output=True, timeout=10, check=True).stdout.decode("utf-8").split("\n")[0].split()[1][:7]
-            # except Exception as e:
-            #     warnings.warn(f"Couldn't get git commit from current branch. Model will be saved with 'nocommit' suffix. Error: {e}")
-            #     git_commit = "nocommit"
-            from gpt_lab.utils.system import run_command
-            git_commit = run_command("git rev-parse --short HEAD") or "unkcommit"
-            from datetime import datetime
-            date = datetime.now().strftime("%Y%m%d_%H-%M-%S")
-            device_name = (str(self.dist_info.get("DEVICE_NAME", "unkdevice"))
-                .lower().split(" ")[-1].replace(" ", "_").replace("/", "_").replace("-", "_"))
-            self.model_tag = f"{device_name}_{self.name}_d{self.depth}_cmt_{git_commit}_dt_{date}"
+        if self.run_name is None:
+            self.run_name = make_default_run_name(self.depth, self.name, self.dist_info)
         if self.vocab_size != -1 and self.vocab_size < 256:
             log_error("Vocab size must be at least 256 to ensure all unicode characters are supported. Please set vocab_size to a value >= 256.", logger=logger, error_type=ValueError)
         # TODO: check that base name is valid (e.g. no special characters, etc.)
@@ -90,7 +79,7 @@ class AutoGPTConfig(BaseModel):
             self.dirname = Path(self.dirname)
 
 
-    def generate_gpt_config(self, device) -> GPTConfig:
+    def generate_gpt_config(self, device) -> Tuple[DenseTransformer, Tokenizer, Dict]:
         special_tokens = SpecialTokens() # TODO: make this configurable
 
         def _get_tokenizer_pretrained(tname: str, source: str = "tiktoken") -> Tokenizer:
@@ -311,13 +300,17 @@ class AutoGPTConfig(BaseModel):
             n_flops_per_token=n_flops_per_token,
             n_total_tokens=n_total_tokens,
         )
-
-        meta_config = dict(
+        meta_config = MetaConfig.model_validate(dict(
             name=self.name,
-            model_tag=self.model_tag,
-            dirname=self.dirname / self.name / self.model_tag,
-            model=model,
-            tokenizer=tokenizer,
+            run_name=self.run_name,
+            model_cfg=model.config,
+            tokenizer_cfg=tokenizer.config,
+        ))
+        cfg = dict(
+            name=self.name,
+            run_name=self.run_name,
+            dirname=self.dirname / self.name / self.run_name,
+            meta=meta_config,
             training_base_config=training_config,
         )
         # Display the generated configuration for verification
@@ -327,6 +320,5 @@ class AutoGPTConfig(BaseModel):
         print0_dict("Model Parameter counts", param_counts)
         print0(f"Estimated FLOPS per token: {n_flops_per_token:.2e}")
 
-        save_meta_config(meta_config)
-        return meta_config
+        return model, tokenizer, cfg
 

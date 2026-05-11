@@ -1,4 +1,5 @@
 import math, random, numpy as np
+import json
 import torch
 import torch.distributed as dist
 from pydantic import BaseModel, Field, ConfigDict, PrivateAttr
@@ -98,6 +99,8 @@ class TokenizerConfig(BaseModel):
     def model_post_init(self, context: Any) -> None:
         if self.pat_str in PAT_STR.keys():
             self.pat_str = PAT_STR.get(self.pat_str)  # Use predefined pattern if pat_str is a key in PAT_STR
+        elif self.pat_str in PAT_STR.values():
+            pass  # pat_str is already a valid pattern
         else:
             log0(f"Using custom {self.pat_str=!r} without validation. " \
                  "Make sure it is a valid regex pattern for tokenization.", 
@@ -450,6 +453,7 @@ class TrainerConfig(BaseModel):
     eval_core_every: int = 2000 # Evaluate CORE metric every N steps (-1 = disable)
     n_core_tokens: int = 500 # Examples per task for CORE metric
     sample_every: int = 2000 # Sample from model every N steps (-1 = disable)
+    save_on_best: bool = True # Whether to save a checkpoint when a new best eval bpb is achieved
     
     # Checkpoint settings
     save_every: int = -1 # default: -1 (only at the end)
@@ -505,12 +509,14 @@ class TrainerConfig(BaseModel):
 class MetaConfig(BaseModel):
     model_config = ConfigDict(json_encoders={Path: str})
 
-    project: str = "gpt_lab"
-    model_tag: str = "base_model"
+    name: str = "gpt_lab"
+    run_name: str = "base_model"
+    dirname: Optional[Union[str, Path]] = None
     model_cfg: TransformerConfig = Field(default_factory=TransformerConfig)
     tokenizer_cfg: TokenizerConfig = Field(default_factory=TokenizerConfig)
     git_info: dict = Field(default_factory=dict)
     version: Optional[str] = None # should be set automatically
+    autosave: bool = True
 
     def model_post_init(self, context: Any) -> None:
         import importlib.metadata
@@ -527,6 +533,17 @@ class MetaConfig(BaseModel):
         elif self.git_info.get('commit', None) != _git_info.get('commit', NotImplemented):
             log0(f"Git info mismatch: MetaConfig commit {self.git_info['commit']} does not match current git commit {_git_info['commit']}.",
                  level="warning", logger=logger)
+        if self.dirname is None:
+            self.dirname = Path(MODELS_FOLDER) / self.name / self.run_name
+        elif isinstance(self.dirname, str):
+            self.dirname = Path(self.dirname)
+        if not self.dirname.exists():
+            self.dirname.mkdir(parents=True, exist_ok=True)
+        
+        if self.autosave and not (self.dirname / "meta.json").exists():
+            with open(self.dirname / "meta.json", "w") as f:
+                json.dump(self.model_dump_json(), f, indent=4)
+
 
 class GPTConfig(BaseModel):
     """
@@ -665,6 +682,7 @@ class TrainerState(BaseModel):
 
 class CheckpointState(BaseModel):
     # Evaluation tracking
+    version: int = 1
     best_eval_step: int = 0
     best_core_step: int = 0
     best_eval_value: Optional[float] = None  # lower is better
