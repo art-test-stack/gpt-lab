@@ -5,12 +5,16 @@ import torch
 from typing import Callable, Iterable, List, Optional, Union, Tuple
 import pickle
 from pathlib import Path
-import random, warnings, json, os, csv
+import random, json, os, csv
 from gpt_lab.utils.default import TOKENIZERS_FOLDER
 from gpt_lab.utils.special_tokens import SpecialTokens
-
 from tokenizers import Tokenizer as HFTokenizer
 
+from gpt_lab.utils.common import print0, print0_dict
+from gpt_lab.utils.logging import log0, log_error
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
 # FACTORY FUNCTION TO BUILD TOKENIZER FROM CONFIG
@@ -33,7 +37,7 @@ def get_closest_tokenizer_size(vocab_size: int) -> Tuple[str, int]:
             for row in reader:
                 name = row.get("name")
                 vocab = row.get("vocab_size")
-                if ncame and vocab:
+                if name and vocab:
                     df_tok_cache[name] = int(vocab) 
         
     tokenizer_sizes = {**tiktoken_encs, **df_tok_cache}
@@ -66,7 +70,10 @@ class _BaseTokenizer:
         try:
             self.token_bytes = self.get_token_bytes()
         except Exception as e:
-            warnings.warn(f"Failed to get token bytes during initialization: {e}. This may cause issues with optimizers that rely on token byte lengths. You can try calling get_token_bytes() manually after initialization to see the full error message and debug the issue.")
+            log0(f"Failed to get token bytes during initialization: {e}. " \
+                  f"This may cause issues with optimizers that rely on token byte lengths. "\
+                "You can try calling get_token_bytes() manually after initialization to see the full error message and debug the issue.", 
+                level="warning", logger=logger)
 
     def get_vocab(self):
         return {**self.token_to_id, **self.special_tokens}
@@ -82,7 +89,7 @@ class _BaseTokenizer:
         
         if token_bytes_path.exists():
             token_bytes = torch.load(token_bytes_path)
-            print(f"Loaded token_bytes from {token_bytes_path}")
+            log0(f"Loaded token_bytes from {token_bytes_path}", logger=logger)
         else:
             vocab_size = self.vocab_size
             special_set = set(self.special_tokens)
@@ -98,7 +105,7 @@ class _BaseTokenizer:
             token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
             with open(token_bytes_path, "wb") as f:
                 torch.save(token_bytes, f)
-            print(f"Saved token_bytes to {token_bytes_path}")
+            log0(f"Saved token_bytes to {token_bytes_path}", logger=logger)
         self.token_bytes_cache = token_bytes
         return token_bytes
 
@@ -289,18 +296,19 @@ class Tokenizer(_BaseTokenizer):
             self.token_bytes = self.get_token_bytes()
 
     @classmethod
-    def from_pretrained(cls, name: str, source: Optional[str] = None):
+    def from_pretrained(cls, name: str, source: Optional[str] = None, special_tokens: Optional[SpecialTokens] = None):
+        if special_tokens is None:
+            special_tokens = SpecialTokens()
         if source is None:
             for source in ("tiktoken", "huggingface", "local"):
                 try:
-                    return cls.from_pretrained(name, source=source)
+                    return cls.from_pretrained(name, source=source, special_tokens=special_tokens)
                 except Exception as e:
                     print(f"Failed to load tokenizer from source {source} with error: {e}. Trying next source...")
             raise ValueError(f"Failed to load tokenizer {name} from all sources.")
         elif source == "tiktoken":
             enc = tiktoken.get_encoding(name)
             mergeable_ranks = enc._mergeable_ranks
-            special_tokens = enc._special_tokens
             pat_str = enc._pat_str
             config = TokenizerConfig(
                 name=name,
@@ -309,7 +317,7 @@ class Tokenizer(_BaseTokenizer):
                 pat_str=pat_str,
                 special_tokens=special_tokens
             )
-            return cls(enc, mergeable_ranks, special_tokens, config)
+            return cls(mergeable_ranks, special_tokens.list(), config)
         elif source == "huggingface":
             return HuggingFaceTokenizerWrapper.from_pretrained(name)
         elif source == "local":
@@ -335,7 +343,7 @@ class Tokenizer(_BaseTokenizer):
             special_tokens = config.special_tokens.list()
             pat_str = config.pat_str
         elif config.source == "dummy":
-            warnings.warn("Using DummyTokenizer, this is not a real tokenizer and should only be used for testing purposes.")
+            log0("Using DummyTokenizer, this is not a real tokenizer and should only be used for testing purposes.", level="warning", logger=logger)
             return DummyTokenizer(config)
         else:
             raise ValueError(f"Unsupported tokenizer source: {config.source}")
@@ -361,11 +369,12 @@ class Tokenizer(_BaseTokenizer):
         vocab_size_no_special = config.vocab_size - len(special_tokens)
         # TODO: make the other tokenizers for comparison; lines +1 and +2 below are temporary
         if not config.trainer == "huggingface":
-            raise NotImplementedError("Training with other configuration than 'huggingface' is not implemented yet.")
+            msg = f"Training tokenizer with trainer {config.trainer!r} is not implemented yet. Please use 'huggingface' trainer for now."
+            log_error(msg, error_type=NotImplementedError, logger=logger)
         # TODO: make pretokenizer here -> options: 1. gpt2, 2. custom
         if config.trainer == "tiktoken":
             from tiktoken._educational import bpe_train
-            warnings.warn("Training tokenizer with tiktoken is a TODO for future improvement.")
+            log0("Training tokenizer with tiktoken is a TODO for future improvement.", level="warning", logger=logger)
             # TODO: WIP, not tested yet
             mergeable_ranks = bpe_train(data=text_iterator, vocab_size=vocab_size_no_special, pat_str=config.pat_str)
         elif config.trainer == "huggingface":
@@ -436,10 +445,11 @@ class Tokenizer(_BaseTokenizer):
             from rbpe import bpe
             ...
         elif config.trainer == "dummy":
-            warnings.warn("Using DummyTokenizer for training, this is not a real tokenizer and should only be used for testing purposes.")
+            log0("Using DummyTokenizer for training, this is not a real tokenizer and should only be used for testing purposes.", level="warning", logger=logger)
             return cls(DummyTokenizer(config), config)
         else:
-            raise ValueError(f"Unsupported tokenizer trainer: {config.trainer}")
+            msg = f"Tokenizer trainer {config.trainer!r} is not supported."
+            log_error(msg, error_type=NotImplementedError, logger=logger)
         tokenizer = cls(
             mergeable_ranks=mergeable_ranks,
             special_tokens=special_tokens,
@@ -488,6 +498,7 @@ class Tokenizer(_BaseTokenizer):
         # dirname = cachedir / name
         config = TokenizerConfig.from_directory(name, cachedir=cachedir)
         mergeable_ranks = config.get_mergeable_ranks()
+        log0(f"Loaded tokenizer config from {name} with vocab size {len(mergeable_ranks) + len(config.special_tokens)}", logger=logger)
         # vocab_path = dirname / "vocab.pkl"
         # with open(vocab_path, "rb") as vf:
         #     mergeable_ranks = pickle.load(vf)
@@ -515,6 +526,7 @@ class Tokenizer(_BaseTokenizer):
         vocab_path = directory / "vocab.pkl" 
         with open(vocab_path, "wb") as vf:
             pickle.dump(self.token_to_id, vf)
+        log0(f"Saved tokenizer vocab to {vocab_path}", logger=logger)
 
     def encode_special(self, token: str) -> int:
         return self.special_tokens[token]
@@ -538,10 +550,12 @@ class Tokenizer(_BaseTokenizer):
             if prepend_bos:
                 token_ids = [[self.bos_token_id] + seq for seq in token_ids]
             if unsqueeze:
-                warnings.warn(f"Unsqueeze option is not typically used for batch encoding, as it adds an extra dimension that may not be necessary. Use with caution. Encoder input is already a batch of {len(text)} sequences.")
+                log0(f"Unsqueeze option is not typically used for batch encoding, as it adds an extra dimension that may not be necessary. Use with caution. Encoder input is already a batch of {len(text)} sequences.", level="warning", logger=logger)
         else:
             text_type = f"List[{type(text[0])}]" if isinstance(text, list) else text_type
-            raise TypeError(f"Tokenizer.encode expected 'str' or 'List[str]', got {text_type!r}.")
+            msg = f"Tokenizer.encode expected 'str' or 'List[str]', got {text_type!r}."
+            log_error(msg, error_type=TypeError, logger=logger)
+
         return token_ids
 
     def decode(self, token_ids: List[int]) -> str:

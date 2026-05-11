@@ -1,26 +1,32 @@
-import math
+import math, json
 
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 import warnings
 
 from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, TOKENIZERS_FOLDER, PAT_STR
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.schemas import (
     GPTConfig, 
+    MetaConfig,
     TokenizerConfig, 
     TransformerConfig, AttnImplTypes
 )
 from gpt_lab.utils.common import print0, print0_dict
+from gpt_lab.utils.logging import log_dict, log0, error, log_error
 from gpt_lab.tokenizer.tokenizer import get_closest_tokenizer_size, Tokenizer
-from gpt_lab.model.gpt import build_meta_model, GPTModel, DenseTransformer
+from gpt_lab.model.gpt import DenseTransformer
+from gpt_lab.model.checkpoint import build_meta_model, save_meta_config, make_default_run_name
+from gpt_lab.utils.system import get_git_info, get_gpu_info, get_system_info
 
+import logging
+logger = logging.getLogger(__name__)
 
 class AutoGPTConfig(BaseModel):
-    basename: str = "ic1"
+    name: str = "ic1" # useless actually lol
     dirname: str | Path = MODELS_FOLDER
-    name: Optional[str] = None # if None, will be set to {basename}_{depth}_{git_commit}_{date} in model_post_init
+    run_name: Optional[str] = None # if None, will be set to {device_name}_{basename}_{depth}_{git_commit}_{date} in model_post_init
     random_seed: int = 42
     dist_info: Optional[dict] = None # if None, will be initialized in model_post_init based on the current distributed environment
 
@@ -57,45 +63,33 @@ class AutoGPTConfig(BaseModel):
     target_param_data_ratio: float = 11.0
 
     def model_post_init(self, context):
-        if self.name is None:
-            # try:
-            #     import subprocess
-            #     git_commit = subprocess.run(["git", "log", "-n", "1"], capture_output=True, timeout=10, check=True).stdout.decode("utf-8").split("\n")[0].split()[1][:7]
-            # except Exception as e:
-            #     warnings.warn(f"Couldn't get git commit from current branch. Model will be saved with 'nocommit' suffix. Error: {e}")
-            #     git_commit = "nocommit"
-            from gpt_lab.utils.report import run_command
-            git_commit = run_command("git rev-parse --short HEAD") or "unkcommit"
-            from datetime import datetime
-            date = datetime.now().strftime("%Y%m%d_%H-%M-%S")
-        
-            self.name = f"{self.basename}_d{self.depth}_cmt_{git_commit}_dt_{date}"
-        if self.vocab_size != -1 and self.vocab_size < 256:
-            raise ValueError("Vocab size must be at least 256 to ensure all unicode characters are supported.")
-        # TODO: check that basename is valid (e.g. no special characters, etc.)
-        if self.basename is not None and (not isinstance(self.basename, str) or len(self.basename) == 0):
-            raise ValueError("Basename must be a non-empty string.")
         if self.dist_info is None:
             from gpt_lab.utils.distributed import get_dist_info
             self.dist_info = get_dist_info()
+        if self.run_name is None:
+            self.run_name = make_default_run_name(self.depth, self.name, self.dist_info)
+        if self.vocab_size != -1 and self.vocab_size < 256:
+            log_error("Vocab size must be at least 256 to ensure all unicode characters are supported. Please set vocab_size to a value >= 256.", logger=logger, error_type=ValueError)
+        # TODO: check that base name is valid (e.g. no special characters, etc.)
+        if self.name is not None and (not isinstance(self.name, str) or len(self.name) == 0):
+            log_error("Model name must be a non-empty string.", logger=logger, error_type=ValueError)
         if self.dirname is None:
             self.dirname = MODELS_FOLDER
         if isinstance(self.dirname, str):
             self.dirname = Path(self.dirname)
 
 
-    def generate_gpt_config(self, device) -> GPTConfig:
-
+    def generate_gpt_config(self, device) -> Tuple[DenseTransformer, Tokenizer, Dict]:
         special_tokens = SpecialTokens() # TODO: make this configurable
 
         def _get_tokenizer_pretrained(tname: str, source: str = "tiktoken") -> Tokenizer:
             # TODO: need to be simplified and optimized
             # if a specific tokenizer model is specified, we will use it and ignore the scaling law
-            
             try: 
                 _tconfig = TokenizerConfig(name=tname, source=source, vocab_size=-1, special_tokens=special_tokens, pat_str="")
                 tokenizer = Tokenizer.from_config(_tconfig)
             except Exception as e:
+                error(f"Error occurred while loading tokenizer model {self.tokenizer_model} from {source}. Error: {e}", logger=logger)
                 _tconfig = TokenizerConfig.from_directory(name=tname)
                 _mergeable_ranks = _tconfig.get_mergeable_ranks()
                 tokenizer = Tokenizer(
@@ -111,7 +105,6 @@ class AutoGPTConfig(BaseModel):
             # Initiate instance of optimized GPTConfig to access default values and methods
             # Use same vocab size for both reference and target model to ensure consistency 
             # in scaling laws
-            
             base_dim = depth * self.aspect_ratio
             d_head = self.d_head
             d_model = ((base_dim + d_head - 1) // d_head) * d_head # Round up to nearest multiple of d_head
@@ -202,13 +195,15 @@ class AutoGPTConfig(BaseModel):
                 pat_str = "o200k_base" # for now, we use the same pattern for larger vocab sizes, but ideally we should have a different pattern for very large vocab sizes to ensure good tokenization performance. This is a TODO for future improvement.
 
             _vs = f"{vocab_size//1000:,}k" if vocab_size < 1e6 else f"{vocab_size/1_000_000:.2f}M"
-            _tname = f"{self.basename}_{_vs}"
+            _tname = f"{self.name}_{_vs}"
 
             from gpt_lab.utils.schemas import TokenizerTrainerConfig
             from gpt_lab.tokenizer.corpus import TokenizerCorpus
-            print0(f"Training new tokenizer with vocab size {vocab_size} using pattern {pat_str} on corpus from {DATA_DIR / 'corpus' / self.basename}. This may take a while...")
+            log0(f"Training new tokenizer with vocab size {vocab_size} using pattern "
+                f"{pat_str} on corpus from {str(DATA_DIR / 'corpus' / self.name)}. This may take a while...",
+                logger=logger, level="warning")
             corpus = TokenizerCorpus.from_sources(
-                corpus_dir=DATA_DIR / "corpus" / self.basename,
+                corpus_dir=DATA_DIR / "corpus" / self.name,
                 # default sources for now
                 max_chars=vocab_size * 4 * 100,
                 random_seed=self.random_seed,
@@ -258,10 +253,10 @@ class AutoGPTConfig(BaseModel):
         if self.n_steps > 0:
             # Override n_steps to a specific value if given
             n_steps = self.n_steps
-            print0(f"Using user-provided number of steps: {n_steps:,}. " \
+            log0(f"Using user-provided number of steps: {n_steps:,}. " \
                    f"Hence, n_total_tokens={total_batch_size * n_steps:=,} and training ignores training horizon based on scaling laws. "\
                    "Recommended to set n_steps to -1 to automatically calculate the number of " \
-                   "steps based on scaling law targets for training horizon.")
+                   "steps based on scaling law targets for training horizon.", level="warning", logger=logger)
         elif self.target_flops > 0:
             # Calculate the number of steps from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
             n_steps = round(self.target_flops / (n_flops_per_token * total_batch_size))
@@ -286,9 +281,13 @@ class AutoGPTConfig(BaseModel):
 
             if self.dist_info["LOCAL_RANK"] == 0:
                 if n_acc_steps == 0:
-                    warnings.warn("Gradient accumulation disabled. Model will be updated every step.")
+                    log0("Gradient accumulation disabled. Model will be updated every step.", level="warning", logger=logger)
                 else:
-                    warnings.warn(f"Using user-provided number of gradient accumulation steps: {n_acc_steps}. This may lead to suboptimal training performance if it does not align well with the training horizon and batch size targets based on scaling laws. Recommended to set n_acc_steps to -1 for automatic configuration based on scaling laws.")
+                    log0(f"Using user-provided number of gradient accumulation steps: {n_acc_steps}. "
+                         "This may lead to suboptimal training performance if it does not align well "
+                         "with the training horizon and batch size targets based on scaling laws. "
+                         "Recommended to set n_acc_steps to -1 for automatic configuration based on "
+                         "scaling laws.", level="warning", logger=logger)
 
         training_config = dict(
             n_steps=n_steps,
@@ -301,14 +300,18 @@ class AutoGPTConfig(BaseModel):
             n_flops_per_token=n_flops_per_token,
             n_total_tokens=n_total_tokens,
         )
-
-        meta_config = dict(
-            project=self.basename,
+        meta_config = MetaConfig.model_validate(dict(
             name=self.name,
-            dirname=self.dirname /self.basename / self.name,
-            model=model,
-            tokenizer=tokenizer,
-            training_config=training_config,
+            run_name=self.run_name,
+            model_cfg=model.config,
+            tokenizer_cfg=tokenizer.config,
+        ))
+        cfg = dict(
+            name=self.name,
+            run_name=self.run_name,
+            dirname=self.dirname / self.name / self.run_name,
+            meta=meta_config,
+            training_base_config=training_config,
         )
         # Display the generated configuration for verification
         print0_dict("AutoGPTConfig generated the following tokenizer configuration", tokenizer.config.model_dump())
@@ -317,6 +320,5 @@ class AutoGPTConfig(BaseModel):
         print0_dict("Model Parameter counts", param_counts)
         print0(f"Estimated FLOPS per token: {n_flops_per_token:.2e}")
 
-        return meta_config
-    
-    
+        return model, tokenizer, cfg
+

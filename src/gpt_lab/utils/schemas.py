@@ -1,4 +1,5 @@
-import math
+import math, random, numpy as np
+import json
 import torch
 import torch.distributed as dist
 from pydantic import BaseModel, Field, ConfigDict, PrivateAttr
@@ -6,9 +7,8 @@ from typing import Any, Dict, List, Literal, Optional, Union, get_args
 from pathlib import Path
 import os, time
 import json, pickle
-
-import warnings
 from gpt_lab.utils.common import print0
+from gpt_lab.utils.logging import log0, log_all
 from gpt_lab.utils.default import (
     DATA_DIR,
     DEVICE,
@@ -39,7 +39,9 @@ from gpt_lab.utils.types import (
 )
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.import_utils import is_flash_attn3_available_from_kernel
+import logging
 
+logger = logging.getLogger(__name__)
 
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
@@ -48,7 +50,6 @@ def get_default_device() -> torch.device:
         return torch.device("mps")
     else:
         return torch.device("cpu")
-
 
 class ParallelismConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -89,7 +90,7 @@ class TokenizerConfig(BaseModel):
     )
     name: str = "ic1_tok"
     dirname: Union[str, Path] = TOKENIZERS_FOLDER
-    dircorpus: Optional[Union[str, Path, Dict[str, Union[str, Path]]]] = None
+    dircorpus: Optional[Union[str, Path]] = None
     vocab_size: int = VOCAB_SIZE
     pat_str: str = "gpt4"
     special_tokens: Optional[SpecialTokens] = Field(default_factory=SpecialTokens)
@@ -98,10 +99,12 @@ class TokenizerConfig(BaseModel):
     def model_post_init(self, context: Any) -> None:
         if self.pat_str in PAT_STR.keys():
             self.pat_str = PAT_STR.get(self.pat_str)  # Use predefined pattern if pat_str is a key in PAT_STR
-        
+        elif self.pat_str in PAT_STR.values():
+            pass  # pat_str is already a valid pattern
         else:
-            warnings.warn(f"Using custom {self.pat_str=!r} without validation." \
-                          "Make sure it is a valid regex pattern for tokenization.")
+            log0(f"Using custom {self.pat_str=!r} without validation. " \
+                 "Make sure it is a valid regex pattern for tokenization.", 
+                 level="warning", logger=logger)
 
         if isinstance(self.dirname, str):
             self.dirname = Path(self.dirname)
@@ -121,6 +124,7 @@ class TokenizerConfig(BaseModel):
             raise FileNotFoundError(f"Mergeable ranks file {mergeable_ranks_path} does not exist.")
         with open(mergeable_ranks_path, "rb") as f:
             mergeable_ranks = pickle.load(f)
+        logger.info(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
         print0(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
         if self.vocab_size == -1:
             self.vocab_size = len(mergeable_ranks) + len(self.special_tokens)
@@ -171,7 +175,8 @@ class TokenizerTrainerConfig(TokenizerConfig):
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
         if self.trainer == "tiktoken" and self.pat_str == "":
-            warnings.warn("Using tiktoken trainer with an empty pat_str may lead to suboptimal tokenization. Consider using a regex pattern for better tokenization performance.")
+            log0("Using tiktoken trainer with an empty pat_str may lead to suboptimal tokenization. "
+                 "Consider using a regex pattern for better tokenization performance.", level="warning", logger=logger)
         
         if self.max_chars == -1:
             self.max_chars = int(self.vocab_size * 1000 * 2.5) # ~3.5 characters per token on average, adjust as needed based on your corpus
@@ -312,18 +317,21 @@ class TransformerConfig(BaseModel):
         if self.d_model % self.n_heads != 0:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
         if self.d_head != self.d_model // self.n_heads:
-            warnings.warn(f"d_head ({self.d_head}) is not equal to d_model/n_heads ({self.d_model // self.n_heads}). This may lead to unexpected behavior in attention mechanisms.")
+            log0(f"d_head ({self.d_head}) is not equal to d_model/n_heads ({self.d_model // self.n_heads}). "
+                 "This may lead to unexpected behavior in attention mechanisms.", level="warning", logger=logger)
         
         self.n_kv_heads = self.n_kv_heads or self.n_heads
         if self.n_kv_heads != self.n_heads:
             self.use_gqa = True
         if self.use_gqa and self.attn_impl == "fused" and is_flash_attn3_available_from_kernel():
-            warnings.warn(f"Fused attention implementation does not support GQA. Falling back to standard attention. Got {self.n_heads=} and {self.n_kv_heads=}", UserWarning)
+            log0("Fused attention implementation does not support GQA. "
+                 "Falling back to standard attention. ",
+                    level="warning", logger=logger)
             self.attn_impl = "sdpa"
         self.attention_dropout = self.attention_dropout if self.attention_dropout is not None else self.dropout
 
         if not self.norm_before_attn:
-            warnings.warn("Using post-attention normalization (norm_before_attn=False) may lead to training instability.")
+            log0("Using post-attention normalization (norm_before_attn=False) may lead to training instability.", level="warning", logger=logger)
         
         # TODO: handles warnings fallbacks
         # if self.attn_impl == "flash_attention":
@@ -399,8 +407,8 @@ class GenerationConfig(BaseModel):
         if self.seed is None or self.seed < 0:
             self.seed = 42  # Ensure seed is within valid range for torch.manual_seed
 
-class TrainingConfig(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class TrainerConfig(BaseModel):
+    # model_config = ConfigDict(frozen=True)
 
     # Training settings
     dist_info: dict = Field(default_factory=dict) # Used for distributed training, populated by get_dist_info()
@@ -437,7 +445,6 @@ class TrainingConfig(BaseModel):
     monitor_grad_norms: bool = False
     
     # Dtype settings
-    use_amp: bool = False
     fp8: bool = False
 
     # Evaluatement settings
@@ -446,10 +453,20 @@ class TrainingConfig(BaseModel):
     eval_core_every: int = 2000 # Evaluate CORE metric every N steps (-1 = disable)
     n_core_tokens: int = 500 # Examples per task for CORE metric
     sample_every: int = 2000 # Sample from model every N steps (-1 = disable)
+    save_on_best: bool = True # Whether to save a checkpoint when a new best eval bpb is achieved
     
     # Checkpoint settings
     save_every: int = -1 # default: -1 (only at the end)
     log_every: int = -1 # default: -1 (only at the end)
+
+    def model_post_init(self, context: Any) -> None:
+        if self.adamw_weight_decay is None:
+            self.adamw_weight_decay = self.weight_decay 
+
+        if self.muon_weight_decay is None:
+            self.muon_weight_decay = self.weight_decay
+
+        self.model_config["frozen"] = True
 
     def lr_multiplier_schedule(self, step: int) -> float:
         n_steps = self.n_steps
@@ -476,7 +493,57 @@ class TrainingConfig(BaseModel):
             return progress * 1.0 + (1 - progress) * self.final_lr_ratio
     
     def weight_decay_schedule(self, step: int) -> float:
-        return self.weight_decay_scale *  0.5 * (1 + math.cos(math.pi * step / self.n_steps))
+        return self.weight_decay_scale * 0.5 * (1 + math.cos(math.pi * step / self.n_steps))
+    
+    @classmethod
+    def from_disk(self, path: Union[str, Path]) -> "TrainerConfig":
+        if isinstance(path, str):
+            path = Path(path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"No such file: {path}")
+        with open(str(path), "rb") as f:
+            data = pickle.load(f)
+        return data
+
+class MetaConfig(BaseModel):
+    model_config = ConfigDict(json_encoders={Path: str})
+
+    name: str = "gpt_lab"
+    run_name: str = "base_model"
+    dirname: Optional[Union[str, Path]] = None
+    model_cfg: TransformerConfig = Field(default_factory=TransformerConfig)
+    tokenizer_cfg: TokenizerConfig = Field(default_factory=TokenizerConfig)
+    git_info: dict = Field(default_factory=dict)
+    version: Optional[str] = None # should be set automatically
+    autosave: bool = True
+
+    def model_post_init(self, context: Any) -> None:
+        import importlib.metadata
+        _version = importlib.metadata.version('gpt-lab')
+        if self.version is None: 
+            self.version = _version
+        elif self.version != _version:
+            log0(f"Version mismatch: MetaConfig version {self.version} does not match package version {_version}.",
+                 level="warning", logger=logger)
+        from .system import get_git_info
+        _git_info = get_git_info()
+        if not self.git_info and _git_info:
+            self.git_info = _git_info
+        elif self.git_info.get('commit', None) != _git_info.get('commit', NotImplemented):
+            log0(f"Git info mismatch: MetaConfig commit {self.git_info['commit']} does not match current git commit {_git_info['commit']}.",
+                 level="warning", logger=logger)
+        if self.dirname is None:
+            self.dirname = Path(MODELS_FOLDER) / self.name / self.run_name
+        elif isinstance(self.dirname, str):
+            self.dirname = Path(self.dirname)
+        if not self.dirname.exists():
+            self.dirname.mkdir(parents=True, exist_ok=True)
+        
+        if self.autosave and not (self.dirname / "meta.json").exists():
+            with open(self.dirname / "meta.json", "w") as f:
+                json.dump(self.model_dump_json(), f, indent=4)
+
 
 class GPTConfig(BaseModel):
     """
@@ -506,11 +573,12 @@ class GPTConfig(BaseModel):
     dirname: str | Path = MODELS_FOLDER
     model: TransformerConfig = Field(default_factory=TransformerConfig)
     loss: LossConfig = Field(default_factory=LossConfig)
-    # trainer: Optional[TrainingConfig] = Field(default_factory=Optional)
+    # trainer: Optional[TrainerConfig] = Field(default_factory=Optional)
     dtype: Dtypes = "bfloat16"
     device: Devices = DEVICE
 
     def model_post_init(self, context: Any) -> None:
+        log0(DeprecationWarning("GPTConfig is deprecated and will be totally changed in a future version. Please use AutoGPTConfig instead for more flexible and powerful configuration management."), level="warning", logger=logger)
         if isinstance(self.dirname, str):
             self.dirname = Path(self.dirname)
         if not self.dirname.name == self.name:
@@ -580,7 +648,6 @@ class GPTConfig(BaseModel):
             config_dict = yaml.safe_load(f)
         return cls.model_validate(config_dict)
 
-
 class TransformerOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -597,13 +664,29 @@ class ModelCompletionOutput(ModelOutput):
     completions: Optional[List[str]] = None
     done: bool = False
 
-class TrainingState(BaseModel):
+class DataLoaderState(BaseModel):
+    shard_idx: int = 0
+    global_shard_idx: Optional[int] = None # used for debugging
+    row_group_idx: int = 0
+    offset_in_row_group: int = 0
+    epoch: int = 1
+    # Add more fields as needed to track the state of the current iteration over a data shard
+
+class TrainerState(BaseModel):
     step: int = 0
-    best_val_loss: float = float("inf")
-    early_stopping_counter: int = 0
-    loss_train: List[float] = Field(default_factory=list)
-    loss_val: List[float] = Field(default_factory=list)
-    metrics_train: List[dict] = Field(default_factory=list)
+    n_tokens: int = 0
+    n_epochs: float = 0.0
+    total_training_time: float = 0.0
+    smooth_train_loss: float = 0.0
+    train_loader_state: Union[DataLoaderState, Dict] = Field(default_factory=DataLoaderState)
+
+class CheckpointState(BaseModel):
+    # Evaluation tracking
+    version: int = 1
+    best_eval_step: int = 0
+    best_core_step: int = 0
+    best_eval_value: Optional[float] = None  # lower is better
+    best_core_value: Optional[float] = None  # higher is better
 
 class _BaseMetrics(BaseModel):
     time: List[float] = Field(default_factory=list)
@@ -612,7 +695,13 @@ class _BaseMetrics(BaseModel):
 
     def append(self, log_dict: dict, step: int) -> None:        
         # NOTE: here we may introduce a bug on dist set; not tested yet. need to be investigated.
-        assert not step in self.step, "Step must not already be in the step list before appending CORE metrics."
+        if step in self.step:
+            log_all(f"Step {step} is already in the step list. "
+                "This may indicate a bug in the logging or training loop where "
+                "metrics are being appended multiple times for the same step. "
+                "Please check your training loop and logging calls to ensure that "
+                "metrics are only appended once per step.", logger=logger, level="warning")
+
         self.time.append(log_dict.get("time", 0))
         self.step.append(step)
         self.epochs.append(log_dict.get("epochs", 0))
@@ -646,11 +735,13 @@ class COREMetrics(_BaseMetrics):
         self.max_per_task.append(log_dict.get("core/max_per_task", 0))
         self.step_time_ms.append(log_dict.get("core/step_time_ms", 0))
         
-class TrainingMetrics(_BaseMetrics):
+class TrainerMetrics(_BaseMetrics):
     loss: List[float] = Field(default_factory=list)
     raw_loss: List[float] = Field(default_factory=list)
     tokens_per_sec: List[float] = Field(default_factory=list)
     step_time_ms: List[float] = Field(default_factory=list)
+    flops_per_sec: List[float] = Field(default_factory=list)
+    mfu: List[float] = Field(default_factory=list)
     total_training_flops: List[float] = Field(default_factory=list)
     total_training_time: List[float] = Field(default_factory=list)
     eta_sec: List[float] = Field(default_factory=list)
@@ -665,6 +756,8 @@ class TrainingMetrics(_BaseMetrics):
         self.raw_loss.append(log_dict.get("train/raw_loss", float('nan')))
         self.tokens_per_sec.append(log_dict.get("train/tokens_per_sec", 0))
         self.step_time_ms.append(log_dict.get("train/step_time_ms", 0))
+        self.flops_per_sec.append(log_dict.get("train/flops_per_sec", 0))
+        self.mfu.append(log_dict.get("train/mfu", 0))
         self.total_training_flops.append(log_dict.get("train/total_training_flops", 0))
         self.total_training_time.append(log_dict.get("train/total_training_time", 0))
         self.eta_sec.append(log_dict.get("train/eta_sec", 0))

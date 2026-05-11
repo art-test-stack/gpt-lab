@@ -1,29 +1,41 @@
 <!-- Template source: See: https://github.com/othneildrew/Best-README-Template -->
 <a id="readme-top"></a>
 
-[![Stargazers][stars-shield]][stars-url]
-[![MIT License][license-shield]][license-url]
-[![LinkedIn][linkedin-shield]](https://www.linkedin.com/in/arthur-testard/)
-[![Ask DeepWiki][deepwiki-shield]](https://deepwiki.com/art-test-stack/gpt-lab)
+<!-- PROJECT HEADER -->
+<div align="center">
 
-<!-- PROJECT LOGO -->
+[![stars-shield]][stars-url]
+[![license-shield]][license-url]
+[![deepwiki-shield]](https://deepwiki.com/art-test-stack/gpt-lab)
+[![hf-page-shield]](https://huggingface.co/ai-testack)
+[![linkedin-shield]](https://www.linkedin.com/in/arthur-testard/)
+</div>
+
 <br />
 <div align="center">
-  <!-- <a href="https://github.com/art-test-stack/gpt-lab">
-    <img src="rsc/logo.jpg" alt="Logo" height="350">
-  </a> -->
-
-<h1 align="center">Generative Pre-trained Transformer Lab*</h1>
+<pre>
+      ___           ___           ___           ___       ___           ___     
+     /\  \         /\  \         /\  \         /\__\     /\  \         /\  \    
+    /::\  \       /::\  \        \:\  \       /:/  /    /::\  \       /::\  \   
+   /:/\:\  \     /:/\:\  \        \:\  \     /:/  /    /:/\:\  \     /:/\:\  \  
+  /:/  \:\  \   /::\~\:\  \       /::\  \   /:/  /    /::\~\:\  \   /::\~\:\__\ 
+ /:/__/_\:\__\ /:/\:\ \:\__\     /:/\:\__\ /:/__/    /:/\:\ \:\__\ /:/\:\ \:|__|
+ \:\  /\ \/__/ \/__\:\/:/  /    /:/  \/__/ \:\  \    \/__\:\/:/  / \:\~\:\/:/  /
+  \:\ \:\__\        \::/  /    /:/  /       \:\  \        \::/  /   \:\ \::/  / 
+   \:\/:/  /         \/__/     \/__/         \:\  \       /:/  /     \:\/:/  /  
+    \::/  /                                   \:\__\     /:/  /       \::/__/   
+     \/__/                                     \/__/     \/__/         ~~       
+</pre>
+</div>
 
   <p align="center">
-    This project is the implementation of a light-weight library for monitoring small LLM trainings, supporting inference, for small-scale ablation studies. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotely.
+  gpt-lab* is a light-weight library for monitoring small LLM trainings, supporting inference, for small-scale ablation studies. It also includes an interface to chat with the model, and with models from 🤗 API, locally or remotely.
     <br />
     <a href="https://github.com/art-test-stack/gpt-lab"><strong>Explore the docs »</strong></a>
     <br />
     <br />
     <a href="https://github.com/art-test-stack/gpt-lab/issues/new?labels=enhancement&template=feature-request---.md">Request Feature »</a>
   </p>
-</div>
 
 *\*This name is quite pompous and vague, I admit it. Any suggestions for a better one are welcomed!* 
 
@@ -106,6 +118,10 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
   ```bash
   uv sync --group=dev
   ```
+- To use the library in jupyter notebooks:
+  ```bash
+  uv sync --group=notebook
+  ```
 
 > [!NOTE]  
 > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation. Default mode uses `kernels` implementation, making the installation easier.
@@ -113,15 +129,22 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
 ## Usage
 
 There is many layers in the library, and many components that can be used and customized. The main ones are the following:
+- [Scripts](#scripts)
 - [Data processing](#data)
 - [Automatic configuration](#automatic-configuration)
 - [Tokenization](#tokenization)
 - [Model architecture](#model-architecture)
 - [Optimization](#optimization)
 - [Training](#training)
+- [Checkpointing](#checkpointing)
+- [Board](#board)
 - [Chat with the model](#chat-with-the-model)
 
 I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-test-stack/gpt-lab) for more detailed documentation and explanations on the different components of the library. The sketchs generated explain well the interaction between the different modules. 
+
+### Scripts
+
+The library includes some scripts for training, evaluation, and inference. They are located in the `scripts/` folder. The main ones are the following:
 
 ### Data
 
@@ -144,6 +167,25 @@ data_loader: DistDataLoader = build_dataloader(
     base_url="karpathy/climbmix-400b-shuffle", # for starting point
     max_shards=6542 # last shard id for the given dataset (if not provided, it will be computed by probing the server, which can take a while)
 ) 
+```
+
+Notice that if you use split `val`, you will get a simple function that returns a dataloader; which permits to ensure the same validation set across different training runs, steps, etc.
+
+```python
+from gpt_lab.data.loader import build_dataloader
+
+val_loader_fn = build_dataloader(
+    name="climbix-base",
+    tokenizer=tokenizer,
+    column="text",
+    split="val", # same config except here
+    seq_len=model.config.max_context,
+    batch_size=32,
+    base_url="karpathy/climbmix-400b-shuffle", 
+    max_shards=6542 
+) 
+
+val_loader = val_loader_fn() # called as a function to get the dataloader instance in trainer
 ```
 
 We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
@@ -382,6 +424,31 @@ class CustomGPT(nn.Module):
 
 Note that if you instantiate your new class based on `gpt_lab.model.gpt.DenseTransformer`, you will only need to implement the `build_optimizer` method, as the other methods are already implemented in the base class. However, you will need to make sure your component implementation names (e.g., transformer blocks, head, etc.) are compatible with the base class implementation.  -->
 
+### Checkpointing
+
+The framework provides a simple checkpointing system that is integrated with the training loop. The checkpointing system is implemented in the `CheckpointManager` class (available in [`gpt_lab.model.checkpoint`](./src/gpt_lab/model/checkpoint.py)) and allows you to save and load model checkpoints during training. Models should be saved in the following directory structure:
+
+```
+<CACHE_DIR>/
+└── models/
+    └── <model_name>/                          # e.g., "ic1", "gpt2-small", "llama2"
+        └── <run_name>/
+            ├── meta.pskl                      # immutable (model, tokenizer, git)
+            └── <source>/                      # base / sft / rl
+                ├── training_config.pkl        # per-phase config
+                ├── checkpoint_state.pkl       # best bpb/core steps and values
+                ├── checkpoint_step_000000/
+                │   ├── model.pt
+                │   ├── optim_rank0.pt         # optimizer state dict (optim_rank{rank}.pt if sharded, otherwise optim.pt)
+                │   ├── optim_rank1.pt
+                │   ├── ...                    # more optimizer shards if needed
+                │   ├── trainer_state.pkl      # training state, rng state, data state, best bpb/core steps
+                │   └── metrics.pkl
+                ├── checkpoint_step_000100/
+                │   └── ...
+                └── ...
+```
+
 ### Board 
 
 Vizualize the training progress in the board of your choice (Tensorboard, Weights & Biases, or Trackio). You can also log to a dummy board that does not log anything, for faster training without logging overhead. 
@@ -415,13 +482,11 @@ and propose improvements via pull requests.
 
 ### Nice repositories to check out for inspiration and reference
 
-1. [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT/tree/master) by Andrej Karpathy.
-2. [karpathy/nanochat](https://github.com/karpathy/nanochat/tree/master)  by Andrej Karpathy.
-3. [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) by Jordan Keller.
+1. [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT/tree/master) by Andrej Karpathy for pretraining code  .
+2. [karpathy/nanochat](https://github.com/karpathy/nanochat/tree/master) by Andrej Karpathy for full training (base, sft, grpo) and inference pipeline.
+3. [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) by Jordan Keller for speedrunner implementation and optimization techniques.
 
-### Some nice blogs and articles
-1. [Building a text generation model from scratch by Vincent Bons](https://wingedsheep.com/building-a-language-model/)
-## Some nice blogs and web-articles
+### Some nice blogs and web-articles
 
 1. Huggingface or nanotron playbooks. All of them are very good. It takes days to read them all, and more to diggest, but they are worth it.
     - [The Ultra-Scale Playbook](https://huggingface.co/spaces/nanotron/ultrascale-playbook?section=high-level_overview): 
@@ -493,11 +558,15 @@ and propose improvements via pull requests.
 
 *Bibliography made with [art-test-stack/MyBible](https://github.com/art-test-stack/MyBible).*
 
-## Some video ressources
+### Some video ressources
 
 For the laziest (😛), there are also a lot of Youtube videos that explain well the different components of the library, and how to implement them. Here are some of them that I found useful:
 1. [Andrej Karpathy's YouTube channel](https://www.youtube.com/@AndrejKarpathy) for his unmatched expertise in the field, and his ability to explain complex concepts in a simple and intuitive way. His videos on Transformers and LLMs are particularly useful for understanding the architecture and training of these models.
 2. [Stanfords CME295 course](https://youtube.com/playlist?list=PLoROMvodv4rOCXd21gf0CF4xr35yINeOy&si=sL3DEmGNNdh9-TEa) for the very nice lecture on Transformers and LLMs by [Afshine](https://github.com/afshinea) and [Shervine Amidi](https://github.com/shervinea). They currently releasing lectures of [CME296](https://youtube.com/playlist?list=PLoROMvodv4rNdy8rt2rZ4T2xM0OjADnfu&si=NF0SmB-aItcdB3tT), which is on diffusion & LVMs.
+
+### Extra
+
+1. Banner made with: [hacker-tools/ascii-banner](https://manytools.org/hacker-tools/ascii-banner/)
 
 
 ## TODOs 
@@ -543,6 +612,7 @@ If you use this work in your research, *please* consider citing the following:
   author={Testard, Arthur},
   title={gpt-lab: A light-weight library for fast-ablation studies on GPT-like LMs},
   year={2026},
+  publisher={GitHub},
   url={https://github.com/art-test-stack/gpt-lab}
 }
 ```
@@ -667,10 +737,11 @@ END_SYSTEM_INSTRUCTION
 [Torch]: https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=for-the-badge&logo=PyTorch&logoColor=white
 [huggingface-url]: https://huggingface.co/
 [huggingface-shield]: https://img.shields.io/badge/HuggingFace-%23FF6C37.svg?style=for-the-badge&logo=HuggingFace&logoColor=white
+[hf-page-shield]: https://img.shields.io/badge/-HuggingFace-black.svg?style=for-the-badge&logo=HuggingFace&colorB=555
+<!-- [hf-page-shield]: https://img.shields.io/badge/Models-%23FF6C37.svg?style=for-the-badge&logo=HuggingFace&logoColor=white -->
 [gradio-url]: https://gradio.app/
 [gradio-shield]: https://img.shields.io/badge/Gradio-%23FF6C37.svg?style=for-the-badge&logo=Gradio&logoColor=white
 [tiktoken-url]: https://github.com/openai/tiktoken
-<!-- [tiktoken-shield]: https://img.shields.io/badge/tiktoken-%23007ACC.svg?style=for-the-badge&logo=ChatGPT&logoColor=white -->
 [tiktoken-shield]: https://custom-icon-badges.demolab.com/badge/tiktoken-black.svg?style=for-the-badge&logo=openai&logoColor=black
 [wandb-url]: https://wandb.ai/site
 [wandb-shield]: https://img.shields.io/badge/Weights_&_Biases-black?style=for-the-badge&logo=WeightsAndBiases&logoColor=FFCC33

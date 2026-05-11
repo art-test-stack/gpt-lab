@@ -11,19 +11,22 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
  
 from gpt_lab.utils.default import DATA_DIR
+from gpt_lab.utils.schemas import DataLoaderState
 from gpt_lab.utils.distributed import get_dist_info
  
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.parquet"
- 
-@dataclass
-class ShardIterationState:
-    """Tracks position in shard iteration for resumption."""
-    shard_idx: int = 0
-    global_shard_idx: Optional[int] = None # for debugging - we keep track of original shard idx
-    row_group_idx: int = 0
-    offset_in_row_group: int = 0
-    epoch: int = 1
 
+def list_parquet_files(data_dir=None):
+    """Looks into a data dir and returns full paths to all parquet files."""
+    if data_dir is None:
+        data_dir = DATA_DIR
+    if isinstance(data_dir, str):
+        data_dir = Path(data_dir).resolve()
+
+    return list(sorted(
+        p for p in data_dir.iterdir()
+        if p.suffix == ".parquet"
+    ))
 
 class ShardManager:
     """
@@ -58,7 +61,7 @@ class ShardManager:
         refresh_interval: float = 5.0,
         download_poll_interval: float = 1.0,
         # dist settings
-        dist_info: Optional[Dict] = None
+        dist_info: Optional[Dict] = None,
     ):
         assert split in ["train", "val"], f"split must be 'train' or 'val'. Got {split=!r}."
         if cachedir is None:
@@ -246,11 +249,11 @@ class ShardManager:
 
     def iterate(
         self,
-        start_state: Optional[ShardIterationState] = None,
+        start_state: Optional[DataLoaderState] = None,
         batch_size: int = 128,
-    ) -> Iterator[Tuple[List[str], ShardIterationState]]:
+    ) -> Iterator[Tuple[List[str], DataLoaderState]]:
         is_resuming = start_state is not None
-        state = start_state or ShardIterationState()
+        state = start_state or DataLoaderState()
 
         while True:
             while state.shard_idx < len(self.shard_paths):
@@ -278,7 +281,7 @@ class ShardManager:
                             continue
                         if is_resuming:
                             is_resuming = False  # only do this once
-                        yield batch[i:i+batch_size], ShardIterationState(
+                        yield batch[i:i+batch_size], DataLoaderState(
                             shard_idx=state.shard_idx,                            
                             global_shard_idx=state.global_shard_idx, # for debbugging - we keep track of original shard idx
                             row_group_idx=state.row_group_idx,
