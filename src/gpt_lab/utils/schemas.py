@@ -514,6 +514,7 @@ class MetaConfig(BaseModel):
     dirname: Optional[Union[str, Path]] = None
     model_cfg: TransformerConfig = Field(default_factory=TransformerConfig)
     tokenizer_cfg: TokenizerConfig = Field(default_factory=TokenizerConfig)
+    base_train: Dict = Field(default_factory=Dict)
     git_info: dict = Field(default_factory=dict)
     version: Optional[str] = None # should be set automatically
     autosave: bool = True

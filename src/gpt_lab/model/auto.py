@@ -79,7 +79,7 @@ class AutoGPTConfig(BaseModel):
             self.dirname = Path(self.dirname)
 
 
-    def generate_gpt_config(self, device) -> Tuple[DenseTransformer, Tokenizer, Dict]:
+    def generate_gpt_config(self, device) -> MetaConfig:
         special_tokens = SpecialTokens() # TODO: make this configurable
 
         def _get_tokenizer_pretrained(tname: str, source: str = "tiktoken") -> Tokenizer:
@@ -303,22 +303,17 @@ class AutoGPTConfig(BaseModel):
         meta_config = MetaConfig.model_validate(dict(
             name=self.name,
             run_name=self.run_name,
+            dirname=self.dirname / self.name / self.run_name,
             model_cfg=model.config,
             tokenizer_cfg=tokenizer.config,
+            base_train=training_config,
         ))
-        cfg = dict(
-            name=self.name,
-            run_name=self.run_name,
-            dirname=self.dirname / self.name / self.run_name,
-            meta=meta_config,
-            training_base_config=training_config,
-        )
         # Display the generated configuration for verification
         print0_dict("AutoGPTConfig generated the following tokenizer configuration", tokenizer.config.model_dump())
         print0_dict("AutoGPTConfig generated the following model configuration", model.config.model_dump())
         
         print0_dict("Model Parameter counts", param_counts)
         print0(f"Estimated FLOPS per token: {n_flops_per_token:.2e}")
-
-        return model, tokenizer, cfg
+        del model, tokenizer, d12_model
+        return meta_config
 

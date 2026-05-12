@@ -229,11 +229,7 @@ cfg = AutoConfig(
     aspect_ratio=16,
 )
 
-meta_config = cfg.generate_gpt_config(device="cuda")
-
-model = meta_config["model"]
-tokenizer = meta_config["tokenizer"]
-training_config = meta_config["training_config"]
+model, tokenizer, meta_config = cfg.generate_gpt_config(device="cuda")
 ```
 
 > [!NOTE]
@@ -279,9 +275,9 @@ The tokenizer training script is located in `scripts/train_tokenizer.py`. It all
 
 Training time benchmarks for different implementations and configurations. All the tokenizers were trained on corpus generated from `gpt_lab.tokenizer.corpus.TokenizerCorpus()` with default settings, tuned with variable `vocab_size`.
 
-Implementation | Vocabulary size | Num proc | Corpus size | Training time
+<!-- Implementation | Vocabulary size | Num proc | Corpus size | Training time
 --- | --- | --- | --- | ---
-huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds 
+huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds  -->
 
 ### Model architecture
 

@@ -344,7 +344,7 @@ class Trainer:
                        f"Validation bpb: {val_res['bpb']:.6f} | "\
                     f"Validation loss: {val_res['loss']:.6f}")
                 
-                dt_bpb_eval = start_bpb_eval - time.time()
+                dt_bpb_eval = time.time() - start_bpb_eval
 
                 if (
                     (self.ckpt_state.best_eval_value is None) or 
@@ -447,12 +447,6 @@ class Trainer:
             
             for _ in range(n_acc_steps):
                 self.state.train_loader_state = dataloader_state
-                if dataloader_state is not None:
-                    if isinstance(dataloader_state, DataLoaderState):
-                        self.state.n_epochs = dataloader_state.epoch
-                    else:
-                        self.state.n_epochs = dataloader_state.get("epoch", 0)
-                
                 with self.train_context():
                     loss = self._compute_loss(x, y)
                 loss = loss / n_acc_steps
@@ -474,7 +468,13 @@ class Trainer:
                         error_type=ValueError, logger=logger  
                     )
                 x, y, dataloader_state = next(train_iter)
-                
+            
+            if dataloader_state is not None:
+                if isinstance(dataloader_state, DataLoaderState):
+                    self.state.n_epochs = dataloader_state.epoch
+                else:
+                    self.state.n_epochs = dataloader_state.get("epoch", 0)
+            
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
 
             if self.config.monitor_grad_norms and self.config.dist_info["RANK"] == 0:
@@ -624,7 +624,7 @@ class Trainer:
         Args:
             tag: Identifier for this checkpoint (e.g., "latest", "best", "step_1000")
         """
-        if not self.config.dist_info.get("RANK", 1) == 0:
+        if not self.config.dist_info.get("RANK", 0) == 0:
             return # Only master process saves checkpoints
         
         self.ckpt_manager.save(step=self.state.step, model=self.model, optimizer=self.optimizer, scaler=self.scaler, trainer_state=self.state)

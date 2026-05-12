@@ -46,9 +46,10 @@ from gpt_lab.utils.distributed import cleanup_dist_groups, get_device_type, init
 from gpt_lab.utils.system import get_git_info, get_gpu_info, get_system_info
 from gpt_lab.utils.schemas import GPTConfig, TrainerConfig
 
+from gpt_lab.tokenizer import Tokenizer
 from gpt_lab.model.auto import AutoGPTConfig
 from gpt_lab.model.gpt import DenseTransformer
-from gpt_lab.model.checkpoint import CheckpointManager, load_meta_config
+from gpt_lab.model.checkpoint import CheckpointManager, build_meta_model, load_meta_config
 
 from argparse import ArgumentParser
 import logging
@@ -184,7 +185,7 @@ if __name__ == "__main__":
     is_master_process = dist_info["RANK"] == 0
 
     device = dist_info["DEVICE"]
-
+    is_resumed = args.model_init == "resume"
     print0_dict("Environment setup", dist_info)
 
     git_info = get_git_info()
@@ -202,7 +203,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------------
 
     if args.model_init == "auto":
-        model, tokenizer, cfg = AutoGPTConfig(
+        meta_config = AutoGPTConfig(
             # metadata
             name=args.model_name,
             run_name=args.run_name,
@@ -232,19 +233,16 @@ if __name__ == "__main__":
             device_batch_size=args.device_batch_size,
             total_batch_size=args.total_batch_size,
         ).generate_gpt_config(device)
-        meta_config = cfg["meta"]
-        base_training_config = cfg["training_base_config"]
+        base_training_config = meta_config.base_train
 
-    elif args.model_init == "resume":
+    elif is_resumed:
         # load config from checkpoint and override with CLI args if specified
         meta_config = load_meta_config(
             name=args.model_name,
             run_name=args.run_name,
             model_cachedir=args.model_dir
         )
-        model = None     
-        tokenizer = None
-        base_training_config = {}
+        base_training_config = meta_config.base_train
     
     elif args.model_init == "arch":
         raise NotImplementedError("Arch-model configuration is not implemented yet. Please use 'auto' mode for now.")
@@ -276,11 +274,13 @@ if __name__ == "__main__":
         model_cachedir=args.model_dir,
         dist_info=dist_info,
     )
+    model = build_meta_model(meta_config.model_cfg)
+    tokenizer = Tokenizer.from_config(meta_config.tokenizer_cfg)
     # TODO: add option to resume training from checkpoint
     if args.model_init == "auto":
         model = model.to_empty(device=device)    
         model.init_weights()
-    elif args.model_init == "resume":
+    elif is_resumed:
         log0("Resuming training from checkpoint.", logger=logger)
         model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(
             step=args.checkpoint_step or "latest",
@@ -296,7 +296,7 @@ if __name__ == "__main__":
     from gpt_lab.data.loader import build_dataloader
 
     resume_state = None
-    if args.model_init == "resume":
+    if is_resumed:
         print("ckpt_data.trainer_state", ckpt_data.trainer_state)
         if ckpt_data and hasattr(ckpt_data.trainer_state, "train_loader_state") and ckpt_data.trainer_state.train_loader_state is not None:
             resume_state = ckpt_data.trainer_state.train_loader_state
@@ -323,7 +323,7 @@ if __name__ == "__main__":
     # TRAINER CONFIG
     # ------------------------------------------------------------------------------
 
-    if args.model_init == "resume":
+    if is_resumed:
         assert type(trainer_config) == TrainerConfig, "Trainer config loaded from checkpoint is not of type TrainerConfig. Please check the checkpoint data and trainer config."
         # TODO: add option to override some trainer config parameters from CLI args even when resuming (eg: evaluation frequency, save frequency, etc.)
     else:
@@ -361,7 +361,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------------
 
     optimizers = model.build_optimizer(trainer_config)
-    if args.model_init == "resume" and ckpt_data and ckpt_data.optimizer_state is not None:
+    if is_resumed and ckpt_data and ckpt_data.optimizer_state is not None:
         log0("Loading optimizer state from checkpoint data.", logger=logger)
         optimizers.load_state_dict(ckpt_data.optimizer_state)
 
@@ -380,6 +380,7 @@ if __name__ == "__main__":
             run=meta_config.run_name,
             config=board_args | {"meta_config": meta_config.model_dump(), "training_config": trainer_config.model_dump(), "model_card": model.config.model_dump()},
             board_dir=args.board_dir,
+            resume=is_resumed,
         )
     else:
         board = DummyBoard()
@@ -394,7 +395,7 @@ if __name__ == "__main__":
         model=model, tokenizer=tokenizer, optimizer=optimizers, 
         train_loader=train_loader, val_loader=val_loader,
         config=trainer_config, board=board, checkpoint_manager=ckpt_manager, 
-        resume_state=ckpt_data.trainer_state if args.model_init == "resume" else None,
+        resume_state=ckpt_data.trainer_state if is_resumed else None,
     )
     trainer.train()
 

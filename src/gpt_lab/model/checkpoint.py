@@ -661,13 +661,15 @@ class CheckpointManager:
     ) -> Path:
         step = _get_checkpoint_step(self.source_dir, step)
         step_dir = self.source_dir / _STEP_DIRNAME(step)
+        if self._ckpt_state is None:
+            self._ckpt_state = CheckpointState(best_eval_step=step, best_eval_value=float('inf'))
         save_checkpoint(
             model=model,
             checkpoint_dir=self.source_dir,
             step=step,
             trainer_state=trainer_state,
             optimizer=optimizer,
-            checkpoint_state=self._ckpt_state or CheckpointState(best_step=step, best_bpb=float('inf')),
+            checkpoint_state=self._ckpt_state or CheckpointState(best_eval_step=step, best_eval_value=float('inf')),
             scaler=scaler,
             mode=self.mode,
             dist_info=self.dist_info,
@@ -733,15 +735,16 @@ class CheckpointManager:
     @property
     def config(self) -> CheckpointConfig:
         meta_config = load_meta_config(self.model_name, run_name=self.run_name, model_cachedir=self.model_cachedir)
+        trainer_config = self.load_training_config()
         return CheckpointConfig(
-            model_name=meta_config["name"],
-            run_name=meta_config["run_name"],
-            model_cachedir=meta_config["dirname"],
-            dist_info=meta_config["dist_info"],
-            mode=meta_config["mode"],
-            model_config=meta_config["model"],
-            tokenizer_config=meta_config["tokenizer"],
-            trainer_config=meta_config["training_base_config"]
+            model_name=meta_config.name,
+            run_name=meta_config.run_name,
+            model_cachedir=meta_config.dirname,
+            dist_info=self.dist_info,
+            mode=self.mode,
+            model_config=meta_config.model_cfg,
+            tokenizer_config=meta_config.tokenizer_cfg,
+            trainer_config=trainer_config
         )
 
     @property

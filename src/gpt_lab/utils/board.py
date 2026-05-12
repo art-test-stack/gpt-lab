@@ -33,6 +33,7 @@ class Board:
             run: str | None = None,
             config: dict | None = None,
             board_dir: str | Path | None = None,
+            resume: bool = False,
         ) -> None:
         self.board_type = board_type
         if board_dir is None:
@@ -44,8 +45,10 @@ class Board:
             self.main = wandb.init(
                 project=project,
                 name=run,
+                id=run,
                 dir=board_dir, # TODO
                 config=config,
+                resume="must" if resume else "auto",
             )
             
         elif self.board_type == "trackio":
