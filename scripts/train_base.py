@@ -360,7 +360,8 @@ if __name__ == "__main__":
     # OPTIMIZER
     # ------------------------------------------------------------------------------
 
-    optimizers = model.build_optimizer(trainer_config)
+    optim_cfg_path = getattr(args, "optim_config_path", None)
+    optimizers = model.build_optimizer(trainer_config, optim_config_path=optim_cfg_path)
     if is_resumed and ckpt_data and ckpt_data.optimizer_state is not None:
         log0("Loading optimizer state from checkpoint data.", logger=logger)
         optimizers.load_state_dict(ckpt_data.optimizer_state)

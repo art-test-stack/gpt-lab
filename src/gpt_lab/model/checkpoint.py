@@ -209,7 +209,7 @@ def _get_checkpoint_step(checkpoint_dir, step: Optional[Union[int, str]] = None)
         index = int(step[1:]) - 1
         checkpoint_files = _sort_checkpoints(checkpoint_dir)
         if index < 0 or index >= len(checkpoint_files):
-            log_error(f"Invalid checkpoint index {step} for checkpoint directory {checkpoint_dir}. "
+            log_error(f"Invalid checkpoint index {step!r} for checkpoint directory {checkpoint_dir}. "
                 f"Found {len(checkpoint_files)} checkpoints in directory {checkpoint_dir}.", logger=logger, error_type=IndexError)
         step = int(checkpoint_files[index].stem.split("_")[-1])
     elif step == "best":
@@ -225,7 +225,7 @@ def _get_checkpoint_step(checkpoint_dir, step: Optional[Union[int, str]] = None)
 
 def _get_model_run_date_from_name(run_name) -> int:
     run_name = run_name.name if isinstance(run_name, Path) else run_name # TODO make it better later
-    match = re.search(r"dt_(\d{8}_\d{6})", run_name)
+    match = re.search(r"dt_(\d{8}_\d{6})", run_name.replace("-", ""))
     if match:
         date_str = match.group(1)
         date_int = int(date_str.replace("_", "").replace("-", ""))
@@ -284,8 +284,6 @@ def save_meta_config(
         git_info=get_git_info(),
     )
     run_dir.mkdir(parents=True, exist_ok=False)
-    print(f"Saving meta config to {run_dir / 'meta.json'}...")
-    print("meta_cfg.model_dump_json()", meta_cfg.model_dump_json())
     _save_json(meta_cfg.model_dump_json(), run_dir, filename="meta.json")
 
     log0(f"Saved meta config in {str(run_dir)}.", logger=logger)
@@ -669,7 +667,7 @@ class CheckpointManager:
             step=step,
             trainer_state=trainer_state,
             optimizer=optimizer,
-            checkpoint_state=self._ckpt_state or CheckpointState(best_eval_step=step, best_eval_value=float('inf')),
+            checkpoint_state=self._ckpt_state,
             scaler=scaler,
             mode=self.mode,
             dist_info=self.dist_info,
@@ -746,22 +744,6 @@ class CheckpointManager:
             tokenizer_config=meta_config.tokenizer_cfg,
             trainer_config=trainer_config
         )
-
-    @property
-    def best_step(self) -> Optional[int]:
-        return self._ckpt_state.best_eval_step if self._ckpt_state else None
- 
-    @property
-    def best_bpb(self) -> Optional[float]:
-        return self._ckpt_state.best_eval_value if self._ckpt_state else None
-
-    @property
-    def best_core_step(self) -> Optional[int]:
-        return self._ckpt_state.best_core_step if self._ckpt_state else None
-    
-    @property
-    def best_core_value(self) -> Optional[float]:
-        return self._ckpt_state.best_core_value if self._ckpt_state else None
  
     def list_steps(self) -> List[int]:
         dirs = sorted(

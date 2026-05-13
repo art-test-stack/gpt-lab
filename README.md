@@ -228,8 +228,7 @@ cfg = AutoConfig(
     depth=12,
     aspect_ratio=16,
 )
-
-model, tokenizer, meta_config = cfg.generate_gpt_config(device="cuda")
+meta_config = cfg.generate_gpt_config(device="cuda")
 ```
 
 > [!NOTE]

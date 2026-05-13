@@ -22,6 +22,7 @@ import gc
 import warnings
 import math
 import logging
+from packaging.version import parse
 
 import torch
 import torch.nn as nn
@@ -30,7 +31,7 @@ from torch.amp import autocast, GradScaler
 
 from gpt_lab.utils.board import Board
 from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
-from gpt_lab.utils.distributed import _DTYPE_MAP
+from gpt_lab.utils.distributed import _DTYPE_MAP, get_dist_info
 from gpt_lab.utils.common import print0, print0_dict
 from gpt_lab.utils.logging import log_error, log_critical, log0
 from gpt_lab.utils.schemas import (
@@ -293,22 +294,23 @@ class Trainer:
         print0("=" * 70)
         
         # Extracte main constants from config
-        step = self.state.step
+        step = self.state.step + int(self.state.step > 0) # start from the next step to avoid repeating the last step if resuming
         n_steps = self.config.n_steps
         n_flops_per_token = self.config.n_flops_per_token
         total_batch_size = self.config.total_batch_size
         n_acc_steps = self.config.n_acc_steps
         
         # Compile model if using PyTorch 2.0+
-        if torch.__version__ >= "2.0":
-            self._model = torch.compile(self.model, dynamic=False)
-        _model = self._model
+        if parse(torch.__version__) >= parse("2.0"):
+            self._compiled_model = torch.compile(self.model, dynamic=False)
+        else:
+            self._compiled_model = self.model
 
         train_iter = iter(self.train_loader)
         x, y, dataloader_state = next(train_iter) # prefetch
 
         # Prepare for training
-        self._model.train()
+        self._compiled_model.train()
         smooth_loss = self.state.smooth_train_loss
         ema_beta = 0.9
         
@@ -330,11 +332,11 @@ class Trainer:
                 (last_step or step % self.config.eval_bpb_every == 0)) 
             ):
                 start_bpb_eval = time.time()
-                _model.eval()
+                self._compiled_model.eval()
                 eval_steps = self.config.n_bpb_tokens // (self.config.device_batch_size * self.model.config.max_context * self.config.dist_info["WORLD_SIZE"])
-                with self.val_context(_model):
+                with self.val_context(self._compiled_model):
                     val_res = compute_bpb(
-                        _model, 
+                        self._compiled_model, 
                         self.val_loader(), 
                         eval_steps,
                         dist_info=self.config.dist_info,
@@ -366,7 +368,7 @@ class Trainer:
                 }
                 self.board.log(log_dict, step=step)
                 self.eval_metrics.append(log_dict, step=step)
-                _model.train()
+                self._compiled_model.train()
 
             # ================================================================
             # Validation on CORE metric every 'core_eval_every' steps
@@ -490,7 +492,7 @@ class Trainer:
             else:
                 self.optimizer.step()
             
-            _model.zero_grad(set_to_none=True)
+            self._compiled_model.zero_grad(set_to_none=True)
 
             self.synchronize()
             step_end_time = time.time()
@@ -584,7 +586,8 @@ class Trainer:
             
             step += 1
 
-        del self._model  # Clean up compiled model if it exists
+        del self._compiled_model  # Clean up compiled model if it exists
+        self._compiled_model = None
         
         print0("=" * 70)
         print0(f"Training completed!")
@@ -597,7 +600,7 @@ class Trainer:
 
     def _compute_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Compute cross-entropy loss."""
-        output = self._model(x, y)
+        output = self._compiled_model(x, y)
         if hasattr(output, "loss"):
             return output.loss
         else:
@@ -630,120 +633,41 @@ class Trainer:
         self.ckpt_manager.save(step=self.state.step, model=self.model, optimizer=self.optimizer, scaler=self.scaler, trainer_state=self.state)
 
     @classmethod
-    def resume_from_step(
-        cls, 
-        model_name: str,
-        checkpoint_dir: Union[str, Path],
-        train_loader,
-        val_loader,
-        tokenizer,
-        config: Optional[TrainerConfig] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
-        lr_schedule: Optional[Callable] = None,
-        muon_momentum_schedule: Optional[Callable] = None,
-        weight_decay_schedule: Optional[Callable] = None,
-        board: Optional[Board] = None,
-        step: Union[int, str] = "latest", 
-        mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[Dict] = None,
-    ):
-        """
-        Create Trainer instance from checkpoint at specific step.
-        
-        Args:
-            checkpoint_dir: Directory where checkpoints are saved
-            step: Step number to load
-            device: Device to load checkpoint onto (defaults to CPU)
-            load_optimizer: Whether to load optimizer state
-            mode: Checkpointing mode ("ddp" or "shard") to determine optimizer filename
-            dist_info: Distributed training info dict (if None, will be obtained from get_dist_info())
-        """
-        device = device or torch.device("cpu")
-        
-        model_data, optimizer_data, meta_data = load_checkpoint(
-            checkpoint_dir=checkpoint_dir,
-            step=step,
-            device=device,
-            load_optimizer=True,
-            mode=mode,
-            dist_info=dist_info,
-        )
-        # TODO: check for custom lr_schedule, muon_momentum_schedule, weight_decay_schedule 
-        # in trainer meta data and pass to constructor if they exist, instead of using defaults or user-provided ones
-        model = model_data["model"]
-        trainer_config = meta_data.get("config")
-        tokenizer = model_data.get("tokenizer")  # TODO
-        trainer_state = meta_data.get("trainer_state")
-
-        return cls(
-            model=model,
-            tokenizer=tokenizer,                        # tokenizer may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            train_loader=train_loader,                  # train_loader cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            val_loader=val_loader,                      # val_loader cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            config=trainer_config,                      # config may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            optimizer=optimizer_data.get("optimizer"),  # optimizer may not be loaded if load_optimizer=False
-            board=board,                                # board cannot be saved in checkpoint
-            checkpoint_dir=checkpoint_dir,
-            lr_schedule=lr_schedule,                    # lr_schedule cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            muon_momentum_schedule=muon_momentum_schedule, 
-            weight_decay_schedule=weight_decay_schedule,
-            resume_state=trainer_state,
-        )
-    
-    @classmethod
     def from_checkpoint(
         cls,
-        ckpt_manager,
-        model,
-        optimizer,
-        train_loader,
-        val_loader,
-        tokenizer,
-        config,
-        board=None,
-        step="latest",
+        model_name: str,
+        model_run: str,
+        step: Union[int, str] = "latest",
+        cache_dir: Optional[Union[str, Path]] = None,
+        board: Optional[Board] = None,
+        dist_info: Optional[Dict] = None,
     ):
-        """
-        Build Trainer from checkpoint using CheckpointManager.
-        """
-
-        # resolve step
-        if step == "latest":
-            step = ckpt_manager.latest_step()
-        elif step == "best":
-            step = ckpt_manager._state.best_step
-        else:
-            step = int(step)
-
-        assert step is not None, "No checkpoint found to resume from"
-
-        # load weights + states
-        trainer_state = ckpt_manager.load(
-            step=step,
-            model=model,
-            optimizer=optimizer,
+        ckpt_manager = CheckpointManager(
+            model_name=model_name,
+            model_run=model_run,
+            source="base", # TODO: make this dynamic based on training type
+            dist_info=dist_info or get_dist_info(),
+            mode="shard", # TODO: make this dynamic based on how checkpoints were saved
+            cache_dir=cache_dir,
         )
+        model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(step=step, phase="train")
+        opt = model.build_optimizer(trainer_config)
 
-        # build trainer
         trainer = cls(
             model=model,
-            tokenizer=tokenizer,                        # tokenizer may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            train_loader=train_loader,                  # train_loader cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            val_loader=val_loader,                      # val_loader cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            config=trainer_config,                      # config may not be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            optimizer=optimizer_data.get("optimizer"),  # optimizer may not be loaded if load_optimizer=False
-            board=board,                                # board cannot be saved in checkpoint
-            checkpoint_dir=checkpoint_dir,
-            lr_schedule=lr_schedule,                    # lr_schedule cannot be saved in checkpoint, so we pass None and expect user to set it manually after loading
-            muon_momentum_schedule=muon_momentum_schedule, 
-            weight_decay_schedule=weight_decay_schedule,
-            resume_state=trainer_state,
+            tokenizer=tokenizer,
+            train_loader=None,
+            val_loader=None,
+            config=trainer_config,
+            optimizer=opt,
+            board=board,
+            lr_schedule=None,
+            muon_momentum_schedule=None, 
+            weight_decay_schedule=None,
+            resume_state=ckpt_data.trainer_state,
+            checkpoint_manager=ckpt_manager,
         )
-
-        # restore internal state
-        if trainer_state is not None:
-            trainer.load_state(trainer_state)
-
-        trainer.step = step
+        log0(f"Resumed trainer from checkpoint at step {trainer.state.step} with best eval bpb {trainer.ckpt_state.best_eval_value:.6f} at step {trainer.ckpt_state.best_eval_step}.", logger=logger)
+        log0(f"Trainer instance created has no 'train_loader' or 'val_loader'. Please set these manually before calling 'trainer.train()'. Maybe consider using 'trainer.state.dataloader_state'", level="warning", logger=logger)
 
         return trainer
