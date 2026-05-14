@@ -1,17 +1,20 @@
-from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
-import tiktoken
-from tokenizers import Tokenizer as HFTokenizer
+from __future__ import annotations
+
 import torch
-from typing import Callable, Iterable, List, Optional, Union, Tuple
+import random, json, os, csv
+
 import pickle
 from pathlib import Path
-import random, json, os, csv
+
+from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
 from gpt_lab.utils.default import TOKENIZERS_FOLDER
 from gpt_lab.utils.special_tokens import SpecialTokens
+from gpt_lab.utils.logging import log0, log_error
+
+import tiktoken
 from tokenizers import Tokenizer as HFTokenizer
 
-from gpt_lab.utils.common import print0, print0_dict
-from gpt_lab.utils.logging import log0, log_error
+from typing import Callable, Iterable, List, Optional, Union, Tuple, Dict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,11 +22,9 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------
 # FACTORY FUNCTION TO BUILD TOKENIZER FROM CONFIG
 # ------------------------------------------------------------
-    
-def get_closest_tokenizer_size(vocab_size: int) -> Tuple[str, int]:
-    """Get the closest tokenizer size from the cache based on the provided vocab size."""
-    # TODO: i removed tokenizer cache manager in a previous commit
-    # have to make it back in order to make this works with new tokenizers
+
+def _get_tokenizer_sizes_in_cache() -> Dict[str, int]:
+    """Get the vocab sizes of all tokenizers in the cache based on the provided tokenizer name."""
     tiktoken_encs = { 
         name: len(tiktoken.get_encoding(name)._mergeable_ranks) 
         for name in ("gpt2", "cl100k_base", "o200k_base") 
@@ -41,6 +42,25 @@ def get_closest_tokenizer_size(vocab_size: int) -> Tuple[str, int]:
                     df_tok_cache[name] = int(vocab) 
         
     tokenizer_sizes = {**tiktoken_encs, **df_tok_cache}
+    return tokenizer_sizes
+
+def get_higher_closest_tokenizer_size(vocab_size: int) -> Tuple[str, int]:
+    """Get the next higher tokenizer size from the cache based on the provided vocab size."""
+    tokenizer_sizes = _get_tokenizer_sizes_in_cache()
+    higher_tokenizers = { name: size for name, size in tokenizer_sizes.items() if size >= vocab_size }
+    if not higher_tokenizers:
+        raise ValueError(f"No tokenizer found with vocab size ≥ {vocab_size}.")
+    tok_name, closest_size = min(
+        higher_tokenizers.items(), 
+        key=lambda x: x[1]
+    )
+    return tok_name, closest_size
+
+def get_closest_tokenizer_size(vocab_size: int) -> Tuple[str, int]:
+    """Get the closest tokenizer size from the cache based on the provided vocab size."""
+    # TODO: i removed tokenizer cache manager in a previous commit
+    # have to make it back in order to make this works with new tokenizers
+    tokenizer_sizes = _get_tokenizer_sizes_in_cache()
     tok_name, closest_size = min(
         tokenizer_sizes.items(), 
         key=lambda x: abs(x[1] - vocab_size)
@@ -148,12 +168,10 @@ class DummyTokenizer(_BaseTokenizer):
 
     def decode(self, tokens, *args, **kwargs):
         return "".join([chr(t) for t in tokens])
-    
 
 # ------------------------------------------------------------
 # HUGGINGFACE TOKENIZER WRAPPER (for some utilities)
 # ------------------------------------------------------------
-
 
 class HuggingFaceTokenizerWrapper(_BaseTokenizer):
     """Light wrapper around HuggingFace Tokenizer for some utilities"""
@@ -356,6 +374,7 @@ class Tokenizer(_BaseTokenizer):
             config=config
         )
     
+
     def get_bos_token_id(self):
         return self.bos_token_id
     
@@ -453,41 +472,11 @@ class Tokenizer(_BaseTokenizer):
         tokenizer = cls(
             mergeable_ranks=mergeable_ranks,
             special_tokens=special_tokens,
-            # special_tokens=config.special_tokens.list(),
             config=config
         )
-
         if config.to_save:
             tokenizer.save_to_directory()
         return tokenizer
-    
-    # def get_token_bytes(self):
-    #     token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-    #     if getattr(self, 'token_bytes', None) is not None:
-    #         return self.token_bytes
-
-    #     if token_bytes_path.exists():
-    #         token_bytes = torch.load(token_bytes_path)
-    #         print(f"Loaded token_bytes from {token_bytes_path}.")
-    #     else:
-    #         vocab_size = self.vocab_size
-    #         special_set = set(self.special_tokens)
-    #         token_strings = [self.decode([token_id]) for token_id in range(vocab_size)]
-    #         token_bytes = []
-    #         for token_id in range(vocab_size):
-    #             token_str = token_strings[token_id] # the Python string representation of this token
-    #             if token_str in special_set:
-    #                 token_bytes.append(0) # special characters are not counted
-    #             else:
-    #                 id_bytes = len(token_str.encode("utf-8")) # number of bytes that make up this token
-    #                 token_bytes.append(id_bytes)
-    #         token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
-    #         with open(token_bytes_path, "wb") as f:
-    #             torch.save(token_bytes, f)
-    #         print(f"Saved token_bytes to {token_bytes_path}")
-    #     # self.token_bytes_cache = token_bytes
-    #     # self.token_bytes = token_bytes
-    #     return token_bytes
 
     @classmethod
     def from_disk(cls, name: str, cachedir: Optional[Union[str, Path]] = None):
@@ -498,16 +487,74 @@ class Tokenizer(_BaseTokenizer):
         # dirname = cachedir / name
         config = TokenizerConfig.from_directory(name, cachedir=cachedir)
         mergeable_ranks = config.get_mergeable_ranks()
-        log0(f"Loaded tokenizer config from {name} with vocab size {len(mergeable_ranks) + len(config.special_tokens)}", logger=logger)
-        # vocab_path = dirname / "vocab.pkl"
-        # with open(vocab_path, "rb") as vf:
-        #     mergeable_ranks = pickle.load(vf)
+        log0(f"Loaded tokenizer config from {name} with vocab size "
+             f"{len(mergeable_ranks) + len(config.special_tokens)}", 
+             logger=logger)
         return cls(
             mergeable_ranks=mergeable_ranks,
             special_tokens=config.special_tokens.list(),
             config=config
         )
+
     
+    @classmethod
+    def clamped_from_pretrained(cls, name: str, new_vocab_size: int, source: str = "tiktoken") -> Tokenizer:
+        """Return a new Tokenizer with vocab clamped to new_vocab_size."""
+        new_name = f"{tokenizer.config.name}_clamped_{new_vocab_size}"
+        try: 
+            tokenizer = cls.from_disk(new_name)
+            log0(f"Found existing clamped tokenizer {new_name} on disk, loading it instead of creating a new one.", logger=logger)
+            return tokenizer
+        except Exception as e:
+            log0(f"No existing clamped tokenizer found on disk for {new_name}. Creating a new one by clamping the pretrained tokenizer {name}. Error: {e}", logger=logger, level="warning")
+        tokenizer = cls.from_pretrained(name, source=source)
+        if new_vocab_size >= tokenizer.vocab_size:
+            return tokenizer  
+
+        merges_to_remove = tokenizer.vocab_size - new_vocab_size
+        token_to_id = dict(tokenizer.token_to_id)  # shallow copy, don't mutate original
+        for merge, _ in sorted(token_to_id.items(), key=lambda x: x[1], reverse=True):
+            if merges_to_remove <= 0:
+                break
+            del token_to_id[merge]
+            merges_to_remove -= 1
+        config = TokenizerConfig(
+            name=f"{tokenizer.config.name}_clamped_{new_vocab_size}",
+            source=tokenizer.config.source,
+            dirname=tokenizer.config.dirname.parent / new_name,
+            vocab_size=new_vocab_size,
+            pat_str=tokenizer.config.pat_str,
+            special_tokens=tokenizer.config.special_tokens,
+            source=tokenizer.config.source
+        )
+        tokenizer = cls(
+            mergeable_ranks=token_to_id,
+            special_tokens=list(config.special_tokens.values()),
+            config=config,
+        )
+        tokenizer.update_token_bytes()
+        return tokenizer
+    
+    @classmethod
+    def get_closest_clamped_from_pretrained(cls, tokenizer: Tokenizer, target_vocab_size: int) -> Tokenizer:
+        # Find the closest vocab size that is less than or equal to the target
+        closest_vocab_size = min(
+            vocab_size for vocab_size in tokenizer.config.vocab_sizes
+            if vocab_size <= target_vocab_size
+        )
+        return cls.clamped_from_pretrained(tokenizer.config.name, closest_vocab_size)
+    
+    def update_token_bytes(self):
+        if len(self.token_to_id) == self.vocab_size - len(self.special_tokens):
+            log0("No merges were removed, token bytes remain the same.", logger=logger)
+            return 
+        self.token_bytes = self.get_token_bytes()
+        self.token_bytes = torch.cat([
+            self.token_bytes[:len(self.token_to_id)],                     # surviving merges, byte counts intact
+            torch.zeros(len(self.special_tokens), dtype=torch.int32) # special tokens always 0
+        ])
+        # Recompute token bytes and save to disk, useful after clamping the vocab
+        
     def save_to_directory(self, directory: Optional[Union[str, Path]] = None):
         # Save the tokenizer's merges and vocab to the specified directory
         if directory is None:

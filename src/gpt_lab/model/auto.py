@@ -32,7 +32,7 @@ class AutoGPTConfig(BaseModel):
 
     # Tokenizer config
     # If None, will be set to vocab size scaling law based on Tao et al. 2O24 (https://arxiv.org/abs/2407.13623)
-    tokenizer_model: Optional[str] = None # none, auto, or name
+    tokenizer_model: Optional[str] = None # none, auto, <name> or clamp
     train_tokenizer: bool = False
     vocab_size: int = -1 
     pat_str: Optional[str] = None
@@ -85,11 +85,16 @@ class AutoGPTConfig(BaseModel):
         def _get_tokenizer_pretrained(tname: str, source: str = "tiktoken") -> Tokenizer:
             # TODO: need to be simplified and optimized
             # if a specific tokenizer model is specified, we will use it and ignore the scaling law
-            try: 
+            try:
+                return Tokenizer.from_pretrained(tname, source=source)
+            except Exception as e1:
+                log0(f"Error occurred while loading tokenizer model {tname} from {source}. Error: {e1}", logger=logger, level="warning")
+            try:
                 _tconfig = TokenizerConfig(name=tname, source=source, vocab_size=-1, special_tokens=special_tokens, pat_str="")
-                tokenizer = Tokenizer.from_config(_tconfig)
-            except Exception as e:
-                error(f"Error occurred while loading tokenizer model {self.tokenizer_model} from {source}. Error: {e}", logger=logger)
+                return Tokenizer.from_config(_tconfig)
+            except Exception as e2:
+                log0(f"Error occurred while loading tokenizer model {tname} from {source}. Error: {e2}", logger=logger, level="warning")
+            try:
                 _tconfig = TokenizerConfig.from_directory(name=tname)
                 _mergeable_ranks = _tconfig.get_mergeable_ranks()
                 tokenizer = Tokenizer(
@@ -97,9 +102,8 @@ class AutoGPTConfig(BaseModel):
                     special_tokens=special_tokens,
                     config=_tconfig
                 )
-            except Exception as e:
-                raise ValueError(f"Could not load tokenizer model {self.tokenizer_model} from either tiktoken or local cache. Error: {e}")
-            return tokenizer
+            except Exception as e3:
+                log_error(f"Error occurred while loading tokenizer model {tname} from local cache. Error: {e3}", logger=logger, error_type=ValueError)
 
         def build_meta_model_from_depth(depth: int, vocab_size: int = -1) -> DenseTransformer:
             # Initiate instance of optimized GPTConfig to access default values and methods
