@@ -524,8 +524,7 @@ class Tokenizer(_BaseTokenizer):
             dirname=tokenizer.config.dirname.parent / new_name,
             vocab_size=new_vocab_size,
             pat_str=tokenizer.config.pat_str,
-            special_tokens=tokenizer.config.special_tokens,
-            source=tokenizer.config.source
+            special_tokens=tokenizer.config.special_tokens
         )
         tokenizer = cls(
             mergeable_ranks=token_to_id,
