@@ -45,7 +45,7 @@ from gpt_lab.utils.schemas import (
 )
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
-from gpt_lab.model.gpt import GPTModel
+from gpt_lab.model.wrapper import Engine
 from gpt_lab.model.checkpoint import CheckpointManager, save_checkpoint, load_checkpoint, make_default_run_name
 
 logger = logging.getLogger(__name__)
@@ -434,7 +434,7 @@ class Trainer:
                     "My favorite color is",
                     "If 5*x + 3 = 13, then x is",
                 ]
-                engine = GPTModel(self.model, self.tokenizer) # use orig_model to avoid recompilation
+                engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
                 with self.val_context(self.model):
                     samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
                 print0(self.tokenizer.decode(samples[0]))

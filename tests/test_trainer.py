@@ -1,6 +1,6 @@
 import pytest
 import torch
-from gpt_lab.model.gpt import GPTModel
+from gpt_lab.model.wrapper import Engine
 from gpt_lab.train.trainer import Trainer
 
 from gpt_lab.utils.schemas import (
@@ -45,14 +45,14 @@ class TestModelTrainer:
         dirname=tmpdirname
     )
 
-    def setup_method(self):
-        self.model = GPTModel.from_scratch(self.config)
-        self.trainer = Trainer(
-            model=self.model,
-            train_dataset=[],
-            val_dataset=[],
-            test_dataset=[],
-        )
+    # def setup_method(self):
+    #     self.model = Engine.from_scratch(self.config)
+    #     self.trainer = Trainer(
+    #         model=self.model,
+    #         train_dataset=[],
+    #         val_dataset=[],
+    #         test_dataset=[],
+    #     )
     
     # WIP
     # @pytest.mark.fast
