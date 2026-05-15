@@ -1,4 +1,4 @@
-from gpt_lab.model.gpt import GPTModel
+from gpt_lab.model.wrapper import Engine
 from gpt_lab.utils.default import (
     ModelConfig,
     TransformerOutput,

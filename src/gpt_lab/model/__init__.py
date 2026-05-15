@@ -3,6 +3,7 @@ from .checkpoint import build_meta_model, CheckpointData, CheckpointManager, Che
 from .flash_attn import flash_attn
 from .gpt import DenseTransformer, TransformerConfig
 from .layers import DecoderLayer, CausalSelfAttention
+from .wrapper import Engine
 from .utils import KVCache
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "flash_attn",
     "DenseTransformer", "TransformerConfig",
     "DecoderLayer", "CausalSelfAttention",
+    "Engine",
     "KVCache",
 ]
