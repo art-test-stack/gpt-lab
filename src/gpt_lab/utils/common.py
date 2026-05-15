@@ -6,11 +6,11 @@ from filelock import FileLock
 import urllib.request
 from functools import lru_cache
 
-@lru_cache()
+@lru_cache() # TODO: move in distributed
 def get_rank():
     return int(os.environ.get("RANK", 0))
 
-@lru_cache()
+@lru_cache() # TODO: move in distributed
 def is_rank0():
     return get_rank() == 0
 
