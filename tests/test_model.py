@@ -1,6 +1,6 @@
 import pytest
 import torch
-from gpt_lab.model.gpt import GPTModel
+from gpt_lab.model.wrapper import Engine
 from gpt_lab.model.utils import KVCache
 
 from gpt_lab.utils.schemas import (
@@ -125,7 +125,7 @@ class TestGPTModel:
         # assert loaded_config == self.config, "Loaded config does not match the original"
         
         # model = assert_single_warning(
-        #     lambda: GPTModel.from_scratch(config=self.config),
+        #     lambda: Engine.from_scratch(config=self.config),
         #     UserWarning,
         #     message_substring="DummyTokenizer",
         # )
@@ -135,7 +135,7 @@ class TestGPTModel:
         # model.save_checkpoint(ckpt_version="test-1", keep_vars=True)
 
         # loaded_model = assert_single_warning(
-        #     lambda: GPTModel.load(model_name=self.model_name, ckpt_version="test-1", model_dir=self.tmpdirname),
+        #     lambda: Engine.load(model_name=self.model_name, ckpt_version="test-1", model_dir=self.tmpdirname),
         #     UserWarning,
         #     message_substring="DummyTokenizer",
         # )
@@ -152,7 +152,7 @@ class TestGPTModel:
         return
         # config = self.config
         # model = assert_single_warning(
-        #     lambda: GPTModel.from_scratch(config=self.config),
+        #     lambda: Engine.from_scratch(config=self.config),
         #     UserWarning,
         #     message_substring="DummyTokenizer",
         # )
@@ -198,7 +198,7 @@ class TestGPTModel:
         return
         # config = self.config
         # model = assert_single_warning(
-        #     lambda: GPTModel.from_scratch(config=self.config),
+        #     lambda: Engine.from_scratch(config=self.config),
         #     UserWarning,
         #     message_substring="DummyTokenizer",
         # )
