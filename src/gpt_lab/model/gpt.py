@@ -2,8 +2,6 @@ from gpt_lab.model.layers import (
     DecoderLayer, 
     Linear, 
     Module, 
-    # apply_layer_norm,
-    # apply_rms_norm,
     build_norm,
 )
 from gpt_lab.model.loss import build_loss
@@ -16,26 +14,17 @@ from gpt_lab.model.utils import (
 from gpt_lab.tokenizer.tokenizer import build_tokenizer
 from gpt_lab.optim.factory import OptimizerFactory
 from gpt_lab.utils.schemas import (
-    get_default_device,
-    GenerationConfig,
-    GPTConfig, 
     ModelOutput, 
-    ModelCompletionOutput,
     TrainerConfig,
-    TransformerConfig, 
-    TransformerOutput
+    TransformerConfig
 )
-from gpt_lab.utils.default import MODELS_FOLDER, DEVICE
 from gpt_lab.utils.common import print0, print0_dict
 from gpt_lab.utils.logging import log0
 
-from gpt_lab.tokenizer.tokenizer import Tokenizer
-
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import math
 from pathlib import Path

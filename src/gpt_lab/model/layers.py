@@ -1,9 +1,9 @@
-from gpt_lab.utils.common import print0
 from gpt_lab.utils.schemas import TransformerConfig
 from gpt_lab.model.flash_attn import flash_attn, scaled_dot_product_attention
 from gpt_lab.model.utils import apply_rope, has_ve
 from gpt_lab.utils.types import AttnImplTypes, NormalizationTypes
 from gpt_lab.utils.default import DEVICE
+from gpt_lab.utils.logging import log0
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,6 +11,9 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Tuple, Optional, Callable, get_args
 import warnings
+
+import logging
+logger = logging.getLogger(__name__)
 
 def apply_rms_norm(x: torch.Tensor, eps: float = 1e-8, torch_impl: bool = True) -> torch.Tensor:
     if torch_impl:
@@ -51,9 +54,11 @@ class Module(nn.Module):
         return sum([np.prod(p.size(), dtype = np.int32) for p in self.parameters() if not p.requires_grad])
 
     def summary(self) -> None:
-        print0(f'Number of parameters: {self.nb_parameters():,}')
-        print0(f'Number of trainable parameters: {self.nb_trainable_parameters():,}')
-        print0(f'Number of non-trainable parameters: {self.nb_non_trainable_parameters():,}')
+        log0(f'Model summary:'
+            f'Number of parameters: {self.nb_parameters():,}'
+            f'Number of trainable parameters: {self.nb_trainable_parameters():,}'
+            f'Number of non-trainable parameters: {self.nb_non_trainable_parameters():,}',
+            logger=logger)
 
     def clean_nan(self) -> None:
         for p in self.parameters():
@@ -63,12 +68,6 @@ class Module(nn.Module):
     def clip_gradient(self, max_norm: float) -> None:
         nn.utils.clip_grad_norm_(self.parameters(), max_norm)
 
-    # def init_weights(self) -> None:
-    #     '''Initialize the module weights'''
-    #     for module in self.modules():
-    #         if hasattr(module, 'init_weights'):
-    #             module.init_weights()
-
 class Embedding(Module):
     '''Embedding layer'''
     def __init__(self, config: TransformerConfig, dtype=torch.float32, device=torch.device(DEVICE)) -> None:
@@ -77,18 +76,7 @@ class Embedding(Module):
             num_embeddings=config.vocab_size, 
             embedding_dim=config.d_model, 
             padding_idx=config.pad_id, 
-            # max_norm=config.max_norm, 
-            # norm_type=config.norm_type, 
-            # scale_grad_by_freq=config.scale_grad_by_freq, 
-            # sparse=config.sparse or True, 
-            # device=config.device,
-            # dtype=config.dtype
         )
-        # self.embedding = nn.Parameter(
-        #     data=torch.randn(config.vocab_size, config.d_model),
-        #     requires_grad=True
-        # )
-
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.embedding(x)

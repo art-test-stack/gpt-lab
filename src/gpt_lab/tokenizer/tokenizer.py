@@ -382,8 +382,6 @@ class Tokenizer(_BaseTokenizer):
             from tokenizers.models import BPE
             from tokenizers.trainers import BpeTrainer
             
-            # from huggingface_hub import logging
-            # logging.disable_progress_bars()
             tknzr = HFTokenizer(
                 BPE(
                     byte_fallback=True,

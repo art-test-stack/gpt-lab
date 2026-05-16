@@ -1,8 +1,7 @@
 import logging, sys, os
 import re
-from typing import Union, Literal, Tuple
+from typing import Union, Tuple
 from .common import format_value, get_rank, is_rank0
-from .system import get_git_info, get_gpu_info, get_system_info
 
 
 class ColoredFormatter(logging.Formatter):
