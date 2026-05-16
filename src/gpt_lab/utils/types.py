@@ -1,8 +1,7 @@
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union, Literal
-from functools import lru_cache
+
 import torch
 
-from gpt_lab.utils.import_utils import is_torch_greater_or_equal
 
 TParams = Union[
     Iterable[torch.Tensor], Iterable[dict[str, Any]], Iterable[tuple[str, torch.Tensor]]

@@ -1,24 +1,21 @@
-import math, json
+import math
 
 from pydantic import BaseModel
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
-import warnings
+from typing import Optional
 
-from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, TOKENIZERS_FOLDER, PAT_STR
+from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, PAT_STR
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.schemas import (
-    GPTConfig, 
     MetaConfig,
     TokenizerConfig, 
     TransformerConfig, AttnImplTypes
 )
 from gpt_lab.utils.common import print0, print0_dict
-from gpt_lab.utils.logging import log_dict, log0, error, log_error
+from gpt_lab.utils.logging import log0, error, log_error
 from gpt_lab.tokenizer.tokenizer import get_closest_tokenizer_size, Tokenizer
 from gpt_lab.model.gpt import DenseTransformer
-from gpt_lab.model.checkpoint import build_meta_model, save_meta_config, make_default_run_name
-from gpt_lab.utils.system import get_git_info, get_gpu_info, get_system_info
+from gpt_lab.model.checkpoint import build_meta_model, make_default_run_name
 
 import logging
 logger = logging.getLogger(__name__)

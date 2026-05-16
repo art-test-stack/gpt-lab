@@ -1,4 +1,3 @@
-# from gpt_lab.train.base import BaseTrainer
 from gpt_lab.model.wrapper import Engine
 from gpt_lab.utils.schemas import TrainerConfig
 from gpt_lab.utils.default import DEVICE

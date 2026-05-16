@@ -14,7 +14,6 @@ from gpt_lab.utils.schemas import (
 from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.tokenizer import Tokenizer
 from gpt_lab.model.utils import KVCache
-from pathlib import Path
 from typing import List, Optional, Iterator
 import logging
 
