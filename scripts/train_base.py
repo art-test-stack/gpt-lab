@@ -48,7 +48,7 @@ from gpt_lab.utils.schemas import GPTConfig, TrainerConfig
 
 from gpt_lab.tokenizer import Tokenizer
 from gpt_lab.model.auto import AutoGPTConfig
-from gpt_lab.model.gpt import DenseTransformer
+
 from gpt_lab.model.checkpoint import CheckpointManager, build_meta_model, load_meta_config
 
 from argparse import ArgumentParser

@@ -9,17 +9,13 @@ Key responsibilities:
 - Device management and memory optimization
 """
 
-from typing import Optional, Callable, Union, Literal, Dict
-from dataclasses import dataclass, field, asdict
+from typing import Optional, Callable, Union, Dict
 from pathlib import Path
 
-import random
 import numpy as np
 
 import time
-import pickle
 import gc
-import warnings
 import math
 import logging
 from packaging.version import parse
@@ -46,7 +42,7 @@ from gpt_lab.utils.schemas import (
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
 from gpt_lab.model.wrapper import Engine
-from gpt_lab.model.checkpoint import CheckpointManager, save_checkpoint, load_checkpoint, make_default_run_name
+from gpt_lab.model.checkpoint import CheckpointManager, make_default_run_name
 
 logger = logging.getLogger(__name__)
 

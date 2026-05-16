@@ -1,4 +1,3 @@
-# from gpt_lab.utils.schemas import ParallelismConfig
 from gpt_lab.utils.logging import log0
 import torch
 import torch.distributed as dist

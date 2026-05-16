@@ -38,19 +38,18 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Union, Tuple, Dict, Literal, Mapping, Callable, List
 from pathlib import Path
-from gpt_lab.utils.logging import log0, log_error, log_all
+from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.utils.default import MODELS_FOLDER
 from gpt_lab.utils.distributed import get_dist_info
 from gpt_lab.utils.schemas import (
     CheckpointState, 
-    DataLoaderState, 
     MetaConfig,
     TrainerConfig,
     TrainerState,
     TokenizerConfig, 
     TransformerConfig, 
 )
-from gpt_lab.utils.system import get_git_info, get_gpu_info, get_system_info
+from gpt_lab.utils.system import get_git_info
 from gpt_lab.tokenizer import build_tokenizer, Tokenizer, TokenizerConfig
 from gpt_lab.model.gpt import DenseTransformer
 

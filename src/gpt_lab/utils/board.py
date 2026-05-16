@@ -9,7 +9,7 @@ try:
 except:
     tb = None
 from gpt_lab.utils.default import BOARD_DIR
-import warnings
+
 from gpt_lab.utils.logging import error
 import logging
 

@@ -1,7 +1,7 @@
 from pathlib import Path
-import os, subprocess, logging
-import random, re
-from .default import CACHE_DIR, DATA_DIR
+import os, subprocess
+import random
+from .default import DATA_DIR
 from filelock import FileLock
 import urllib.request
 from functools import lru_cache

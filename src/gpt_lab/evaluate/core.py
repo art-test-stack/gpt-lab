@@ -13,7 +13,7 @@ from jinja2 import Template
 import torch
 import torch.distributed as dist
 
-from gpt_lab.utils.default import CACHE_DIR, DATA_DIR
+from gpt_lab.utils.default import DATA_DIR
 from gpt_lab.utils.common import print0, download_file_with_lock
 from gpt_lab.tokenizer import Tokenizer, TokenizerConfig
 

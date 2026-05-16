@@ -2,7 +2,6 @@ import os
 import warnings
 from pathlib import Path
 from typing import Union, List, Optional, Tuple, Iterator, Dict
-from dataclasses import dataclass
 import time, json
  
 import pyarrow.parquet as pq
