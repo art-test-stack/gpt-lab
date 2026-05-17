@@ -24,9 +24,6 @@ class SpecialTokens(BaseModel):
         """
         return [v for v in self.__dict__.values() if v is not None]
     
-    def __list__(self):
-        return self.list()
-    
     def dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
     

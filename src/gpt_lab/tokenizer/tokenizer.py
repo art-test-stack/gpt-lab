@@ -285,7 +285,7 @@ class HuggingFaceTokenizerWrapper(_BaseTokenizer):
 # ------------------------------------------------------------
 
 class Tokenizer(_BaseTokenizer):
-    """Wrapper class for different tokenizer implementations 
+    """ Wrapper class for different tokenizer implementations 
     ## Use cases include:
         - Encoding with Tiktoken API (faster)
         - Loading TikToken tokenizer
@@ -381,6 +381,7 @@ class Tokenizer(_BaseTokenizer):
             special_tokens=special_tokens,
             config=config
         )
+    
 
     def get_bos_token_id(self):
         return self.bos_token_id
@@ -500,6 +501,7 @@ class Tokenizer(_BaseTokenizer):
             special_tokens=config.special_tokens.list(),
             config=config
         )
+
     
     @classmethod
     def truncated_from_pretrained(cls, name: str, new_vocab_size: int, source: str = "tiktoken") -> Tokenizer:
@@ -543,7 +545,7 @@ class Tokenizer(_BaseTokenizer):
             merges_to_remove -= 1
         
         config = TokenizerConfig(
-            name=new_name,
+            name=f"{tokenizer.config.name}_truncated_{new_vocab_size}",
             source=tokenizer.config.source,
             dirname=tokenizer.config.dirname.parent / new_name,
             vocab_size=new_vocab_size,
