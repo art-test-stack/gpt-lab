@@ -160,10 +160,33 @@ class TokenizerConfig(BaseModel):
             pickle.dump(self, f)
 
 
+class TokenizerTrainingParams(BaseModel):
+    """Encapsulate training-related parameters for tokenizer training.
+
+    Phase 6: move training-specific params into a dedicated model to cleanly
+    separate tokenizer metadata from training-run configuration.
+    """
+    max_chars: int = -1
+    chars_per_doc: int = -1
+    merges_per_pass: int = 512
+    num_proc: int = -1
+    trainer: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "huggingface"
+    show_progress: bool = True
+    to_save: bool = True
+
+    def model_post_init(self, context: Any) -> None:
+        # leave defaults; some values will be adjusted by TokenizerTrainerConfig
+        pass
+
+
 class TokenizerTrainerConfig(TokenizerConfig):
     model_config = ConfigDict(
         json_encoders={Path: str},
     )
+    # Backwards-compatible placement of training params. New code should use
+    # `training_params` to access training-related options.
+    training_params: TokenizerTrainingParams = Field(default_factory=TokenizerTrainingParams)
+    # Keep legacy fields for compatibility; they'll be synced into training_params
     max_chars: int = -1
     chars_per_doc: int = -1
     merges_per_pass: int = 512 # Only used for fbpe
@@ -174,16 +197,25 @@ class TokenizerTrainerConfig(TokenizerConfig):
     
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
-        if self.trainer == "tiktoken" and self.pat_str == "":
+        # Sync legacy fields into the new `training_params` container
+        self.training_params.max_chars = self.max_chars
+        self.training_params.chars_per_doc = self.chars_per_doc
+        self.training_params.merges_per_pass = self.merges_per_pass
+        self.training_params.num_proc = self.num_proc
+        self.training_params.trainer = self.trainer
+        self.training_params.show_progress = self.show_progress
+        self.training_params.to_save = self.to_save
+
+        if self.training_params.trainer == "tiktoken" and self.pat_str == "":
             log0("Using tiktoken trainer with an empty pat_str may lead to suboptimal tokenization. "
                  "Consider using a regex pattern for better tokenization performance.", level="warning", logger=logger)
         
-        if self.max_chars == -1:
-            self.max_chars = int(self.vocab_size * 1000 * 2.5) # ~3.5 characters per token on average, adjust as needed based on your corpus
-        if self.chars_per_doc == -1:
-            self.chars_per_doc = self.max_chars // 1000 # Default to 1000 documents if not specified, adjust as needed
-        if self.num_proc <= 0:
-            self.num_proc = min(32, (os.cpu_count() or 1) - 1) # Use all available CPUs minus one for training, adjust as needed
+        if self.training_params.max_chars == -1:
+            self.training_params.max_chars = int(self.vocab_size * 1000 * 2.5)
+        if self.training_params.chars_per_doc == -1:
+            self.training_params.chars_per_doc = self.training_params.max_chars // 1000
+        if self.training_params.num_proc <= 0:
+            self.training_params.num_proc = min(32, (os.cpu_count() or 1) - 1)
     
     def save_to_directory(self, directory: Optional[Union[str, Path]] = None):
         if directory is not None:

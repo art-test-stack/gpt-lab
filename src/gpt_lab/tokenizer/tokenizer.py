@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import torch
-import random, json, os, csv
+import random, csv
 
 import pickle
 import warnings
 import json as _json
-from hashlib import sha256
+
+from gpt_lab.tokenizer.base import _BaseTokenizer
 from gpt_lab.tokenizer.serialization import (
     save_mergeable_ranks,
     load_mergeable_ranks,
@@ -21,7 +22,7 @@ from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.logging import log0, log_error
 
 import tiktoken
-from tokenizers import Tokenizer as HFTokenizer
+from gpt_lab.tokenizer.hf import HuggingFaceTokenizerWrapper, train_huggingface_from_iterator
 
 from typing import Callable, Iterable, List, Optional, Union, Tuple, Dict
 import logging
@@ -81,74 +82,6 @@ def build_tokenizer(config: TokenizerConfig) -> Callable:
     return Tokenizer.from_config(config)
 
 # ------------------------------------------------------------
-# BASE TOKENIZER INTERFACE (for consistency)
-# ------------------------------------------------------------
-
-class _BaseTokenizer:
-    """Base tokenizer class defining the common interface for all tokenizers.
-    
-    This class is not meant to be used directly, but rather to be inherited by specific tokenizer implementations.
-    
-    Should implement the following methods:
-    - encode: to convert text to token ids
-    - decode: to convert token ids back to text
-    - encode_special: to encode special tokens to their corresponding ids"""
-    def __init__(self, config: Optional[TokenizerConfig] = None):
-        self.config = config
-        self.special_tokens = None
-        self.mergeable_ranks = None
-        try:
-            self.token_bytes = self.get_token_bytes()
-        except Exception as e:
-            log0(f"Failed to get token bytes during initialization: {e}. " \
-                  f"This may cause issues with optimizers that rely on token byte lengths. "\
-                "You can try calling get_token_bytes() manually after initialization to see the full error message and debug the issue.", 
-                level="warning", logger=logger)
-
-    def get_vocab(self):
-        return {**self.mergeable_ranks, **self.special_tokens}
-    
-    @property
-    def vocab_size(self):
-        "vocab_size value icludes both mergeable ranks and special tokens"
-        return len(self.mergeable_ranks) + len(self.special_tokens)
-    
-    @property
-    def n_special_tokens(self):
-        return len(self.special_tokens)
-    
-    @property
-    def n_ranks(self):
-        return len(self.mergeable_ranks)
-         
-    def get_token_bytes(self):
-        token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-        if getattr(self, "token_bytes", None) is not None:
-            return self.token_bytes
-
-        if token_bytes_path.exists():
-            token_bytes = torch.load(token_bytes_path)
-            log0(f"Loaded token_bytes from {token_bytes_path}", logger=logger)
-        else:
-            # Compute byte lengths directly from mergeable_ranks keys (which are bytes)
-            mergeable = self.mergeable_ranks or {}
-            # Sort by rank to produce deterministic ordering
-            sorted_items = sorted(mergeable.items(), key=lambda x: x[1])
-            token_bytes_list = [len(token) for token, _ in sorted_items]
-            # Special tokens are always zero-length for token_bytes
-            token_bytes_list.extend([0] * len(self.special_tokens))
-            token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device="cpu")
-            with open(token_bytes_path, "wb") as f:
-                torch.save(token_bytes, f)
-            log0(f"Saved token_bytes to {token_bytes_path}", logger=logger)
-
-        self.token_bytes = token_bytes
-        return token_bytes
-
-    def __call__(self, text, *args, **kwds):
-        return self.encode(text, *args, **kwds)
-    
-# ------------------------------------------------------------
 # DUMMY TOKENIZER INSTANCE (for quick tests/dev)
 # ------------------------------------------------------------
 
@@ -184,105 +117,6 @@ class DummyTokenizer(_BaseTokenizer):
 
     def decode(self, tokens, *args, **kwargs):
         return "".join([chr(t) for t in tokens])
-
-# ------------------------------------------------------------
-# HUGGINGFACE TOKENIZER WRAPPER (for some utilities)
-# ------------------------------------------------------------
-
-class HuggingFaceTokenizerWrapper(_BaseTokenizer):
-    """Light wrapper around HuggingFace Tokenizer for some utilities"""
-
-    def __init__(self, tokenizer: HFTokenizer, config: TokenizerConfig):
-        super().__init__(config)
-        self.main = tokenizer
-    
-    @property
-    def special_tokens(self):
-        special_tokens_map = self.main.get_added_tokens_decoder()
-        special_tokens = [w.content for w in special_tokens_map.values()]
-        return special_tokens
-
-    @classmethod
-    def from_pretrained(cls, hf_path):
-        # init from a HuggingFace pretrained tokenizer (e.g. "gpt2")
-        tokenizer = HFTokenizer.from_pretrained(hf_path)
-        config = TokenizerConfig(
-            name=hf_path,
-            source="huggingface",
-            vocab_size=tokenizer.get_vocab_size(),
-            pat_str=None, # TODO: extract pattern from HuggingFace tokenizer if possible, otherwise use a default one
-            special_tokens=tokenizer.get_added_tokens_decoder()
-        )
-        return cls(tokenizer, config=config)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir):
-        # init from a local directory on disk (e.g. "out/tokenizer")
-        tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
-        tokenizer = HFTokenizer.from_file(tokenizer_path)
-        config = TokenizerConfig(
-            name=tokenizer_dir,
-            source="local",
-            vocab_size=tokenizer.get_vocab_size(),
-            pat_str=None,
-            special_tokens=SpecialTokens(), # tokenizer.get_added_tokens_decoder()
-        )
-        return cls(tokenizer, config=config)
-    
-    def id_to_token(self, id):
-        return self.main.id_to_token(id)
-
-    def _encode_one(self, text, prepend=None, append=None, num_threads=None):
-        # encode a single string
-        # prepend/append can be either a string of a special token or a token id directly.
-        # num_threads is ignored (only used by the nanochat Tokenizer for parallel encoding)
-        assert isinstance(text, str)
-        ids = []
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
-            ids.append(prepend_id)
-        ids.extend(self.main.encode(text, add_special_tokens=False).ids)
-        if append is not None:
-            append_id = append if isinstance(append, int) else self.encode_special(append)
-            ids.append(append_id)
-        return ids
-
-    def encode_special(self, text):
-        # encode a single special token via exact match
-        return self.main.mergeable_ranks(text)
-
-    def get_bos_token_id(self):
-        # Different HuggingFace models use different BOS tokens and there is little consistency
-        # 1) attempt to find a <|bos|> token
-        bos = self.encode_special("<|bos|>")
-        # 2) if that fails, attempt to find a <|endoftext|> token (e.g. GPT-2 models)
-        if bos is None:
-            bos = self.encode_special("<|endoftext|>")
-        # 3) if these fail, it's better to crash than to silently return None
-        assert bos is not None, "Failed to find BOS token in tokenizer"
-        return bos
-
-    def encode_ordinary(self, text, *args, **kwargs):
-        # encode a single string without adding special tokens
-        return self._encode_one(text, *args, **kwargs)
-    
-    def encode(self, text, *args, **kwargs):
-        if isinstance(text, str):
-            return self._encode_one(text, *args, **kwargs)
-        elif isinstance(text, list):
-            return [self._encode_one(t, *args, **kwargs) for t in text]
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-
-    def decode(self, ids):
-        return self.main.decode(ids, skip_special_tokens=False)
-
-    def save(self, tokenizer_dir):
-        # save the tokenizer to disk
-        os.makedirs(tokenizer_dir, exist_ok=True)
-        tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
-        self.main.save(tokenizer_path)
-        print(f"Saved tokenizer to {tokenizer_path}")
 
 # ------------------------------------------------------------
 # MAIN TOKENIZER CLASS 
@@ -439,92 +273,53 @@ class Tokenizer(_BaseTokenizer):
         special_tokens = config.special_tokens.list()
         vocab_size_no_special = config.vocab_size - len(special_tokens)
         # TODO: make the other tokenizers for comparison; lines +1 and +2 below are temporary
-        if not config.trainer == "huggingface":
-            msg = f"Training tokenizer with trainer {config.trainer!r} is not implemented yet. Please use 'huggingface' trainer for now."
+        tp = getattr(config, "training_params", None)
+        if tp is None:
+            # Legacy fallback
+            tp_trainer = config.trainer
+        else:
+            tp_trainer = tp.trainer
+
+        if tp_trainer != "huggingface":
+            msg = f"Training tokenizer with trainer {tp_trainer!r} is not implemented yet. Please use 'huggingface' trainer for now."
             log_error(msg, error_type=NotImplementedError, logger=logger)
         # TODO: make pretokenizer here -> options: 1. gpt2, 2. custom
-        if config.trainer == "tiktoken":
+        if tp_trainer == "tiktoken":
             from tiktoken._educational import bpe_train
             log0("Training tokenizer with tiktoken is a TODO for future improvement.", level="warning", logger=logger)
             # TODO: WIP, not tested yet
             mergeable_ranks = bpe_train(data=text_iterator, vocab_size=vocab_size_no_special, pat_str=config.pat_str)
-        elif config.trainer == "huggingface":
-            from tokenizers import decoders, pre_tokenizers, Regex
-            from tokenizers.models import BPE
-            from tokenizers.trainers import BpeTrainer
-            
-            tknzr = HFTokenizer(
-                BPE(
-                    byte_fallback=True,
-                    unk_token=None,
-                    fuse_unk=False
-                ))
-            tknzr.normalizer = None
-            pattern = Regex(config.pat_str)
-            tknzr.pre_tokenizer = pre_tokenizers.Sequence([
-                pre_tokenizers.Split(pattern=pattern, behavior="isolated", invert=False),
-                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
-            ])
-            tknzr.decoder = decoders.ByteLevel()
-            tknzr.post_processor = None
-            initial_alphabet = pre_tokenizers.ByteLevel.alphabet()
-            
-            trainer = BpeTrainer(
-                vocab_size=vocab_size_no_special, 
-                show_progress=True,
-                min_frequency=0,
-                initial_alphabet=initial_alphabet,
-                special_tokens=[]
-            )
-            trainer.show_progress = config.show_progress
-            tknzr.train_from_iterator(iterator=text_iterator, trainer=trainer)
-
-            # os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
-            # print("Tokenizer state", tknzr.model.__getstate__().keys())
-            merges = json.loads(tknzr.to_str())["model"]["merges"]
-            def merge_to_bytes(merge):
-                left, right = merge
-                # Handle the special case of the space token, 
-                # which is represented as "Ġ" in the HuggingFace tokenizer
-                left = left.replace("Ġ", " ") 
-                right = right.replace("Ġ", " ")
-                return left.encode("utf-8") + right.encode("utf-8")
-            mergeable_ranks = { 
-                merge_to_bytes(merge): rank + 256
-                for rank, merge in enumerate(merges) 
-            }
-            # mergeable_ranks = { 
-            #     left.encode("utf-8") + right.encode("utf-8"): rank + 256
-            #     for rank, (left, right) in enumerate(merges) 
-            # }
-            mergeable_ranks.update({ bytes([i]): i for i in range(256) if i not in mergeable_ranks }) # Add single byte tokens to mergeable ranks
+        elif tp_trainer == "huggingface":
+            # Delegate HuggingFace training logic to tokenizer.hf module
+            mergeable_ranks = train_huggingface_from_iterator(text_iterator, config)
 
         # TODO: add other trainer options (bpe, rust bpe, fast bpe...)
         # The following options are placeholders for future impl.
-        elif config.trainer in ["bpe", "fbpe", "rbpe"]:
-            raise NotImplementedError(f"Tokenizer training mode {config.trainer!r} is not yet implemented. Please use 'huggingface' mode.")
-        elif config.trainer == "bpe":
+        elif tp_trainer in ["bpe", "fbpe", "rbpe"]:
+            raise NotImplementedError(f"Tokenizer training mode {tp_trainer!r} is not yet implemented. Please use 'huggingface' mode.")
+        elif tp_trainer == "bpe":
             # naive python implementation of byte-level BPE, not optimized for large corpora, but serves as a reference
             from gpt_lab.tokenizer.bpe import bpe
             _, mergeable_ranks = bpe()
-        elif config.trainer == "fbpe":
+        elif tp_trainer == "fbpe":
             from gpt_lab.tokenizer.bpe import bpe_fast
             trainer = ...
-        elif config.trainer == "rbpe":
+        elif tp_trainer == "rbpe":
             from rbpe import bpe
             ...
-        elif config.trainer == "dummy":
+        elif tp_trainer == "dummy":
             log0("Using DummyTokenizer for training, this is not a real tokenizer and should only be used for testing purposes.", level="warning", logger=logger)
             return cls(DummyTokenizer(config), config)
         else:
-            msg = f"Tokenizer trainer {config.trainer!r} is not supported."
+            msg = f"Tokenizer trainer {tp_trainer!r} is not supported."
             log_error(msg, error_type=NotImplementedError, logger=logger)
         tokenizer = cls(
             mergeable_ranks=mergeable_ranks,
             special_tokens=special_tokens,
             config=config
         )
-        if config.to_save:
+        to_save_flag = tp.to_save if tp is not None else getattr(config, "to_save", True)
+        if to_save_flag:
             tokenizer.save_to_directory()
         return tokenizer
 

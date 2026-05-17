@@ -165,7 +165,9 @@ def bpe_fast(corpus_iter_fn, corpus_path, config):
     pair_locs = defaultdict(list)
 
     pretknzr = SimplePreTokenizer(config)
-    for head in tqdm(iter_word_nodes(corpus_iter_fn, corpus_path, pretknzr), desc="Building initial pair stats", total=config.max_chars // 10_000):
+    tp = getattr(config, "training_params", None)
+    max_chars_for_progress = tp.max_chars if tp is not None else config.max_chars
+    for head in tqdm(iter_word_nodes(corpus_iter_fn, corpus_path, pretknzr), desc="Building initial pair stats", total=max_chars_for_progress // 10_000):
         all_words.append(head)
         for node in collect_pairs(head):
             pair = (node.sym, node.next.sym)
