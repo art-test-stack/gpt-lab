@@ -580,8 +580,6 @@ class Tokenizer(_BaseTokenizer):
             text: Union[str, List[str]],
             *args, **kwargs
         ) -> Union[List[int], List[List[int]]]:
-        # NOTE: maybe it would be better to unfused both str and list encoding into separate methods to avoid confusion 
-        # and potential bugs with the different options (e.g. prepend_bos, unsqueeze) that may not be compatible with both modes?
         prepend_bos = kwargs.pop("prepend_bos", False)
         unsqueeze = kwargs.pop("unsqueeze", False)
         if isinstance(text, str):
