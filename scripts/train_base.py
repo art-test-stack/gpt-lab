@@ -112,7 +112,7 @@ if __name__ == "__main__":
     auto_parser.add_argument("--vocab-size", type=int, default=-1, help="(default: -1) Vocabulary size for auto-configured models. If not set, will be determined by vocab size scaling law based on model depth.")
     auto_parser.add_argument("--pat-str", type=str, default=None, help="(default: None) Split pattern for pre-tokenization if training a new-tokenizer. Options are 'gpt2, 'gpt4', 'cl100k_base', 'o200k_base', or directly the pattern string. If not set, will default to 'gpt2' pattern.")
     auto_parser.add_argument("--train-tokenizer", action="store_true", help="(default: False) Whether to train a new tokenizer from scratch.")
-    auto_parser.add_argument("--truncate-tokenizer", action="store_true", help="(default: False) Whether to truncate tokenizer values.")
+    auto_parser.add_argument("--clamp-tokenizer", action="store_true", help="(default: False) Whether to clamp tokenizer values.")
 
     ## Model arguments
     auto_parser.add_argument("--depth", type=int, default=12, help="(default: 12) Number of model layers.")

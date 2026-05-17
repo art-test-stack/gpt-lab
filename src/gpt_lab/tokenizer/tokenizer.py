@@ -86,7 +86,7 @@ class _BaseTokenizer:
     def __init__(self, config: Optional[TokenizerConfig] = None):
         self.config = config
         self.special_tokens = None
-        self.mergeable_ranks = None
+        self.token_to_id = None
         try:
             self.token_bytes = self.get_token_bytes()
         except Exception as e:
@@ -96,20 +96,11 @@ class _BaseTokenizer:
                 level="warning", logger=logger)
 
     def get_vocab(self):
-        return {**self.mergeable_ranks, **self.special_tokens}
+        return {**self.token_to_id, **self.special_tokens}
     
     @property
     def vocab_size(self):
-        "vocab_size value icludes both mergeable ranks and special tokens"
-        return len(self.mergeable_ranks) + len(self.special_tokens)
-    
-    @property
-    def n_special_tokens(self):
-        return len(self.special_tokens)
-    
-    @property
-    def n_ranks(self):
-        return len(self.mergeable_ranks)
+        return len(self.token_to_id) + len(self.special_tokens)
          
     def get_token_bytes(self):
         token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
@@ -157,13 +148,13 @@ class DummyTokenizer(_BaseTokenizer):
             )
         super().__init__(config)
         n_merges = config.vocab_size - len(config.special_tokens)
-        self.mergeable_ranks = { bytes([i]): i for i in range(min(256, n_merges)) }
+        self.token_to_id = { bytes([i]): i for i in range(min(256, n_merges)) }
         
         if n_merges > 256:
             for i in range(256, n_merges): # make merges deterministic at least lol
                 merge1 = bytes([i // 256])
                 merge2 = bytes([i % 256])
-                self.mergeable_ranks[merge1+merge2] = i
+                self.token_to_id[merge1+merge2] = i
 
         self.special_tokens = config.special_tokens
         self.bos_token_id = config.vocab_size 
@@ -198,7 +189,7 @@ class HuggingFaceTokenizerWrapper(_BaseTokenizer):
     @classmethod
     def from_pretrained(cls, hf_path):
         # init from a HuggingFace pretrained tokenizer (e.g. "gpt2")
-        tokenizer = HFTokenizer.from_pretrained(hf_path)
+        tokenizer = HFTokenizer.from_config(hf_path)
         config = TokenizerConfig(
             name=hf_path,
             source="huggingface",
@@ -242,7 +233,7 @@ class HuggingFaceTokenizerWrapper(_BaseTokenizer):
 
     def encode_special(self, text):
         # encode a single special token via exact match
-        return self.main.mergeable_ranks(text)
+        return self.main.token_to_id(text)
 
     def get_bos_token_id(self):
         # Different HuggingFace models use different BOS tokens and there is little consistency
@@ -277,6 +268,7 @@ class HuggingFaceTokenizerWrapper(_BaseTokenizer):
         self.main.save(tokenizer_path)
         print(f"Saved tokenizer to {tokenizer_path}")
 
+
 # ------------------------------------------------------------
 # MAIN TOKENIZER CLASS 
 #   - train with huggingface, 
@@ -307,7 +299,7 @@ class Tokenizer(_BaseTokenizer):
         ):
         super().__init__(config=config)
         special_tokens = { sp: rank + len(mergeable_ranks) for rank, sp in enumerate(special_tokens) }
-        self.mergeable_ranks = mergeable_ranks
+        self.token_to_id = mergeable_ranks
         self.main = tiktoken.Encoding(
             name=config.name,
             pat_str=config.pat_str,
@@ -504,48 +496,28 @@ class Tokenizer(_BaseTokenizer):
 
     
     @classmethod
-    def truncated_from_pretrained(cls, name: str, new_vocab_size: int, source: str = "tiktoken") -> Tokenizer:
-        """Construct a tokenizer by truncating the merge-rank table
-        of a pretrained tokenizer.
-
-        The tokenizer retains:
-            - all primitive byte tokens
-            - the earliest merge rules
-            - all special tokens
-
-        and removes later BPE merges according to merge rank order.
-
-        Because BPE merge ranks are constructed incrementally,
-        keeping the first K mergeable ranks preserves a valid
-        prefix of the original tokenizer.
-        """
-        new_name = f"{name}_truncated_{new_vocab_size}"
-
+    def clamped_from_pretrained(cls, name: str, new_vocab_size: int, source: str = "tiktoken") -> Tokenizer:
+        """Return a new Tokenizer with vocab clamped to new_vocab_size."""
+        new_name = f"{tokenizer.config.name}_clamped_{new_vocab_size}"
         try: 
             tokenizer = cls.from_disk(new_name)
-            log0(f"Found existing truncated tokenizer {new_name} on disk, loading it instead of creating a new one.", logger=logger)
+            log0(f"Found existing clamped tokenizer {new_name} on disk, loading it instead of creating a new one.", logger=logger)
             return tokenizer
         except Exception as e:
-            log0(f"No existing truncated tokenizer found on disk for {new_name}. Creating a new one by truncating the pretrained tokenizer {name}. Error: {e}", logger=logger, level="warning")
-        
+            log0(f"No existing clamped tokenizer found on disk for {new_name}. Creating a new one by clamping the pretrained tokenizer {name}. Error: {e}", logger=logger, level="warning")
         tokenizer = cls.from_pretrained(name, source=source)
-        if new_vocab_size - len(tokenizer.special_tokens) < 256:
-            msg = f"New vocab size {new_vocab_size} is too small to fit all single byte tokens and special tokens. Minimum vocab size is {256 + len(tokenizer.special_tokens)}."
-            log_error(msg, error_type=ValueError, logger=logger)
-
         if new_vocab_size >= tokenizer.vocab_size:
             return tokenizer  
 
         merges_to_remove = tokenizer.vocab_size - new_vocab_size
-        mergeable_ranks = dict(tokenizer.mergeable_ranks)  # shallow copy, don't mutate original
-        for merge, _ in sorted(mergeable_ranks.items(), key=lambda x: x[1], reverse=True):
+        token_to_id = dict(tokenizer.token_to_id)  # shallow copy, don't mutate original
+        for merge, _ in sorted(token_to_id.items(), key=lambda x: x[1], reverse=True):
             if merges_to_remove <= 0:
                 break
-            del mergeable_ranks[merge]
+            del token_to_id[merge]
             merges_to_remove -= 1
-        
         config = TokenizerConfig(
-            name=f"{tokenizer.config.name}_truncated_{new_vocab_size}",
+            name=f"{tokenizer.config.name}_clamped_{new_vocab_size}",
             source=tokenizer.config.source,
             dirname=tokenizer.config.dirname.parent / new_name,
             vocab_size=new_vocab_size,
@@ -553,38 +525,33 @@ class Tokenizer(_BaseTokenizer):
             special_tokens=tokenizer.config.special_tokens
         )
         tokenizer = cls(
-            mergeable_ranks=mergeable_ranks,
-            special_tokens=config.special_tokens.list(),
+            mergeable_ranks=token_to_id,
+            special_tokens=list(config.special_tokens.values()),
             config=config,
         )
         tokenizer.update_token_bytes()
         return tokenizer
     
     @classmethod
-    def get_closest_truncated_from_pretrained(cls, tokenizer: Tokenizer, target_vocab_size: int) -> Tokenizer:
+    def get_closest_clamped_from_pretrained(cls, tokenizer: Tokenizer, target_vocab_size: int) -> Tokenizer:
         # Find the closest vocab size that is less than or equal to the target
         closest_vocab_size = min(
             vocab_size for vocab_size in tokenizer.config.vocab_sizes
             if vocab_size <= target_vocab_size
         )
-        return cls.truncated_from_pretrained(tokenizer.config.name, closest_vocab_size)
+        return cls.clamped_from_pretrained(tokenizer.config.name, closest_vocab_size)
     
     def update_token_bytes(self):
-        if not hasattr(self, 'token_bytes'):
-            self.token_bytes = self.get_token_bytes()
-        if len(self.token_bytes) == len(self.mergeable_ranks) + len(self.special_tokens):
+        if len(self.token_to_id) == self.vocab_size - len(self.special_tokens):
             log0("No merges were removed, token bytes remain the same.", logger=logger)
             return 
-        old_vocab_size = len(self.token_bytes)
         self.token_bytes = self.get_token_bytes()
         self.token_bytes = torch.cat([
-            self.token_bytes[:len(self.mergeable_ranks)],                     # surviving merges, byte counts intact
-            torch.zeros(len(self.special_tokens), dtype=torch.int32)      # special tokens always 0
+            self.token_bytes[:len(self.token_to_id)],                     # surviving merges, byte counts intact
+            torch.zeros(len(self.special_tokens), dtype=torch.int32) # special tokens always 0
         ])
-        log0(f"Updated token bytes after truncation from {old_vocab_size:,} to {self.vocab_size:,}", logger=logger)
-        # Recompute token bytes and save to disk, useful after truncating the vocab
-        self.config.save_to_directory()
-
+        # Recompute token bytes and save to disk, useful after clamping the vocab
+        
     def save_to_directory(self, directory: Optional[Union[str, Path]] = None):
         # Save the tokenizer's merges and vocab to the specified directory
         if directory is None:
@@ -602,7 +569,7 @@ class Tokenizer(_BaseTokenizer):
 
         vocab_path = directory / "vocab.pkl" 
         with open(vocab_path, "wb") as vf:
-            pickle.dump(self.mergeable_ranks, vf)
+            pickle.dump(self.token_to_id, vf)
         log0(f"Saved tokenizer vocab to {vocab_path}", logger=logger)
 
     def encode_special(self, token: str) -> int:
