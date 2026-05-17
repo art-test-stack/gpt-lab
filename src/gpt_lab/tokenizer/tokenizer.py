@@ -4,6 +4,15 @@ import torch
 import random, json, os, csv
 
 import pickle
+import warnings
+import json as _json
+from hashlib import sha256
+from gpt_lab.tokenizer.serialization import (
+    save_mergeable_ranks,
+    load_mergeable_ranks,
+    validate_mergeable_ranks,
+    validate_no_special_token_overlap,
+)
 from pathlib import Path
 
 from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
@@ -18,6 +27,7 @@ from typing import Callable, Iterable, List, Optional, Union, Tuple, Dict
 import logging
 
 logger = logging.getLogger(__name__)
+from gpt_lab.tokenizer.truncation import parse_truncated_name
 
 # ------------------------------------------------------------
 # FACTORY FUNCTION TO BUILD TOKENIZER FROM CONFIG
@@ -113,29 +123,26 @@ class _BaseTokenizer:
          
     def get_token_bytes(self):
         token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-        if getattr(self, 'token_bytes', None) is not None:
-            return self.token_bytes_cache
-        
+        if getattr(self, "token_bytes", None) is not None:
+            return self.token_bytes
+
         if token_bytes_path.exists():
             token_bytes = torch.load(token_bytes_path)
             log0(f"Loaded token_bytes from {token_bytes_path}", logger=logger)
         else:
-            vocab_size = self.vocab_size
-            special_set = set(self.special_tokens)
-            token_strings = [self.decode([token_id]) for token_id in range(vocab_size)]
-            token_bytes = []
-            for token_id in range(vocab_size):
-                token_str = token_strings[token_id] # the Python string representation of this token
-                if token_str in special_set:
-                    token_bytes.append(0) # special characters are not counted
-                else:
-                    id_bytes = len(token_str.encode("utf-8")) # number of bytes that make up this token
-                    token_bytes.append(id_bytes)
-            token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
+            # Compute byte lengths directly from mergeable_ranks keys (which are bytes)
+            mergeable = self.mergeable_ranks or {}
+            # Sort by rank to produce deterministic ordering
+            sorted_items = sorted(mergeable.items(), key=lambda x: x[1])
+            token_bytes_list = [len(token) for token, _ in sorted_items]
+            # Special tokens are always zero-length for token_bytes
+            token_bytes_list.extend([0] * len(self.special_tokens))
+            token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device="cpu")
             with open(token_bytes_path, "wb") as f:
                 torch.save(token_bytes, f)
             log0(f"Saved token_bytes to {token_bytes_path}", logger=logger)
-        self.token_bytes_cache = token_bytes
+
+        self.token_bytes = token_bytes
         return token_bytes
 
     def __call__(self, text, *args, **kwds):
@@ -325,13 +332,51 @@ class Tokenizer(_BaseTokenizer):
     def from_pretrained(cls, name: str, source: Optional[str] = None, special_tokens: Optional[SpecialTokens] = None):
         if special_tokens is None:
             special_tokens = SpecialTokens()
+        # Phase 3: handle truncated names early to allow creating or loading
+        # pre-truncated tokenizers. This must run before any source-dispatch logic.
+        truncated = parse_truncated_name(name)
+        if truncated is not None:
+            base_name, vocab_size = truncated
+            try:
+                return cls.from_disk(name)
+            except FileNotFoundError:
+                # Expected: not cached yet. Build from base tokenizer.
+                return cls.truncated_from_pretrained(
+                    base_name,
+                    vocab_size,
+                    source=source or "tiktoken",
+                    special_tokens=special_tokens,
+                )
+            # Do not catch other exceptions here; allow them to propagate.
         if source is None:
+            # Build expected-missing exception tuple dynamically, adding any
+            # tiktoken-specific exception if it can be discovered at runtime.
+            EXPECTED_MISSING = (FileNotFoundError, KeyError)
+            try:
+                import tiktoken
+                try:
+                    # probe tiktoken for its missing-encoding exception type
+                    tiktoken.get_encoding("__NONEXISTENT_ENCODING__")
+                except Exception as e:
+                    EXPECTED_MISSING = tuple(set(EXPECTED_MISSING) | {type(e)})
+            except Exception:
+                # tiktoken not available in this environment; proceed with defaults
+                pass
+
             for source in ("tiktoken", "huggingface", "local"):
                 try:
                     return cls.from_pretrained(name, source=source, special_tokens=special_tokens)
-                except Exception as e:
-                    print(f"Failed to load tokenizer from source {source} with error: {e}. Trying next source...")
-            raise ValueError(f"Failed to load tokenizer {name} from all sources.")
+                except EXPECTED_MISSING as e:
+                    logger.debug(f"Source {source!r} not applicable for {name!r}: {e}")
+                    continue
+                except Exception:
+                    logger.debug(
+                        f"Unexpected error loading {name!r} from {source!r}:",
+                        exc_info=True,
+                    )
+                    raise
+
+            raise ValueError(f"Failed to load tokenizer {name!r} from all sources.")
         elif source == "tiktoken":
             enc = tiktoken.get_encoding(name)
             mergeable_ranks = enc._mergeable_ranks
@@ -491,10 +536,37 @@ class Tokenizer(_BaseTokenizer):
             cachedir = Path(cachedir)
         # dirname = cachedir / name
         config = TokenizerConfig.from_directory(name, cachedir=cachedir)
-        mergeable_ranks = config.get_mergeable_ranks()
-        log0(f"Loaded tokenizer config from {name} with vocab size "
-             f"{len(mergeable_ranks) + len(config.special_tokens)}", 
-             logger=logger)
+
+        directory = Path(config.dirname)
+        msgpack_path = directory / "mergeable_ranks.msgpack"
+        pkl_path = directory / "vocab.pkl"
+
+        if msgpack_path.exists():
+            mergeable_ranks = load_mergeable_ranks(msgpack_path)
+        elif pkl_path.exists():
+            warnings.warn(
+                f"Loading tokenizer from legacy pickle format at {pkl_path}. "
+                "Re-save this tokenizer to migrate to the msgpack format.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            with open(pkl_path, "rb") as f:
+                mergeable_ranks = pickle.load(f)
+        else:
+            raise FileNotFoundError(
+                f"No tokenizer vocab file found in {directory}. Expected {msgpack_path} or {pkl_path}."
+            )
+
+        # Validate mergeable ranks and ensure no overlap with special tokens
+        validate_mergeable_ranks(mergeable_ranks)
+        special_tokens_map = {tok: 0 for tok in config.special_tokens.list()}
+        validate_no_special_token_overlap(mergeable_ranks, special_tokens_map)
+
+        log0(
+            f"Loaded tokenizer config from {name} with vocab size "
+            f"{len(mergeable_ranks) + len(config.special_tokens)}",
+            logger=logger,
+        )
         return cls(
             mergeable_ranks=mergeable_ranks,
             special_tokens=config.special_tokens.list(),
@@ -503,60 +575,13 @@ class Tokenizer(_BaseTokenizer):
     
     @classmethod
     def truncated_from_pretrained(cls, name: str, new_vocab_size: int, source: str = "tiktoken") -> Tokenizer:
-        """Construct a tokenizer by truncating the merge-rank table
-        of a pretrained tokenizer.
+        """Delegate truncation to tokenizer.truncation.truncated_from_pretrained (Phase 2).
 
-        The tokenizer retains:
-            - all primitive byte tokens
-            - the earliest merge rules
-            - all special tokens
-
-        and removes later BPE merges according to merge rank order.
-
-        Because BPE merge ranks are constructed incrementally,
-        keeping the first K mergeable ranks preserves a valid
-        prefix of the original tokenizer.
+        Signature preserved for backward compatibility.
         """
-        new_name = f"{name}_truncated_{new_vocab_size}"
+        from gpt_lab.tokenizer.truncation import truncated_from_pretrained as _trunc
 
-        try: 
-            tokenizer = cls.from_disk(new_name)
-            log0(f"Found existing truncated tokenizer {new_name} on disk, loading it instead of creating a new one.", logger=logger)
-            return tokenizer
-        except Exception as e:
-            log0(f"No existing truncated tokenizer found on disk for {new_name}. Creating a new one by truncating the pretrained tokenizer {name}. Error: {e}", logger=logger, level="warning")
-        
-        tokenizer = cls.from_pretrained(name, source=source)
-        if new_vocab_size - len(tokenizer.special_tokens) < 256:
-            msg = f"New vocab size {new_vocab_size} is too small to fit all single byte tokens and special tokens. Minimum vocab size is {256 + len(tokenizer.special_tokens)}."
-            log_error(msg, error_type=ValueError, logger=logger)
-
-        if new_vocab_size >= tokenizer.vocab_size:
-            return tokenizer  
-
-        merges_to_remove = tokenizer.vocab_size - new_vocab_size
-        mergeable_ranks = dict(tokenizer.mergeable_ranks)  # shallow copy, don't mutate original
-        for merge, _ in sorted(mergeable_ranks.items(), key=lambda x: x[1], reverse=True):
-            if merges_to_remove <= 0:
-                break
-            del mergeable_ranks[merge]
-            merges_to_remove -= 1
-        
-        config = TokenizerConfig(
-            name=new_name,
-            source=tokenizer.config.source,
-            dirname=tokenizer.config.dirname.parent / new_name,
-            vocab_size=new_vocab_size,
-            pat_str=tokenizer.config.pat_str,
-            special_tokens=tokenizer.config.special_tokens
-        )
-        tokenizer = cls(
-            mergeable_ranks=mergeable_ranks,
-            special_tokens=config.special_tokens.list(),
-            config=config,
-        )
-        tokenizer.update_token_bytes()
-        return tokenizer
+        return _trunc(name, new_vocab_size, source=source)
     
     @classmethod
     def get_closest_truncated_from_pretrained(cls, tokenizer: Tokenizer, target_vocab_size: int) -> Tokenizer:
@@ -568,20 +593,26 @@ class Tokenizer(_BaseTokenizer):
         return cls.truncated_from_pretrained(tokenizer.config.name, closest_vocab_size)
     
     def update_token_bytes(self):
-        if not hasattr(self, 'token_bytes'):
-            self.token_bytes = self.get_token_bytes()
-        if len(self.token_bytes) == len(self.mergeable_ranks) + len(self.special_tokens):
-            log0("No merges were removed, token bytes remain the same.", logger=logger)
-            return 
-        old_vocab_size = len(self.token_bytes)
-        self.token_bytes = self.get_token_bytes()
-        self.token_bytes = torch.cat([
-            self.token_bytes[:len(self.mergeable_ranks)],                     # surviving merges, byte counts intact
-            torch.zeros(len(self.special_tokens), dtype=torch.int32)      # special tokens always 0
-        ])
+        # Recompute token_bytes directly from mergeable_ranks keys to avoid decode()/string roundtrip
+        if not hasattr(self, "mergeable_ranks") or self.mergeable_ranks is None:
+            raise RuntimeError("mergeable_ranks is missing when updating token bytes")
+
+        sorted_items = sorted(self.mergeable_ranks.items(), key=lambda x: x[1])
+        token_bytes_list = [len(token) for token, _ in sorted_items]
+        token_bytes_list.extend([0] * len(self.special_tokens))
+        new_token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device="cpu")
+
+        old_vocab_size = getattr(self, "token_bytes", torch.tensor([])).numel() if hasattr(self, "token_bytes") else 0
+        self.token_bytes = new_token_bytes
         log0(f"Updated token bytes after truncation from {old_vocab_size:,} to {self.vocab_size:,}", logger=logger)
-        # Recompute token bytes and save to disk, useful after truncating the vocab
-        self.config.save_to_directory()
+        # Save token_bytes to disk
+        token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
+        torch.save(self.token_bytes, token_bytes_path)
+        # Persist tokenizer config/metadata
+        try:
+            self.config.save_to_directory()
+        except Exception:
+            log0("Warning: failed to save config.pkl after truncation; token_bytes saved.", level="warning", logger=logger)
 
     def save_to_directory(self, directory: Optional[Union[str, Path]] = None):
         # Save the tokenizer's merges and vocab to the specified directory
@@ -596,12 +627,36 @@ class Tokenizer(_BaseTokenizer):
         # which is essentially the vocab of the tokenizer. 
         # We don't have a separate merges dict since the mergeable ranks already 
         # encodes the merges in the order they were added during training.
-        self.config.save_to_directory()
+        # Persist mergeable ranks in deterministic msgpack format and compute fingerprint
+        msgpack_path = directory / "mergeable_ranks.msgpack"
+        fingerprint = save_mergeable_ranks(msgpack_path, self.mergeable_ranks)
 
-        vocab_path = directory / "vocab.pkl" 
-        with open(vocab_path, "wb") as vf:
-            pickle.dump(self.mergeable_ranks, vf)
-        log0(f"Saved tokenizer vocab to {vocab_path}", logger=logger)
+        # Save token bytes tensor
+        token_bytes_path = directory / "token_bytes.pt"
+        if getattr(self, "token_bytes", None) is None:
+            self.token_bytes = self.get_token_bytes()
+        torch.save(self.token_bytes, token_bytes_path)
+
+        # Write a lightweight JSON descriptor alongside the pickle config for readability
+        config_json = {
+            "name": self.config.name,
+            "vocab_size": self.config.vocab_size,
+            "pat_str": self.config.pat_str,
+            "mergeable_ranks_sha256": fingerprint,
+            "source": self.config.source,
+        }
+        json_path = directory / "tokenizer_config.json"
+        with open(json_path, "w") as jf:
+            _json.dump(config_json, jf, indent=2)
+
+        # Keep legacy pickle-based config for backwards compatibility
+        try:
+            self.config.save_to_directory()
+        except Exception:
+            # If saving the pickle-config fails, still keep msgpack and json
+            log0("Warning: failed to save config.pkl; msgpack and json were written.", level="warning", logger=logger)
+
+        log0(f"Saved tokenizer mergeable ranks to {msgpack_path}", logger=logger)
 
     def encode_special(self, token: str) -> int:
         return self.special_tokens[token]
