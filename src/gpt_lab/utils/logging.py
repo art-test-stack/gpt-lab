@@ -115,6 +115,8 @@ def log_all(msg, level=logging.ERROR, logger=logger):
     if isinstance(level, str):
         level = log_levels.get(level.upper(), logging.ERROR)
     logger.log(level, _with_rank(msg), stacklevel=3)
+    if level >= logging.ERROR:
+        raise RuntimeError(msg)
 
 def log_dict(title, info, logger=logger, level=logging.INFO, only_rank0=True, structured=False):
     level = _get_level(level)

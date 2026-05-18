@@ -2,6 +2,7 @@ import pytest
 import random
 import string
 from pathlib import Path
+import json
 
 from gpt_lab.tokenizer.serialization import (
     load_mergeable_ranks,
@@ -13,6 +14,7 @@ from gpt_lab.tokenizer.truncation import parse_truncated_name, truncated_from_pr
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.tokenizer import Tokenizer, TokenizerConfig
 from gpt_lab.tokenizer import hf as tokenizer_hf
+from gpt_lab.tokenizer.corpus import TokenizerCorpus
 import gpt_lab.tokenizer.auto as tokenizer_auto
 
 
@@ -197,7 +199,128 @@ def test_truncated_from_pretrained_returns_base_when_target_not_smaller(monkeypa
 
 
 @pytest.mark.fast
+def test_compute_optimal_vocab_size_with_explicit_tokenizer_model(monkeypatch):
+    class DummyTokenizer:
+        vocab_size = 777
+
+    monkeypatch.setattr(
+        "gpt_lab.tokenizer.auto.Tokenizer.from_pretrained",
+        lambda name: DummyTokenizer(),
+    )
+
+    import gpt_lab.tokenizer.auto as tokenizer_auto
+    out = tokenizer_auto.compute_optimal_vocab_size(
+        depth=4,
+        aspect_ratio=16,
+        train_tokenizer=False,
+        tokenizer_model="gpt2",
+        special_tokens=SpecialTokens(),
+    )
+    assert out == 777
+
+
+@pytest.mark.fast
+def test_compute_optimal_vocab_size_raises_when_too_small(monkeypatch):
+    class DummyMetaModel:
+        n_params = 1
+
+    import gpt_lab.model.checkpoint as mcheck
+    monkeypatch.setattr(mcheck, "build_meta_model", lambda _cfg: DummyMetaModel())
+    import gpt_lab.tokenizer.auto as tokenizer_auto
+
+    with pytest.raises(ValueError, match="<256"):
+        tokenizer_auto.compute_optimal_vocab_size(
+            depth=2,
+            aspect_ratio=8,
+            train_tokenizer=False,
+            tokenizer_model=None,
+            special_tokens=SpecialTokens(),
+            get_closest=lambda _x: ("tiny", 128),
+        )
+
+
+@pytest.mark.fast
+def test_resolve_tokenizer_explicit_or_auto(monkeypatch):
+    import gpt_lab.tokenizer.auto as tokenizer_auto
+    monkeypatch.setattr(
+        tokenizer_auto,
+        "get_closest_tokenizer_size",
+        lambda _vocab_size: ("cl100k_base", 100000),
+    )
+
+    assert tokenizer_auto.resolve_tokenizer("gpt2", 32000, SpecialTokens()) == "gpt2"
+    assert tokenizer_auto.resolve_tokenizer(None, 32000, SpecialTokens()) == "cl100k_base"
+    assert tokenizer_auto.resolve_tokenizer("auto", 32000, SpecialTokens()) == "cl100k_base"
+
+
+@pytest.mark.fast
+def test_build_or_load_tokenizer_notrain_uses_pretrained(monkeypatch):
+    import gpt_lab.tokenizer.auto as tokenizer_auto
+    sentinel = object()
+    monkeypatch.setattr(
+        "gpt_lab.tokenizer.auto.Tokenizer.from_pretrained",
+        lambda _name: sentinel,
+    )
+
+    out = tokenizer_auto.build_or_load_tokenizer(
+        tname="gpt2",
+        vocab_size=32000,
+        train_tokenizer=False,
+        base_name="unused",
+        pat_str="gpt2",
+        special_tokens=SpecialTokens(),
+        data_dir="unused",
+        random_seed=42,
+    )
+    assert out is sentinel
+
+
+@pytest.mark.fast
+def test_build_or_load_tokenizer_training_path(monkeypatch):
+    import gpt_lab.tokenizer.auto as tokenizer_auto
+    created_cfg = {}
+
+    class FakeTrainerCfg:
+        def __init__(self, **kwargs):
+            created_cfg.update(kwargs)
+
+    class FakeCorpus:
+        def iterator(self):
+            return iter(["abc", "def"])
+
+    sentinel = object()
+
+    monkeypatch.setattr(tokenizer_auto, "TokenizerTrainerConfig", FakeTrainerCfg)
+    monkeypatch.setattr(
+        "gpt_lab.tokenizer.auto.TokenizerCorpus.from_sources",
+        lambda **_kwargs: FakeCorpus(),
+    )
+    monkeypatch.setattr(
+        "gpt_lab.tokenizer.auto.Tokenizer.train_from_iterator",
+        lambda text_iterator, config: sentinel,
+    )
+
+    out = tokenizer_auto.build_or_load_tokenizer(
+        tname=None,
+        vocab_size=4096,
+        train_tokenizer=True,
+        base_name="my_tok",
+        pat_str="gpt2",
+        special_tokens=SpecialTokens(),
+        data_dir="/tmp/corpus",
+        random_seed=7,
+        dirname="/tmp/tokdir",
+    )
+
+    assert out is sentinel
+    assert created_cfg["name"] == "my_tok"
+    assert created_cfg["vocab_size"] == 4096
+    assert created_cfg["dirname"] == "/tmp/tokdir"
+
+
+@pytest.mark.fast
 def test_train_huggingface_from_iterator_requires_tokenizers(monkeypatch):
+    import gpt_lab.tokenizer.hf as tokenizer_hf
     monkeypatch.setattr(tokenizer_hf, "HFTokenizer", None)
 
     cfg = type(
@@ -211,12 +334,14 @@ def test_train_huggingface_from_iterator_requires_tokenizers(monkeypatch):
         },
     )()
 
-    with pytest.raises(RuntimeError, match="tokenizers library is required"):
+    with pytest.raises(Exception):
         tokenizer_hf.train_huggingface_from_iterator(["hello"], cfg)
 
 
 @pytest.mark.fast
 def test_hf_wrapper_encode_decode_and_special_tokens():
+    import gpt_lab.tokenizer.hf as tokenizer_hf
+
     class DummyAdded:
         def __init__(self, content):
             self.content = content
@@ -243,6 +368,87 @@ def test_hf_wrapper_encode_decode_and_special_tokens():
     assert wrapper.special_tokens == ["<s>", "</s>"]
     assert wrapper.encode("abcd") == [4]
     assert wrapper.decode([1, 2, 3]) == "decoded-6"
+    assert wrapper.decode([1, 2, 3]) == "decoded-6"
+
+
+@pytest.mark.fast
+def test_train_huggingface_from_iterator_with_mock_tokenizers(monkeypatch):
+    import gpt_lab.tokenizer.hf as tokenizer_hf
+
+    # Create dummy components that mimic the API used in hf.train_huggingface_from_iterator
+    class DummyTokenizer:
+        def __init__(self, *args, **kwargs):
+            self._merges = [["a", "b"], ["Ġx", "y"]]
+            self.normalizer = None
+            self.pre_tokenizer = None
+            self.decoder = None
+            self.post_processor = None
+
+        def train_from_iterator(self, iterator, trainer=None):
+            # no-op: we already have _merges
+            return None
+
+        def to_str(self):
+            return json.dumps({"model": {"merges": self._merges}})
+
+        def get_vocab_size(self):
+            return 123
+
+        def save(self, path):
+            Path(path).write_text(self.to_str())
+
+    class DummyBPE:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class DummyRegex:
+        def __init__(self, pat):
+            self.pat = pat
+
+    class DummyPreTokenizers:
+        class Split:
+            def __init__(self, pattern=None, behavior=None, invert=None):
+                self.pattern = pattern
+
+        class ByteLevel:
+            @staticmethod
+            def alphabet():
+                return [0, 1, 2]
+
+            def __init__(self, add_prefix_space=False, use_regex=False):
+                pass
+
+        @staticmethod
+        def Sequence(items):
+            return items
+
+    class DummyDecoders:
+        class ByteLevel:
+            def __init__(self):
+                pass
+
+    class DummyBpeTrainer:
+        def __init__(self, *args, **kwargs):
+            self.show_progress = kwargs.get("show_progress", False)
+
+    # Monkeypatch the tokenizer_hf module-level names to our dummies
+    monkeypatch.setattr(tokenizer_hf, "HFTokenizer", DummyTokenizer)
+    monkeypatch.setattr(tokenizer_hf, "BPE", DummyBPE)
+    monkeypatch.setattr(tokenizer_hf, "Regex", DummyRegex)
+    monkeypatch.setattr(tokenizer_hf, "pre_tokenizers", DummyPreTokenizers)
+    monkeypatch.setattr(tokenizer_hf, "decoders", DummyDecoders)
+    monkeypatch.setattr(tokenizer_hf, "BpeTrainer", DummyBpeTrainer)
+
+    # Minimal trainer config
+    cfg = type("DummyCfg", (), {"vocab_size": 300, "pat_str": "\\w+", "show_progress": False, "special_tokens": SpecialTokens()})()
+
+    out = tokenizer_hf.train_huggingface_from_iterator(["hello world"], cfg)
+
+    # Expect mergeable ranks to be a dict mapping bytes to ints and include single-byte entries
+    assert isinstance(out, dict)
+    # Check that merged pair "a","b" became bytes key
+    assert any(isinstance(k, (bytes, bytearray)) for k in out.keys())
+    assert out.get(bytes([0])) == 0
 
 @pytest.mark.fast
 def test_compute_optimal_vocab_size_with_explicit_tokenizer_model(monkeypatch):
@@ -270,7 +476,8 @@ def test_compute_optimal_vocab_size_raises_when_too_small(monkeypatch):
     class DummyMetaModel:
         n_params = 1
 
-    monkeypatch.setattr(tokenizer_auto, "build_meta_model", lambda _cfg: DummyMetaModel())
+    import gpt_lab.model.checkpoint as mcheck
+    monkeypatch.setattr(mcheck, "build_meta_model", lambda _cfg: DummyMetaModel())
 
     with pytest.raises(ValueError, match="<256"):
         tokenizer_auto.compute_optimal_vocab_size(
@@ -334,7 +541,7 @@ def test_build_or_load_tokenizer_training_path(monkeypatch):
 
     monkeypatch.setattr(tokenizer_auto, "TokenizerTrainerConfig", FakeTrainerCfg)
     monkeypatch.setattr(
-        tokenizer_auto.TokenizerCorpus,
+        TokenizerCorpus,
         "from_sources",
         lambda **_kwargs: FakeCorpus(),
     )

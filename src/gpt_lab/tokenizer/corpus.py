@@ -1,14 +1,18 @@
 from pathlib import Path
 import random, pickle
-from gpt_lab.utils.default import RANDOM_SEED, CACHE_DIR, DATA_DIR
-from gpt_lab.data.loader import load_datasets
+from gpt_lab.utils.default import RANDOM_SEED, DATA_DIR
 from gpt_lab.data.normalizers import clean_codeparrot_example
 from typing import Union, Dict, Callable, Optional, Iterable, Tuple
 
 # TODO: consider using compression.ztsd when python.version >= 3.14 (pi)
-import zstd
+# import zstd
 
 from tqdm import tqdm
+try:
+    from datasets import load_dataset
+except ImportError:
+    load_dataset = None
+
 
 _fineweb_2_names_raw = ["rus_Cyrl", "cmn_Hani", "deu_Latn", "jpn_Jpan", "spa_Latn", "fra_Latn", "ita_Latn", "por_Latn", "pol_Latn", "nld_Latn", "ind_Latn", "vie_Latn", "fas_Arab", "arb_Arab", "tur_Latn", "tha_Thai", "ukr_Cyrl", "ell_Grek", "kor_Hang", "ces_Latn", "swe_Latn", "hun_Latn", "ron_Latn", "nob_Latn", "dan_Latn", "fin_Latn", "bul_Cyrl", "hin_Deva", "ben_Beng", "slk_Latn", "slk_Latn", "lit_Latn", "bos_Latn", "slv_Latn", "ekk_Latn", "cat_Latn", "tam_Taml", "hrv_Latn", "lvs_Latn", "zsm_Latn", "azj_Latn", "srp_Cyrl", "kat_Geor", "npi_Deva", "mar_Deva", "nno_Latn"]
 _fineweb_2_names = []
@@ -18,6 +22,79 @@ for lang in _fineweb_2_names_raw:
     if script not in alph:
         alph.append(script)
         _fineweb_2_names.append(lang)
+
+
+def load_datasets(
+         # { "path": str, "name": str (optional), "weight": float (optional), "hook": Callable (optional) } 
+        sources: Iterable[Dict[str, Union[str, float, Callable]]],
+        data_dir: Union[str,Path] = DATA_DIR,
+        split: str = "train",
+        streaming: bool = True,
+        shuffle: bool = True,
+        random_seed: int = 42,
+        *args, **kwargs
+    ) -> Dict[str, Iterable]:
+    ds = dict()
+    for src in sources:
+        path, name = src["path"], src.get("name", None)
+        ds_name = path if name is None else f"{path}:{name}"
+        ds_split = src.get("split", split)
+        ds_hook = src.get("hook", lambda x: x)
+        _ds = ds_hook(
+            load_dataset(
+                path, 
+                name=name,
+                split=ds_split,
+                streaming=streaming, 
+                cache_dir=data_dir, 
+                *args, **kwargs
+            )
+        )
+        if "filter_fn" in src:
+            _ds = _ds.filter(src["filter_fn"])
+        if shuffle and streaming:
+            _ds = _ds.shuffle(seed=random_seed)
+        ds[ds_name] = _ds
+    return ds
+
+def weighted_sample_generator(streams, prng):
+    """
+    streams: list of (iterable, weight)
+    yields items from one of the streams according to weights.
+    Designed to keep reading from selected stream until exhausted (streams are long)
+    For streaming HF datasets these are effectively infinite for training; we just sample.
+    """
+    # convert weights to cumulative thresholds
+    total = sum(w for _, w in streams)
+    cum = []
+    acc = 0.0
+    for _, w in streams:
+        acc += w / total
+        cum.append(acc)
+
+    # create iterators
+    iterators = [iter(s) for s, _ in streams]
+    while True:
+        p = prng.random()
+        # pick which stream index
+        idx = 0
+        while p > cum[idx]:
+            idx += 1
+        try:
+            yield next(iterators[idx])
+        except StopIteration:
+            # If a stream ends, remove it from selection.
+            # For HF streaming this is unlikely; but handle gracefully.
+            iterators.pop(idx)
+            streams.pop(idx)
+            cum = []
+            total = sum(w for _, w in streams) if streams else 0
+            acc = 0.0
+            for _, w in streams:
+                acc += w / total
+                cum.append(acc)
+            if not streams:
+                break
 
 def display_stat_by_source(stat_by_source: Dict[str, Dict[str, int]]):
     from rich.console import Console

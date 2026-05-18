@@ -4,21 +4,26 @@ import os, json
 from pathlib import Path
 from typing import Iterable, Dict
 
-from gpt_lab.utils.logging import log_all
+from gpt_lab.utils.logging import log_all, log0, log_error
 from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.tokenizer.base import _BaseTokenizer
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from tokenizers import Tokenizer as HFTokenizer
     from tokenizers import decoders, pre_tokenizers, Regex
     from tokenizers.models import BPE
     from tokenizers.trainers import BpeTrainer
-except Exception:
+except Exception as e:
+    log0(f"Failed to import HuggingFace tokenizers library: {e}. " \
+         "HuggingFace tokenizer functionality will be unavailable. " \
+         "To use HuggingFace tokenizers, please install the 'tokenizers' library via pip.", 
+         level="warning", logger=logger)
     HFTokenizer = None
-import logging
-
-logger = logging.getLogger(__name__)
 
 class HuggingFaceTokenizerWrapper(_BaseTokenizer):
     """Light wrapper around HuggingFace `tokenizers` tokenizer.
@@ -39,7 +44,7 @@ class HuggingFaceTokenizerWrapper(_BaseTokenizer):
     @classmethod
     def from_pretrained(cls, hf_path: str):
         if HFTokenizer is None:
-            log_all("tokenizers library not available, cannot load HuggingFace tokenizer", level="error", logger=logger)
+            log_error("tokenizers library is required to load HuggingFace tokenizer", logger=logger, error_type=ImportError)
         tokenizer = HFTokenizer.from_pretrained(hf_path)
         config = TokenizerConfig(
             name=hf_path,
@@ -53,7 +58,7 @@ class HuggingFaceTokenizerWrapper(_BaseTokenizer):
     @classmethod
     def from_directory(cls, tokenizer_dir: str):
         if HFTokenizer is None:
-            log_all("tokenizers library not available, cannot load HuggingFace tokenizer", level="error", logger=logger)
+            log_error("tokenizers library is required to load HuggingFace tokenizer", logger=logger, error_type=ImportError)
         tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
         tokenizer = HFTokenizer.from_file(tokenizer_path)
         config = TokenizerConfig(
@@ -86,8 +91,8 @@ def train_huggingface_from_iterator(text_iterator: Iterable[str], config: Tokeni
     Returns a dict mapping byte-strings to ranks (integers).
     """
     if HFTokenizer is None:
-        log_all("tokenizers library is required for HuggingFace trainer", level="error", logger=logger)
-
+        log_error("tokenizers library is required for HuggingFace trainer", logger=logger, error_type=ImportError)
+    
     tknzr = HFTokenizer(
         BPE(
             byte_fallback=True,
