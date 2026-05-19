@@ -71,8 +71,9 @@ class _BaseTokenizer:
             # Special tokens are always zero-length for token_bytes
             token_bytes_list.extend([0] * len(self.special_tokens))
             token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device="cpu")
-            with open(token_bytes_path, "wb") as f:
-                torch.save(token_bytes, f)
+            if self.config.save_token_bytes:
+                with open(token_bytes_path, "wb") as f:
+                    torch.save(token_bytes, f)
             log0(f"Saved token_bytes to {token_bytes_path}", logger=logger)
 
         self._token_bytes = token_bytes

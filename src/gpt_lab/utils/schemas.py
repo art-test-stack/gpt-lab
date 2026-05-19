@@ -114,6 +114,7 @@ class TokenizerConfig(BaseModel):
     special_tokens: Optional[SpecialTokens] = Field(default_factory=SpecialTokens)
     source: TokenizerSources = "tiktoken"
 
+    save_token_bytes: bool = True
     trainer: Optional[TokenizerTrainerConfig] = None
 
     def model_post_init(self, context: Any) -> None:

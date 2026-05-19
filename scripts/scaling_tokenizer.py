@@ -1,7 +1,11 @@
+from gpt_lab.utils.common import get_banner
+get_banner(to_print=True)
+
 from gpt_lab.tokenizer.tokenizer import Tokenizer
 from gpt_lab.utils.schemas import TokenizerTrainerConfig, TokenizerConfig
 from gpt_lab.tokenizer.corpus import TokenizerCorpus
 from gpt_lab.utils.default import PAT_STR_GPT2, PAT_STR_GPT4, PAT_STR_punct, PAT_STR_cl100k_base, PAT_STR_o200k_base, TOKENIZERS_FOLDER, DATA_DIR
+from gpt_lab.utils.logging import log0
 
 from pathlib import Path
 import argparse, pickle, zipfile
@@ -11,7 +15,14 @@ from collections import Counter
 
 import regex as re
 
+import logging
+logger = logging.getLogger(__name__)
+
 BASELINES = ["gpt2", "cl100k_base", "o200k_base"]
+
+# easy
+def print(*args, **kwargs):
+    log0(" ".join(str(arg) for arg in args), **kwargs, logger=logger)
 
 def load_all_results(path):
     results = []
@@ -200,6 +211,7 @@ def run_tokenizer_experiment(task):
         pat_str=p_str,
         trainer=trainer_config,
         source="huggingface", # this is quite dummy
+        save_token_bytes=False, # we will compute token bytes on the fly without saving to disk to avoid IO overhead, adjust as needed based on your use case and whether you want to inspect the token bytes files
         # special_tokens=SpecialTokens(), # using default special tokens, adjust as needed
     )
     t0 = time.time()
@@ -258,13 +270,13 @@ def main():
             with open(backup_path, "rb") as f:
                 results = pickle.load(f)
             if results == [] or results is None:
-                print(f"Existing results file {backup_path} is empty. It will be overwritten with new results.")
+                log0(f"Existing results file {backup_path} is empty. It will be overwritten with new results.", logger=logger)
                 break
             new_name = results_path.stem + f"_{i}"
             backup_path = backup_path.with_stem(new_name)
             i += 1
         results_path.rename(backup_path)
-        print(f"Existing results file found. Renamed to {backup_path!r} to avoid overwriting. New results will be stored in {results_path!r}.")
+        log0(f"Existing results file found. Renamed to {backup_path!r} to avoid overwriting. New results will be stored in {results_path!r}.", logger=logger)
 
 
     def store_results(results_batch, path=results_path):
@@ -311,18 +323,19 @@ def main():
     
 
     # Corpus size varying with different vocab_sizes and split patterns
-    patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_str-punct": PAT_STR_punct, "pat_str-cl100k_base": PAT_STR_cl100k_base, "pat_str-o200k_base": PAT_STR_o200k_base }
+    # patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_str-punct": PAT_STR_punct, "pat_str-cl100k_base": PAT_STR_cl100k_base, "pat_str-o200k_base": PAT_STR_o200k_base }
+    patterns = { "pat_str-gpt4": PAT_STR_GPT4 }
     # patterns = { "PAT_STR_o200k_base": PAT_STR_o200k_base }
     # TODO: optimize by running the biggest vocab size and slice it on top-k merges for smaller vocabs
     # vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
-    vocab_sizes = [30_000, 50_000, 70_000, 100_000, 200_000] 
+    vocab_sizes = [50_000, 70_000, 100_000, 200_000] 
 
     # vocab_sizes = list(reversed(vocab_sizes))
-    _max_char_runs = 8  # adjust the divisor to control how many runs are done before storing results to disk, this is a trade-off between memory usage and frequency of saving intermediate results. With 3 processes, we can afford to do more runs before saving, but if you have more memory constraints, you might want to save more frequently by using a smaller divisor.
-    max_bytes = lambda vocab_size: [int(vocab_size * i * 512) for i in range(1, _max_char_runs+1)] # ~3.5 characters per token on average, adjust as needed based on your corpus
+    _max_char_runs = 16  # adjust the divisor to control how many runs are done before storing results to disk, this is a trade-off between memory usage and frequency of saving intermediate results. With 3 processes, we can afford to do more runs before saving, but if you have more memory constraints, you might want to save more frequently by using a smaller divisor.
+    max_bytes = lambda vocab_size: [int(vocab_size * i * 512) for i in range(1, _max_char_runs+1, 2)] # ~3.5 characters per token on average, adjust as needed based on your corpus
     # Two options: same name for all tokenizers -> overwrite / different names -> many tokenizers on disk, consider cleaning up after training or implementing a caching mechanism to avoid retraining the same tokenizer multiple times.
     # name = lambda vocab_size, max_char, p_str_name: f"ic1-tok-{int(vocab_size//1000)}k_maxchar-{max_char//1e6:.1f}M_pattern-{p_str_name}"
-    print(f"Using {num_procs} processes for tokenizer training.")
+    log0(f"Using {num_procs} processes for tokenizer training.")
     corpus_path = DATA_DIR / "corpus" / results_path.stem
     results = []
     corpus_bytemax = max(max_bytes(max(vocab_sizes)))
@@ -367,7 +380,7 @@ def main():
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     mp.set_start_method("spawn", force=True)
-    max_workers = min(os.cpu_count(), 8)  # be conservative
+    max_workers = min(os.cpu_count(), 4)  # be conservative
     results = []
     # tasks_chunks = [tasks[i:i + max_workers] for i in range(0, len(tasks), _max_char_runs)]
     # for chunk in tqdm(tasks_chunks, desc="Processing task chunks"):

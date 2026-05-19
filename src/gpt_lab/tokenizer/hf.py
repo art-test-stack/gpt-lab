@@ -114,7 +114,8 @@ def train_huggingface_from_iterator(text_iterator: Iterable[str], config: Tokeni
     initial_alphabet = pre_tokenizers.ByteLevel.alphabet()
 
     # Prefer training-specific params container when available
-    vocab_size_no_special = config.vocab_size - len(config.special_tokens.list())
+    _special_tokens = list(config.special_tokens) or []
+    vocab_size_no_special = config.vocab_size - len(config.special_tokens)
     trainer = BpeTrainer(
         vocab_size=vocab_size_no_special,
         show_progress=True,

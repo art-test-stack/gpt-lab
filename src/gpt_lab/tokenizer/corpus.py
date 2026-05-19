@@ -172,9 +172,11 @@ class TokenizerCorpus:
         for shard in self.shard_paths():
             with self.open_text_file(shard) as f:
                 for line in f:
-                    yield line.strip()
-                    byte_count += len(line)
-                    if max_bytes and byte_count >= max_bytes:
+                    byte_count += len(line.encode("utf-8"))
+
+                    yield line.rstrip("\n")
+
+                    if max_bytes is not None and byte_count >= max_bytes:
                         return
 
     @staticmethod
@@ -267,7 +269,14 @@ class TokenizerCorpus:
         else:
             try:
                 meta = cls.from_path(corpus_dir)
-            except (FileNotFoundError, pickle.UnpicklingError, EOFError):
+            except (
+                 FileNotFoundError,
+                 pickle.PickleError,
+                 EOFError,
+                 ValueError,
+                 AttributeError,
+                 ModuleNotFoundError,
+             ):
                 meta = cls.write_from_sources(
                     corpus_dir=corpus_dir,
                     sources=sources,
