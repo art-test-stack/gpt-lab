@@ -16,7 +16,7 @@ from gpt_lab.tokenizer.serialization import (
 )
 from pathlib import Path
 
-from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
+from gpt_lab.utils.schemas import TokenizerConfig
 from gpt_lab.utils.default import TOKENIZERS_FOLDER
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.logging import log0, log_error
@@ -267,56 +267,52 @@ class Tokenizer(_BaseTokenizer):
             cls,
             text_iterator: Iterable[str],
             config: TokenizerConfig,
-            tp: Optional[TokenizerTrainerConfig] = None
         ):
         special_tokens = config.special_tokens.list()
         vocab_size_no_special = config.vocab_size - len(special_tokens)
         # TODO: make the other tokenizers for comparison; lines +1 and +2 below are temporary
-        if tp is None:
-            # Legacy fallback
-            tp_trainer = config.trainer
-        else:
-            tp_trainer = tp.trainer
-
-        if tp_trainer != "huggingface":
-            msg = f"Training tokenizer with trainer {tp_trainer!r} is not implemented yet. Please use 'huggingface' trainer for now."
+        tp_trainer = config.trainer 
+        if tp_trainer is None:
+            log_error("TokenizerConfig.trainer is not set. Please set the trainer explicitly in TokenizerConfig.", logger=logger, error_type=UserWarning)
+        if tp_trainer.source != "huggingface":
+            msg = f"Training tokenizer with trainer {tp_trainer.source!r} is not implemented yet. Please use 'huggingface' trainer for now."
             log_error(msg, error_type=NotImplementedError, logger=logger)
         # TODO: make pretokenizer here -> options: 1. gpt2, 2. custom
-        if tp_trainer == "tiktoken":
+        if tp_trainer.source == "tiktoken":
             from tiktoken._educational import bpe_train
             log0("Training tokenizer with tiktoken is a TODO for future improvement.", level="warning", logger=logger)
             # TODO: WIP, not tested yet
             mergeable_ranks = bpe_train(data=text_iterator, vocab_size=vocab_size_no_special, pat_str=config.pat_str)
-        elif tp_trainer == "huggingface":
+        elif tp_trainer.source == "huggingface":
             # Delegate HuggingFace training logic to tokenizer.hf module
             mergeable_ranks = train_huggingface_from_iterator(text_iterator, config)
 
         # TODO: add other trainer options (bpe, rust bpe, fast bpe...)
         # The following options are placeholders for future impl.
-        elif tp_trainer in ["bpe", "fbpe", "rbpe"]:
-            raise NotImplementedError(f"Tokenizer training mode {tp_trainer!r} is not yet implemented. Please use 'huggingface' mode.")
-        elif tp_trainer == "bpe":
+        elif tp_trainer.source in ["bpe", "fbpe", "rbpe"]:
+            raise NotImplementedError(f"Tokenizer training mode {tp_trainer.source!r} is not yet implemented. Please use 'huggingface' mode.")
+        elif tp_trainer.source == "bpe":
             # naive python implementation of byte-level BPE, not optimized for large corpora, but serves as a reference
             from gpt_lab.tokenizer.bpe import bpe
             _, mergeable_ranks = bpe()
-        elif tp_trainer == "fbpe":
+        elif tp_trainer.source == "fbpe":
             from gpt_lab.tokenizer.bpe import bpe_fast
             trainer = ...
-        elif tp_trainer == "rbpe":
+        elif tp_trainer.source == "rbpe":
             from rbpe import bpe
             ...
-        elif tp_trainer == "dummy":
+        elif tp_trainer.source == "dummy":
             log0("Using DummyTokenizer for training, this is not a real tokenizer and should only be used for testing purposes.", level="warning", logger=logger)
             return cls(DummyTokenizer(config), config)
         else:
-            msg = f"Tokenizer trainer {tp_trainer!r} is not supported."
+            msg = f"Tokenizer trainer {tp_trainer.source!r} is not supported."
             log_error(msg, error_type=NotImplementedError, logger=logger)
         tokenizer = cls(
             mergeable_ranks=mergeable_ranks,
             special_tokens=special_tokens,
             config=config
         )
-        to_save_flag = tp.to_save if tp is not None else getattr(config, "to_save", False)
+        to_save_flag = tp_trainer.to_save if tp_trainer is not None else getattr(config, "to_save", False)
         if to_save_flag:
             tokenizer.save_to_directory()
         return tokenizer

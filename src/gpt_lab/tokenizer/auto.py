@@ -107,7 +107,8 @@ def build_or_load_tokenizer(tname: Optional[str], vocab_size: int, train_tokeniz
     from gpt_lab.tokenizer.corpus import TokenizerCorpus
     
     _tname = base_name
-    trainer_cfg = TokenizerTrainerConfig(name=_tname, dirname=dirname or base_name, vocab_size=vocab_size, pat_str=pat_str, special_tokens=special_tokens)
+    trainer_cfg = TokenizerTrainerConfig() # cfg should be adapted
+    cfg = TokenizerConfig(name=_tname, source="huggingface", vocab_size=vocab_size, pat_str=pat_str, special_tokens=special_tokens, trainer=trainer_cfg)
     corpus = TokenizerCorpus.from_sources(corpus_dir=data_dir, max_chars=vocab_size * 4 * 100, random_seed=random_seed)
     tokenizer = Tokenizer.train_from_iterator(text_iterator=corpus.iterator(), config=trainer_cfg)
     return tokenizer

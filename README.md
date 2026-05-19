@@ -351,14 +351,19 @@ The tokenization implementation are located in [`gpt_lab.tokenizer`](./src/gpt_l
 ```python
 from gpt_lab.tokenizer import Tokenizer
 from gpt_lab.tokenizer.corpus import TokenizerCorpus
-from gpt_lab.utils.schemas import TokenizerTrainerConfig
+from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
 
 # uses default corpus settings (mixture of HuggingFaceFW/fineweb-edu, HuggingFaceFW/fineweb-2, HuggingFaceTB/finemath and codeparrot/codeparrot-clean)
 corpus = TokenizerCorpus.from_sources(random_seed=42)
-cfg = TokenizerTrainerConfig(
+trainer_cfg = TokenizerTrainerConfig(
+    source="huggingface", # training backend (e.g., "huggingface", "tiktoken", "bpe", "fbpe", "rbpe", "dummy")
+    to_save=True, # pattern for pre-tokenization (e.g., "gpt2", "cl100k-base", etc., or regex pattern for custom pre-tokenization)
+)
+cfg = TokenizerConfig(
     name="my_tokenizer",
     vocab_size=32_000,
-    pat_str="gpt2", # pattern for pre-tokenization (e.g., "gpt2", "cl100k-base", etc., or regex pattern for custom pre-tokenization)
+    pat_str="gpt2", 
+    trainer=trainer_cfg,# whether to save the trained tokenizer to disk
 )
 tokenizer = Tokenizer.train_from_iterator(cfg, iterator=corpus.iterator())
 ```

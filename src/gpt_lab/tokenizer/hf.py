@@ -85,11 +85,14 @@ class HuggingFaceTokenizerWrapper(_BaseTokenizer):
         self.main.save(tokenizer_path)
 
 
-def train_huggingface_from_iterator(text_iterator: Iterable[str], config: TokenizerTrainerConfig) -> Dict[bytes, int]:
+def train_huggingface_from_iterator(text_iterator: Iterable[str], config: TokenizerConfig) -> Dict[bytes, int]:
     """Train a HuggingFace BPE tokenizer and return mergeable_ranks mapping.
 
     Returns a dict mapping byte-strings to ranks (integers).
     """
+    tr_config = getattr(config, "trainer", None)
+    if tr_config is None:
+        log_error("TokenizerConfig must have a 'trainer' attribute with training parameters for HuggingFace tokenizer training.", logger=logger, error_type=ValueError)
     if HFTokenizer is None:
         log_error("tokenizers library is required for HuggingFace trainer", logger=logger, error_type=ImportError)
     
@@ -111,7 +114,6 @@ def train_huggingface_from_iterator(text_iterator: Iterable[str], config: Tokeni
     initial_alphabet = pre_tokenizers.ByteLevel.alphabet()
 
     # Prefer training-specific params container when available
-    tp = getattr(config, "training_params", None)
     vocab_size_no_special = config.vocab_size - len(config.special_tokens.list())
     trainer = BpeTrainer(
         vocab_size=vocab_size_no_special,
@@ -120,7 +122,7 @@ def train_huggingface_from_iterator(text_iterator: Iterable[str], config: Tokeni
         initial_alphabet=initial_alphabet,
         special_tokens=[],
     )
-    trainer.show_progress = tp.show_progress if tp is not None else config.show_progress
+    trainer.show_progress = tr_config.show_progress 
     tknzr.train_from_iterator(iterator=text_iterator, trainer=trainer)
 
     merges = json.loads(tknzr.to_str())["model"]["merges"]

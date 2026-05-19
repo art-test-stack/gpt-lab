@@ -1,3 +1,4 @@
+from __future__ import annotations
 from pathlib import Path
 import random, pickle
 from gpt_lab.utils.default import RANDOM_SEED, DATA_DIR
@@ -255,7 +256,7 @@ class TokenizerCorpus:
             compressed: bool = False,
             shard_size_bytes: Optional[int] = None,
             loader_fn: Optional[Callable] = None, # if provided, should be function that takes dataset config and returns iterator of text samples; overrides default loading from datasets library
-        ):
+        ) -> TokenizerCorpus:
         meta = None
         if loader_fn is not None:
             class CustomLoaderCorpus(TokenizerCorpus):

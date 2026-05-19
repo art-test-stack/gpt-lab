@@ -1,5 +1,5 @@
 from gpt_lab.tokenizer.tokenizer import Tokenizer
-from gpt_lab.utils.schemas import TokenizerTrainerConfig
+from gpt_lab.utils.schemas import TokenizerTrainerConfig, TokenizerConfig
 from gpt_lab.tokenizer.corpus import TokenizerCorpus
 from gpt_lab.utils.default import PAT_STR_GPT2, PAT_STR_GPT4, PAT_STR_punct, PAT_STR_cl100k_base, PAT_STR_o200k_base, TOKENIZERS_FOLDER, DATA_DIR
 
@@ -182,20 +182,25 @@ def run_tokenizer_experiment(task):
         corpus_dir=corpus_path,
         sources=None,
         max_bytes=corpus_bytemax,
-        bytes_per_doc=corpus_bytemax // 10_000,
+        bytes_per_doc=corpus_bytemax // 20_000,
         random_seed=seed,
     )
-    config = TokenizerTrainerConfig(
+    trainer_config = TokenizerTrainerConfig(
         max_bytes=max_bytes,
-        bytes_per_doc=max_bytes // 10_000,
-        vocab_size=vocab_size,
-        name=name,
+        bytes_per_doc=max_bytes // 20_000,
         num_proc=num_procs,
-        trainer="huggingface",
-        dircorpus=corpus_path,
-        pat_str=p_str,
+        source="huggingface",
+        dircorpus=corpus_path, # TODO: add CorpusConfig instead
         show_progress=False,
         to_save=False,
+    )
+    config = TokenizerConfig(
+        name=name,
+        vocab_size=vocab_size,
+        pat_str=p_str,
+        trainer=trainer_config,
+        source="huggingface", # this is quite dummy
+        # special_tokens=SpecialTokens(), # using default special tokens, adjust as needed
     )
     t0 = time.time()
     tokenizer = Tokenizer.train_from_iterator(
