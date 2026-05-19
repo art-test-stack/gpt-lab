@@ -160,100 +160,57 @@ class TokenizerConfig(BaseModel):
             pickle.dump(self, f)
 
 
-class TokenizerTrainingParams(BaseModel):
-    """Encapsulate training-related parameters for tokenizer training.
-
-    Phase 6: move training-specific params into a dedicated model to cleanly
-    separate tokenizer metadata from training-run configuration.
-    """
-    max_chars: int = -1
-    chars_per_doc: int = -1
-    merges_per_pass: int = 512
-    num_proc: int = -1
-    trainer: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "huggingface"
-    show_progress: bool = True
-    to_save: bool = True
-
-    def model_post_init(self, context: Any) -> None:
-        # leave defaults; some values will be adjusted by TokenizerTrainerConfig
-        pass
-
-
-class TokenizerTrainerConfig(TokenizerConfig):
+class TokenizerTrainerConfig(BaseModel):
     model_config = ConfigDict(
         json_encoders={Path: str},
     )
     # Backwards-compatible placement of training params. New code should use
     # `training_params` to access training-related options.
-    training_params: TokenizerTrainingParams = Field(default_factory=TokenizerTrainingParams)
     # Keep legacy fields for compatibility; they'll be synced into training_params
-    max_chars: int = -1
-    chars_per_doc: int = -1
+    max_bytes: int = -1
+    bytes_per_doc: int = -1
     merges_per_pass: int = 512 # Only used for fbpe
     num_proc: int = -1
     trainer: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "huggingface"
     show_progress: bool = True
     to_save: bool = True
     
-    def model_post_init(self, context: Any) -> None:
-        super().model_post_init(context)
-        # Sync legacy fields into the new `training_params` container
-        self.training_params.max_chars = self.max_chars
-        self.training_params.chars_per_doc = self.chars_per_doc
-        self.training_params.merges_per_pass = self.merges_per_pass
-        self.training_params.num_proc = self.num_proc
-        self.training_params.trainer = self.trainer
-        self.training_params.show_progress = self.show_progress
-        self.training_params.to_save = self.to_save
-
-        if self.training_params.trainer == "tiktoken" and self.pat_str == "":
-            log0("Using tiktoken trainer with an empty pat_str may lead to suboptimal tokenization. "
-                 "Consider using a regex pattern for better tokenization performance.", level="warning", logger=logger)
-        
-        if self.training_params.max_chars == -1:
-            self.training_params.max_chars = int(self.vocab_size * 1000 * 2.5)
-        if self.training_params.chars_per_doc == -1:
-            self.training_params.chars_per_doc = self.training_params.max_chars // 1000
-        if self.training_params.num_proc <= 0:
-            self.training_params.num_proc = min(32, (os.cpu_count() or 1) - 1)
-    
     def save_to_directory(self, directory: Optional[Union[str, Path]] = None):
-        if directory is not None:
-            if isinstance(directory, str):
-                directory = Path(directory)
-        else:
-            directory = self.dirname
-        config_path = directory / "config.pkl"
-        if not config_path.parent.exists():
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(str(config_path), "wb") as f:
-            pickle.dump(self, f)
+        pass 
+        # if directory is not None:
+        #     if isinstance(directory, str):
+        #         directory = Path(directory)
+        # else:
+        #     directory = self.dirname
+        # config_path = directory / "config.pkl"
+        # if not config_path.parent.exists():
+        #     config_path.parent.mkdir(parents=True, exist_ok=True)
+        # with open(str(config_path), "wb") as f:
+        #     pickle.dump(self, f)
 
-        # TODO: consider saving with an other tool
-        json_path = TOKENIZERS_FOLDER / "tokenizers.json"
-        # df = df[df["name"] != self.name]  # Remove existing entry if it exists
+        # # TODO: consider saving with an other tool
+        # json_path = TOKENIZERS_FOLDER / "tokenizers.json"
 
-        new_row = {
-            "datetime": time.time(),
-            "name": self.name,
-            "vocab_size": self.vocab_size,
-            "special_tokens": len(self.special_tokens.list()),
-            "source": self.source,
-            "trainer": self.trainer,
-            "directory": str(directory),
-            "corpus_files": self.dircorpus if isinstance(self.dircorpus, str) else str(self.dircorpus),
-            "chars_per_doc": self.chars_per_doc,
-            "corpus_nb_chars": self.max_chars,
-        }
-        if json_path.exists():
-            with open(json_path, "r") as f:
-                data = json.load(f)
-        else:
-            data = []
-        data.append(new_row)
-        with open(json_path, "w") as f:
-            json.dump(data, f, indent=2)
-        
+        # new_row = {
+        #     "datetime": time.time(),
+        #     "name": self.name,
+        #     "vocab_size": self.vocab_size,
+        #     "special_tokens": len(self.special_tokens.list()),
+        #     "source": self.source,
+        #     "trainer": self.trainer,
+        #     "directory": str(directory),
+        #     "corpus_files": self.dircorpus if isinstance(self.dircorpus, str) else str(self.dircorpus),
+        #     "chars_per_doc": self.bytes_per_doc,
+        #     "corpus_nb_chars": self.max_bytes,
+        # }
+        # if json_path.exists():
+        #     with open(json_path, "r") as f:
+        #         data = json.load(f)
+        # else:
+        #     data = []
+        # data.append(new_row)
+        # with open(json_path, "w") as f:
+        #     json.dump(data, f, indent=2)
 
 class DatasetConfig(BaseModel):
     name: str
@@ -266,14 +223,6 @@ class DatasetConfig(BaseModel):
     sorted: bool = True
     max_shards: Optional[int] = None
     streaming: bool = False
-    # source: str
-    # split: Literal["train", "validation", "test"]
-    # seed: Optional[int]
-    # shard_size: Optional[int]
-    # num_shards: Optional[int]
-    # data_dir: Optional[Union[str,Path]] = DATA_DIR
-    # num_proc: Optional[int]
-    # stream: bool = True
 
 class DataLoaderConfig(BaseModel):
     batch_size: int = 1

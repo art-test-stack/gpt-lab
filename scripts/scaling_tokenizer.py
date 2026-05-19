@@ -11,6 +11,8 @@ from collections import Counter
 
 import regex as re
 
+BASELINES = ["gpt2", "cl100k_base", "o200k_base"]
+
 def load_all_results(path):
     results = []
     with open(path, "rb") as f:
@@ -94,11 +96,12 @@ def get_eval_corpus(eval_set):
     return TokenizerCorpus.from_sources(
         corpus_dir=eval_set["localdir"],
         sources=[eval_set["generator_source"]],
-        max_chars=500_000, # just for evaluation, we can use a subset of the data
-        chars_per_doc=10_000,
+        # max_chars=500_000, # just for evaluation, we can use a subset of the data
+        max_bytes=500_000 * 4, # just for evaluation, we can use a subset of the data, adjust as needed based on your corpus
+        bytes_per_doc=4096 * 4,
         split=eval_set["split"],
         compressed=True,
-        shard_size_chars=50_000,
+        shard_size_bytes=50_000 * 4,
         loader_fn=eval_set.get("loader_fn", None), # will overwrite for enwik8
     )
 
@@ -144,14 +147,33 @@ def eval_tokenizer(tokenizer):
         results[eval_set["metricname"]] = res
     return results
 
+def compare_with_truncated_baselines(target_vocab_size):
+    comparisons = {}
+    from tiktoken import get_encoding
+
+    for baseline in BASELINES:
+        baseline_vocab_size = get_encoding(baseline).n_vocab
+        if baseline_vocab_size <= target_vocab_size:
+            continue
+
+        truncated_name = f"{baseline}_truncated_{target_vocab_size}"
+        truncated_tokenizer = Tokenizer.from_pretrained(truncated_name)
+        comparisons[baseline] = {
+            "base_vocab_size": baseline_vocab_size,
+            "truncated_name": truncated_name,
+            "evaluation": eval_tokenizer(truncated_tokenizer),
+        }
+
+    return comparisons
+
 def run_tokenizer_experiment(task):
     (
         vocab_size,
         p_str_name,
         p_str,
-        max_char,
+        max_bytes,
         corpus_path,
-        corpus_charmax,
+        corpus_bytemax,
         seed,
         name,
     ) = task
@@ -159,13 +181,13 @@ def run_tokenizer_experiment(task):
     corpus = TokenizerCorpus.from_sources(
         corpus_dir=corpus_path,
         sources=None,
-        max_chars=corpus_charmax,
-        chars_per_doc=corpus_charmax // 10_000,
+        max_bytes=corpus_bytemax,
+        bytes_per_doc=corpus_bytemax // 10_000,
         random_seed=seed,
     )
     config = TokenizerTrainerConfig(
-        max_chars=max_char,
-        chars_per_doc=max_char // 1000,
+        max_bytes=max_bytes,
+        bytes_per_doc=max_bytes // 10_000,
         vocab_size=vocab_size,
         name=name,
         num_proc=num_procs,
@@ -177,7 +199,7 @@ def run_tokenizer_experiment(task):
     )
     t0 = time.time()
     tokenizer = Tokenizer.train_from_iterator(
-        text_iterator=corpus.iterator(max_chars=max_char),
+        text_iterator=corpus.iterator(max_bytes=max_bytes),
         config=config,
     )
     t1 = time.time()
@@ -185,13 +207,14 @@ def run_tokenizer_experiment(task):
     result = {
         "vocab_size": vocab_size,
         "pattern": p_str_name,
-        "max_chars": max_char,
+        "max_bytes": max_bytes,
+        "tokenizer_name": name,
         "config": str(config),
         "training_time": t1 - t0,
         "corpus_size_mb": corpus_path.stat().st_size / 1e6,
     }
 
-    for text in corpus.iterator(max_chars=max_char):
+    for text in corpus.iterator(max_bytes=max_bytes):
         result["nb_chars_trained"] = result.get("nb_chars_trained", 0) + len(text)
         result["nb_words_trained"] = result.get("nb_words_trained", 0) + len(text.split())
         result["nb_bytes_trained"] = result.get("nb_bytes_trained", 0) + len(text.encode("utf-8"))
@@ -203,13 +226,15 @@ def run_tokenizer_experiment(task):
     del tokenizer
     return result
 
-char_per_doc = lambda max_char: max_char // 10_000 # Default to 1000 documents if not specified, adjust as needed
+byte_per_doc = lambda max_byte: max_byte // 10_000 # Default to 1000 documents if not specified, adjust as needed
 
 def main():
     parser = argparse.ArgumentParser(description="Find the optimal corpus size for training a BPE tokenizer with different vocabulary sizes, and evaluate the trained tokenizers on a simple test set to analyze the trade-offs between corpus size, vocabulary size, training time, and tokenization quality.")
     parser.add_argument("--write-corpus", action="store_true", help="Flag to indicate training mode (write corpus). If not set, the script will attempt to load an existing corpus from disk.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--results-path", type=str, default=str(TOKENIZERS_FOLDER / 'scaling_tokenizer_results.pkl'), help="Path to store the results of the tokenizer evaluations.")
+    parser.add_argument("--compare-truncated-baselines", action="store_true", help="Whether to compare trained tokenizers with truncated versions of baseline tokenizers.")
+    parser.add_argument("--corpus-temperature-alpha", type=float, default=None, help="Optional temperature parameter to control the randomness of the corpus generation. Higher values will result in a more diverse corpus, while lower values will make it more focused on the most common samples. This can be useful for testing how the tokenizer performs with different levels of corpus diversity.")
     args = parser.parse_args()
     import os
     num_procs = min(os.cpu_count(), 32) 
@@ -260,11 +285,10 @@ def main():
     # Baselines: gpt2, cl100k_base, o200k_base
     from tiktoken import get_encoding
 
-    baselines = ["gpt2", "cl100k_base", "o200k_base"]
     results = load_all_results(results_path) if results_path.exists() else []
     if len(results) == 0:
         results = []
-        for baseline in baselines:
+        for baseline in BASELINES:
             enc = get_encoding(baseline)
             evaluation = eval_tokenizer(enc)
             result = dict(
@@ -285,31 +309,32 @@ def main():
     patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_str-punct": PAT_STR_punct, "pat_str-cl100k_base": PAT_STR_cl100k_base, "pat_str-o200k_base": PAT_STR_o200k_base }
     # patterns = { "PAT_STR_o200k_base": PAT_STR_o200k_base }
     # TODO: optimize by running the biggest vocab size and slice it on top-k merges for smaller vocabs
-    vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
+    # vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
+    vocab_sizes = [30_000, 50_000, 70_000, 100_000, 200_000] 
 
     # vocab_sizes = list(reversed(vocab_sizes))
-    _max_char_runs = 8
-    max_chars = lambda vocab_size: [int(vocab_size * i * 500) for i in range(1, _max_char_runs+1)] # ~3.5 characters per token on average, adjust as needed based on your corpus
+    _max_char_runs = 8  # adjust the divisor to control how many runs are done before storing results to disk, this is a trade-off between memory usage and frequency of saving intermediate results. With 3 processes, we can afford to do more runs before saving, but if you have more memory constraints, you might want to save more frequently by using a smaller divisor.
+    max_bytes = lambda vocab_size: [int(vocab_size * i * 512) for i in range(1, _max_char_runs+1)] # ~3.5 characters per token on average, adjust as needed based on your corpus
     # Two options: same name for all tokenizers -> overwrite / different names -> many tokenizers on disk, consider cleaning up after training or implementing a caching mechanism to avoid retraining the same tokenizer multiple times.
     # name = lambda vocab_size, max_char, p_str_name: f"ic1-tok-{int(vocab_size//1000)}k_maxchar-{max_char//1e6:.1f}M_pattern-{p_str_name}"
-    name = "ic1-scaling-tok"
     print(f"Using {num_procs} processes for tokenizer training.")
     corpus_path = DATA_DIR / "corpus" / results_path.stem
     results = []
-    corpus_charmax = max(max_chars(max(vocab_sizes)))
+    corpus_bytemax = max(max_bytes(max(vocab_sizes)))
 
     if args.write_corpus:
-        print(f"Writing corpus to {corpus_path} with max chars {corpus_charmax:,}...")
+        print(f"Writing corpus to {corpus_path} with max bytes {corpus_bytemax:,}...")
         corpus = TokenizerCorpus.write_from_sources(
             corpus_dir=corpus_path,
-            max_chars=corpus_charmax,
-            chars_per_doc=char_per_doc(corpus_charmax),
+            max_bytes=corpus_bytemax,
+            bytes_per_doc=byte_per_doc(corpus_bytemax),
             random_seed=args.seed,
+            temperature_alpha=args.corpus_temperature_alpha,
         )
         print(f"Corpus written to {corpus_path}. Size: {sum(c.stat().st_size / 1e6 for c in corpus_path.glob('*.txt')):.2f} MB")
     # Prepare run configurations
     if not args.write_corpus:
-        print(f"Using existing corpus at {corpus_path} with max chars {corpus_charmax:,} for tokenizer training.")
+        print(f"Using existing corpus at {corpus_path} with max bytes {corpus_bytemax:,} for tokenizer training.")
         if not corpus_path.exists():
             raise FileNotFoundError(f"Corpus path {corpus_path} does not exist. Please run the script with --write-corpus flag to create the corpus before training tokenizers.")
         corpus = TokenizerCorpus.from_sources(corpus_dir=corpus_path)
@@ -318,17 +343,17 @@ def main():
 
     for vocab_size in vocab_sizes:
         for p_str_name, p_str in patterns.items():
-            for max_char in max_chars(vocab_size):
+            for max_byte in max_bytes(vocab_size):
                 tasks.append(
                     (
                         vocab_size,
                         p_str_name,
                         p_str,
-                        max_char,
+                        max_byte,
                         corpus_path,
-                        corpus_charmax,
+                        corpus_bytemax,
                         args.seed,
-                        name,
+                        f"ic1-scaling-tok-{p_str_name}-v{vocab_size}-b{max_byte//1e6:.1f}M",
                     )
                 )
 
@@ -353,14 +378,33 @@ def main():
 
         buffer = []
         for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Tokenizer experiments")):
-            buffer.append(future.result())
+            result = future.result()
+            buffer.append(result)
+            results.append(result)
 
-            if i % _max_char_runs == 0:
+            if len(buffer) >= _max_char_runs:
                 store_results(buffer)
                 buffer.clear()
 
         if buffer:
             store_results(buffer)
+
+    if args.compare_truncated_baselines:
+        comparison_records = []
+        for entry in results:
+            if entry.get("baseline") is not None:
+                continue
+            target_vocab_size = entry["vocab_size"]
+            comparison_records.append({
+                "comparison_for": entry.get("tokenizer_name"),
+                "vocab_size": target_vocab_size,
+                "pattern": entry.get("pattern"),
+                "max_chars": entry.get("max_chars"),
+                "max_bytes": entry.get("max_bytes"),
+                "truncated_baseline_evaluations": compare_with_truncated_baselines(target_vocab_size),
+            })
+        if comparison_records:
+            store_results(comparison_records)
 
     print(f"Total time for all runs: {(time.time() - t_total_start)/3600:.2f} hours.")
     print(f"All runs completed. Results stored in {results_path}.")

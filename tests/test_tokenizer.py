@@ -446,9 +446,17 @@ def test_train_huggingface_from_iterator_with_mock_tokenizers(monkeypatch):
 
     # Expect mergeable ranks to be a dict mapping bytes to ints and include single-byte entries
     assert isinstance(out, dict)
-    # Check that merged pair "a","b" became bytes key
-    assert any(isinstance(k, (bytes, bytearray)) for k in out.keys())
-    assert out.get(bytes([0])) == 0
+    # Check that merged pairs produced exact byte keys and ranks
+    # Dummy merges: ["a","b"] -> b"ab" with rank 256, ["Ġx","y"] -> b" xy" with rank 257
+    assert out.get(b"ab") == 256
+    assert out.get(" xy".encode("utf-8")) == 257
+
+    # All single-byte tokens should be present and map to their own integer values
+    for i in range(256):
+        assert out.get(bytes([i])) == i
+
+    # Total entries should equal 256 single-bytes + 2 merges
+    assert len(out) == 256 + 2
 
 @pytest.mark.fast
 def test_compute_optimal_vocab_size_with_explicit_tokenizer_model(monkeypatch):

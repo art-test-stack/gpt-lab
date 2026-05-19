@@ -12,6 +12,8 @@ import re
 from typing import Optional
 from pathlib import Path
 
+from gpt_lab.utils.special_tokens import SpecialTokens
+
 # Lightweight module: avoid importing heavy project modules at import time.
 # Logging is optional; use print() for informational messages here.
 

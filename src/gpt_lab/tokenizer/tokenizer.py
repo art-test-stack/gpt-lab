@@ -159,8 +159,6 @@ class Tokenizer(_BaseTokenizer):
         self.special_tokens = special_tokens
         self.config = config
         self.bos_token_id = self.encode_special(config.special_tokens.bos)
-        if getattr(self, 'token_bytes', None) is None:
-            self.token_bytes = self.get_token_bytes()
 
     @classmethod
     def from_pretrained(cls, name: str, source: Optional[str] = None, special_tokens: Optional[SpecialTokens] = None):
@@ -268,12 +266,12 @@ class Tokenizer(_BaseTokenizer):
     def train_from_iterator(
             cls,
             text_iterator: Iterable[str],
-            config: TokenizerTrainerConfig
+            config: TokenizerConfig,
+            tp: Optional[TokenizerTrainerConfig] = None
         ):
         special_tokens = config.special_tokens.list()
         vocab_size_no_special = config.vocab_size - len(special_tokens)
         # TODO: make the other tokenizers for comparison; lines +1 and +2 below are temporary
-        tp = getattr(config, "training_params", None)
         if tp is None:
             # Legacy fallback
             tp_trainer = config.trainer
@@ -318,7 +316,7 @@ class Tokenizer(_BaseTokenizer):
             special_tokens=special_tokens,
             config=config
         )
-        to_save_flag = tp.to_save if tp is not None else getattr(config, "to_save", True)
+        to_save_flag = tp.to_save if tp is not None else getattr(config, "to_save", False)
         if to_save_flag:
             tokenizer.save_to_directory()
         return tokenizer
@@ -397,12 +395,12 @@ class Tokenizer(_BaseTokenizer):
         token_bytes_list.extend([0] * len(self.special_tokens))
         new_token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device="cpu")
 
-        old_vocab_size = getattr(self, "token_bytes", torch.tensor([])).numel() if hasattr(self, "token_bytes") else 0
-        self.token_bytes = new_token_bytes
+        old_vocab_size = getattr(self, "_token_bytes", torch.tensor([])).numel() if hasattr(self, "_token_bytes") else 0
+        self._token_bytes = new_token_bytes
         log0(f"Updated token bytes after truncation from {old_vocab_size:,} to {self.vocab_size:,}", logger=logger)
         # Save token_bytes to disk
         token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-        torch.save(self.token_bytes, token_bytes_path)
+        torch.save(self._token_bytes, token_bytes_path)
         # Persist tokenizer config/metadata
         try:
             self.config.save_to_directory()
@@ -428,9 +426,7 @@ class Tokenizer(_BaseTokenizer):
 
         # Save token bytes tensor
         token_bytes_path = directory / "token_bytes.pt"
-        if getattr(self, "token_bytes", None) is None:
-            self.token_bytes = self.get_token_bytes()
-        torch.save(self.token_bytes, token_bytes_path)
+        torch.save(self._token_bytes, token_bytes_path)
 
         # Write a lightweight JSON descriptor alongside the pickle config for readability
         config_json = {

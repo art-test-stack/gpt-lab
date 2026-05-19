@@ -23,20 +23,21 @@ class _BaseTokenizer:
         self.config = config
         self.special_tokens = None
         self.mergeable_ranks = None
-        try:
-            self.token_bytes = self.get_token_bytes()
-        except Exception as e:
-            log0(f"Failed to get token bytes during initialization: {e}. " \
-                  f"This may cause issues with optimizers that rely on token byte lengths. "\
-                "You can try calling get_token_bytes() manually after initialization to see the full error message and debug the issue.", 
-                level="warning", logger=logger)
+        # disable token_bytes inits for scaling tok
+        # try:
+        #     self.token_bytes = self.get_token_bytes()
+        # except Exception as e:
+        #     log0(f"Failed to get token bytes during initialization: {e}. " \
+        #           f"This may cause issues with optimizers that rely on token byte lengths. "\
+        #         "You can try calling get_token_bytes() manually after initialization to see the full error message and debug the issue.", 
+        #         level="warning", logger=logger)
 
     def get_vocab(self):
         return {**self.mergeable_ranks, **self.special_tokens}
     
     @property
     def vocab_size(self):
-        "vocab_size value icludes both mergeable ranks and special tokens"
+        "vocab_size value includes both mergeable ranks and special tokens"
         return len(self.mergeable_ranks) + len(self.special_tokens)
     
     @property
@@ -46,11 +47,17 @@ class _BaseTokenizer:
     @property
     def n_ranks(self):
         return len(self.mergeable_ranks)
+    
+    @property
+    def token_bytes(self):
+        if getattr(self, "_token_bytes", None) is None:
+            self._token_bytes = self.get_token_bytes()
+        return self._token_bytes
          
     def get_token_bytes(self):
         token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-        if getattr(self, "token_bytes", None) is not None:
-            return self.token_bytes
+        if getattr(self, "_token_bytes", None) is not None:
+            return self._token_bytes
 
         if token_bytes_path.exists():
             token_bytes = torch.load(token_bytes_path)
@@ -68,7 +75,7 @@ class _BaseTokenizer:
                 torch.save(token_bytes, f)
             log0(f"Saved token_bytes to {token_bytes_path}", logger=logger)
 
-        self.token_bytes = token_bytes
+        self._token_bytes = token_bytes
         return token_bytes
 
     def __call__(self, text, *args, **kwds):
