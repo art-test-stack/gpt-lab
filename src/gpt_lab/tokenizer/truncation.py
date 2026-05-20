@@ -13,6 +13,7 @@ from typing import Optional
 from pathlib import Path
 
 from gpt_lab.utils.special_tokens import SpecialTokens
+from gpt_lab.tokenizer.serialization import validate_mergeable_ranks
 
 # Lightweight module: avoid importing heavy project modules at import time.
 # Logging is optional; use print() for informational messages here.
@@ -94,17 +95,7 @@ def truncated_from_pretrained(base_name: str, new_vocab_size: int, source: str =
         config=config,
     )
 
-    # Validate contiguous ranks on the created mergeable_ranks using the
-    # serialization validation function (loaded lazily to avoid importing
-    # the package and its heavy dependencies at module import time).
-    import importlib.util, sys
-    from pathlib import Path as _P
-    src_root = _P(__file__).resolve().parents[2]
-    serial_path = src_root / 'gpt_lab' / 'tokenizer' / 'serialization.py'
-    spec = importlib.util.spec_from_file_location('tokenizer_serial_local', str(serial_path))
-    serial_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(serial_mod)
-    serial_mod.validate_mergeable_ranks(new_mergeable)
+    validate_mergeable_ranks(new_mergeable)
 
     # Verify token_bytes semantics (compute from raw bytes keys)
     sorted_items_new = sorted(new_mergeable.items(), key=lambda x: x[1])

@@ -363,14 +363,16 @@ class Tokenizer(_BaseTokenizer):
         )
     
     @classmethod
-    def truncated_from_pretrained(cls, name: str, new_vocab_size: int, source: str = "tiktoken") -> Tokenizer:
+    def truncated_from_pretrained(cls, name: str, new_vocab_size: int, source: str = "tiktoken", special_tokens: Optional[SpecialTokens] = None) -> Tokenizer:
         """Delegate truncation to tokenizer.truncation.truncated_from_pretrained (Phase 2).
 
         Signature preserved for backward compatibility.
         """
+        if special_tokens is None:
+            special_tokens = SpecialTokens()
         from gpt_lab.tokenizer.truncation import truncated_from_pretrained as _trunc
 
-        return _trunc(name, new_vocab_size, source=source)
+        return _trunc(name, new_vocab_size, source=source, special_tokens=special_tokens)
     
     @classmethod
     def get_closest_truncated_from_pretrained(cls, tokenizer: Tokenizer, target_vocab_size: int) -> Tokenizer:

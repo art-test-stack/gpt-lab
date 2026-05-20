@@ -1,5 +1,48 @@
-from gpt_lab.utils.common import get_banner
-get_banner(to_print=True)
+"""
+# Tokenizer Corpus Size Benchmarking Script
+
+Full recipe for training and scaling tokenizer with different corpus sizes, vocabulary sizes, patterns, 
+and evaluating the trained tokenizers on a simple test set to analyze the trade-offs between corpus size, 
+vocabulary size, training time, and tokenization quality.
+
+There is similar study on studying the optimal corpus size for training a BPE tokenizer as:
+- Reddy et al., "How Much is Enough? The Diminishing Returns of Tokenization Training Data", 
+
+However, this study is focused on training a BPE tokenizer with a specific size. Here, we want to analyze the trade-offs 
+between corpus size, vocabulary size, and tokenization quality, and also compare with truncated versions of baseline 
+tokenizers to see how much of the performance can be retained with a smaller vocabulary size.
+
+This is mainly motivated by the following facts:
+- Language model have been scaled up but tokenizers sizes have not been scaled up as much, and it is not clear how much the tokenizer performance can be improved by scaling up the tokenizer training corpus and vocabulary size.
+- According to [2], Language model performance is sensitive to tokenizer size, and the optimal size is often larger than the commonly used 50k tokens, especially for larger models and more diverse corpora. 
+
+## Usage
+
+How to run it from root directory of the repo:
+
+- Make a new scaling run with new corpus sizes:
+
+
+[!NOTE]
+Recommended: run with `--optim-config-path=configs/optim.yaml` argument.
+
+## Aknowledgements:
+This code is inspired by and adapted from the following sources:
+- The Hugging Face Tokenizers library (https://github.com/huggingface/tokenizers)
+- The OpenAI tiktoken library (https://github.com/openai/tiktoken)
+
+## References:
+1. Reddy, Varshini, et al. "How much is enough? the diminishing returns of tokenization training data." arXiv preprint arXiv:2502.20273 (2025).
+2. 
+
+Author: Arthur Testard (arthur.testard.pro@gmail.com)
+Please cite this work if the code is helpful to you.
+"""
+if __name__ == "__main__":
+    from gpt_lab.utils.logging import init_logger
+    init_logger()
+    from gpt_lab.utils.common import get_banner
+    get_banner(to_print=True)
 
 from gpt_lab.tokenizer.tokenizer import Tokenizer
 from gpt_lab.utils.schemas import TokenizerTrainerConfig, TokenizerConfig
@@ -249,7 +292,10 @@ def main():
     parser = argparse.ArgumentParser(description="Find the optimal corpus size for training a BPE tokenizer with different vocabulary sizes, and evaluate the trained tokenizers on a simple test set to analyze the trade-offs between corpus size, vocabulary size, training time, and tokenization quality.")
     parser.add_argument("--write-corpus", action="store_true", help="Flag to indicate training mode (write corpus). If not set, the script will attempt to load an existing corpus from disk.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--results-path", type=str, default=str(TOKENIZERS_FOLDER / 'scaling_tokenizer_results.pkl'), help="Path to store the results of the tokenizer evaluations.")
+    parser.add_argument("--vocab-sizes", type=str, default="50000,70000,100000,200000", help="Comma-separated list of vocabulary sizes to train tokenizers with.")
+    parser.add_argument("--pat-strs", type=str, default=None, help="Comma-separated list of pattern string names to use for tokenizer training. If not specified, defaults to using the GPT-2 pattern string.")
+    parser.add_argument("--corpus-sizes-mb", type=str, default=None, help="Comma-separated list of corpus sizes in megabytes to use for tokenizer training. If not specified, defaults to a range of sizes based on the vocabulary size.")
+    parser.add_argument("--results-path", type=str, default=str(TOKENIZERS_FOLDER / 'scaling_tokenizer_results.pkl'), help="Path to store the results of the tokenizer evaluations. Default to './.gpt_lab/tokenizers/scaling_tokenizer_results.pkl'. If a file already exists at this path, it will be renamed with a number suffix to avoid overwriting previous results.")
     parser.add_argument("--compare-truncated-baselines", action="store_true", help="Whether to compare trained tokenizers with truncated versions of baseline tokenizers.")
     parser.add_argument("--corpus-temperature-alpha", type=float, default=None, help="Optional temperature parameter to control the randomness of the corpus generation. Higher values will result in a more diverse corpus, while lower values will make it more focused on the most common samples. This can be useful for testing how the tokenizer performs with different levels of corpus diversity.")
     args = parser.parse_args()
@@ -324,15 +370,15 @@ def main():
 
     # Corpus size varying with different vocab_sizes and split patterns
     # patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_str-punct": PAT_STR_punct, "pat_str-cl100k_base": PAT_STR_cl100k_base, "pat_str-o200k_base": PAT_STR_o200k_base }
-    patterns = { "pat_str-gpt4": PAT_STR_GPT4 }
+    patterns = { "pat_str-gpt2": PAT_STR_GPT2 }
     # patterns = { "PAT_STR_o200k_base": PAT_STR_o200k_base }
     # TODO: optimize by running the biggest vocab size and slice it on top-k merges for smaller vocabs
     # vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
-    vocab_sizes = [50_000, 70_000, 100_000, 200_000] 
+    vocab_sizes = [int(v) for v in args.vocab_sizes.split(",")] if args.vocab_sizes else [50_000, 70_000, 100_000, 200_000]
 
     # vocab_sizes = list(reversed(vocab_sizes))
     _max_char_runs = 16  # adjust the divisor to control how many runs are done before storing results to disk, this is a trade-off between memory usage and frequency of saving intermediate results. With 3 processes, we can afford to do more runs before saving, but if you have more memory constraints, you might want to save more frequently by using a smaller divisor.
-    max_bytes = lambda vocab_size: [int(vocab_size * i * 512) for i in range(1, _max_char_runs+1, 2)] # ~3.5 characters per token on average, adjust as needed based on your corpus
+    max_bytes = lambda vocab_size: [int(vocab_size * i * 1024) for i in range(1, _max_char_runs+1, 2)] # ~3.5 characters per token on average, adjust as needed based on your corpus
     # Two options: same name for all tokenizers -> overwrite / different names -> many tokenizers on disk, consider cleaning up after training or implementing a caching mechanism to avoid retraining the same tokenizer multiple times.
     # name = lambda vocab_size, max_char, p_str_name: f"ic1-tok-{int(vocab_size//1000)}k_maxchar-{max_char//1e6:.1f}M_pattern-{p_str_name}"
     log0(f"Using {num_procs} processes for tokenizer training.")
@@ -400,9 +446,9 @@ def main():
             buffer.append(result)
             results.append(result)
 
-            if len(buffer) >= _max_char_runs:
-                store_results(buffer)
-                buffer.clear()
+            # if len(buffer) >= _max_char_runs:
+            store_results(buffer)
+            buffer.clear()
 
         if buffer:
             store_results(buffer)
