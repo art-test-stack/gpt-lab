@@ -1,14 +1,21 @@
 """
-# Tokenizer Corpus Size Benchmarking Script
+# How ByteLevel BPE Tokenization Scales? 
 
+## Summary
 Full recipe for training and scaling tokenizer with different corpus sizes, vocabulary sizes, patterns, 
-and evaluating the trained tokenizers on a simple test set to analyze the trade-offs between corpus size, 
-vocabulary size, training time, and tokenization quality.
+and evaluating the trained tokenizers on a simple test set to analyze the trade-offs between:
+- training corpus size, 
+- vocabulary size, 
+- split pattern,
+- tokenization quality (compression ration, efficiency, etc.)
+- and cross-language generalization (if we have multilingual evaluation sets).
 
 There is similar study on studying the optimal corpus size for training a BPE tokenizer as:
-- Reddy et al., "How Much is Enough? The Diminishing Returns of Tokenization Training Data", 
+- [1] in which they find that the returns diminish after 150GB of training data, for BPE tokenizers with 40,960, 64,000, 128,000, and 256,000 vocabulary sizes.
 
-However, this study is focused on training a BPE tokenizer with a specific size. Here, we want to analyze the trade-offs 
+However, this study is focused on training a BPE tokenizer with a specific size. They conclude that over 150GB a tokenizer with 
+
+Here, we want to analyze the trade-offs 
 between corpus size, vocabulary size, and tokenization quality, and also compare with truncated versions of baseline 
 tokenizers to see how much of the performance can be retained with a smaller vocabulary size.
 
@@ -27,13 +34,14 @@ How to run it from root directory of the repo:
 Recommended: run with `--optim-config-path=configs/optim.yaml` argument.
 
 ## Aknowledgements:
-This code is inspired by and adapted from the following sources:
+This code is inspired by and has some code adapted from the following sources:
 - The Hugging Face Tokenizers library (https://github.com/huggingface/tokenizers)
 - The OpenAI tiktoken library (https://github.com/openai/tiktoken)
+- nanochat tokenizer code (https://github.com/karpathy/nanochat) for the idea of using HF-training backend + tiktoken-inference backend for efficient training and evaluation of tokenizers.
 
 ## References:
 1. Reddy, Varshini, et al. "How much is enough? the diminishing returns of tokenization training data." arXiv preprint arXiv:2502.20273 (2025).
-2. 
+2. Zouhar, Vilém, et al. "Tokenization and the noiseless channel." Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers). 2023.
 
 Author: Arthur Testard (arthur.testard.pro@gmail.com)
 Please cite this work if the code is helpful to you.
@@ -47,9 +55,10 @@ if __name__ == "__main__":
 from gpt_lab.tokenizer.tokenizer import Tokenizer
 from gpt_lab.utils.schemas import TokenizerTrainerConfig, TokenizerConfig
 from gpt_lab.tokenizer.corpus import TokenizerCorpus
-from gpt_lab.utils.default import PAT_STR_GPT2, PAT_STR_GPT4, PAT_STR_punct, PAT_STR_cl100k_base, PAT_STR_o200k_base, TOKENIZERS_FOLDER, DATA_DIR
+from gpt_lab.utils.default import PAT_STR, TOKENIZERS_FOLDER, DATA_DIR
 from gpt_lab.utils.logging import log0
 
+import math
 from pathlib import Path
 import argparse, pickle, zipfile
 import time
@@ -76,6 +85,38 @@ def load_all_results(path):
             except EOFError:
                 break
     return results
+
+def renyi_entropy(counter, alpha=2.5, eps=1e-12):
+    """
+    Rényi entropy of order alpha as proposed by Zouhar et al. (2023) to measure the diversity of the corpus:
+    $$H_{\alpha}(X) = (1 / (1 - \alpha)) * \log( \sum_{x \in \mathcal{X}} p(x)^{\alpha})$$
+    where p(x) is the probability of token x in the corpus.
+    - For $\alpha \to 0$, it corresponds to the logarithm of the support size (number of unique tokens).
+    - For $\alpha \to 1$, it corresponds to the Shannon entropy (the limit as $\alpha$approaches 1).
+    - For $\alpha \to 2$, it corresponds to the collision entropy, which is related to the probability that two randomly chosen tokens are the same.
+    - For $\alpha \to \infty$, it corresponds to the min-entropy, which is related to the probability of the most likely token.
+    """
+    total = sum(counter.values())
+    if total == 0:
+        return 0.0
+    probabilities = [count / total for count in counter.values()]
+    if alpha == 1:
+        return -sum(p * math.log(p) for p in probabilities)
+    else:
+        return (1 / (1 - alpha)) * math.log(sum(p ** alpha for p in probabilities))
+    
+def entropy_efficiency(counter, alpha=2.5, eps=1e-12):
+    """
+    Efficiency of the tokenizer as proposed by Zouhar et al. (2023), defined as the ratio of the Rényi entropy of the token distribution to the logarithm of the vocabulary size:
+    $$\text{Efficiency} = \frac{H_{\alpha}(X)}{\log(|V|)}$$
+    where $H_{\alpha}(X)$ is the Rényi entropy of order $\alpha$ and $|V|$ is the vocabulary size.
+    This metric captures how well the tokenizer utilizes its vocabulary to represent the diversity of the corpus. A higher efficiency indicates that the tokenizer is effectively using its vocabulary to capture the variability in the data, while a lower efficiency may suggest that many tokens are underutilized or that the tokenizer is not capturing enough diversity.
+    """
+    vocab_size = len(counter)
+    if vocab_size == 0:
+        return 0.0
+    renyi_ent = renyi_entropy(counter, alpha=alpha, eps=eps)
+    return renyi_ent / math.log(vocab_size)
     
 def enwik8_path():
     base_dir = DATA_DIR / "corpus/eval_enwik8"
@@ -193,6 +234,10 @@ def eval_tokenizer(tokenizer):
                 metrics[key].append(value)
         t1 = time.time()
         res = {key: sum(values) / len(values) for key, values in metrics.items()}
+        # both are useless actually as we store the counter and can compute any metric we want from it, 
+        # but let's keep them for now as they are easy to compute and can be a quick proxy
+        res["renyi_entropy"] = renyi_entropy(counter)
+        res["entropy_efficiency"] = entropy_efficiency(counter)
         res["nb_tokens"] = len_tokens
         res["nb_chars"] = len_chars
         res["nb_bytes"] = len_bytes
@@ -290,12 +335,15 @@ byte_per_doc = lambda max_byte: max_byte // 10_000 # Default to 1000 documents i
 
 def main():
     parser = argparse.ArgumentParser(description="Find the optimal corpus size for training a BPE tokenizer with different vocabulary sizes, and evaluate the trained tokenizers on a simple test set to analyze the trade-offs between corpus size, vocabulary size, training time, and tokenization quality.")
-    parser.add_argument("--write-corpus", action="store_true", help="Flag to indicate training mode (write corpus). If not set, the script will attempt to load an existing corpus from disk.")
-    parser.add_argument("--seed", type=int, default=42)
+    # General arguments
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility. Default is 42.")
+    parser.add_argument("--results-path", type=str, default=str(TOKENIZERS_FOLDER / 'scaling_tokenizer_results.pkl'), help="Path to store the results of the tokenizer evaluations. Default to './.gpt_lab/tokenizers/scaling_tokenizer_results.pkl'. If a file already exists at this path, it will be renamed with a number suffix to avoid overwriting previous results.")
+    # Tokenizers configuration arguments
     parser.add_argument("--vocab-sizes", type=str, default="50000,70000,100000,200000", help="Comma-separated list of vocabulary sizes to train tokenizers with.")
     parser.add_argument("--pat-strs", type=str, default=None, help="Comma-separated list of pattern string names to use for tokenizer training. If not specified, defaults to using the GPT-2 pattern string.")
+    # Corpus configuration arguments
+    parser.add_argument("--write-corpus", action="store_true", help="Flag to indicate training mode (write corpus). If not set, the script will attempt to load an existing corpus from disk.")
     parser.add_argument("--corpus-sizes-mb", type=str, default=None, help="Comma-separated list of corpus sizes in megabytes to use for tokenizer training. If not specified, defaults to a range of sizes based on the vocabulary size.")
-    parser.add_argument("--results-path", type=str, default=str(TOKENIZERS_FOLDER / 'scaling_tokenizer_results.pkl'), help="Path to store the results of the tokenizer evaluations. Default to './.gpt_lab/tokenizers/scaling_tokenizer_results.pkl'. If a file already exists at this path, it will be renamed with a number suffix to avoid overwriting previous results.")
     parser.add_argument("--compare-truncated-baselines", action="store_true", help="Whether to compare trained tokenizers with truncated versions of baseline tokenizers.")
     parser.add_argument("--corpus-temperature-alpha", type=float, default=None, help="Optional temperature parameter to control the randomness of the corpus generation. Higher values will result in a more diverse corpus, while lower values will make it more focused on the most common samples. This can be useful for testing how the tokenizer performs with different levels of corpus diversity.")
     args = parser.parse_args()
@@ -307,7 +355,6 @@ def main():
     # and backup existing file if it does to avoid overwriting/mixing previous results
     results_path = Path(args.results_path)
     results_path.parent.mkdir(parents=True, exist_ok=True)
-
 
     if results_path.exists():
         backup_path = results_path
@@ -323,7 +370,6 @@ def main():
             i += 1
         results_path.rename(backup_path)
         log0(f"Existing results file found. Renamed to {backup_path!r} to avoid overwriting. New results will be stored in {results_path!r}.", logger=logger)
-
 
     def store_results(results_batch, path=results_path):
         with open(path, "ab") as f:
@@ -341,11 +387,6 @@ def main():
         #     pickle.dump(results, f)
     # Initiate test set and evaluation functions
 
-    # testing_sets = ["HuggingFaceFW/fineweb-edu", "HuggingFaceTB/finemath", "codeparrot/codeparrot-clean", ]
-    # "HuggingFaceFW/fineweb-2" "subset=fra_Latn,jpn_Jpan,kor_Hang,arb_Arab"
-
-
-    # Baselines: gpt2, cl100k_base, o200k_base
     from tiktoken import get_encoding
 
     results = load_all_results(results_path) if results_path.exists() else []
@@ -370,13 +411,13 @@ def main():
 
     # Corpus size varying with different vocab_sizes and split patterns
     # patterns = { "pat_str-gpt2": PAT_STR_GPT2, "pat_str-gpt4": PAT_STR_GPT4, "pat_str-punct": PAT_STR_punct, "pat_str-cl100k_base": PAT_STR_cl100k_base, "pat_str-o200k_base": PAT_STR_o200k_base }
-    patterns = { "pat_str-gpt2": PAT_STR_GPT2 }
+    patterns = { "pat_str-gpt2": PAT_STR["gpt2"] }
     # patterns = { "PAT_STR_o200k_base": PAT_STR_o200k_base }
     # TODO: optimize by running the biggest vocab size and slice it on top-k merges for smaller vocabs
     # vocab_sizes = [10_000, 20_000, 30_000, 50_000, 100_000, 200_000, 300_000, 500_000] 
     vocab_sizes = [int(v) for v in args.vocab_sizes.split(",")] if args.vocab_sizes else [50_000, 70_000, 100_000, 200_000]
+    
 
-    # vocab_sizes = list(reversed(vocab_sizes))
     _max_char_runs = 16  # adjust the divisor to control how many runs are done before storing results to disk, this is a trade-off between memory usage and frequency of saving intermediate results. With 3 processes, we can afford to do more runs before saving, but if you have more memory constraints, you might want to save more frequently by using a smaller divisor.
     max_bytes = lambda vocab_size: [int(vocab_size * i * 1024) for i in range(1, _max_char_runs+1, 2)] # ~3.5 characters per token on average, adjust as needed based on your corpus
     # Two options: same name for all tokenizers -> overwrite / different names -> many tokenizers on disk, consider cleaning up after training or implementing a caching mechanism to avoid retraining the same tokenizer multiple times.
