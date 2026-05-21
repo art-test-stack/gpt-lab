@@ -64,7 +64,7 @@ def compute_optimal_vocab_size(depth: int, aspect_ratio: int, train_tokenizer: b
         vocab_size = round(opt_vocab_size / step) * step
 
     if vocab_size < 256:
-        raise ValueError("Computed optimal vocab size is <256; increase model size or set vocab_size explicitly.")
+        raise ValueError(f"Computed optimal vocab size {vocab_size} is <256; increase model size or set vocab_size explicitly.")
 
     return int(vocab_size) + len(special_tokens.list())
 
@@ -80,15 +80,27 @@ def resolve_tokenizer(name: Optional[str], vocab_size: int, special_tokens: Spec
     return get_closest_tokenizer_size(vocab_size)[0]
 
 
-def build_or_load_tokenizer(tname: Optional[str], vocab_size: int, train_tokenizer: bool, base_name: str, pat_str: str, special_tokens: SpecialTokens, data_dir, random_seed: int, dirname=None):
+def build_or_load_tokenizer(
+        name: Optional[str], 
+        vocab_size: int, 
+        train_tokenizer: bool, 
+        base_name: str, 
+        pat_str: str, 
+        special_tokens: SpecialTokens, 
+        data_dir, 
+        random_seed: int, 
+        dirname=None
+    ) -> Tokenizer:
     """Orchestrate loading or training of a tokenizer.
 
     - If `not train_tokenizer`, attempt to load a pretrained tokenizer.
     - Else, train a new tokenizer using the corpus and `TokenizerTrainerConfig`.
     Returns a `Tokenizer` instance.
     """
+    if name in ("auto", None):
+        name = resolve_tokenizer(name, vocab_size, special_tokens)
     if not train_tokenizer:
-        name_or_choice = tname or resolve_tokenizer(tname, vocab_size, special_tokens)
+        name_or_choice = name or resolve_tokenizer(name, vocab_size, special_tokens)
         try:
             return Tokenizer.from_pretrained(name_or_choice)
         except Exception as e:

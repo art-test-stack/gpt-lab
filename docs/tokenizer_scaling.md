@@ -12,7 +12,7 @@ uv run python -m scripts.benchmark.tokenizer_corpus_size \
     --vocab-sizes 20000,50000,100000 \
     --pat-strs gpt2,cl100k_base \
     --write-corpus \
-    --corpus-sizes-mb 10,50,100,500,1000,5000,10000 
+    --corpus-sizes-gb 10,50,100,500,1000,5000,10000 
 ```
 
 Args:
@@ -21,7 +21,7 @@ Args:
 - `--vocab-sizes`: Comma-separated list of vocabulary sizes to train tokenizers with.
 - `--pat-strs`: Comma-separated list of pattern string names to use for tokenizer training. If not specified, defaults to using the GPT-2 pattern string.
 - `--write-corpus`: Flag to indicate training mode (write corpus). If not set, the script will attempt to load an existing corpus from disk.
-- `--corpus-sizes-mb`: Comma-separated list of corpus sizes in megabytes to use for tokenizer training. If not specified, defaults to a range of sizes based on the vocabulary size.
+- `--corpus-sizes-gb`: Comma-separated list of corpus sizes in gigabytes to use for tokenizer training. If not specified, defaults to a range of sizes based on the vocabulary size.
 - `--compare-truncated-baselines`: Whether to compare trained tokenizers with truncated versions of baseline tokenizers.
 - `--corpus-temperature-alpha`: Optional temperature parameter to control the randomness of the corpus generation. 
 
@@ -57,8 +57,7 @@ The evaluation is done on the following datasets (eval_configs in the code):
 > [!WARNING]
 > With it current implementation, the script may use the same samples for both training and evaluation, 
 which can lead to overfitting and an overestimation of the tokenizer's performance.
-> However, the results obtained were quite poored compared to the baselines, given that I could not reach
-the optimal memory budget for training the tokenizers. 
+> However, the results obtained were quite poor compared to the baselines, given that I could not reach the optimal memory budget for training the tokenizers. 
 > Hence, in case of future runs with **exceptionally good results**, it would be important to check whether 
 the training and evaluation samples are overlapping, and if so, to implement a proper train/eval 
 split to get a more accurate estimate of the tokenizer's performance.
@@ -81,53 +80,20 @@ This is mainly motivated by the following facts:
 - Language model have been scaled up but tokenizers sizes have not been scaled up as much, and it is not clear how much the tokenizer performance can be improved by scaling up the tokenizer training corpus and vocabulary size.
 - According to [3], Language model performance is sensitive to tokenizer size, and the optimal size is often larger than the commonly used 50-100k tokens, especially for larger models. 
 
-## Usage
-
-How to run it from root directory of the repo:
-
-options:
-  -h, --help            show the help message and exit
-  --seed SEED           
-                        Random seed for reproducibility. Default is 42.
-  --num-procs NUM_PROCS  
-                        Number of processes to use for tokenizer training. Defaults to the number of CPU cores available, capped at 32 to avoid overloading the system.
-  --vocab-sizes VOCAB_SIZES 
-                        Comma-separated list of vocabulary sizes to train tokenizers with.
-  --pat-strs PAT_STRS   
-                        Comma-separated list of pattern string names to use for tokenizer training. If not specified, defaults to using the GPT-2 pattern string.
-  --write-corpus        
-                        Flag to indicate training mode (write corpus). If not set, the script will attempt to load an existing corpus from disk.
-  --corpus-sizes-mb CORPUS_SIZES_MB
-                        Comma-separated list of corpus sizes in megabytes to use for tokenizer training. If not specified, defaults to a range of sizes based on the vocabulary size.
-  --compare-truncated-baselines  
-                        Whether to compare trained tokenizers with truncated versions of baseline tokenizers.
-  --corpus-temperature-alpha CORPUS_TEMPERATURE_ALPHA
-                        Optional temperature parameter to control the randomness of the corpus generation. Higher values will result in a more diverse corpus, while lower values will make it
-                        more focused on the most common samples. This can be useful for testing how the tokenizer performs with different levels of corpus diversity.
-  --resume              
-                        Whether to resume from existing results file. If set, the script will attempt to load existing results from the specified results path and continue from there,
-                        skipping any experiments that have already been completed. This can be useful for long-running experiments that may be interrupted or for iteratively adding new
-                        configurations without re-running everything.
-  --results-path RESULTS_PATH
-                        Path to store the results of the tokenizer evaluations. Default to './.gpt_lab/tokenizers/scaling_tokenizer_results.pkl'. If a file already exists at this path, it
-                        will be renamed with a number suffix to avoid overwriting previous results.
-
-- Make a new scaling run with new corpus sizes:
-
-## Aknowledgements:
+## Acknowledgements
 
 This experiment is inspired by and has some code adapted from the following sources:
 - The Hugging Face Tokenizers library (https://github.com/huggingface/tokenizers)
 - The OpenAI tiktoken library (https://github.com/openai/tiktoken)
 - nanochat tokenizer code (https://github.com/karpathy/nanochat) for the idea of using HF-training backend + tiktoken-inference backend for efficient training and evaluation of tokenizers.
 
-## References:
+## References
 1. Reddy, Varshini, et al. "How much is enough? the diminishing returns of tokenization training data." arXiv preprint arXiv:2502.20273 (2025).
 2. Zouhar, Vilém, et al. "Tokenization and the noiseless channel." Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers). 2023.
 3. Tao, Chaofan, et al. "Scaling laws with vocabulary: Larger models deserve larger vocabularies." Advances in Neural Information Processing Systems 37 (2024): 114147-114179.
 4. Karpathy, Andrej. "Let’s Build the GPT Tokenizer: A Complete Guide to Tokenization in LLMs. A text and code version of Karpathy’s famous tokenizer video." https://www.fast.ai/posts/2025-10-16-karpathy-tokenizers.html (2025).
 
-## Contributing:
+## Contributing
 - If you want to contribute to this project, please feel free to open an issue or a pull request. Any contributions are welcome, whether it's fixing a bug, adding a new feature, or improving the documentation.
 
 Author: Arthur Testard (arthur.testard.pro@gmail.com) \

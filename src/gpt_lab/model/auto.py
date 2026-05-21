@@ -164,7 +164,17 @@ class AutoGPTConfig(BaseModel):
                 f"{pat_str} on corpus from {str(DATA_DIR / 'corpus' / self.name)}. This may take a while...",
                 logger=logger, level="warning")
 
-            tokenizer = build_or_load_tokenizer(self.tokenizer_model, int(vocab_size), True, _tname, PAT_STR.get(pat_str, "gpt2"), special_tokens, DATA_DIR / "corpus" / self.name, self.random_seed, dirname=self.dirname)
+            tokenizer = build_or_load_tokenizer(
+                tname=self.tokenizer_model, 
+                vocab_size=int(vocab_size), 
+                train_tokenizer=True, 
+                base_name=_tname, 
+                pattern=PAT_STR.get(pat_str, "gpt2"), 
+                special_tokens=special_tokens, 
+                corpus_dir=DATA_DIR / "corpus" / self.name, 
+                random_seed=self.random_seed, 
+                dirname=self.dirname
+            )
 
         param_counts = model.n_params_per_layer()
 

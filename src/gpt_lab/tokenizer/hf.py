@@ -115,7 +115,7 @@ def train_huggingface_from_iterator(text_iterator: Iterable[str], config: Tokeni
 
     # Prefer training-specific params container when available
     _special_tokens = list(config.special_tokens) or []
-    vocab_size_no_special = config.vocab_size - len(config.special_tokens)
+    vocab_size_no_special = config.vocab_size - len(_special_tokens)
     trainer = BpeTrainer(
         vocab_size=vocab_size_no_special,
         show_progress=True,

@@ -171,7 +171,7 @@ class TokenizerConfig(BaseModel):
         if not directory.name == cleaned_name: # add model name to path if not already included
             directory = directory / cleaned_name
         config_path = directory / "config.pkl"
-        config_path.mkdir(parents=True, exist_ok=True)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(str(config_path), "wb") as f:
             pickle.dump(self, f)

@@ -398,7 +398,7 @@ class Tokenizer(_BaseTokenizer):
         log0(f"Updated token bytes after truncation from {old_vocab_size:,} to {self.vocab_size:,}", logger=logger)
         # Save token_bytes to disk
         token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-        torch.save(self._token_bytes, token_bytes_path)
+        torch.save(self.token_bytes, token_bytes_path)
         # Persist tokenizer config/metadata
         try:
             self.config.save_to_directory()

@@ -277,13 +277,18 @@ def main():
 
     t_total_start = time.time()
     with ProcessPoolExecutor(max_workers=meta.get("num_procs")) as executor:
-        futures = [executor.submit(run_tokenizer_experiment, t) for t in tasks]
+        future_to_name = {}
+        futures = []
+        for t in tasks:
+            future = executor.submit(run_tokenizer_experiment, t)
+            futures.append(future)
+            future_to_name[future] = t[0]
 
         buffer = []
         for i, future in enumerate(tqdm(as_completed(futures), total=len(futures), desc="Tokenizer experiments")):
             result = future.result()
-            _ = None # placeholder for run name or other metadata if needed
-            buffer.append((result, _))
+            run_name = future_to_name[future]
+            buffer.append((result, run_name))
 
             if len(buffer) >= args.save_every:
                 store_buffered_results(buffer, result_dir)
@@ -308,6 +313,19 @@ def load_all_result_paths(result_dir: Path) -> List[str]:
                 continue
     return result_paths
 
+def _normalize_result_run_name(run_name: str) -> str:
+    if not isinstance(run_name, str):
+        raise ValueError("run_name must be a non-empty string filename")
+    normalized_run_name = run_name.strip()
+    if not normalized_run_name:
+        raise ValueError("run_name must be a non-empty string filename")
+    run_path = Path(normalized_run_name)
+    if run_path.name != normalized_run_name or normalized_run_name in {".", ".."}:
+        raise ValueError("run_name must be a filename without directory components")
+    if run_path.suffix != ".pkl":
+        normalized_run_name = f"{normalized_run_name}.pkl"
+    return normalized_run_name
+
 def store_single_result(result, path):
     with open(path, "wb") as f:
         pickle.dump(result, f)
@@ -315,6 +333,8 @@ def store_single_result(result, path):
 def store_buffered_results(buffer, result_dir):
     for result, run_name in buffer:
         path = result_dir / run_name
+        safe_run_name = _normalize_result_run_name(run_name)
+        path = result_dir / safe_run_name
         store_single_result(result, path)
     buffer.clear()
 
@@ -366,7 +386,7 @@ def get_eval_corpus(eval_set):
 
 def eval_tokenizer(tokenizer):
     results = {}
-    _counter.update(tokens)
+    _counter = Counter()
     _token_len_cache = {
         tok: len(tokenizer.decode([tok]))
         for tok in range(tokenizer.n_vocab)
