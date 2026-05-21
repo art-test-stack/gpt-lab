@@ -111,10 +111,12 @@ def log_critical(message, error_type=RuntimeError, logger=logger):
     logger.critical(_with_rank(message), stacklevel=3)
     raise error_type(message)
 
-def log_all(msg, level=logging.ERROR, logger=logger):
+def log_all(msg, level=logging.ERROR, logger=logger, raise_error: bool = False):
     if isinstance(level, str):
         level = log_levels.get(level.upper(), logging.ERROR)
     logger.log(level, _with_rank(msg), stacklevel=3)
+    if level >= logging.ERROR and raise_error:
+        raise RuntimeError(msg)
 
 def log_dict(title, info, logger=logger, level=logging.INFO, only_rank0=True, structured=False):
     level = _get_level(level)

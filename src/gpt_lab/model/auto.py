@@ -13,7 +13,8 @@ from gpt_lab.utils.schemas import (
 )
 from gpt_lab.utils.common import print0, print0_dict
 from gpt_lab.utils.logging import log0, error, log_error
-from gpt_lab.tokenizer.tokenizer import get_closest_tokenizer_size, Tokenizer
+from gpt_lab.tokenizer.tokenizer import Tokenizer
+from gpt_lab.tokenizer.auto import compute_optimal_vocab_size as auto_compute_optimal_vocab_size, build_or_load_tokenizer, resolve_tokenizer
 from gpt_lab.model.gpt import DenseTransformer
 from gpt_lab.model.checkpoint import build_meta_model, make_default_run_name
 
@@ -125,49 +126,9 @@ class AutoGPTConfig(BaseModel):
             )
             return build_meta_model(config)
 
+        # Delegate computation of optimal vocab size to tokenizer.auto
         def compute_optimal_vocab_size(depth: int) -> int:
-            """
-            Compute optimal vocabulary size based on scaling law from Tao et al. 2024 (https://arxiv.org/abs/2407.13623).
-            
-            This is a rough estimate and can be tuned based on experiments. The scaling law is based on the number of scaling parameters in the model, which is approximated here as
-            $depth * (depth * aspect_ratio) ** 2
-            
-            If self.train_tokenizer is True: the optimal vocab size is rounded to the nearest 1000 for tokenizer cache efficiency.
-            Else: the optimal vocab size is set to the closest in the tokenizer cache to maximize reuse of existing tokenizers.
-            
-            Args:
-                depth (int): The depth of the model (number of layers).
-            
-            Returns:
-                int: The optimal vocabulary size for the model (including special tokens).
-            """
-            assert (self.tokenizer_model is None) or (self.tokenizer_model == "auto") or (not self.train_tokenizer), "Tokenizer model should not be specified if train_tokenizer is True, since we will be training a new tokenizer from scratch. Please set tokenizer_model to None or 'auto'."
-            
-            if self.tokenizer_model not in (None, "auto"):
-                tokenizer = _get_tokenizer_pretrained(self.tokenizer_model)
-                return tokenizer.vocab_size # vocab size = mergeable ranks size + special tokens size
- 
-            # set vocab size based on scaling law from Tao et al. 2024 (https://arxiv.org/abs/2407.13623)
-            # we approximate the values from their paper with a simple scaling law for vocab size based on depth and aspect ratio
-            # this is a rough estimate and can be tuned based on experiments.
-            # we also approximate the vocab size to the closest in the tokenizer cache to maximize reuse of existing tokenizers
-            _mmodel = build_meta_model_from_depth(depth, vocab_size=1)
-            n_non_vocab_scaling_params = _mmodel.n_params # vocab size = 1, so n_params ~ Nnv
-            power = 0.84
-            coeff = .2 / (.08 ** power) / (depth * self.aspect_ratio)
-            opt_vocab_size = coeff * (n_non_vocab_scaling_params ** power) # V ~ .2 / d_model * (n_scaling_params / 0.08) ^.84
-            del _mmodel # free memory
-            print0(f"Number of non-vocabulary scaling parameters for depth {depth}: {n_non_vocab_scaling_params:.2e}")
-            if not self.train_tokenizer:
-                _, vocab_size = get_closest_tokenizer_size(opt_vocab_size)
-            else:
-                step = 10 ** (int(math.log10(opt_vocab_size)) - 1)
-                vocab_size = round(opt_vocab_size / step) * step # round to nearest log10 for better tokenizer cache efficiency
-
-            if vocab_size < 256:
-                raise ValueError(f"Vocab size must be specified and at least 256 to ensure all unicode characters are supported. Computed optimal vocab size based on scaling law is {opt_vocab_size}, but got {self.vocab_size}. Please set vocab_size to a value >= 256.")
-                
-            return vocab_size + len(special_tokens) # add special tokens to vocab size
+            return auto_compute_optimal_vocab_size(depth, self.aspect_ratio, self.train_tokenizer, self.tokenizer_model, special_tokens)
         
         # TODO: for more efficient training of the model make 
         # vocab size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -180,8 +141,9 @@ class AutoGPTConfig(BaseModel):
         model = build_meta_model_from_depth(self.depth, vocab_size=vocab_size)
         
         # initiate tokenizer based on vocab size and user config
-        if (self.tokenizer_model not in (None, "auto")) or not self.train_tokenizer: 
-            tname = self.tokenizer_model or get_closest_tokenizer_size(vocab_size)[0]
+        if (self.tokenizer_model not in (None, "auto")) or not self.train_tokenizer:
+            # attempt to load or resolve tokenizer
+            tname = self.tokenizer_model or resolve_tokenizer(self.tokenizer_model, vocab_size, special_tokens)
             tokenizer = _get_tokenizer_pretrained(tname)
         else: # otherwise train tokenizer
             # choose a pat_str based on vocab size (method/thresholds arbitrary for now)
@@ -198,22 +160,21 @@ class AutoGPTConfig(BaseModel):
             _vs = f"{vocab_size//1000:,}k" if vocab_size < 1e6 else f"{vocab_size/1_000_000:.2f}M"
             _tname = f"{self.name}_{_vs}"
 
-            from gpt_lab.utils.schemas import TokenizerTrainerConfig
-            from gpt_lab.tokenizer.corpus import TokenizerCorpus
             log0(f"Training new tokenizer with vocab size {vocab_size} using pattern "
                 f"{pat_str} on corpus from {str(DATA_DIR / 'corpus' / self.name)}. This may take a while...",
                 logger=logger, level="warning")
-            corpus = TokenizerCorpus.from_sources(
-                corpus_dir=DATA_DIR / "corpus" / self.name,
-                # default sources for now
-                max_chars=vocab_size * 4 * 100,
-                random_seed=self.random_seed,
+
+            tokenizer = build_or_load_tokenizer(
+                name=self.tokenizer_model, 
+                vocab_size=int(vocab_size), 
+                train_tokenizer=True, 
+                base_name=_tname, 
+                pat_str=PAT_STR.get(pat_str, "gpt2"), 
+                special_tokens=special_tokens, 
+                data_dir=DATA_DIR / "corpus" / self.name, 
+                random_seed=self.random_seed, 
+                dirname=self.dirname
             )
-            _tok_trainer = TokenizerTrainerConfig(
-                name=_tname, dirname=self.dirname, vocab_size=int(vocab_size),
-                pat_str=PAT_STR.get(pat_str, "gpt2"), special_tokens=special_tokens
-            )
-            tokenizer = Tokenizer.train_from_iterator(_tok_trainer, iterator=corpus.iterator())
 
         param_counts = model.n_params_per_layer()
 

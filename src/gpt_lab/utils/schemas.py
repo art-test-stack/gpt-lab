@@ -84,17 +84,38 @@ class ParallelismConfig(BaseModel):
             raise ValueError("n_heads_kv is not set for TensorParallelConfig")
         return self.n_heads_kv // self.tp_size
 
+class TokenizerTrainerConfig(BaseModel):
+    model_config = ConfigDict(
+        json_encoders={Path: str},
+    )
+    # Backwards-compatible placement of training params. New code should use
+    # `training_params` to access training-related options.
+    # Keep legacy fields for compatibility; they'll be synced into training_params
+    max_bytes: int = -1
+    bytes_per_doc: int = -1
+    merges_per_pass: int = 512 # Only used for fbpe
+    num_proc: int = -1
+    source: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "huggingface"
+    show_progress: bool = True
+    to_save: bool = True
+        
+    dircorpus: Optional[Union[str, Path]] = None
+
+    # corpus: CorpusConfig = Field(default_factory=CorpusConfig) # TODO: for reproducity
+
 class TokenizerConfig(BaseModel):
     model_config = ConfigDict(
         json_encoders={Path: str},
     )
     name: str = "ic1_tok"
     dirname: Union[str, Path] = TOKENIZERS_FOLDER
-    dircorpus: Optional[Union[str, Path]] = None
     vocab_size: int = VOCAB_SIZE
     pat_str: str = "gpt4"
     special_tokens: Optional[SpecialTokens] = Field(default_factory=SpecialTokens)
     source: TokenizerSources = "tiktoken"
+
+    save_token_bytes: bool = True
+    trainer: Optional[TokenizerTrainerConfig] = None
 
     def model_post_init(self, context: Any) -> None:
         if self.pat_str in PAT_STR.keys():
@@ -110,11 +131,7 @@ class TokenizerConfig(BaseModel):
             self.dirname = Path(self.dirname)
         cleaned_name = self.name.split("/")[-1] # Remove leading/trailing slashes
         if not self.dirname.name == cleaned_name: # add model name to path if not already included
-            self.dirname = self.dirname / cleaned_name
-        if self.dircorpus is not None and isinstance(self.dircorpus, str):
-            self.dircorpus = Path(self.dircorpus) 
-        if not self.dirname.exists():
-            self.dirname.mkdir(parents=True, exist_ok=False)
+            self.dirname = self.dirname / cleaned_name 
 
     def get_mergeable_ranks(self) -> dict:
         if not self.dirname.exists():
@@ -154,74 +171,10 @@ class TokenizerConfig(BaseModel):
         if not directory.name == cleaned_name: # add model name to path if not already included
             directory = directory / cleaned_name
         config_path = directory / "config.pkl"
-        config_path.mkdir(parents=True, exist_ok=False)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(str(config_path), "wb") as f:
             pickle.dump(self, f)
-
-
-class TokenizerTrainerConfig(TokenizerConfig):
-    model_config = ConfigDict(
-        json_encoders={Path: str},
-    )
-    max_chars: int = -1
-    chars_per_doc: int = -1
-    merges_per_pass: int = 512 # Only used for fbpe
-    num_proc: int = -1
-    trainer: Literal["tiktoken", "huggingface", "bpe", "fbpe", "rbpe", "dummy"] = "huggingface"
-    show_progress: bool = True
-    to_save: bool = True
-    
-    def model_post_init(self, context: Any) -> None:
-        super().model_post_init(context)
-        if self.trainer == "tiktoken" and self.pat_str == "":
-            log0("Using tiktoken trainer with an empty pat_str may lead to suboptimal tokenization. "
-                 "Consider using a regex pattern for better tokenization performance.", level="warning", logger=logger)
-        
-        if self.max_chars == -1:
-            self.max_chars = int(self.vocab_size * 1000 * 2.5) # ~3.5 characters per token on average, adjust as needed based on your corpus
-        if self.chars_per_doc == -1:
-            self.chars_per_doc = self.max_chars // 1000 # Default to 1000 documents if not specified, adjust as needed
-        if self.num_proc <= 0:
-            self.num_proc = min(32, (os.cpu_count() or 1) - 1) # Use all available CPUs minus one for training, adjust as needed
-    
-    def save_to_directory(self, directory: Optional[Union[str, Path]] = None):
-        if directory is not None:
-            if isinstance(directory, str):
-                directory = Path(directory)
-        else:
-            directory = self.dirname
-        config_path = directory / "config.pkl"
-        if not config_path.parent.exists():
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(str(config_path), "wb") as f:
-            pickle.dump(self, f)
-
-        # TODO: consider saving with an other tool
-        json_path = TOKENIZERS_FOLDER / "tokenizers.json"
-        # df = df[df["name"] != self.name]  # Remove existing entry if it exists
-
-        new_row = {
-            "datetime": time.time(),
-            "name": self.name,
-            "vocab_size": self.vocab_size,
-            "special_tokens": len(self.special_tokens.list()),
-            "source": self.source,
-            "trainer": self.trainer,
-            "directory": str(directory),
-            "corpus_files": self.dircorpus if isinstance(self.dircorpus, str) else str(self.dircorpus),
-            "chars_per_doc": self.chars_per_doc,
-            "corpus_nb_chars": self.max_chars,
-        }
-        if json_path.exists():
-            with open(json_path, "r") as f:
-                data = json.load(f)
-        else:
-            data = []
-        data.append(new_row)
-        with open(json_path, "w") as f:
-            json.dump(data, f, indent=2)
-        
 
 class DatasetConfig(BaseModel):
     name: str
@@ -234,14 +187,6 @@ class DatasetConfig(BaseModel):
     sorted: bool = True
     max_shards: Optional[int] = None
     streaming: bool = False
-    # source: str
-    # split: Literal["train", "validation", "test"]
-    # seed: Optional[int]
-    # shard_size: Optional[int]
-    # num_shards: Optional[int]
-    # data_dir: Optional[Union[str,Path]] = DATA_DIR
-    # num_proc: Optional[int]
-    # stream: bool = True
 
 class DataLoaderConfig(BaseModel):
     batch_size: int = 1
