@@ -482,5 +482,12 @@ class Tokenizer(_BaseTokenizer):
     def decode(self, token_ids: List[int]) -> str:
         return self.main.decode(token_ids)
     
+    def decode_single_token_bytes(self, token_id: int) -> bytes:
+        if token_id in self.special_tokens.values():
+            # Special tokens are not part of the mergeable ranks and do not have corresponding byte sequences
+            log0(f"Token ID {token_id} is a special token and does not have a corresponding byte sequence. Returning empty bytes.", level="warning", logger=logger)
+            return b""
+        return self.main.decode_single_token_bytes(token_id)
+    
     def __call__(self, text, *args, **kwds):
         return self.encode(text, *args, **kwds)

@@ -49,6 +49,11 @@ class _BaseTokenizer:
         return len(self.mergeable_ranks)
     
     @property
+    def n_vocab(self):
+        """Alias for vocab_size for compatibility with tiktoken interface."""
+        return self.vocab_size
+    
+    @property
     def token_bytes(self):
         if getattr(self, "_token_bytes", None) is None:
             self._token_bytes = self.get_token_bytes()
