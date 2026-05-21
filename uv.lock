@@ -573,6 +573,7 @@ name = "gpt-lab"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "datasets" },
     { name = "gradio" },
     { name = "jinja2" },
     { name = "kernels" },
@@ -606,7 +607,6 @@ gpu = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "datasets" },
     { name = "huggingface-hub" },
     { name = "matplotlib" },
     { name = "pytest" },
@@ -618,6 +618,7 @@ notebook = [
 
 [package.metadata]
 requires-dist = [
+    { name = "datasets", specifier = "==4.8.4" },
     { name = "gradio", specifier = "==3.18.0" },
     { name = "jinja2", specifier = "==3.1.6" },
     { name = "kernels", specifier = "==0.11.7" },
@@ -642,7 +643,6 @@ provides-extras = ["cpu", "gpu"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "datasets", specifier = "==4.8.4" },
     { name = "huggingface-hub", specifier = "==1.12.0" },
     { name = "matplotlib", specifier = "==3.10.8" },
     { name = "pytest", specifier = "==8.0" },
