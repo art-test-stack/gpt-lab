@@ -264,7 +264,7 @@ def test_build_or_load_tokenizer_notrain_uses_pretrained(monkeypatch):
     )
 
     out = tokenizer_auto.build_or_load_tokenizer(
-        tname="gpt2",
+        name="gpt2",
         vocab_size=32000,
         train_tokenizer=False,
         base_name="unused",
@@ -296,7 +296,7 @@ def test_build_or_load_tokenizer_training_path(monkeypatch):
     )
 
     out = tokenizer_auto.build_or_load_tokenizer(
-        tname=None,
+        name=None,
         vocab_size=4096,
         train_tokenizer=True,
         base_name="my_tok",
