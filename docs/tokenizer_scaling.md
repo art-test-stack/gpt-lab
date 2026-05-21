@@ -80,6 +80,18 @@ This is mainly motivated by the following facts:
 - Language model have been scaled up but tokenizers sizes have not been scaled up as much, and it is not clear how much the tokenizer performance can be improved by scaling up the tokenizer training corpus and vocabulary size.
 - According to [3], Language model performance is sensitive to tokenizer size, and the optimal size is often larger than the commonly used 50-100k tokens, especially for larger models. 
 
+## About the Evaluation
+
+The evaluation is done on different datasets; which can be easily customized in the code (making it easy to add new evaluation datasets is a TODO), with the following metrics:
+- **Compression ratio**: the ratio of the number of tokens produced by the tokenizer to the number of characters in the input text.
+- **Efficiency**: the average number of characters per token, which is the inverse of the compression ratio.
+- **Rényi entropy**: introduced in [2], it is a generalization of the Shannon entropy that can be used to measure the diversity of the token distribution. It is defined as:
+    $$H_\alpha(X) = \frac{1}{1-\alpha} \log \sum_{i=1}^n p_i^\alpha$$
+    where $p_i$ is the probability of the $i$-th token in the distribution, and $\alpha$ is a parameter that controls the sensitivity of the entropy to the probabilities of the tokens. When $\alpha \to 1$, the Rényi entropy converges to the Shannon entropy, which is the most commonly used measure of entropy. When $\alpha > 1$, the Rényi entropy is more sensitive to the probabilities of the most common tokens, while when $\alpha < 1$, it is more sensitive to the probabilities of the less common tokens. In our experiments, we use $\alpha = 2.5$, which is a common choice in the literature for measuring the diversity of token distributions.
+- **Efficient Entropy**: also introduced in [2], it is a the Rényi entropy with $\alpha = 2.5$ scaled by the number of tokens:
+    $$H_\alpha^{\text{eff}}(X) = \frac{H_\alpha(X)}{\log n}$$
+    where $n$ is the number of tokens in the vocabulary. The efficient entropy is a measure of the diversity of the token distribution that takes into account the size of the vocabulary. It is defined as the Rényi entropy scaled by the logarithm of the number of tokens in the vocabulary, which allows us to compare tokenizers with different vocabulary sizes on a more equal footing.
+
 ## Acknowledgements
 
 This experiment is inspired by and has some code adapted from the following sources:

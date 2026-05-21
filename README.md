@@ -281,8 +281,7 @@ tokenizer is loaded, truncated, saved, and returned.
 tokenizer = Tokenizer.from_pretrained("cl100k_base_truncated_32000")
 ```
 
-Truncation always preserves all 256 byte-level tokens and reassigns ranks
-to be contiguous from 0.
+Truncation always preserves all 256 byte-level tokens and reassigns ranks to be contiguous from 0.
 
 #### Training a tokenizer
 
@@ -303,7 +302,7 @@ cfg = TokenizerConfig(
     pat_str="gpt2", 
     trainer=trainer_cfg,# whether to save the trained tokenizer to disk
 )
-tokenizer = Tokenizer.train_from_iterator(cfg, iterator=corpus.iterator())
+tokenizer = Tokenizer.train_from_iterator(iterator=corpus.iterator(), config=trainer_cfg)
 ```
 
 

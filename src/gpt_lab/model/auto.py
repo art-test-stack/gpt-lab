@@ -165,13 +165,13 @@ class AutoGPTConfig(BaseModel):
                 logger=logger, level="warning")
 
             tokenizer = build_or_load_tokenizer(
-                tname=self.tokenizer_model, 
+                name=self.tokenizer_model, 
                 vocab_size=int(vocab_size), 
                 train_tokenizer=True, 
                 base_name=_tname, 
-                pattern=PAT_STR.get(pat_str, "gpt2"), 
+                pat_str=PAT_STR.get(pat_str, "gpt2"), 
                 special_tokens=special_tokens, 
-                corpus_dir=DATA_DIR / "corpus" / self.name, 
+                data_dir=DATA_DIR / "corpus" / self.name, 
                 random_seed=self.random_seed, 
                 dirname=self.dirname
             )

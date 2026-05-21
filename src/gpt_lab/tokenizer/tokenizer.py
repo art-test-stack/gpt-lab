@@ -424,8 +424,8 @@ class Tokenizer(_BaseTokenizer):
 
         # Save token bytes tensor
         token_bytes_path = directory / "token_bytes.pt"
-        torch.save(self._token_bytes, token_bytes_path)
-
+        torch.save(self.token_bytes, token_bytes_path)
+        
         # Write a lightweight JSON descriptor alongside the pickle config for readability
         config_json = {
             "name": self.config.name,

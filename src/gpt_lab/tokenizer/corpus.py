@@ -9,10 +9,7 @@ from typing import Union, Dict, Callable, Optional, Iterable, Tuple
 # TODO: consider using compression.ztsd when python.version >= 3.14 (pi)
 
 from tqdm import tqdm
-try:
-    from datasets import load_dataset
-except ImportError:
-    load_dataset = None
+from datasets import load_dataset
 
 import logging
 
@@ -51,6 +48,14 @@ def apply_temperature_sampling(
     scaled = [w ** alpha for w in raw]
     total = sum(scaled)
 
+    if total == 0:
+        if not sources:
+            return sources
+        uniform_weight = 1.0 / len(sources)
+        for src in sources:
+            src["weight"] = uniform_weight
+        return sources
+    
     for src, w in zip(sources, scaled):
         src["weight"] = w / total
 

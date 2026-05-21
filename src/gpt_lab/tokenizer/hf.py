@@ -4,7 +4,7 @@ import os, json
 from pathlib import Path
 from typing import Iterable, Dict
 
-from gpt_lab.utils.logging import log_all, log0, log_error
+from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.tokenizer.base import _BaseTokenizer
