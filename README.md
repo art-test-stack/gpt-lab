@@ -240,24 +240,108 @@ Next sections detail the different generated components.
 
 ### Tokenization
 
-The tokenization implementation are located in [`gpt_lab.tokenizer`](./src/gpt_lab/tokenizer/tokenizer.py). The code only includes BPE tokenization for now (include sentencepiece is a TODO). The tokenizer training is only supported by huggingface implementation for now. For inference, the tiktoken implementation is the default one, as it is much faster than the huggingface one. The custom BPE implementation is still under development, and is not functional yet.
+The tokenization system lives in [`gpt_lab/tokenizer/`](./src/gpt_lab/tokenizer/) and is organized as follows:
+
+```
+tokenizer/
+├── auto.py            # tokenizer resolution and scaling-law selection
+├── base.py            # base Tokenizer class and utilities for internal logic
+├── corpus.py          # TokenizerCorpus class and training data generation logic
+├── hf.py              # HuggingFace backend wrapper and conversion
+├── serialization.py   # msgpack save/load, validation, fingerprinting
+├── tokenizer.py       # core Tokenizer class and public API
+└── truncation.py      # vocabulary truncation helpers
+```
+
+The library supports BPE tokenization only (SentencePiece is a TODO). Training uses the HuggingFace backend; encoding and decoding use tiktoken.
+
+Tokenizers are serialized with `msgpack` (binary, rank-sorted, SHA-256 fingerprinted) rather than pickle. Legacy `vocab.pkl` files are still readable with a deprecation warning.
+
+#### Using a pretrained tokenizer
+
+```python
+from gpt_lab.tokenizer import Tokenizer
+
+# Load from tiktoken (default)
+tokenizer = Tokenizer.from_pretrained("cl100k_base")
+
+# Load from a specific source
+tokenizer = Tokenizer.from_pretrained("cl100k_base", source="tiktoken")
+```
+
+#### Loading a truncated tokenizer
+
+Truncated tokenizers are identified by name suffix and handled automatically.
+If a cached version exists on disk it is loaded directly; otherwise the base
+tokenizer is loaded, truncated, saved, and returned.
+
+```python
+# Automatically builds cl100k_base truncated to 32k mergeable ranks
+# and caches it to disk for future loads
+tokenizer = Tokenizer.from_pretrained("cl100k_base_truncated_32000")
+```
+
+Truncation always preserves all 256 byte-level tokens and reassigns ranks to be contiguous from 0.
 
 #### Training a tokenizer
 
 ```python
 from gpt_lab.tokenizer import Tokenizer
 from gpt_lab.tokenizer.corpus import TokenizerCorpus
-from gpt_lab.utils.schemas import TokenizerTrainerConfig
+from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
 
 # uses default corpus settings (mixture of HuggingFaceFW/fineweb-edu, HuggingFaceFW/fineweb-2, HuggingFaceTB/finemath and codeparrot/codeparrot-clean)
 corpus = TokenizerCorpus.from_sources(random_seed=42)
-cfg = TokenizerTrainerConfig(
+trainer_cfg = TokenizerTrainerConfig(
+    source="huggingface", # training backend (e.g., "huggingface", "tiktoken", "bpe", "fbpe", "rbpe", "dummy")
+    to_save=True, # pattern for pre-tokenization (e.g., "gpt2", "cl100k-base", etc., or regex pattern for custom pre-tokenization)
+)
+cfg = TokenizerConfig(
     name="my_tokenizer",
     vocab_size=32_000,
-    pat_str="gpt2", # pattern for pre-tokenization (e.g., "gpt2", "cl100k-base", etc., or regex pattern for custom pre-tokenization)
+    pat_str="gpt2", 
+    trainer=trainer_cfg,# whether to save the trained tokenizer to disk
 )
-tokenizer = Tokenizer.train_from_iterator(cfg, iterator=corpus.iterator())
+tokenizer = Tokenizer.train_from_iterator(iterator=corpus.iterator(), config=trainer_cfg)
 ```
+
+
+#### Loading a locally saved tokenizer
+
+```python
+tokenizer = Tokenizer.from_disk("my_tokenizer")
+```
+
+Expects the directory structure:
+
+```
+<TOKENIZERS_FOLDER>/my_tokenizer/
+├── tokenizer_config.json       # includes SHA-256 fingerprint
+├── mergeable_ranks.msgpack
+└── token_bytes.pt
+```
+
+#### Automatic tokenizer resolution
+
+When using `AutoConfig`, the tokenizer is resolved automatically based on
+scaling laws. You can also call the resolver directly:
+
+```python
+from gpt_lab.tokenizer.auto import resolve_tokenizer
+
+tokenizer = resolve_tokenizer("cl100k_base", vocab_size=32_000)
+```
+
+#### Which tokenizer to use?
+
+The training script is at `scripts/train_tokenizer.py`. For encoding during
+training and inference, tiktoken is always used regardless of which backend
+trained the tokenizer.
+
+> [!NOTE]
+> HuggingFace `BpeTrainer` does not expose a random seed, so trained
+> tokenizers are not guaranteed to be bit-for-bit reproducible across runs.
+> Pretrained and truncated tokenizers are fully deterministic.
 
 #### Using a pre-trained tokenizer
 
@@ -274,9 +358,27 @@ The tokenizer training script is located in `scripts/train_tokenizer.py`. It all
 
 Training time benchmarks for different implementations and configurations. All the tokenizers were trained on corpus generated from `gpt_lab.tokenizer.corpus.TokenizerCorpus()` with default settings, tuned with variable `vocab_size`.
 
-<!-- Implementation | Vocabulary size | Num proc | Corpus size | Training time
---- | --- | --- | --- | ---
-huggingface | 32,000 | 7 | 112.58 MB | 11.45 seconds  -->
+#### Scaling laws for tokenizer training
+
+In [docs/tokenizer_scaling.md](./docs/tokenizer_scaling.md), we analyze how ByteLevel BPE tokenization scales with different corpus sizes, vocabulary sizes, and split patterns. The goal is to understand the trade-offs between these factors and their impact on tokenization quality and efficiency.
+
+To experiment yourself tokenizer scaling, you can run the following command from the root directory of the repo:
+
+```bash
+uv run python -m scripts.benchmark.tokenizer_corpus_size \
+    --seed 42 \
+    --num-procs 16 \
+    --vocab-sizes 20000,50000,100000 \
+    --pat-strs gpt2,cl100k_base \
+    --write-corpus \
+    --corpus-sizes-gb 10,50,100,500,1000,5000,10000 
+```
+
+More details on the arguments are given in [tokenizer_corpus_size.py](./scripts/benchmark/tokenizer_corpus_size.py) or using `--help`:
+
+```bash
+uv run python -m scripts.benchmark.tokenizer_corpus_size --help
+```
 
 ### Model architecture
 

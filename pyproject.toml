@@ -4,11 +4,16 @@ version = "0.1.0"
 description = "Library for training and serving LLMs from scratch, with local and Hugging Face interfaces."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
+authors = [
+    {name = "art-test-stack"}
+]
 
 dependencies = [
+    "datasets==4.8.4",
     "gradio==3.18.0",
     "jinja2==3.1.6",
     "kernels==0.11.7",
+    "msgpack>=1.1.2",
     "numpy==2.4.3",
     "psutil==7.2.2",
     "pydantic==2.12.5",
@@ -39,7 +44,6 @@ gpu = [
 [dependency-groups]
 dev = [
     "pytest==8.0",
-    "datasets==4.8.4",
     "huggingface-hub==1.12.0",
     "matplotlib==3.10.8",
 ]
