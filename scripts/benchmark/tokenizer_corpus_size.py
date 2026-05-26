@@ -204,7 +204,7 @@ def main():
 
     for baseline in baselines:
         if baseline not in result_paths:
-            enc = get_encoding(baseline)
+            enc = Tokenizer.from_pretrained(baseline, source="tiktoken") 
             evaluation = eval_tokenizer(enc)
             result = dict(
                 vocab_size=enc.n_vocab,
@@ -386,7 +386,7 @@ def eval_tokenizer(tokenizer):
     results = {}
     _counter = Counter()
     _token_len_cache = {}
-    for tok in tokenizer._mergeable_ranks.values():
+    for tok in tokenizer.mergeable_ranks.values():
         _token_len_cache[tok] = len(
             tokenizer.decode_single_token_bytes(tok)
         )
