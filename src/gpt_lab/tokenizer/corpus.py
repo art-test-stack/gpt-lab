@@ -62,9 +62,11 @@ def apply_temperature_sampling(
     return sources
 
 def safe_byte_truncate(text: str, max_bytes: int) -> str:
+    max_bytes = int(max_bytes)
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
+
     truncated = encoded[:max_bytes]
     # walk backward until valid UTF-8
     while truncated:
@@ -72,6 +74,7 @@ def safe_byte_truncate(text: str, max_bytes: int) -> str:
             return truncated.decode("utf-8")
         except UnicodeDecodeError:
             truncated = truncated[:-1]
+
     return ""
 
 def _normalize_sources_weights(sources, weights_sum):
@@ -415,7 +418,6 @@ def write_corpus_sample(
 
             text = safe_byte_truncate(text, bytes_per_doc) # arbitrary truncation
             
-
             if per_dataset_normalizer:
                 text = per_dataset_normalizer(text, dataset_name=src_name) # should be function(text, dataset_name) -> text
             

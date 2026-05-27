@@ -735,6 +735,7 @@ For the laziest (😛), there are also a lot of Youtube videos that explain well
 ### Extra
 
 1. Banner made with: [hacker-tools/ascii-banner](https://manytools.org/hacker-tools/ascii-banner/)
+2. For some extra documentation: [![Ask DeepWiki](https://deepwiki.com/badge.svg?style=for-the-badge)](https://deepwiki.com/art-test-stack/gpt-lab)
 
 
 ## TODOs 

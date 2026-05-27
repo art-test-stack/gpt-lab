@@ -157,9 +157,8 @@ def main():
         backup_dir = result_dir
         i = 1
         while backup_dir.exists():
-            with open(backup_dir, "rb") as f:
-                results = pickle.load(f)
-            if results == [] or results is None:
+            backup_dir_files = list(backup_dir.glob("*.pkl"))
+            if backup_dir_files == [] or backup_dir_files is None:
                 log0(f"Existing results file {backup_dir} is empty. It will be overwritten with new results.", logger=logger)
                 break
             new_name = result_dir.stem + f"_{i}"
@@ -167,7 +166,7 @@ def main():
             i += 1
         result_dir.rename(backup_dir)
         log0(f"Existing results file found. New results will be stored in {result_dir!r} to avoid overwriting.", logger=logger)
-
+    result_dir.mkdir(parents=True, exist_ok=False)
     exp_name = result_dir.stem
 
     # Store experiment metadata for reproducibility and analysis
@@ -205,7 +204,7 @@ def main():
 
     for baseline in baselines:
         if baseline not in result_paths:
-            enc = get_encoding(baseline)
+            enc = Tokenizer.from_pretrained(baseline, source="tiktoken") 
             evaluation = eval_tokenizer(enc)
             result = dict(
                 vocab_size=enc.n_vocab,
@@ -340,13 +339,7 @@ def store_buffered_results(buffer, result_dir):
 
 def renyi_entropy(counter, alpha=2.5, eps=1e-12):
     """
-    Rényi entropy of order alpha as proposed by Zouhar et al. (2023) to measure the diversity of the corpus:
-    $$H_{\alpha}(X) = (1 / (1 - \alpha)) * \log( \sum_{x \in \mathcal{X}} p(x)^{\alpha})$$
-    where p(x) is the probability of token x in the corpus.
-    - For $\alpha \to 0$, it corresponds to the logarithm of the support size (number of unique tokens).
-    - For $\alpha \to 1$, it corresponds to the Shannon entropy (the limit as $\alpha$approaches 1).
-    - For $\alpha \to 2$, it corresponds to the collision entropy, which is related to the probability that two randomly chosen tokens are the same.
-    - For $\alpha \to \infty$, it corresponds to the min-entropy, which is related to the probability of the most likely token.
+    Rényi entropy of order alpha as proposed by Zouhar et al. (2023) to measure the diversity of the corpus.
     """
     total = sum(counter.values())
     if total == 0:
@@ -359,10 +352,15 @@ def renyi_entropy(counter, alpha=2.5, eps=1e-12):
     
 def entropy_efficiency(counter, alpha=2.5, eps=1e-12):
     """
-    Efficiency of the tokenizer as proposed by Zouhar et al. (2023), defined as the ratio of the Rényi entropy of the token distribution to the logarithm of the vocabulary size:
-    $$\text{Efficiency} = \frac{H_{\alpha}(X)}{\log(|V|)}$$
-    where $H_{\alpha}(X)$ is the Rényi entropy of order $\alpha$ and $|V|$ is the vocabulary size.
-    This metric captures how well the tokenizer utilizes its vocabulary to represent the diversity of the corpus. A higher efficiency indicates that the tokenizer is effectively using its vocabulary to capture the variability in the data, while a lower efficiency may suggest that many tokens are underutilized or that the tokenizer is not capturing enough diversity.
+    Efficiency of the tokenizer as proposed by Zouhar et al. (2023), defined as 
+    the ratio of the Rényi entropy of the token distribution to the logarithm of 
+    the vocabulary size.
+    
+    This metric captures how well the tokenizer utilizes its vocabulary to represent
+    the diversity of the corpus. A higher efficiency indicates that the tokenizer is 
+    effectively using its vocabulary to capture the variability in the data, while a 
+    lower efficiency may suggest that many tokens are underutilized or that the tokenizer 
+    is not capturing enough diversity.
     """
     vocab_size = len(counter)
     if vocab_size == 0:
@@ -387,10 +385,11 @@ def get_eval_corpus(eval_set):
 def eval_tokenizer(tokenizer):
     results = {}
     _counter = Counter()
-    _token_len_cache = {
-        tok: len(tokenizer.decode([tok]))
-        for tok in range(tokenizer.n_vocab)
-    }
+    _token_len_cache = {}
+    for tok in tokenizer.mergeable_ranks.values():
+        _token_len_cache[tok] = len(
+            tokenizer.decode_single_token_bytes(tok)
+        )
     for eval_set in eval_sets:
         metrics = dict()
         _counter = Counter()
