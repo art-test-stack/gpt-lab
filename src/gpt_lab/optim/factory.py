@@ -48,6 +48,9 @@ class OptimizerFactory(torch.optim.Optimizer):
         for idx, group in enumerate(param_groups):
             _validate_group(group, idx)
             group.setdefault("initial_lr", group["lr"])
+            group.setdefault("initial_weight_decay", group["weight_decay"])
+            if group["opt"] == "muon":
+                group.setdefault("initial_momentum", group["momentum"])
         
         super().__init__(param_groups, defaults={})
         
@@ -82,6 +85,12 @@ class OptimizerFactory(torch.optim.Optimizer):
     def load_state_dict(self, state_dict: dict) -> None:
         """Load optimizer state dict."""
         super().load_state_dict(state_dict)
+        # Older checkpoints predate the schedule baselines.
+        for group in self.param_groups:
+            group.setdefault("initial_lr", group["lr"])
+            group.setdefault("initial_weight_decay", group["weight_decay"])
+            if group["opt"] == "muon":
+                group.setdefault("initial_momentum", group["momentum"])
     
     @torch.no_grad()
     def update_hyperparams(
@@ -96,17 +105,17 @@ class OptimizerFactory(torch.optim.Optimizer):
         
         Args:
             lrm: Learning rate multiplier, applied via initial_lr to all groups.
-            muon_momentum: Override momentum for Muon groups only.
-            weight_decay: Override weight_decay for all groups.
+            muon_momentum: Momentum multiplier for Muon groups only.
+            weight_decay: Weight-decay multiplier for all groups.
         """
         for group in self.param_groups:
             group["lr"] = group["initial_lr"] * lrm
             
             if weight_decay is not None:
-                group["weight_decay"] = weight_decay
+                group["weight_decay"] = group["initial_weight_decay"] * weight_decay
             
             if group["opt"] == "muon" and muon_momentum is not None:
-                group["momentum"] = muon_momentum
+                group["momentum"] = group["initial_momentum"] * muon_momentum
         
         return lrm, muon_momentum, weight_decay
 
