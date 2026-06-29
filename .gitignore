@@ -9,7 +9,7 @@ __pycache__/
 *$py.class
 archive/
 .*/
-!/*/.github/
+!/.github/*
 # work in progress, not ready for sharing yet
 dumas.py 
 draft.md
