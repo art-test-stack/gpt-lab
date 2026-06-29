@@ -58,7 +58,7 @@ class ShardedDataset:
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, DataLoaderState]]:
         for texts, state in self.sm.iterate(start_state=self.start_state):
-            for txt in texts:
+            for offset, txt in enumerate(texts, state.offset_in_row_group):
                 tokens = (
                     self.tokenizer(txt, prepend_bos=True, threads=self.tokenizer_threads)
                     if self.tokenizer is not None
@@ -69,7 +69,7 @@ class ShardedDataset:
                 # needs to call torch.tensor() again (no extra allocations).
                 if not isinstance(tokens, torch.Tensor):
                     tokens = torch.tensor(tokens, dtype=torch.long)
-                yield tokens, state
+                yield tokens, state.model_copy(update={"offset_in_row_group": offset})
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +253,8 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, base_path=
 
     warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
     parquet_paths = list_parquet_files(base_path)
-    assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
+    if len(parquet_paths) < 2:
+        raise ValueError("At least two parquet shards are required (train and validation).")
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
     resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
@@ -323,7 +324,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        token_lists = tokenizer.encode(doc_batch, prepend_bos=True, num_threads=tokenizer_threads)
         for tokens in token_lists:
             doc_buffer.append(tokens)
 
@@ -429,7 +430,7 @@ def build_dataloader(
             device=dist_info["DEVICE"],
             resume_state_dict=resume_state_dict,
             buffer_size=buffer_size or (batch_size * seq_len * 16),
-            base_path=datadir / name
+            base_path=Path(datadir or cachedir or DATA_DIR) / name
         )
     else:
         ds = ShardedDataset(

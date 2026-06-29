@@ -181,7 +181,7 @@ class ShardManager:
                 lo = mid + 1
             else:
                 hi = mid
-        return lo
+        return lo - 1
     
     def list_local_shards(self):
         return list(sorted(
@@ -262,13 +262,11 @@ class ShardManager:
                 pf = pq.ParquetFile(shard_path)
 
                 if is_resuming:
-                    base = state.row_group_idx // self.world_size
-                    state.row_group_idx = (base + 1) * self.world_size + self.ddp_rank      
-                    if state.row_group_idx >= pf.num_row_groups:
-                        state.shard_idx += 1 # go to resuming shard id
-                        state.row_group_idx = self.ddp_rank # start at the first row group for the next shard
-                        state.offset_in_row_group = 0
-                        continue
+                    if state.row_group_idx % self.world_size != self.ddp_rank:
+                        raise ValueError(
+                            f"Resume row group {state.row_group_idx} does not belong "
+                            f"to rank {self.ddp_rank} of {self.world_size}."
+                        )
                 else:
                     state.row_group_idx = self.ddp_rank
 
@@ -276,11 +274,14 @@ class ShardManager:
                     rg = pf.read_row_group(state.row_group_idx)
                     batch = rg.column(self.column_name).to_pylist()
                     for i in range(0, len(batch), batch_size):
-                        if is_resuming and i < state.offset_in_row_group:
+                        texts = batch[i:i+batch_size]
+                        if is_resuming and i + len(texts) <= state.offset_in_row_group + 1:
                             continue
                         if is_resuming:
+                            texts = texts[state.offset_in_row_group - i + 1:]
+                            i = state.offset_in_row_group + 1
                             is_resuming = False  # only do this once
-                        yield batch[i:i+batch_size], DataLoaderState(
+                        yield texts, DataLoaderState(
                             shard_idx=state.shard_idx,                            
                             global_shard_idx=state.global_shard_idx, # for debbugging - we keep track of original shard idx
                             row_group_idx=state.row_group_idx,

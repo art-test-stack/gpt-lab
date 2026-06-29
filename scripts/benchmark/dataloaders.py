@@ -602,16 +602,7 @@ def main():
         dataset = SyntheticPretokenizedDataset(tokens, offsets)
         print(f"  vocab=50257  len range=[32, 1024]  total tokens={len(tokens):,}\n")
     else:
-        if args.bin is None or args.idx is None:
-            sys.exit("--mode real requires --bin and --idx arguments.")
-        # import real dataset class
-        try:
-            from gpt_lab.data.loader import ...   # adjust import path as needed
-        except ImportError:
-            sys.exit("Could not import PretokenizedDataset. "
-                     "Make sure dataloader.py is on sys.path.")
-        dataset = PretokenizedDataset(args.bin, args.idx)
-        print(f"Loaded dataset: {len(dataset):,} docs\n")
+        sys.exit("--mode real is not implemented; use --mode synthetic.")
 
     results = []
 
