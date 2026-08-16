@@ -20,7 +20,7 @@ def precompute_rope(seq_len: int, d_head: int, base: int = 10000, dtype: torch.d
         warnings.warn(f'Device not specified for RoPE precomputation. Using default device {DEVICE}.')
         device = DEVICE
     assert d_head % 2 == 0, 'd_head must be even for RoPE'
-    channel_range = torch.arange(0, d_head, 2.0, dtype=dtype, device=device)
+    channel_range = torch.arange(0, d_head, 2, dtype=dtype, device=device)
     inv_freq = 1.0 / (base ** (channel_range / d_head))
     pos_seq = torch.arange(0, seq_len, dtype=dtype, device=device)
 
@@ -28,14 +28,14 @@ def precompute_rope(seq_len: int, d_head: int, base: int = 10000, dtype: torch.d
     rope_cache = torch.stack((torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)), dim=-1)
     return rope_cache # seq_len x (d_head/2) x 2
 
-def precompute_positional_encoding(n_pos: int, d_model: int, dtype: torch.dtype = torch.float32, device: Optional[torch.device] = None) -> torch.Tensor:
+def precompute_positional_encoding(n_pos: int, d_model: int, base: int = 1e4, dtype: torch.dtype = torch.float32, device: Optional[torch.device] = None) -> torch.Tensor:
     if not device:
         warnings.warn('Device not specified for positional encoding precomputation. Using default device.')
         device = torch.device(DEVICE)
     pos = torch.arange(n_pos, dtype=dtype, device=device)
     i = torch.arange(d_model, dtype=dtype, device=device)
 
-    pos_enc = torch.ger(pos, 1e4 ** (- 2 * (i//2) / d_model))
+    pos_enc = torch.outer(pos, base ** (- 2 * (i//2) / d_model))
 
     pos_enc[:, 0::2] = torch.sin(pos_enc[:, 0::2])
     pos_enc[:, 1::2] = torch.cos(pos_enc[:, 1::2]) 

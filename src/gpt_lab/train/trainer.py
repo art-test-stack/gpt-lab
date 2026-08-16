@@ -295,6 +295,8 @@ class Trainer:
         n_flops_per_token = self.config.n_flops_per_token
         total_batch_size = self.config.total_batch_size
         n_acc_steps = self.config.n_acc_steps
+
+        world_size = self.config.dist_info.get("WORLD_SIZE", 1) if self.config.dist_info else 1
         
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
@@ -433,17 +435,22 @@ class Trainer:
                 engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
                 with self.val_context(self.model):
                     samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
-                print0(self.tokenizer.decode(samples[0]))
+                # print0(self.tokenizer.decode(samples[0]))
                 self.model.train()
 
             # ================================================================
             # Training step with gradient accumulation
             # ================================================================
 
-            step_start_time = time.time()
-            loss_accum = 0.0
-            
+            loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
+
+            eff_global_tokens = 0
+
+            self.synchronize()
+            step_start_time = time.perf_counter()
             for _ in range(n_acc_steps):
+                eff_global_tokens += x.numel() * world_size
+
                 self.state.train_loader_state = dataloader_state
                 with self.train_context():
                     loss = self._compute_loss(x, y)
@@ -454,8 +461,9 @@ class Trainer:
                 else:
                     loss.backward()
 
-                loss_accum += loss.detach().item()
-                if math.isnan(loss_accum) or math.isinf(loss_accum):
+                loss_accum.add_(loss.detach().float())
+
+                if torch.isnan(loss_accum) or torch.isinf(loss_accum):
                     torch.save(x, self.dirname / "bad_batch.pt")
                     log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
                         f"Loss is NaN or Inf at {step=}.\n" \
@@ -481,7 +489,7 @@ class Trainer:
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
                 if self.config.dist_info["IS_DDP_INITIALIZED"]:
-                    for g in self.scaler._found_inf__per_device:
+                    for g in self.scaler._found_inf_per_device(self.optimizer).values():
                         dist.all_reduce(g, op=dist.ReduceOp.MAX)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -491,26 +499,32 @@ class Trainer:
             self._compiled_model.zero_grad(set_to_none=True)
 
             self.synchronize()
-            step_end_time = time.time()
+            step_end_time = time.perf_counter()
             
             # ================================================================
             # Logging and metrics
             # ================================================================
             
-            step_dt = step_end_time - step_start_time
+            step_dt_tensor = torch.tensor(step_end_time - step_start_time, device=self.device)
+
+            if self.config.dist_info["IS_DDP_INITIALIZED"]:
+                dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
+
+            step_dt = step_dt_tensor.item()
+
+            loss_accum = loss_accum.item()
             
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
             debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
             
             # Calculate throughput
-            eff_global_tokens = (
-                x.numel() * n_acc_steps *
-                (self.config.dist_info.get("WORLD_SIZE", 1) if self.config.dist_info else 1)
-            )
+            if eff_global_tokens != total_batch_size:
+                log0(f"eff_global_tokens != total_batch_size, got {eff_global_tokens=} and {total_batch_size=}", logger=logger, level="warning")
+
             tokens_per_sec = eff_global_tokens / step_dt
 
             step_flops_per_sec = n_flops_per_token * tokens_per_sec
-            mfu = step_flops_per_sec / self.config.dist_info["gpu_peak_flops"] * 100
+            mfu = step_flops_per_sec / self.config.dist_info["gpu_peak_flops"] * 100 / world_size
             
             total_dt.append(step_dt)
             self.state.n_tokens += eff_global_tokens
@@ -592,7 +606,7 @@ class Trainer:
         print0("=" * 70)
         
         # Final checkpoint
-        self.save_checkpoint(tag="final")
+        self.save_checkpoint()
 
     def _compute_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Compute cross-entropy loss."""

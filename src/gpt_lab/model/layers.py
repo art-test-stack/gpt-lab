@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def apply_rms_norm(x: torch.Tensor, eps: float = 1e-8, torch_impl: bool = True) -> torch.Tensor:
     if torch_impl:
-        return torch.rms_norm(x, normalized_shape=(x.size(-1),))
+        return torch.rms_norm(x, normalized_shape=(x.size(-1),), eps=eps)
     else:
         rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
         return x / rms
