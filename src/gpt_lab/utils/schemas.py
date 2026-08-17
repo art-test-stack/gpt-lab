@@ -33,6 +33,7 @@ from gpt_lab.utils.types import (
     LossTypes,
     NormalizationTypes,
     PositionalEncodingTypes,
+    PackingStrategy,
     TfTypes,
     TokenizerSources,
     TpModes,
@@ -196,6 +197,7 @@ class DataLoaderConfig(BaseModel):
     buffer_size: int = 10000
     device: str = "cuda"
     use_pin_memory: bool = False
+    packing_strategy: PackingStrategy = "stream"
 
 class BaseConfig(BaseModel):
     data_dir: Union[str, Path] = DATA_DIR
@@ -324,7 +326,7 @@ class MoETransformerConfig(TransformerConfig):
 class LossConfig(BaseModel):
     loss_fn: LossTypes = "cross_entropy"
     kwargs: dict = Field(default_factory=dict)
-    ignore_index: int = -100
+    ignore_index: int = -1
     reduction: LossReductionTypes = "mean"
 
 class GenerationConfig(BaseModel):
@@ -616,7 +618,12 @@ class DataLoaderState(BaseModel):
     row_group_idx: int = 0
     offset_in_row_group: int = 0
     epoch: int = 1
-    # Add more fields as needed to track the state of the current iteration over a data shard
+    packing_strategy: Optional[PackingStrategy] = None
+    pending_tokens: List[int] = Field(default_factory=list)
+    pending_is_document_start: bool = False
+    carry_token: Optional[int] = None
+    continuation_pending: bool = False
+    packing_stats: Dict[str, Any] = Field(default_factory=dict)
 
 class TrainerState(BaseModel):
     step: int = 0

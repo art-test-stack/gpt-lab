@@ -261,15 +261,7 @@ class ShardManager:
 
                 pf = pq.ParquetFile(shard_path)
 
-                if is_resuming:
-                    base = state.row_group_idx // self.world_size
-                    state.row_group_idx = (base + 1) * self.world_size + self.ddp_rank      
-                    if state.row_group_idx >= pf.num_row_groups:
-                        state.shard_idx += 1 # go to resuming shard id
-                        state.row_group_idx = self.ddp_rank # start at the first row group for the next shard
-                        state.offset_in_row_group = 0
-                        continue
-                else:
+                if not is_resuming:
                     state.row_group_idx = self.ddp_rank
 
                 while state.row_group_idx < pf.num_row_groups:
@@ -280,11 +272,14 @@ class ShardManager:
                             continue
                         if is_resuming:
                             is_resuming = False  # only do this once
-                        yield batch[i:i+batch_size], DataLoaderState(
+                        chunk = batch[i:i+batch_size]
+                        yield chunk, DataLoaderState(
                             shard_idx=state.shard_idx,                            
                             global_shard_idx=state.global_shard_idx, # for debbugging - we keep track of original shard idx
                             row_group_idx=state.row_group_idx,
-                            offset_in_row_group=i,
+                            # State always names the next unread document, so a
+                            # checkpoint resumes without repeating this chunk.
+                            offset_in_row_group=i + len(chunk),
                             epoch=state.epoch,
                         )
                     state.offset_in_row_group = 0

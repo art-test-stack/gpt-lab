@@ -91,8 +91,12 @@ if __name__ == "__main__":
         # Temporary
         prs.add_argument("--device-batch-size", type=int, default=32, help="(default: 32) Batch size for each device during training. Batch size define further effective batch size as device_batch_size * max_seq_len * n_acc_steps.")
 
-        # For tests
-        prs.add_argument("--use-nanochat-dataloader", action="store_true", help="(default: False) Whether to use the nanochat dataloader instead of the default dataloader.")
+        prs.add_argument(
+            "--packing-strategy",
+            choices=("stream", "bos_aligned", "bos_bestfit_crop"),
+            default="stream",
+            help="Token packing policy. bos_bestfit_crop may discard document suffixes.",
+        )
 
         return prs
     
@@ -313,7 +317,7 @@ if __name__ == "__main__":
         max_shards=None, # TODO: configured based on configs/data.yaml
         batch_size=base_training_config.get("device_batch_size", args.device_batch_size),
         dist_info=dist_info,
-        use_nanochat=args.use_nanochat_dataloader,
+        packing_strategy=args.packing_strategy,
     )
     # TODO: add option to configure buffer size
     train_loader = build_dataloader(split="train", resume_state=resume_state, **loader_common_kwargs)

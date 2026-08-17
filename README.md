@@ -165,7 +165,8 @@ data_loader: DistDataLoader = build_dataloader(
     seq_len=model.config.max_context,
     batch_size=32,
     base_url="karpathy/climbmix-400b-shuffle", # for starting point
-    max_shards=6542 # last shard id for the given dataset (if not provided, it will be computed by probing the server, which can take a while)
+    max_shards=6542, # last shard id for the given dataset (if not provided, it will be computed by probing the server, which can take a while)
+    packing_strategy="stream", # default
 ) 
 ```
 
@@ -201,7 +202,13 @@ The data pipeline basically works with for any dataset available on internet tha
 ![sequence packing](./assets/sequence_packing.png)
 Sequence packing strategy. From [The Smol Training Playbook](https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook).
 
-The `build_dataloader` function the data loader, which is accessible from [`gpt_lab.data.DistDataLoader`](./src/gpt_lab/data/loader.py). It employs a distributed streaming data pipeline over Parquet shards with on-the-fly tokenization and greedy document packing into fixed-length sequences. It creates cpu and gpu buffers to pre-load the data in contiguous memory, stream the data from local shards downloaded from the given dataset, and feed the model with the data with a packing strategy, to maximize the throughput of the training loop by avoiding the use of padding tokens. It also supports distributed training setups, and can be used with DDP or other distributed training frameworks.
+The `build_dataloader` function, accessible through [`gpt_lab.data.DistDataLoader`](./src/gpt_lab/data/loader.py), exposes three explicit packing strategies:
+
+- `stream` (default) treats documents as one flat stream. It builds each batch from exactly `B*T+1` tokens and carries the final token into the next batch, so no source token or adjacent transition is silently lost. Rows are arbitrary views of that stream and need not start with BOS.
+- `bos_aligned` is lossless and deterministic. Every row starts with BOS. A document suffix that crosses a row is retained and prioritized on the next row after a synthetic BOS. Normal infinite train/validation streams remain fully utilized; a finite final batch is explicitly padded and its padded targets are set to `-1`, the model loss ignore index. `PackingStats` reports synthetic-BOS and padding overhead.
+- `bos_bestfit_crop` preserves the exact nanochat-style best-fit behavior. It keeps rows full and BOS-aligned by discarding suffixes when no complete document fits. This destructive crop rate can be substantial and is reported by `PackingStats`; its legacy resume position remains row-group approximate. `stream` and `bos_aligned` checkpoint the carry/continuation state exactly.
+
+These are context-layout policies, not document-isolation policies. A BOS token does **not** prevent causal attention from crossing document boundaries within the same row; GPT-Lab does not currently pass segment-aware attention masks to the model.
 
 The critical point regarding model training, is that we must make sure to have a good balance between loader time and model forward/backward time to avoid bottlenecks from the data loading process. Given that constraint, the implementated data loader is satisfying. 
 
