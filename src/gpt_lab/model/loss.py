@@ -40,7 +40,7 @@ def cross_entropy_loss(logits: Union[torch.Tensor, ModelOutput], labels: torch.T
     loss = F.cross_entropy(
         logits.view(-1, logits.size(-1)),
         labels.view(-1),
-        ignore_index=ignore_index,
+        ignore_index=-1,
         reduction=reduction,
     )
     return loss
@@ -83,9 +83,8 @@ class KLDivLoss(BaseLoss):
         with torch.no_grad():
             target_dist = torch.zeros_like(log_probs)
             target_dist.fill_(self.epsilon / (vocab_size - 1))
-            safe_labels = labels.masked_fill(~mask, 0)
             target_dist.scatter_(
-                -1, safe_labels.unsqueeze(-1), 1.0 - self.epsilon
+                -1, labels.unsqueeze(-1), 1.0 - self.epsilon
             )
 
         kl = F.kl_div(
@@ -104,10 +103,7 @@ def build_loss(config: Optional[LossConfig] = None) -> "BaseLoss":
     loss_type = config.loss_fn
     loss_kwargs = config.kwargs
     if loss_type == "cross_entropy":
-        return CrossEntropyLoss(
-            ignore_index=config.ignore_index,
-            reduction=config.reduction,
-        )
+        return cross_entropy_loss
     elif loss_type == "kl_divergence":
         return KLDivLoss(
             epsilon=loss_kwargs.get("epsilon", 0.1),
@@ -115,3 +111,4 @@ def build_loss(config: Optional[LossConfig] = None) -> "BaseLoss":
         )
     else:
         raise ValueError(f"Unsupported loss type: {loss_type}")
+    

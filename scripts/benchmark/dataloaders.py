@@ -51,15 +51,12 @@ class Result:
     source_tokens_read: int
     new_source_tokens_advanced: int
     target_positions_emitted: int
-    active_target_positions: int
     destructively_cropped_tokens: int
     skipped_adjacent_transitions: int
     synthetic_bos_tokens_inserted: int
     intentional_bos_boundaries: int
     buffered_source_tokens_delta: int
-    padding_tokens: int
     source_token_utilization: float
-    compute_utilization: float
     target_supervision_utilization: float
     source_transition_coverage: float
     destructive_crop_rate: float
@@ -93,14 +90,11 @@ def write_split(path: Path, documents: Sequence[Any], row_group_size: int) -> No
 
 def check_accounting(*, source_tokens_read, new_source_tokens_advanced,
                      buffered_source_tokens_delta, target_positions_emitted,
-                     skipped_adjacent_transitions, synthetic_bos_tokens_inserted,
-                     active_target_positions=None):
+                     skipped_adjacent_transitions, synthetic_bos_tokens_inserted):
     """Check source conservation independently from next-token supervision."""
     assert source_tokens_read == new_source_tokens_advanced + buffered_source_tokens_delta
     represented = new_source_tokens_advanced - skipped_adjacent_transitions
-    active = target_positions_emitted if active_target_positions is None else active_target_positions
-    assert active == represented + synthetic_bos_tokens_inserted
-    assert active <= target_positions_emitted
+    assert target_positions_emitted == represented + synthetic_bos_tokens_inserted
 
 
 class TorchPackedDataset:
@@ -215,11 +209,11 @@ def benchmark(loader_name: str, factory: Callable[[Counters], Iterator],
     counters.reset()
     counters.buffered_source_tokens = buffered
 
-    bos_rows = total_rows = active_targets = 0
+    bos_rows = total_rows = 0
     for _ in range(args.batches):
         _sync(args.device)
         started = time.perf_counter()
-        inputs, labels, batch_stats = next(loader)
+        inputs, _, batch_stats = next(loader)
         accumulate(batch_stats)
         if model is not None:
             model(inputs)
@@ -227,7 +221,6 @@ def benchmark(loader_name: str, factory: Callable[[Counters], Iterator],
         latencies.append(time.perf_counter() - started)
         bos_rows += int((inputs[:, 0] == bos_id).sum())
         total_rows += inputs.shape[0]
-        active_targets += int((labels != DistDataLoader.IGNORE_INDEX).sum())
 
     target_positions = args.batches * args.batch_size * args.seq_len
     buffered_delta = counters.buffered_source_tokens - buffered
@@ -236,7 +229,6 @@ def benchmark(loader_name: str, factory: Callable[[Counters], Iterator],
         new_source_tokens_advanced=counters.new_source_tokens_advanced,
         buffered_source_tokens_delta=buffered_delta,
         target_positions_emitted=target_positions,
-        active_target_positions=active_targets,
         skipped_adjacent_transitions=counters.skipped_adjacent_transitions,
         synthetic_bos_tokens_inserted=counters.synthetic_bos_tokens_inserted,
     )
@@ -246,11 +238,10 @@ def benchmark(loader_name: str, factory: Callable[[Counters], Iterator],
         loader_name, target_positions / sum(latencies), statistics.mean(latencies) * 1000,
         statistics.stdev(latencies) * 1000 if len(latencies) > 1 else 0.0,
         counters.source_tokens_read, counters.new_source_tokens_advanced, target_positions,
-        active_targets, counters.destructive_cropped_tokens,
+        counters.destructive_cropped_tokens,
         counters.skipped_adjacent_transitions, counters.synthetic_bos_tokens_inserted,
-        counters.intentional_bos_boundaries, buffered_delta, counters.padding_tokens,
+        counters.intentional_bos_boundaries, buffered_delta,
         (counters.new_source_tokens_advanced - counters.destructive_cropped_tokens) / advanced,
-        active_targets / max(target_positions, 1),
         represented / max(target_positions, 1), represented / advanced,
         counters.destructive_cropped_tokens / advanced,
         bos_rows / max(total_rows, 1),
@@ -307,13 +298,11 @@ class ComparisonResult:
     source_tokens_read: int
     new_source_tokens_advanced: int
     target_positions_emitted: int
-    active_target_positions: int
     skipped_adjacent_transitions: int
     synthetic_bos_tokens_inserted: int
     intentional_bos_boundaries: int
     buffered_source_tokens_delta: int
     source_token_utilization: float
-    compute_utilization: float
     target_supervision_utilization: float
     source_transition_coverage: float
     correctness_status: str
@@ -634,9 +623,9 @@ def aggregate(spec, trials, alignment, mode, tokenizer_name, pretokenization_sec
         statistics.mean(token_samples) if token_samples else None,
         min(token_samples) if token_samples else None, max(token_samples) if token_samples else None,
         statistics.mean(document_samples) if document_samples else None,
-        source_read, advanced, target_positions, target_positions,
+        source_read, advanced, target_positions,
         skipped, synthetic, intentional, buffered_delta,
-        (advanced - cropped) / max(advanced, 1), 1.0,
+        (advanced - cropped) / max(advanced, 1),
         represented / max(target_positions, 1), represented / max(advanced, 1),
         "passed", args.correctness_batches, pretokenization_seconds,
     )
@@ -688,7 +677,7 @@ def write_outputs(results, metadata, output, plots, html_report):
             "source_tokens_read", "new_source_tokens_advanced", "target_positions_emitted",
             "destructively_cropped_tokens", "skipped_adjacent_transitions",
             "synthetic_bos_tokens_inserted", "intentional_bos_boundaries",
-            "source_token_utilization", "compute_utilization",
+            "source_token_utilization",
             "target_supervision_utilization", "source_transition_coverage",
             "destructive_crop_rate", "bos_row_alignment", "actual_buffered_tokens_mean",
         ]
@@ -777,11 +766,10 @@ def main() -> None:
             "source_tokens_read": "Tokenized source tokens entering the packer during measured batches, including original document BOS tokens; excludes warmup and synthetic BOS.",
             "new_source_tokens_advanced": "Unique source-stream tokens permanently advanced during measured batches, including discarded tokens and excluding a retained carry token.",
             "target_positions_emitted": "Language-model target tensor positions produced; exactly trials * batches * B * T.",
-            "active_target_positions": "Emitted target positions that are not padding/ignore positions.",
             "destructively_cropped_tokens": (
                 "Original tokenized source tokens permanently discarded by the packing algorithm "
                 "and never emitted or retained for a future batch. Excludes the shifted-batch carry, "
-                "padding, synthetic BOS, temporarily buffered tails, and separately reported skipped "
+                "synthetic BOS, temporarily buffered tails, and separately reported skipped "
                 "adjacent transitions."
             ),
             "skipped_adjacent_transitions": "Adjacent source-token pairs not emitted as (input, target), including crop loss and intentional row segmentation at BOS.",
@@ -790,14 +778,13 @@ def main() -> None:
             "buffered_source_tokens_delta": "Final minus initial buffered source tokens over measured batches, including retained carry tokens.",
             "bos_row_alignment": "Fraction of rows whose first input token is BOS.",
             "source_token_utilization": "(advanced - destructively cropped) / advanced; source preservation.",
-            "compute_utilization": "Active target positions / emitted target positions; 1.0 for these full, unpadded benchmark policies.",
-            "target_supervision_utilization": "Represented adjacent source transitions / emitted target positions; excludes synthetic and padding supervision.",
+            "target_supervision_utilization": "Represented adjacent source transitions / emitted target positions; excludes synthetic supervision.",
             "source_transition_coverage": "Represented adjacent source transitions / advanced source tokens.",
             "destructive_crop_rate": "Destructively cropped source tokens / advanced source tokens.",
         },
         "accounting_invariants": {
             "source_balance": "source_tokens_read = new_source_tokens_advanced + buffered_source_tokens_delta",
-            "supervision_balance": "active_target_positions = new_source_tokens_advanced - skipped_adjacent_transitions + synthetic_bos_tokens_inserted",
+            "supervision_balance": "target_positions_emitted = new_source_tokens_advanced - skipped_adjacent_transitions + synthetic_bos_tokens_inserted",
             "target_capacity": "target_positions_emitted = trials * batches * B * T",
             "fifo": "Flat B*T+1 stream retains one carry and has zero destructive crop and zero skipped adjacent transitions.",
         },

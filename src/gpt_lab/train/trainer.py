@@ -618,7 +618,6 @@ class Trainer:
             return torch.nn.functional.cross_entropy(
                 output.view(B * T, V),
                 y.view(B * T),
-                ignore_index=-1,
             )
 
     def _apply_optim_hparam_scheduler(self, step: int):

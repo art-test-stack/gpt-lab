@@ -4,10 +4,8 @@ import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-import torch.nn.functional as F
 
 from gpt_lab.data.loader import DistDataLoader, build_dataloader
-from gpt_lab.model.loss import build_loss
 from gpt_lab.utils.schemas import DataLoaderState
 
 
@@ -57,9 +55,7 @@ def source_rows(batch):
     inputs, targets, _ = batch
     rows = []
     for row_inputs, row_targets in zip(inputs, targets):
-        valid_targets = row_targets[row_targets != DistDataLoader.IGNORE_INDEX]
-        if len(valid_targets):
-            rows.append([int(row_inputs[0]), *valid_targets.tolist()])
+        rows.append([int(row_inputs[0]), *row_targets.tolist()])
     return rows
 
 
@@ -83,7 +79,7 @@ def test_bos_aligned_emits_each_source_content_once_and_counts_synthetic_bos():
     documents = [
         [BOS, 1, 2],                    # shorter than row capacity
         [BOS, 3, 4, 5, 6],             # equal to row capacity
-        [BOS, 7, 8, 9, 10, 11, 12, 13],  # longer than row capacity
+        [BOS, 7, 8, 9, 10, 11, 12, 13, 14],  # longer than row capacity
     ]
     loader = make_loader(documents)
     rows = [row for batch in drain(loader) for row in source_rows(batch)]
@@ -105,7 +101,7 @@ def test_bos_aligned_packs_multiple_short_documents_in_one_row():
 
 
 def test_bos_aligned_long_document_spans_rows_and_batches_without_loss():
-    document = [BOS, *range(1, 31)]
+    document = [BOS, *range(1, 25)]
     loader = make_loader([document], batch_size=2, seq_len=4)
     batches = drain(loader)
     rows = [row for batch in batches for row in source_rows(batch)]
@@ -144,12 +140,11 @@ def test_default_strategy_remains_stream():
     assert loader.packing_strategy == "stream"
 
 
-def test_padding_targets_are_ignored_by_model_loss():
-    logits = torch.tensor([[[3.0, 0.0], [0.0, 3.0], [1.0, 1.0]]])
-    labels = torch.tensor([[0, 1, DistDataLoader.IGNORE_INDEX]])
-    loss = build_loss()(logits, labels)
-    expected = F.cross_entropy(logits[:, :2].reshape(-1, 2), labels[:, :2].reshape(-1))
-    assert torch.allclose(loss, expected)
+@pytest.mark.parametrize("strategy", ["stream", "bos_aligned"])
+def test_incomplete_batches_are_not_emitted(strategy):
+    loader = make_loader([[BOS, 1]], strategy=strategy, batch_size=1, seq_len=4)
+    with pytest.raises(StopIteration):
+        next(loader)
 
 
 def test_build_dataloader_validation_and_shard_resume(tmp_path):

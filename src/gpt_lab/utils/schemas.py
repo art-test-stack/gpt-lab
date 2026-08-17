@@ -326,7 +326,7 @@ class MoETransformerConfig(TransformerConfig):
 class LossConfig(BaseModel):
     loss_fn: LossTypes = "cross_entropy"
     kwargs: dict = Field(default_factory=dict)
-    ignore_index: int = -1
+    ignore_index: int = -100
     reduction: LossReductionTypes = "mean"
 
 class GenerationConfig(BaseModel):

@@ -33,7 +33,6 @@ class PackingStats:
     buffered_source_tokens: int = 0
     source_tokens_emitted: int = 0
     source_bos_tokens_emitted: int = 0
-    padding_tokens: int = 0
     rows: int = 0
     batches: int = 0
     debug_discarded_suffixes: Optional[list[tuple[int, ...]]] = None
@@ -48,7 +47,6 @@ class PackingStats:
         self.buffered_source_tokens = 0
         self.source_tokens_emitted = 0
         self.source_bos_tokens_emitted = 0
-        self.padding_tokens = 0
         self.rows = 0
         self.batches = 0
         if self.debug_discarded_suffixes is not None:
@@ -136,8 +134,6 @@ class DistDataLoader:
     given a segment-aware attention mask.
     """
 
-    IGNORE_INDEX = -1
-
     def __init__(
         self,
         dataset: ShardedDataset,
@@ -147,7 +143,6 @@ class DistDataLoader:
         buffer_size: Optional[int] = None,
         packing_strategy: PackingStrategy = "stream",
         bos_token_id: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
         resume_state: Optional[DataLoaderState] = None,
         packing_stats: Optional[PackingStats] = None,
     ):
@@ -163,9 +158,6 @@ class DistDataLoader:
         self.device = torch.device(device)
         self.packing_strategy = packing_strategy
         self.bos_token_id = bos_token_id
-        self.pad_token_id = bos_token_id if pad_token_id is None else pad_token_id
-        if self.pad_token_id is None:
-            self.pad_token_id = 0
         self.packing_stats = packing_stats or PackingStats()
         self.last_batch_stats = PackingStats()
 
@@ -178,7 +170,6 @@ class DistDataLoader:
         self.last_state: Optional[DataLoaderState] = None
         self._carry_token: Optional[int] = None
         self._continuation_pending = False
-        self._source_exhausted = False
         self._finished = False
 
         state = resume_state or getattr(dataset, "start_state", None)
@@ -210,8 +201,6 @@ class DistDataLoader:
             pin_memory=(self.device.type == "cuda"),
         )
         self.gpu = torch.empty(total, dtype=torch.long, device=self.device)
-        self.valid = torch.empty(total, dtype=torch.bool)
-
         # Single contiguous allocation; inputs and targets are non-overlapping
         # views into it.  Avoids two separate allocations per forward pass.
         _out = torch.empty(
@@ -226,7 +215,6 @@ class DistDataLoader:
         try:
             tokens, state = next(self.iterator)
         except StopIteration:
-            self._source_exhausted = True
             return False
         if not isinstance(tokens, torch.Tensor):
             tokens = torch.tensor(tokens, dtype=torch.long)
@@ -274,26 +262,19 @@ class DistDataLoader:
     def _next_stream(self) -> None:
         total = self.B * self.T + 1
         pos = 0
-        self.valid[:total].fill_(False)
         had_carry = self._carry_token is not None
         if had_carry:
             self.packing_stats.buffered_source_tokens -= 1
             self.cpu[0] = self._carry_token
-            self.valid[0] = True
             pos = 1
         while pos < total:
             take = self._copy_source(self.cpu[pos:total], total - pos)
             if not take:
                 break
-            self.valid[pos:pos + take] = True
             pos += take
-        if pos <= 1:
-            raise StopIteration
         if pos < total:
-            self.cpu[pos:total].fill_(self.pad_token_id)
-            for stats in (self.packing_stats, self.last_batch_stats):
-                stats.padding_tokens += total - pos
             self._finished = True
+            raise StopIteration
         if not had_carry:
             # The first source token seeds the flat window; only the following
             # B*T tokens advance the stream and contribute target positions.
@@ -302,23 +283,16 @@ class DistDataLoader:
         self.gpu[:total].copy_(self.cpu[:total], non_blocking=(self.device.type == "cuda"))
         self.inputs.copy_(self.gpu[:total - 1].view(self.B, self.T))
         self.targets.copy_(self.gpu[1:total].view(self.B, self.T))
-        target_valid = self.valid[1:total].view(self.B, self.T).to(self.device)
-        self.targets.masked_fill_(~target_valid, self.IGNORE_INDEX)
-        self._carry_token = int(self.cpu[total - 1]) if self.valid[total - 1] else None
-        if self._carry_token is not None:
-            self.packing_stats.buffered_source_tokens += 1
+        self._carry_token = int(self.cpu[total - 1])
+        self.packing_stats.buffered_source_tokens += 1
 
     def _next_bos_aligned(self) -> None:
         B, capacity = self.B, self.T + 1
         rows = self.cpu[:B * capacity].view(B, capacity)
-        valid = self.valid[:B * capacity].view(B, capacity)
-        valid.fill_(False)
-        any_source = False
         for row_index in range(B):
             pos = 0
             if self._continuation_pending:
                 rows[row_index, 0] = self.bos_token_id
-                valid[row_index, 0] = True
                 for stats in (self.packing_stats, self.last_batch_stats):
                     stats.synthetic_bos_tokens_inserted += 1
                     stats.skipped_adjacent_transitions += 1
@@ -326,7 +300,8 @@ class DistDataLoader:
                 pos = 1
             while pos < capacity:
                 if not self._pull_document():
-                    break
+                    self._finished = True
+                    raise StopIteration
                 tokens, _, is_start = self.buffer[0]
                 if is_start and (not len(tokens) or int(tokens[0]) != self.bos_token_id):
                     raise ValueError("bos_aligned requires every source document to begin with BOS")
@@ -335,25 +310,13 @@ class DistDataLoader:
                         stats.intentional_bos_boundaries += 1
                         stats.skipped_adjacent_transitions += 1
                 take = self._copy_source(rows[row_index, pos:capacity], capacity - pos)
-                any_source = any_source or take > 0
-                valid[row_index, pos:pos + take] = True
                 pos += take
                 if self.buffer and pos == capacity:
                     self._continuation_pending = True
-            if pos < capacity:
-                rows[row_index, pos:capacity].fill_(self.pad_token_id)
-                for stats in (self.packing_stats, self.last_batch_stats):
-                    stats.padding_tokens += capacity - pos
-        if not any_source:
-            raise StopIteration
-        if self._source_exhausted:
-            self._finished = True
         self.gpu.copy_(self.cpu, non_blocking=(self.device.type == "cuda"))
         data = self.gpu.view(B, capacity)
         self.inputs.copy_(data[:, :-1])
         self.targets.copy_(data[:, 1:])
-        target_valid = valid[:, 1:].to(self.device)
-        self.targets.masked_fill_(~target_valid, self.IGNORE_INDEX)
 
     def _state(self) -> DataLoaderState:
         base = self.last_state or DataLoaderState()
@@ -587,7 +550,6 @@ def build_dataloader(
     tokenizer_threads: int = 4,
     packing_strategy: PackingStrategy = "stream",
     bos_token_id: Optional[int] = None,
-    pad_token_id: Optional[int] = None,
     use_nanochat: Optional[bool] = None,
     packing_stats: Optional[PackingStats] = None,
 ) -> DistDataLoader:
@@ -645,7 +607,6 @@ def build_dataloader(
             buffer_size=buffer_size,
             packing_strategy=packing_strategy,
             bos_token_id=bos_token_id,
-            pad_token_id=pad_token_id,
             resume_state=resume_state,
             packing_stats=packing_stats,
         )
