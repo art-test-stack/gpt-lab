@@ -214,7 +214,7 @@ class TokenizerConfig(BaseModel):
 class DatasetConfig(BaseModel):
     name: str
     hfkwargs: dict = Field(default_factory=dict)
-    output_dir: str = "dataset"
+    output_dir: str = "data"
     column_name: str = "text"
     postprocess: Optional[str] = None
     upload_name: Optional[str] = None

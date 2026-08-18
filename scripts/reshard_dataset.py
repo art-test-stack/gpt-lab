@@ -181,8 +181,7 @@ def reshard_dataset(
     else:
         writer = LocalWriter(DATA_DIR / ds_config.output_dir)
 
-    work_dir = CACHE_DIR / "data"
-
+    work_dir = CACHE_DIR / "data" / ds_config.name
     work_dir.mkdir(parents=True, exist_ok=True)
 
     if not ds_config.streaming:
