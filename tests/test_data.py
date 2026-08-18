@@ -13,8 +13,11 @@ from gpt_lab.utils.schemas import DataLoaderState
 from scripts.benchmark.dataloaders import (
     Counters,
     IdentityTokenizer,
+    LoaderSpec,
     TorchPackedDataset,
+    aggregate,
     benchmark,
+    benchmark_trial,
     check_accounting,
     write_split,
 )
@@ -197,3 +200,40 @@ def test_benchmark_excludes_warmup_counters():
     assert result.source_tokens_read == 8
     assert result.new_source_tokens_advanced == 8
     assert result.target_positions_emitted == 8
+
+
+def test_benchmark_trial_reports_memory_pressure():
+    def factory():
+        def batches():
+            while True:
+                tokens = torch.tensor([[99, 1, 2, 3]])
+                yield tokens, tokens, {
+                    "source_tokens_read": 4,
+                    "new_source_tokens_advanced": 4,
+                    "destructive_cropped_tokens": 0,
+                    "buffered_source_tokens_delta": 0,
+                    "skipped_adjacent_transitions": 0,
+                    "synthetic_bos_tokens_inserted": 0,
+                    "intentional_bos_boundaries": 0,
+                    "actual_buffered_tokens": 0,
+                    "actual_buffered_documents": 0,
+                }
+        return batches()
+
+    spec = LoaderSpec("fake", "fake", "flat_stream", "stream_packing", "test", factory)
+    args = Namespace(
+        warmup_batches=1, batches=2, device=torch.device("cpu"),
+        batch_size=1, seq_len=4, trials=1, best_fit_buffer_docs=1,
+        correctness_batches=1,
+    )
+
+    trial = benchmark_trial(spec, args)
+    _, _, _, memory = trial
+    result = aggregate(spec, [trial], 0.5, "pretokenized", "identity", 0.0, args)
+
+    assert memory["host_rss_peak_mib"] > 0
+    assert memory["host_rss_peak_delta_mib"] >= 0
+    assert memory["accelerator_peak_allocated_mib"] is None
+    assert memory["accelerator_peak_delta_mib"] is None
+    assert result.host_rss_peak_mib == memory["host_rss_peak_mib"]
+    assert result.accelerator_peak_allocated_mib is None

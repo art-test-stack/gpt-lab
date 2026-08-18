@@ -20,6 +20,7 @@ Metrics reported
 - Crop rate                     fraction of source tokens destructively cropped
 - BOS alignment                 fraction of rows beginning with the BOS token
 - Buffer occupancy              observed buffered tokens/documents
+- Memory pressure               peak host RSS and accelerator allocation
 
 Artifacts
 ---------
@@ -75,6 +76,7 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import psutil
 import torch
 
 from gpt_lab.data.loader import (
@@ -90,6 +92,8 @@ STREAM = "flat_stream"
 BEST_FIT = "bos_aligned_best_fit"
 STREAM_GROUP = "stream_packing"
 BEST_FIT_GROUP = "bos_aligned_best_fit"
+MIB = 1024 ** 2
+PROCESS = psutil.Process()
 
 
 @dataclass
@@ -239,6 +243,17 @@ def _sync(device):
         torch.mps.synchronize()
 
 
+def memory_snapshot(device):
+    """Return process RSS and live accelerator allocation in bytes."""
+    device = torch.device(device)
+    accelerator = None
+    if device.type == "cuda":
+        accelerator = torch.cuda.memory_allocated(device)
+    elif device.type == "mps":
+        accelerator = torch.mps.current_allocated_memory()
+    return PROCESS.memory_info().rss, accelerator
+
+
 def benchmark(loader_name: str, factory: Callable[[Counters], Iterator],
               tokenization: str, tokenizer_name: str, bos_id: int,
               eos_id, workload: str, model_target: str, model, torch_workers,
@@ -341,6 +356,10 @@ class ComparisonResult:
     latency_p95_ms: float
     latency_mean_ms: float
     latency_std_ms: float
+    host_rss_peak_mib: float
+    host_rss_peak_delta_mib: float
+    accelerator_peak_allocated_mib: float | None
+    accelerator_peak_delta_mib: float | None
     destructive_crop_policy: str
     destructively_cropped_tokens: int
     destructive_crop_rate: float
@@ -617,16 +636,36 @@ def correctness_gate(specs, documents, bos, args):
 
 
 def benchmark_trial(spec, args):
+    _sync(args.device)
+    host_baseline, accelerator_baseline = memory_snapshot(args.device)
+    if args.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(args.device)
+    host_peak, accelerator_peak = host_baseline, accelerator_baseline
+
+    def sample_memory():
+        nonlocal host_peak, accelerator_peak
+        host, accelerator = memory_snapshot(args.device)
+        host_peak = max(host_peak, host)
+        if accelerator is not None:
+            accelerator_peak = max(accelerator_peak or 0, accelerator)
+
     loader = spec.factory()
+    sample_memory()
     for _ in range(args.warmup_batches):
         next(loader)
+        _sync(args.device)
+        sample_memory()
     _sync(args.device)
     latencies, stats = [], []
     for _ in range(args.batches):
         _sync(args.device); started = time.perf_counter()
-        _, _, batch_stats = next(loader)
+        inputs, targets, batch_stats = next(loader)
         _sync(args.device); latencies.append((time.perf_counter() - started) * 1000)
+        sample_memory()
         stats.append(batch_stats)
+    del inputs, targets
+    if args.device.type == "cuda":
+        accelerator_peak = max(accelerator_peak or 0, torch.cuda.max_memory_allocated(args.device))
     tokens = args.batches * args.batch_size * args.seq_len
     for batch_stats in stats:
         check_accounting(
@@ -637,13 +676,20 @@ def benchmark_trial(spec, args):
             skipped_adjacent_transitions=batch_stats["skipped_adjacent_transitions"],
             synthetic_bos_tokens_inserted=batch_stats["synthetic_bos_tokens_inserted"],
         )
-    return tokens / (sum(latencies) / 1000), latencies, stats
+    memory = {
+        "host_rss_peak_mib": host_peak / MIB,
+        "host_rss_peak_delta_mib": max(0, host_peak - host_baseline) / MIB,
+        "accelerator_peak_allocated_mib": None if accelerator_peak is None else accelerator_peak / MIB,
+        "accelerator_peak_delta_mib": None if accelerator_peak is None else max(0, accelerator_peak - (accelerator_baseline or 0)) / MIB,
+    }
+    return tokens / (sum(latencies) / 1000), latencies, stats, memory
 
 
 def aggregate(spec, trials, alignment, mode, tokenizer_name, pretokenization_seconds, args):
     throughputs = [trial[0] for trial in trials]
-    latencies = [latency for _, values, _ in trials for latency in values]
-    stats = [value for _, _, values in trials for value in values]
+    latencies = [latency for _, values, _, _ in trials for latency in values]
+    stats = [value for _, _, values, _ in trials for value in values]
+    memories = [memory for _, _, _, memory in trials]
     token_samples = [row["actual_buffered_tokens"] for row in stats if row.get("actual_buffered_tokens") is not None]
     document_samples = [row["actual_buffered_documents"] for row in stats if row.get("actual_buffered_documents") is not None]
     cropped = sum(row["destructive_cropped_tokens"] for row in stats)
@@ -672,6 +718,10 @@ def aggregate(spec, trials, alignment, mode, tokenizer_name, pretokenization_sec
         statistics.mean(throughputs), statistics.stdev(throughputs) if len(throughputs) > 1 else 0.0,
         statistics.median(latencies), percentile(latencies, .5), percentile(latencies, .95),
         statistics.mean(latencies), statistics.stdev(latencies) if len(latencies) > 1 else 0.0,
+        max(row["host_rss_peak_mib"] for row in memories),
+        max(row["host_rss_peak_delta_mib"] for row in memories),
+        max((row["accelerator_peak_allocated_mib"] for row in memories if row["accelerator_peak_allocated_mib"] is not None), default=None),
+        max((row["accelerator_peak_delta_mib"] for row in memories if row["accelerator_peak_delta_mib"] is not None), default=None),
         "none" if spec.packing_policy == STREAM else "discard selected document remainder",
         cropped, cropped / max(advanced, 1), alignment,
         args.batch_size * args.seq_len + 1 if spec.packing_policy == STREAM else None,
@@ -700,7 +750,7 @@ def write_outputs(results, metadata, output, plots, html_report):
                 selected = [row for row in results if row.packing_policy == policy]
                 if not selected: continue
                 labels = [f"{row.implementation}\n{row.tokenization}" for row in selected]
-                figure, axes = plt.subplots(1, 4, figsize=(max(18, len(selected) * 2.6), 5))
+                figure, axes = plt.subplots(1, 5, figsize=(max(22, len(selected) * 3), 5))
                 axes[0].bar(labels, [row.throughput_median_tokens_s for row in selected])
                 axes[1].bar(labels, [row.latency_p50_ms for row in selected], yerr=[row.latency_p95_ms - row.latency_p50_ms for row in selected], capsize=4)
                 axes[0].set_ylabel("tokens/s (trial median)"); axes[1].set_ylabel("latency p50, whisker to p95 (ms)")
@@ -721,6 +771,23 @@ def write_outputs(results, metadata, output, plots, html_report):
                 axes[3].bar(labels, [row.destructive_crop_rate for row in selected])
                 axes[3].set_ylim(0, 1.05)
                 axes[3].set_ylabel("destructive crop rate")
+                memory_width = 0.35
+                axes[4].bar(
+                    [value - memory_width / 2 for value in x],
+                    [row.host_rss_peak_delta_mib for row in selected],
+                    memory_width,
+                    label="host RSS",
+                )
+                if any(row.accelerator_peak_delta_mib is not None for row in selected):
+                    axes[4].bar(
+                        [value + memory_width / 2 for value in x],
+                        [row.accelerator_peak_delta_mib or 0 for row in selected],
+                        memory_width,
+                        label="accelerator",
+                    )
+                axes[4].set_xticks(x, labels)
+                axes[4].set_ylabel("peak above baseline (MiB)")
+                axes[4].legend(fontsize=8)
                 for axis in axes: axis.tick_params(axis="x", labelrotation=20); axis.grid(axis="y", alpha=.25)
                 figure.suptitle(f"Matched policy: {policy}"); figure.tight_layout()
                 path = output / f"{policy}.png"; figure.savefig(path, dpi=150); plt.close(figure); images.append(path)
@@ -730,6 +797,8 @@ def write_outputs(results, metadata, output, plots, html_report):
         columns = [
             "comparison_group", "packing_policy", "implementation", "tokenization",
             "throughput_median_tokens_s", "latency_p50_ms", "latency_p95_ms",
+            "host_rss_peak_mib", "host_rss_peak_delta_mib",
+            "accelerator_peak_allocated_mib", "accelerator_peak_delta_mib",
             "source_tokens_read", "new_source_tokens_advanced", "target_positions_emitted",
             "destructively_cropped_tokens", "skipped_adjacent_transitions",
             "synthetic_bos_tokens_inserted", "intentional_bos_boundaries",
@@ -818,10 +887,20 @@ def main() -> None:
         "gpt_lab_best_fit": "Unavailable: GPT-Lab bos_aligned retains suffixes and is not destructive best-fit, so it is excluded.",
         "invalid_previous_comparisons": ["stream versus destructive BOS-best-fit", "B*(T+1) row stream versus flat B*T+1 carry stream", "loader timing obscured by model execution"],
         "timing": {"scope": "loader-only next() and device transfer", "excluded": ["construction", "correctness", "warmup", "pretokenization", "model execution"], "accelerator_sync": "before/after each measured batch", "rotated_orders": execution_orders},
+        "memory": {
+            "scope": "loader construction, warmup, and measured batches",
+            "host": "process RSS sampled before construction and after construction/warmup/batches",
+            "accelerator": "CUDA allocator peak; live allocation samples on MPS; unavailable on CPU",
+            "aggregation": "maximum peak and peak-above-baseline across trials",
+        },
         "metric_definitions": {
             "source_tokens_read": "Tokenized source tokens entering the packer during measured batches, including original document BOS tokens; excludes warmup and synthetic BOS.",
             "new_source_tokens_advanced": "Unique source-stream tokens permanently advanced during measured batches, including discarded tokens and excluding a retained carry token.",
             "target_positions_emitted": "Language-model target tensor positions produced; exactly trials * batches * B * T.",
+            "host_rss_peak_mib": "Maximum process resident memory observed during a trial, in MiB.",
+            "host_rss_peak_delta_mib": "Maximum process RSS above the pre-construction trial baseline, in MiB.",
+            "accelerator_peak_allocated_mib": "Maximum live tensor memory allocated on the selected accelerator, in MiB; null on CPU.",
+            "accelerator_peak_delta_mib": "Maximum accelerator allocation above the pre-construction trial baseline, in MiB; null on CPU.",
             "destructively_cropped_tokens": (
                 "Original tokenized source tokens permanently discarded by the packing algorithm "
                 "and never emitted or retained for a future batch. Excludes the shifted-batch carry, "
@@ -858,7 +937,10 @@ def main() -> None:
             f"crop={result.destructive_crop_rate:.2%} "
             f"skips={result.skipped_adjacent_transitions:,} "
             f"synth_BOS={result.synthetic_bos_tokens_inserted:,} "
-            f"BOS_rows={result.bos_row_alignment:.2%}"
+            f"BOS_rows={result.bos_row_alignment:.2%} "
+            f"host_peak={result.host_rss_peak_mib:.1f}MiB "
+            f"host_delta={result.host_rss_peak_delta_mib:.1f}MiB "
+            f"accelerator_delta={'n/a' if result.accelerator_peak_delta_mib is None else f'{result.accelerator_peak_delta_mib:.1f}MiB'}"
         )
     print(f"Artifacts: {args.output_dir}")
 
