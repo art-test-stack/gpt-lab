@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os, json
 from pathlib import Path
-from typing import Iterable, Dict
+from typing import Iterable, Dict, Optional
 
 from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
@@ -36,37 +36,53 @@ class HuggingFaceTokenizerWrapper(_BaseTokenizer):
         self.config = config
 
     @property
+    def vocab_size(self):
+        return self.main.get_vocab_size(with_added_tokens=True)
+
+    @property
     def special_tokens(self):
         special_tokens_map = self.main.get_added_tokens_decoder()
         special_tokens = [w.content for w in special_tokens_map.values()]
         return special_tokens
 
     @classmethod
-    def from_pretrained(cls, hf_path: str):
+    def from_pretrained(
+        cls,
+        hf_path: str,
+        special_tokens: Optional[SpecialTokens] = None,
+    ):
         if HFTokenizer is None:
             log_error("tokenizers library is required to load HuggingFace tokenizer", logger=logger, error_type=ImportError)
+        special_tokens = special_tokens or SpecialTokens()
         tokenizer = HFTokenizer.from_pretrained(hf_path)
+        tokenizer.add_special_tokens(special_tokens.list())
         config = TokenizerConfig(
             name=hf_path,
             source="huggingface",
-            vocab_size=tokenizer.get_vocab_size(),
+            vocab_size=tokenizer.get_vocab_size(with_added_tokens=True),
             pat_str=None,
-            special_tokens=SpecialTokens(),
+            special_tokens=special_tokens,
         )
         return cls(tokenizer, config=config)
 
     @classmethod
-    def from_directory(cls, tokenizer_dir: str):
+    def from_directory(
+        cls,
+        tokenizer_dir: str,
+        special_tokens: Optional[SpecialTokens] = None,
+    ):
         if HFTokenizer is None:
             log_error("tokenizers library is required to load HuggingFace tokenizer", logger=logger, error_type=ImportError)
+        special_tokens = special_tokens or SpecialTokens()
         tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
         tokenizer = HFTokenizer.from_file(tokenizer_path)
+        tokenizer.add_special_tokens(special_tokens.list())
         config = TokenizerConfig(
             name=tokenizer_dir,
             source="local",
-            vocab_size=tokenizer.get_vocab_size(),
+            vocab_size=tokenizer.get_vocab_size(with_added_tokens=True),
             pat_str=None,
-            special_tokens=SpecialTokens(),
+            special_tokens=special_tokens,
         )
         return cls(tokenizer, config=config)
 
@@ -114,7 +130,7 @@ def train_huggingface_from_iterator(text_iterator: Iterable[str], config: Tokeni
     initial_alphabet = pre_tokenizers.ByteLevel.alphabet()
 
     # Prefer training-specific params container when available
-    _special_tokens = list(config.special_tokens) or []
+    _special_tokens = config.special_tokens.list()
     vocab_size_no_special = config.vocab_size - len(_special_tokens)
     trainer = BpeTrainer(
         vocab_size=vocab_size_no_special,
