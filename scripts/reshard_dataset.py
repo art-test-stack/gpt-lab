@@ -176,16 +176,14 @@ def reshard_dataset(
 
     if mode == "bucket":
         writer = BucketWriter(repo_id, hf_token, max_retries, retry_timeout)
-        work_dir = CACHE_DIR / "bucket"
     elif mode == "dataset":
         writer = DatasetWriter(repo_id, hf_token, max_retries, retry_timeout)
-        work_dir = CACHE_DIR / "dataset"
     else:
         writer = LocalWriter(DATA_DIR / ds_config.output_dir)
-        work_dir = CACHE_DIR / "local"
+
+    work_dir = CACHE_DIR / "data"
 
     work_dir.mkdir(parents=True, exist_ok=True)
-
 
     if not ds_config.streaming:
         ndocs = len(ds)
