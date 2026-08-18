@@ -118,7 +118,17 @@ if __name__ == "__main__":
     auto_parser.add_argument("--depth", type=int, default=12, help="(default: 12) Number of model layers.")
     auto_parser.add_argument("--aspect-ratio", type=float, default=64, help="(default: 64) Aspect ratio for auto-configured models.")
     auto_parser.add_argument("--d-head", type=int, default=128, help="(default: 128) Dimension of each attention head for auto-configured models. If not set, will be determined by aspect ratio and model depth.")
-    auto_parser.add_argument("--d-kv-head", type=int, default=None, help="(default: None) Dimension of each key/value attention head for enable GQA. If not set, will be set to d_head.")
+    auto_parser.add_argument(
+        "--n-kv-heads",
+        "--d-kv-head",
+        dest="n_kv_heads",
+        type=int,
+        default=None,
+        help=(
+            "(default: query head count) Number of key/value heads for GQA. "
+            "--d-kv-head is retained as a deprecated alias."
+        ),
+    )
     auto_parser.add_argument("--window-pattern", type=str, default=None, help="(default: None) Window pattern for sliding attention window. String of 'S' and 'L'. If 'None', will be later set as 'SSSL'.")
     auto_parser.add_argument("--window-size", type=str, default=None, help="(default: None) Window size for pattern smalls (S).")
     auto_parser.add_argument("--softcap", type=float, default=18.0, help="(default: 12.0) Soft cap for model logits to prevent overflow.")
@@ -213,12 +223,14 @@ if __name__ == "__main__":
             max_seq_len=args.max_seq_len,
             # tokenizer
             tokenizer_model="auto" if args.train_tokenizer else args.tokenizer_model,
+            train_tokenizer=args.train_tokenizer,
             vocab_size=args.vocab_size,
+            pat_str=args.pat_str,
             # model architecture
             depth=args.depth,
             aspect_ratio=args.aspect_ratio,
             d_head=args.d_head,
-            d_kv_head=args.d_kv_head,
+            n_kv_heads=args.n_kv_heads,
             window_pattern=args.window_pattern,
             window_size=args.window_size,
             softcap=args.softcap,
