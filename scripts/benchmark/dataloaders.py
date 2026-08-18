@@ -1,4 +1,60 @@
-"""Compare GPT-Lab packing strategies on deterministic tokenized documents."""
+"""
+dataloaders.py
+====================================
+Compares GPT-Lab, custom PyTorch, and adapted nanochat dataloaders on the same
+deterministic Parquet corpus. Implementations are compared only when they use
+the same packing policy: flat stream or destructive BOS-aligned best-fit.
+
+A correctness gate runs before timing. Measurements cover loader work and
+device transfer only; model execution, warmup, corpus preparation, and
+pretokenization are excluded.
+
+Metrics reported
+----------------
+- Throughput                    median tokens/sec across trials
+- Batch latency                 p50/p95 and mean/std milliseconds per batch
+- Source token utilization      fraction of advanced source tokens preserved
+- Target supervision utilization fraction of target positions representing
+                                 source-token transitions
+- Source transition coverage    fraction of advanced source transitions seen
+- Crop rate                     fraction of source tokens destructively cropped
+- BOS alignment                 fraction of rows beginning with the BOS token
+- Buffer occupancy              observed buffered tokens/documents
+
+Artifacts
+---------
+Each run writes reproducibility metadata and results to JSON and CSV, plus an
+HTML report and policy-specific plots unless disabled.
+
+Usage
+-----
+  # Quick policy-matched benchmark
+  uv run python -m scripts.benchmark.dataloaders \
+      --dataset-path path/to/parquets \
+      --quick
+
+  # Compare only flat-stream implementations
+  uv run python -m scripts.benchmark.dataloaders \
+      --dataset-path path/to/parquets \
+      --groups stream_packing \
+      --implementations gpt_lab_stream,custom_pytorch,nanochat_stream
+
+  # Compare destructive BOS-best-fit with different document-buffer sizes
+  for buf in 100 500 1000 2000; do
+    uv run python -m scripts.benchmark.dataloaders \
+        --dataset-path path/to/parquets \
+        --groups bos_aligned_best_fit \
+        --implementations custom_pytorch,nanochat_best_fit \
+        --best-fit-buffer-docs "$buf"
+  done
+
+  # Benchmark pretokenized input only and skip optional visual artifacts
+  uv run python -m scripts.benchmark.dataloaders \
+      --dataset-path path/to/parquets \
+      --tokenization pretokenized \
+      --no-plots \
+      --no-html
+"""
 
 from __future__ import annotations
 
