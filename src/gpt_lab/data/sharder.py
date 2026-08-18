@@ -1,8 +1,10 @@
+import json
 import os
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Union, List, Optional, Tuple, Iterator, Dict
-import time, json
+import time
  
 import pyarrow.parquet as pq
 from requests import Session
@@ -120,15 +122,41 @@ class ShardManager:
 
     def save_metadata(self, metadata: dict):
         metadata_path = self.ds_path / "meta.json"
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f)
+        tmp_path = None
+        try:
+            # Write beside the destination so os.replace() is atomic.  A direct
+            # open(..., "w") briefly exposes an empty file to other ranks while
+            # they construct their train/validation ShardManagers.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.ds_path,
+                prefix=f".{metadata_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_path = Path(f.name)
+                json.dump(metadata, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, metadata_path)
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     def load_metadata(self) -> dict:
         metadata_path = self.ds_path / "meta.json"
         if not metadata_path.exists():
             return {}
-        with open(metadata_path, "r") as f:
-            return json.load(f)
+        payload = metadata_path.read_text(encoding="utf-8")
+        # Recover metadata files left empty by the previous non-atomic writer.
+        # Rank 0 will regenerate the file after deriving values from the shards.
+        if not payload.strip():
+            return {}
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid dataset metadata in {metadata_path}") from exc
         
     def get_shard_path(self, shard_idx: int) -> Path:
         return self.ds_path / SHARD_FILENAME_TEMPLATE.format(shard_idx)
