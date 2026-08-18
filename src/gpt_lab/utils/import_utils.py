@@ -54,15 +54,16 @@ def is_torch_bf16_gpu_available() -> bool:
 
 @lru_cache()
 def is_flash_attn3_available_from_kernel() -> bool:
-    if not is_torch_available():
+    if not is_torch_cuda_available():
         return False
     try: 
         from kernels import get_kernel
-        flash_attn3 = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+        get_kernel('varunneal/flash-attention-3').flash_attn_interface
         return True
-    except:
-        if is_torch_cuda_available():
-            if not is_flash_attn3_available_from_kernel():
-                warnings.warn("FlashAttention 3 is not available. Falling back to standard attention. Computation will be significantly slower.", UserWarning)
-            
+    except Exception:
+        warnings.warn(
+            "FlashAttention 3 is not available. Falling back to PyTorch SDPA.",
+            UserWarning,
+            stacklevel=2,
+        )
         return False

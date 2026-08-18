@@ -11,6 +11,7 @@ Key responsibilities:
 
 from typing import Optional, Callable, Union, Dict
 from pathlib import Path
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import numpy as np
 
@@ -152,7 +153,7 @@ class Trainer:
         if checkpoint_manager is None:
             model_name = self.model.__class__.__name__
             depth = getattr(self.model.config, "n_layers", "unknown")
-            model_run = make_default_run_name(model_name, depth, self.config.dist_info)
+            model_run = make_default_run_name(depth, model_name, self.config.dist_info)
             checkpoint_manager = CheckpointManager(
                 model_name=self.model.__class__.__name__,
                 model_run=model_run,
@@ -188,44 +189,58 @@ class Trainer:
         self.eval_metrics = EvalMetrics()   # TODO
         self.core_metrics = COREMetrics()   # TODO
         
-        # Mixed precision
-        self.dtype = self.config.dist_info["compute_dtype"]
-        self.use_amp = self.dtype in ["float16", "bfloat16"]
+        # Device and mixed precision. get_dist_info() stores a torch.dtype, but
+        # accept legacy string values when resuming older checkpoints.
+        self.device_type = config.dist_info.get("DEVICE_TYPE", "cpu")
+        self.device = torch.device(config.dist_info.get("DEVICE", "cpu"))
+        raw_dtype = self.config.dist_info["compute_dtype"]
+        self.dtype = _DTYPE_MAP.get(raw_dtype, raw_dtype)
+        if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported compute dtype: {raw_dtype!r}")
+        self.use_amp = self.dtype in (torch.float16, torch.bfloat16)
+
         def amp_context():
             if self.use_amp:
                 return autocast(
-                    device_type=self.config.dist_info["DEVICE_TYPE"],
-                    dtype=_DTYPE_MAP[self.dtype]
+                    device_type=self.device_type,
+                    dtype=self.dtype,
                 )
-            else:
-                return DummyContext()
-            
-        def disable_fp8_context():
-            if self.config.fp8:
-                # TODO: this is a placeholder impl.
-                from gpt_lab.model.fp8 import DisableFP8
-                return DisableFP8
-            else:
-                return DummyContext
-        self.train_context = amp_context
-        self.val_context = disable_fp8_context()
+            return nullcontext()
 
-        self.scaler = None
-        if scaler is not None:
-            self.scaler = scaler
-        elif self.dtype == "float16":
-            self.scaler = GradScaler()
+        @contextmanager
+        def val_context(model):
+            with ExitStack() as stack:
+                stack.enter_context(amp_context())
+                if self.config.fp8:
+                    from gpt_lab.model.fp8 import DisableFP8
+                    stack.enter_context(DisableFP8(model))
+                yield model
+
+        self.train_context = amp_context
+        self.val_context = val_context
+
+        self.scaler = scaler
+        if self.scaler is None and self.dtype == torch.float16:
+            if self.device_type != "cuda":
+                raise ValueError("float16 training is only supported on CUDA")
+            self.scaler = GradScaler(self.device_type)
+
+        actual_batch_size = getattr(self.train_loader, "B", None)
+        if (
+            actual_batch_size is not None
+            and actual_batch_size != self.config.device_batch_size
+        ):
+            raise ValueError(
+                "TrainerConfig.device_batch_size does not match the training "
+                f"loader: {self.config.device_batch_size} != {actual_batch_size}"
+            )
         
         # LR and other schedules
         self.lr_schedule = lr_schedule or config.lr_multiplier_schedule
         self.muon_momentum_schedule = muon_momentum_schedule or config.muon_momentum_schedule
         self.weight_decay_schedule = weight_decay_schedule or config.weight_decay_schedule
 
-        # Device config
-        self.device_type = config.dist_info.get("DEVICE_TYPE", "cpu")
-        self.device = torch.device(config.dist_info.get("DEVICE", "cpu"))
         self._get_sync_fn()
-        self._add_model_hook_for_grad_monitoring()
 
     def _get_sync_fn(self):
         """Set up device synchronization function."""
@@ -236,48 +251,52 @@ class Trainer:
             self.synchronize = lambda: None
             self.get_max_memory = lambda: 0
 
-    def _add_model_hook_for_grad_monitoring(self):
-        if not self.config.monitor_grad_norms or getattr(self, "_hooked", False):
-            return
-        self._grad_stats = {}
-
-        def _hook(name):
-            if not name.endswith("weight"):
-                return lambda grad: None  # only monitor weight gradients for now
-            param_name = name.replace('.', '/').replace('/weight', '')
-            def hook_fn(grad):
-                self._grad_stats[param_name] = {
-                    "rms": grad.square().mean().sqrt().detach(),
-                    "mean": grad.mean().detach(),
-                    "abs_mean": grad.abs().mean().detach(),
-                }
-            return hook_fn
-
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                param.register_hook(_hook(name))
-
-        self._hooked = True # avoid hooking multiple times
-
-    def _rm_model_hooks(self):
-        """Remove all hooks from model parameters."""
-        for param in self.model.parameters():
-            param._backward_hooks = {}
-        self._hooked = False
-
     def log_gradients(self):
-        "called between loss.backward() and optimizer.step() to log gradient norms and means"
-        if not hasattr(self, "_grad_stats"):
+        """Log accumulated pre-reduction gradient statistics.
+
+        Statistics are aggregated across rank-local accumulated gradients with
+        one small collective. This avoids a hook on every parameter for every
+        microbatch while still reporting all ranks, rather than only rank zero's
+        final microbatch.
+        """
+        names = []
+        stats = []
+        numels = []
+        for name, param in self.model.named_parameters():
+            if not name.endswith("weight") or param.grad is None:
+                continue
+            grad = param.grad.detach().float()
+            names.append(name.replace('.', '/').removesuffix('/weight'))
+            stats.append(torch.stack((
+                grad.square().sum(),
+                grad.sum(),
+                grad.abs().sum(),
+            )))
+            numels.append(param.numel())
+
+        if not stats:
             return
+
+        stats_tensor = torch.stack(stats)
+        world_size = self.config.dist_info.get("WORLD_SIZE", 1)
+        if self.config.dist_info.get("IS_DDP_INITIALIZED", False):
+            dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
 
         logs = {}
-        for name, stats in self._grad_stats.items():
-            logs[f"grad_rms/{name}"] = stats["rms"].item()
-            logs[f"grad_mean/{name}"] = stats["mean"].item()
-            logs[f"grad_abs_mean/{name}"] = stats["abs_mean"].item()
-
-        self.board.log(logs, step=self.state.step)
-        self._grad_stats.clear()  # important: reset for next step
+        if self.config.dist_info.get("RANK", 0) == 0:
+            # One device synchronization for the complete statistics table,
+            # rather than one .item() synchronization per metric.
+            stats_cpu = stats_tensor.detach().cpu()
+            for name, row, numel in zip(names, stats_cpu, numels):
+                denominator = numel * world_size
+                logs[f"grad_rms/{name}"] = (
+                    row[0] / denominator
+                ).sqrt().item()
+                logs[f"grad_mean/{name}"] = (row[1] / denominator).item()
+                logs[f"grad_abs_mean/{name}"] = (
+                    row[2] / denominator
+                ).item()
+            self.board.log(logs, step=self.state.step)
 
     def train(self):
         """
@@ -317,6 +336,13 @@ class Trainer:
         while step < n_steps:
             self.state.step = step
             last_step = (step == n_steps - 1)
+            should_log_step = (
+                (self.config.log_every == -1 and last_step)
+                or (
+                    self.config.log_every > 0
+                    and step % self.config.log_every == 0
+                )
+            )
             flops_so_far = n_flops_per_token * total_batch_size * step
             self.synchronize()
             
@@ -331,7 +357,15 @@ class Trainer:
             ):
                 start_bpb_eval = time.time()
                 self._compiled_model.eval()
-                eval_steps = self.config.n_bpb_tokens // (self.config.device_batch_size * self.model.config.max_context * self.config.dist_info["WORLD_SIZE"])
+                tokens_per_eval_step = (
+                    self.config.device_batch_size
+                    * self.model.config.max_context
+                    * self.config.dist_info["WORLD_SIZE"]
+                )
+                eval_steps = max(
+                    1,
+                    math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
+                )
                 with self.val_context(self._compiled_model):
                     val_res = compute_bpb(
                         self._compiled_model, 
@@ -483,14 +517,16 @@ class Trainer:
             
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
 
-            if self.config.monitor_grad_norms and self.config.dist_info["RANK"] == 0:
-                self.log_gradients()
-
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
                 if self.config.dist_info["IS_DDP_INITIALIZED"]:
                     for g in self.scaler._found_inf_per_device(self.optimizer).values():
                         dist.all_reduce(g, op=dist.ReduceOp.MAX)
+
+            if self.config.monitor_grad_norms and should_log_step:
+                self.log_gradients()
+
+            if self.scaler is not None:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -532,7 +568,7 @@ class Trainer:
             self.state.total_training_time += step_dt
             
             # Log every log_every steps
-            if step % self.config.log_every == 0:
+            if should_log_step:
                 pct_done = 100 * step / n_steps
                 
                 # ETA calculation
@@ -637,10 +673,14 @@ class Trainer:
         Args:
             tag: Identifier for this checkpoint (e.g., "latest", "best", "step_1000")
         """
-        if not self.config.dist_info.get("RANK", 0) == 0:
-            return # Only master process saves checkpoints
-        
-        self.ckpt_manager.save(step=self.state.step, model=self.model, optimizer=self.optimizer, scaler=self.scaler, trainer_state=self.state)
+        self.ckpt_manager.save(
+            step=self.state.step,
+            model=self.model,
+            optimizer=self.optimizer,
+            scaler=self.scaler,
+            trainer_state=self.state,
+            checkpoint_state=self.ckpt_state,
+        )
 
     @classmethod
     def from_checkpoint(
@@ -652,16 +692,19 @@ class Trainer:
         board: Optional[Board] = None,
         dist_info: Optional[Dict] = None,
     ):
+        dist_info = dist_info or get_dist_info()
         ckpt_manager = CheckpointManager(
             model_name=model_name,
             model_run=model_run,
             source="base", # TODO: make this dynamic based on training type
-            dist_info=dist_info or get_dist_info(),
-            mode="shard", # TODO: make this dynamic based on how checkpoints were saved
-            cache_dir=cache_dir,
+            dist_info=dist_info,
+            mode="shard" if dist_info.get("IS_DDP_INITIALIZED", False) else "ddp",
+            model_cachedir=cache_dir,
         )
         model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(step=step, phase="train")
         opt = model.build_optimizer(trainer_config)
+        if ckpt_data.optimizer_state is not None:
+            opt.load_state_dict(ckpt_data.optimizer_state)
 
         trainer = cls(
             model=model,
@@ -675,8 +718,16 @@ class Trainer:
             muon_momentum_schedule=None, 
             weight_decay_schedule=None,
             resume_state=ckpt_data.trainer_state,
+            best_state=ckpt_data.checkpoint_state,
             checkpoint_manager=ckpt_manager,
         )
+        if ckpt_data.scaler_state is not None:
+            if trainer.scaler is None:
+                raise ValueError(
+                    "Checkpoint contains GradScaler state but the resumed "
+                    "trainer did not create a scaler."
+                )
+            trainer.scaler.load_state_dict(ckpt_data.scaler_state)
         log0(f"Resumed trainer from checkpoint at step {trainer.state.step} with best eval bpb {trainer.ckpt_state.best_eval_value:.6f} at step {trainer.ckpt_state.best_eval_step}.", logger=logger)
         log0(f"Trainer instance created has no 'train_loader' or 'val_loader'. Please set these manually before calling 'trainer.train()'. Maybe consider using 'trainer.state.dataloader_state'", level="warning", logger=logger)
 

@@ -285,6 +285,7 @@ if __name__ == "__main__":
         model_run=meta_config.run_name,
         model_cachedir=args.model_dir,
         dist_info=dist_info,
+        mode="shard" if dist_info["IS_DDP_INITIALIZED"] else "ddp",
     )
     model = build_meta_model(meta_config.model_cfg)
     tokenizer = Tokenizer.from_config(meta_config.tokenizer_cfg)
@@ -349,7 +350,7 @@ if __name__ == "__main__":
             weight_decay=args.weight_decay * weight_decay_scale,
             lr_warmup_steps=args.warmup_steps,
             lr_warmdown_ratio=args.warmdown_ratio,
-            final_lr_frac=args.final_lr_frac,
+            final_lr_ratio=args.final_lr_frac,
             target_time=args.target_time,
             dist_info=dist_info,
             optim_config_path=args.optim_config_path,
@@ -409,7 +410,15 @@ if __name__ == "__main__":
         train_loader=train_loader, val_loader=val_loader,
         config=trainer_config, board=board, checkpoint_manager=ckpt_manager, 
         resume_state=ckpt_data.trainer_state if is_resumed else None,
+        best_state=ckpt_data.checkpoint_state if is_resumed else None,
     )
+    if is_resumed and ckpt_data.scaler_state is not None:
+        if trainer.scaler is None:
+            raise ValueError(
+                "Checkpoint contains GradScaler state but the resumed trainer "
+                "did not create a scaler. Check GPTLAB_DTYPE."
+            )
+        trainer.scaler.load_state_dict(ckpt_data.scaler_state)
     trainer.train()
 
     # ------------------------------------------------------------------------------

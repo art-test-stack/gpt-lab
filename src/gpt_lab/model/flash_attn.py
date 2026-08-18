@@ -10,15 +10,14 @@ import math
 
 _flash_attn = None
 if is_torch_cuda_available():
-    if is_flash_attn3_available_from_kernel():
-        try:
-            major, _ = torch.cuda_get_device_capability()
-            if major >= 9:
-                os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-                import kernels
-                _flash_attn = kernels.get_kernel('varunneal/flash-attention-3').flash_attn_interface
-        except:
-            pass
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 9 and is_flash_attn3_available_from_kernel():
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            import kernels
+            _flash_attn = kernels.get_kernel('varunneal/flash-attention-3').flash_attn_interface
+    except Exception:
+        pass
 
 flash_attention_is_installed = _flash_attn is not None
 
@@ -86,7 +85,8 @@ def scaled_dot_product_attention(
 
 def _sdpa_fallback(q, k, v, 
                    dropout_p=0.0, softmax_scale=None, window_size=(-1, -1), 
-                   alibi_slopes=None, deterministic=False, use_gqa=False):
+                   alibi_slopes=None, deterministic=False, use_gqa=False,
+                   causal=False):
     """
     Args:
         q: (B, Tq, H, D)
@@ -101,34 +101,39 @@ def _sdpa_fallback(q, k, v,
     Tq, Tk = q.size(1), k.size(1)
     if window_size is None:
         window_size = (-1, -1)
-    window = window_size[0]
+    window_left, window_right = window_size
     q = q.transpose(1, 2)  # B, H, Tq, D
     k = k.transpose(1, 2)  # B, H, Tk, D
     v = v.transpose(1, 2)  # B, H, Tk, D
-    
-    device = q.device
-    if Tq == 1:
+
+    has_local_window = window_left >= 0 or window_right >= 0
+    if causal and Tq == Tk and not has_local_window:
         output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=dropout_p,
-            is_causal=False, scale=softmax_scale
+            is_causal=True, scale=softmax_scale, enable_gqa=use_gqa
         )
-    elif Tq == Tk:
-        if window < 0 or window >= Tq:
-            output = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=dropout_p,
-                is_causal=True, scale=softmax_scale, enable_gqa=use_gqa
-            )
-        else:
-            mask = torch.triu(torch.ones((Tq, Tq), device=device), diagonal=1)
-            mask = torch.logical_or(mask, torch.tril(torch.ones((Tq, Tq), device=device), diagonal=-window-1))
-            output = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, dropout_p=dropout_p,
-                is_causal=False, scale=softmax_scale, enable_gqa=use_gqa
-            )
+    elif not causal and not has_local_window:
+        output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=dropout_p,
+            is_causal=False, scale=softmax_scale, enable_gqa=use_gqa
+        )
     else:
-        prefix_len = Tk - Tq
-        mask = torch.zeros((Tq, Tk), device=device, dtype=torch.bool)
-        mask = mask.masked_fill(torch.tril(torch.ones((Tq, Tk), device=device), diagonal=-prefix_len-1) == 1, True)
+        # FlashAttention aligns a shorter query sequence to the bottom-right of
+        # the key sequence. PyTorch boolean masks use True for positions that
+        # are allowed to attend (not positions that should be masked out).
+        query_positions = torch.arange(Tq, device=q.device) + (Tk - Tq)
+        key_positions = torch.arange(Tk, device=q.device)
+        mask = torch.ones((Tq, Tk), device=q.device, dtype=torch.bool)
+        if causal:
+            mask &= key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+        if window_left >= 0:
+            mask &= key_positions.unsqueeze(0) >= (
+                query_positions - window_left
+            ).unsqueeze(1)
+        if window_right >= 0:
+            mask &= key_positions.unsqueeze(0) <= (
+                query_positions + window_right
+            ).unsqueeze(1)
         output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=dropout_p, 
             is_causal=False, scale=softmax_scale, enable_gqa=use_gqa
@@ -182,7 +187,8 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
         softmax_scale=softmax_scale,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
-        # deterministic=deterministic
+        deterministic=deterministic,
+        causal=causal,
     )
 
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
@@ -214,7 +220,8 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
-        use_gqa=use_gqa
+        use_gqa=use_gqa,
+        causal=causal,
     )
 
 def flash_attn_with_kvcache(
@@ -351,7 +358,8 @@ def flash_attn_with_kvcache(
         dropout_p=0.0,
         softmax_scale=softmax_scale,
         window_size=window_size,
-        enable_gqa=use_gqa
+        use_gqa=use_gqa,
+        causal=causal,
     )
     
 

@@ -38,7 +38,6 @@ from gpt_lab.utils.types import (
     TpModes,
 )
 from gpt_lab.utils.special_tokens import SpecialTokens
-from gpt_lab.utils.import_utils import is_flash_attn3_available_from_kernel
 import logging
 
 logger = logging.getLogger(__name__)
@@ -303,7 +302,7 @@ class TransformerConfig(BaseModel):
         self.n_kv_heads = self.n_kv_heads or self.n_heads
         if self.n_kv_heads != self.n_heads:
             self.use_gqa = True
-        if self.use_gqa and self.attn_impl == "fused" and is_flash_attn3_available_from_kernel():
+        if self.use_gqa and self.attn_impl == "fused":
             log0("Fused attention implementation does not support GQA. "
                  "Falling back to standard attention. ",
                     level="warning", logger=logger)

@@ -185,7 +185,6 @@ class Tokenizer(_BaseTokenizer):
             # tiktoken-specific exception if it can be discovered at runtime.
             EXPECTED_MISSING = (FileNotFoundError, KeyError)
             try:
-                import tiktoken
                 try:
                     # probe tiktoken for its missing-encoding exception type
                     tiktoken.get_encoding("__NONEXISTENT_ENCODING__")
