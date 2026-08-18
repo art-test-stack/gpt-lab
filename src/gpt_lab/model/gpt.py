@@ -198,7 +198,20 @@ class DenseTransformer(BaseTransformer):
     @property
     def n_params(self) -> int:
         return self.n_params_per_layer()["total"]
-    
+
+    def n_non_vocab_params(self) -> int:
+        """Return parameters whose size does not depend on the vocabulary.
+
+        Input embeddings, the output head, and ResFormer value embeddings all
+        grow with the vocabulary and are excluded from ``N_nv`` used by
+        vocabulary scaling laws.
+        """
+        counts = self.n_params_per_layer()
+        vocab_parameter_groups = ("embeds", "lm_head", "value_embeds")
+        return counts["total"] - sum(
+            counts[group] for group in vocab_parameter_groups
+        )
+
     def n_params_per_layer(self) -> Dict[str, int]:
         nb_of_params = dict(
             embeds=sum(p.numel() for p in self.embeds.parameters()),
@@ -417,4 +430,3 @@ class DenseTransformer(BaseTransformer):
         )
         
         return output
-    

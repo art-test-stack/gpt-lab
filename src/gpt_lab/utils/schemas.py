@@ -110,7 +110,7 @@ class TokenizerConfig(BaseModel):
     name: str = "ic1_tok"
     dirname: Union[str, Path] = TOKENIZERS_FOLDER
     vocab_size: int = VOCAB_SIZE
-    pat_str: str = "gpt4"
+    pat_str: Optional[str] = "gpt4"
     special_tokens: Optional[SpecialTokens] = Field(default_factory=SpecialTokens)
     source: TokenizerSources = "tiktoken"
 
@@ -118,7 +118,14 @@ class TokenizerConfig(BaseModel):
     trainer: Optional[TokenizerTrainerConfig] = None
 
     def model_post_init(self, context: Any) -> None:
-        if self.pat_str in PAT_STR.keys():
+        if self.pat_str is None:
+            if self.source not in ("huggingface", "dummy"):
+                log0(
+                    f"Tokenizer source {self.source!r} has no split pattern.",
+                    level="warning",
+                    logger=logger,
+                )
+        elif self.pat_str in PAT_STR.keys():
             self.pat_str = PAT_STR.get(self.pat_str)  # Use predefined pattern if pat_str is a key in PAT_STR
         elif self.pat_str in PAT_STR.values():
             pass  # pat_str is already a valid pattern
@@ -136,16 +143,44 @@ class TokenizerConfig(BaseModel):
     def get_mergeable_ranks(self) -> dict:
         if not self.dirname.exists():
             raise FileNotFoundError(f"Tokenizer directory {self.dirname} does not exist.")
+
+        msgpack_path = self.dirname / "mergeable_ranks.msgpack"
         mergeable_ranks_path = self.dirname / "vocab.pkl"
-        if not mergeable_ranks_path.exists():
-            raise FileNotFoundError(f"Mergeable ranks file {mergeable_ranks_path} does not exist.")
-        with open(mergeable_ranks_path, "rb") as f:
-            mergeable_ranks = pickle.load(f)
-        logger.info(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
-        print0(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
+
+        if msgpack_path.exists():
+            # Local import avoids making schemas depend on tokenizer modules at
+            # import time.
+            from gpt_lab.tokenizer.serialization import load_mergeable_ranks
+
+            mergeable_ranks = load_mergeable_ranks(msgpack_path)
+            loaded_path = msgpack_path
+        elif mergeable_ranks_path.exists():
+            with open(mergeable_ranks_path, "rb") as f:
+                mergeable_ranks = pickle.load(f)
+            loaded_path = mergeable_ranks_path
+        else:
+            raise FileNotFoundError(
+                f"No tokenizer vocabulary found in {self.dirname}; expected "
+                f"{msgpack_path.name} or {mergeable_ranks_path.name}."
+            )
+
+        logger.info(
+            "Loaded mergeable ranks from %s. Size: %d",
+            loaded_path,
+            len(mergeable_ranks),
+        )
+        print0(
+            f"Loaded mergeable ranks from {loaded_path}. "
+            f"Size: {len(mergeable_ranks)}"
+        )
         if self.vocab_size == -1:
             self.vocab_size = len(mergeable_ranks) + len(self.special_tokens)
-        assert len(mergeable_ranks) + len(self.special_tokens) == self.vocab_size , "Mergeable ranks size does not match vocab size."
+        if len(mergeable_ranks) + len(self.special_tokens) != self.vocab_size:
+            raise ValueError(
+                "Mergeable ranks size plus special-token count does not match "
+                f"vocab_size: {len(mergeable_ranks)} + "
+                f"{len(self.special_tokens)} != {self.vocab_size}."
+            )
         return mergeable_ranks
     
     @classmethod

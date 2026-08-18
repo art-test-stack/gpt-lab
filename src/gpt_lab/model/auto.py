@@ -1,20 +1,27 @@
 import math
+import warnings
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pathlib import Path
 from typing import Optional
 
-from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, PAT_STR
+from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, TOKENIZERS_FOLDER
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.schemas import (
     MetaConfig,
-    TokenizerConfig, 
-    TransformerConfig, AttnImplTypes
+    TokenizerTrainerConfig,
+    TransformerConfig,
+    AttnImplTypes,
 )
 from gpt_lab.utils.common import print0, print0_dict
-from gpt_lab.utils.logging import log0, error, log_error
-from gpt_lab.tokenizer.tokenizer import Tokenizer
-from gpt_lab.tokenizer.auto import compute_optimal_vocab_size as auto_compute_optimal_vocab_size, build_or_load_tokenizer, resolve_tokenizer
+from gpt_lab.utils.logging import log0, log_error
+from gpt_lab.tokenizer.auto import (
+    compute_optimal_vocab_size,
+    load_tokenizer,
+    resolve_tokenizer,
+    round_vocab_size,
+    train_new_tokenizer,
+)
 from gpt_lab.model.gpt import DenseTransformer
 from gpt_lab.model.checkpoint import build_meta_model, make_default_run_name
 
@@ -35,17 +42,24 @@ class AutoGPTConfig(BaseModel):
     vocab_size: int = -1 
     pat_str: Optional[str] = None
     special_tokens: Optional[SpecialTokens] = None
+    tokenizer_dir: str | Path = TOKENIZERS_FOLDER
+    tokenizer_trainer: TokenizerTrainerConfig = Field(
+        default_factory=TokenizerTrainerConfig
+    )
 
     # Model
     depth: int = 20
     aspect_ratio: int = 64
     d_head: int = 2**9 # 512
-    d_kv_head: Optional[int] = None # if None, will be set to d_head
+    n_kv_heads: Optional[int] = None
+    # Deprecated compatibility alias. The old field was named as a dimension
+    # but was always consumed as a head count.
+    d_kv_head: Optional[int] = Field(default=None, exclude=True)
     max_seq_len: int = 2048
     window_pattern: Optional[str] = None
     window_size: Optional[int] = None
     attn_softcap: Optional[float] = None # not supported yet
-    softcap: Optional[float] = None
+    softcap: Optional[float] = 18.0
     attn_impl: AttnImplTypes = "sdpa" 
     quantization: Optional[str] = None # not supported yet
 
@@ -61,13 +75,51 @@ class AutoGPTConfig(BaseModel):
     target_param_data_ratio: float = 11.0
 
     def model_post_init(self, context):
+        if self.special_tokens is None:
+            self.special_tokens = SpecialTokens()
+
+        if self.depth <= 0:
+            raise ValueError("depth must be positive")
+        if self.aspect_ratio <= 0:
+            raise ValueError("aspect_ratio must be positive")
+        if self.d_head <= 0:
+            raise ValueError("d_head must be positive")
+
+        if self.d_kv_head is not None:
+            if self.n_kv_heads is not None and self.n_kv_heads != self.d_kv_head:
+                raise ValueError(
+                    "n_kv_heads and deprecated d_kv_head disagree; provide only "
+                    "n_kv_heads"
+                )
+            warnings.warn(
+                "d_kv_head is deprecated because it represents a head count; "
+                "use n_kv_heads instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.n_kv_heads = self.d_kv_head
+
+        if self.n_kv_heads is not None and self.n_kv_heads <= 0:
+            raise ValueError("n_kv_heads must be positive")
+
+        if self.train_tokenizer and self.tokenizer_model not in (None, "auto"):
+            raise ValueError(
+                "tokenizer_model must be None or 'auto' when train_tokenizer=True"
+            )
+
         if self.dist_info is None:
             from gpt_lab.utils.distributed import get_dist_info
             self.dist_info = get_dist_info()
         if self.run_name is None:
             self.run_name = make_default_run_name(self.depth, self.name, self.dist_info)
-        if self.vocab_size != -1 and self.vocab_size < 256:
-            log_error("Vocab size must be at least 256 to ensure all unicode characters are supported. Please set vocab_size to a value >= 256.", logger=logger, error_type=ValueError)
+        min_vocab_size = 256 + len(self.special_tokens)
+        if self.vocab_size != -1 and self.vocab_size < min_vocab_size:
+            log_error(
+                "Vocab size must include all 256 byte tokens and configured "
+                f"special tokens, so it must be at least {min_vocab_size}.",
+                logger=logger,
+                error_type=ValueError,
+            )
         # TODO: check that base name is valid (e.g. no special characters, etc.)
         if self.name is not None and (not isinstance(self.name, str) or len(self.name) == 0):
             log_error("Model name must be a non-empty string.", logger=logger, error_type=ValueError)
@@ -75,106 +127,167 @@ class AutoGPTConfig(BaseModel):
             self.dirname = MODELS_FOLDER
         if isinstance(self.dirname, str):
             self.dirname = Path(self.dirname)
+        if isinstance(self.tokenizer_dir, str):
+            self.tokenizer_dir = Path(self.tokenizer_dir)
 
 
     def generate_gpt_config(self, device) -> MetaConfig:
-        special_tokens = SpecialTokens() # TODO: make this configurable
+        # Models are built on the meta device below; keep this argument for API
+        # compatibility with existing callers.
+        _ = device
+        special_tokens = self.special_tokens
+        min_vocab_size = 256 + len(special_tokens)
 
-        def _get_tokenizer_pretrained(tname: str, source: str = "tiktoken") -> Tokenizer:
-            # TODO: need to be simplified and optimized
-            # if a specific tokenizer model is specified, we will use it and ignore the scaling law
-            try:
-                return Tokenizer.from_pretrained(tname, source=source)
-            except Exception as e1:
-                log0(f"Error occurred while loading tokenizer model {tname} from {source}. Error: {e1}", logger=logger, level="warning")
-            try:
-                _tconfig = TokenizerConfig(name=tname, source=source, vocab_size=-1, special_tokens=special_tokens, pat_str="")
-                return Tokenizer.from_config(_tconfig)
-            except Exception as e2:
-                log0(f"Error occurred while loading tokenizer model {tname} from {source}. Error: {e2}", logger=logger, level="warning")
-            try:
-                _tconfig = TokenizerConfig.from_directory(name=tname)
-                _mergeable_ranks = _tconfig.get_mergeable_ranks()
-                tokenizer = Tokenizer(
-                    mergeable_ranks=_mergeable_ranks,
-                    special_tokens=special_tokens,
-                    config=_tconfig
-                )
-            except Exception as e3:
-                log_error(f"Error occurred while loading tokenizer model {tname} from local cache. Error: {e3}", logger=logger, error_type=ValueError)
-
-        def build_meta_model_from_depth(depth: int, vocab_size: int = -1) -> DenseTransformer:
-            # Initiate instance of optimized GPTConfig to access default values and methods
-            # Use same vocab size for both reference and target model to ensure consistency 
-            # in scaling laws
+        def build_transformer_config(depth: int, vocab_size: int) -> TransformerConfig:
             base_dim = depth * self.aspect_ratio
-            d_head = self.d_head
-            d_model = ((base_dim + d_head - 1) // d_head) * d_head # Round up to nearest multiple of d_head
-            n_heads = d_model // d_head
-            d_ffn = 4 * d_model # default expansion factor of 4 for FFN dimension
-            softcap = self.softcap
-
-            window_pattern = self.window_pattern or "SSSL"
-            window_size = self.window_size
-            attn_impl = self.attn_impl
-            max_seq_len = self.max_seq_len
-
-            config = TransformerConfig(
-                tf_type="dense", vocab_size=vocab_size, max_context=max_seq_len, d_model=d_model, d_ffn=d_ffn, 
-                n_layers=depth, n_heads=n_heads, n_kv_heads=self.d_kv_head or n_heads, d_head=d_head, 
-                window_pattern=window_pattern, window_size=window_size, attn_impl=attn_impl, softcap=softcap
+            d_model = (
+                (base_dim + self.d_head - 1) // self.d_head
+            ) * self.d_head
+            n_heads = d_model // self.d_head
+            n_kv_heads = (
+                self.n_kv_heads
+                if self.n_kv_heads is not None
+                else n_heads
             )
-            return build_meta_model(config)
+            if n_heads % n_kv_heads != 0:
+                raise ValueError(
+                    f"n_heads ({n_heads}) must be divisible by n_kv_heads "
+                    f"({n_kv_heads})"
+                )
 
-        # Delegate computation of optimal vocab size to tokenizer.auto
-        def compute_optimal_vocab_size(depth: int) -> int:
-            return auto_compute_optimal_vocab_size(depth, self.aspect_ratio, self.train_tokenizer, self.tokenizer_model, special_tokens)
-        
-        # TODO: for more efficient training of the model make 
-        # vocab size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
-        vocab_size = self.vocab_size
-        if vocab_size == -1:
-            vocab_size = compute_optimal_vocab_size(self.depth)
-            print0(f"Optimal vocab size based on scaling law for depth {self.depth}: {vocab_size:,.0f}")
+            return TransformerConfig(
+                tf_type="dense",
+                vocab_size=vocab_size,
+                max_context=self.max_seq_len,
+                d_model=d_model,
+                d_ffn=4 * d_model,
+                n_layers=depth,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                d_head=self.d_head,
+                window_pattern=self.window_pattern or "SSSL",
+                window_size=self.window_size,
+                attn_impl=self.attn_impl,
+                softcap=self.softcap if self.softcap is not None else 18.0,
+                quantization=self.quantization,
+            )
 
-        d12_model = build_meta_model_from_depth(12, vocab_size=vocab_size) # reference model for scaling laws
-        model = build_meta_model_from_depth(self.depth, vocab_size=vocab_size)
-        
-        # initiate tokenizer based on vocab size and user config
-        if (self.tokenizer_model not in (None, "auto")) or not self.train_tokenizer:
-            # attempt to load or resolve tokenizer
-            tname = self.tokenizer_model or resolve_tokenizer(self.tokenizer_model, vocab_size, special_tokens)
-            tokenizer = _get_tokenizer_pretrained(tname)
-        else: # otherwise train tokenizer
-            # choose a pat_str based on vocab size (method/thresholds arbitrary for now)
-            # TODO: need to be tuned based on experiments
-            if vocab_size < 256:
-                raise ValueError(f"Computed vocab size {vocab_size} is too small. Please increase the aspect ratio or set a custom vocab size.")
-            elif vocab_size < 64_000:
-                pat_str = "gpt2"
-            elif vocab_size < 150_000:
-                pat_str = "cl100k_base"
+        def build_meta_model_from_depth(
+            depth: int,
+            vocab_size: int,
+        ) -> DenseTransformer:
+            return build_meta_model(
+                build_transformer_config(depth, vocab_size)
+            )
+
+        def choose_pattern(vocab_size: int) -> str:
+            if self.pat_str is not None:
+                return self.pat_str
+            if vocab_size < 64_000:
+                return "gpt2"
+            if vocab_size < 150_000:
+                return "cl100k_base"
+            return "o200k_base"
+
+        explicit_tokenizer = self.tokenizer_model not in (None, "auto")
+        requested_vocab_size = self.vocab_size
+
+        if explicit_tokenizer:
+            tokenizer = load_tokenizer(
+                self.tokenizer_model,
+                special_tokens=special_tokens,
+                tokenizer_dir=self.tokenizer_dir,
+            )
+            if (
+                requested_vocab_size != -1
+                and requested_vocab_size != tokenizer.vocab_size
+            ):
+                raise ValueError(
+                    f"Configured vocab_size {requested_vocab_size} does not "
+                    f"match tokenizer {self.tokenizer_model!r} vocabulary "
+                    f"size {tokenizer.vocab_size}."
+                )
+            vocab_size = tokenizer.vocab_size
+        else:
+            vocab_size = requested_vocab_size
+            if vocab_size == -1:
+                probe_model = build_meta_model_from_depth(
+                    self.depth,
+                    vocab_size=min_vocab_size,
+                )
+                n_non_vocab_params = probe_model.n_non_vocab_params()
+                raw_vocab_size = compute_optimal_vocab_size(
+                    n_non_vocab_params=n_non_vocab_params,
+                    d_model=probe_model.config.d_model,
+                )
+                del probe_model
+
+                vocab_size = round_vocab_size(
+                    raw_vocab_size,
+                    multiple=128,
+                    minimum=min_vocab_size,
+                )
+                print0(
+                    "Approach-1 vocabulary estimate for "
+                    f"N_nv={n_non_vocab_params:.2e}: {raw_vocab_size:,.0f}; "
+                    f"rounded target: {vocab_size:,}"
+                )
+                if self.n_steps > 0 or self.target_flops > 0:
+                    log0(
+                        "Automatic vocabulary sizing assumes compute-optimal "
+                        "model/data allocation, but an explicit training "
+                        "horizon is configured.",
+                        logger=logger,
+                        level="warning",
+                    )
+
+            if self.train_tokenizer:
+                pat_str = choose_pattern(vocab_size)
+                vocab_label = (
+                    f"{vocab_size // 1_000}k"
+                    if vocab_size < 1_000_000
+                    else f"{vocab_size / 1_000_000:.2f}M"
+                )
+                tokenizer_name = f"{self.name}_{vocab_label}"
+                corpus_dir = DATA_DIR / "corpus" / self.name
+                log0(
+                    f"Training tokenizer {tokenizer_name!r} with vocabulary "
+                    f"size {vocab_size:,} and pattern {pat_str!r} on "
+                    f"{corpus_dir}.",
+                    logger=logger,
+                    level="warning",
+                )
+                tokenizer = train_new_tokenizer(
+                    name=tokenizer_name,
+                    vocab_size=vocab_size,
+                    pat_str=pat_str,
+                    special_tokens=special_tokens,
+                    data_dir=corpus_dir,
+                    random_seed=self.random_seed,
+                    tokenizer_dir=self.tokenizer_dir,
+                    trainer_config=self.tokenizer_trainer,
+                )
             else:
-                pat_str = "o200k_base" # for now, we use the same pattern for larger vocab sizes, but ideally we should have a different pattern for very large vocab sizes to ensure good tokenization performance. This is a TODO for future improvement.
+                tokenizer_name = resolve_tokenizer(
+                    self.tokenizer_model,
+                    vocab_size,
+                    special_tokens,
+                )
+                tokenizer = load_tokenizer(
+                    tokenizer_name,
+                    special_tokens=special_tokens,
+                    tokenizer_dir=self.tokenizer_dir,
+                )
+                vocab_size = tokenizer.vocab_size
 
-            _vs = f"{vocab_size//1000:,}k" if vocab_size < 1e6 else f"{vocab_size/1_000_000:.2f}M"
-            _tname = f"{self.name}_{_vs}"
-
-            log0(f"Training new tokenizer with vocab size {vocab_size} using pattern "
-                f"{pat_str} on corpus from {str(DATA_DIR / 'corpus' / self.name)}. This may take a while...",
-                logger=logger, level="warning")
-
-            tokenizer = build_or_load_tokenizer(
-                name=self.tokenizer_model, 
-                vocab_size=int(vocab_size), 
-                train_tokenizer=True, 
-                base_name=_tname, 
-                pat_str=PAT_STR.get(pat_str, "gpt2"), 
-                special_tokens=special_tokens, 
-                data_dir=DATA_DIR / "corpus" / self.name, 
-                random_seed=self.random_seed, 
-                dirname=self.dirname
+        if tokenizer.vocab_size != vocab_size:
+            raise ValueError(
+                f"Tokenizer vocabulary size {tokenizer.vocab_size} does not "
+                f"match final model vocabulary size {vocab_size}."
             )
+
+        d12_model = build_meta_model_from_depth(12, vocab_size=vocab_size)
+        model = build_meta_model_from_depth(self.depth, vocab_size=vocab_size)
 
         param_counts = model.n_params_per_layer()
 
@@ -211,7 +324,15 @@ class AutoGPTConfig(BaseModel):
         if not weight_decay_ratio == 1.0:
             print0(f"Scaling weight decay by {weight_decay_ratio=:.6f} for {self.depth=}")
         
-        assert self.n_steps > 0 or self.target_param_data_ratio > 0 or self.target_flops > 0 or self.target_time > 0
+        if not (
+            self.n_steps > 0
+            or self.target_param_data_ratio > 0
+            or self.target_flops > 0
+        ):
+            raise ValueError(
+                "Set n_steps, target_flops, or target_param_data_ratio to a "
+                "positive value."
+            )
         if self.n_steps > 0:
             # Override n_steps to a specific value if given
             n_steps = self.n_steps
@@ -278,4 +399,3 @@ class AutoGPTConfig(BaseModel):
         print0(f"Estimated FLOPS per token: {n_flops_per_token:.2e}")
         del model, tokenizer, d12_model
         return meta_config
-

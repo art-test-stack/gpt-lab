@@ -222,9 +222,15 @@ class Tokenizer(_BaseTokenizer):
             )
             return cls(mergeable_ranks, special_tokens.list(), config)
         elif source == "huggingface":
-            return HuggingFaceTokenizerWrapper.from_pretrained(name)
+            return HuggingFaceTokenizerWrapper.from_pretrained(
+                name,
+                special_tokens=special_tokens,
+            )
         elif source == "local":
-            return HuggingFaceTokenizerWrapper.from_directory(name)
+            return HuggingFaceTokenizerWrapper.from_directory(
+                name,
+                special_tokens=special_tokens,
+            )
 
     @classmethod
     def from_config(cls, config: TokenizerConfig):
@@ -240,7 +246,10 @@ class Tokenizer(_BaseTokenizer):
             # -> creating a new tiktoken encoding with those merges and vocab
             # -> need to handle special tokens 
             # -> need to extract hgf pretokenizer + string pattern
-            return HuggingFaceTokenizerWrapper.from_pretrained(config.name)
+            return HuggingFaceTokenizerWrapper.from_pretrained(
+                config.name,
+                special_tokens=config.special_tokens,
+            )
         elif config.source == "local":
             mergeable_ranks = config.get_mergeable_ranks()
             special_tokens = config.special_tokens.list()
