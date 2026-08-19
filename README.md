@@ -146,6 +146,12 @@ I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-t
 
 The library includes some scripts for training, evaluation, and inference. They are located in the `scripts/` folder. The main ones are the following:
 
+- `train_base.py`: Pre-train a GPT model from scratch with auto-configuration or custom settings.
+- `train_tokenizer.py`: Train a BPE tokenizer on a custom corpus using various backends.
+- `reshard_dataset.py`: Reshape raw datasets into contiguous Parquet shards for the data loader.
+- `chat_app.py`: Launch the Gradio web interface for chatting with local or remote models.
+- `benchmark/`: Utilities for benchmarking tokenizers and dataloaders.
+
 ### Data
 
 **TLDR;** The dataloader is easily built with the following code snippet. It employs the following strategies:
