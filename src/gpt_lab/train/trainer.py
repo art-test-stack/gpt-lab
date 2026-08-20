@@ -494,6 +494,7 @@ class Trainer:
 
             self.synchronize()
             step_start_time = time.perf_counter()
+            
             for _ in range(n_acc_steps):
                 eff_global_tokens += x.numel() * world_size
 
