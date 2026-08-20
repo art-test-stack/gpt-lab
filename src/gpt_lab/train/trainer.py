@@ -325,11 +325,17 @@ class Trainer:
 
         train_iter = iter(self.train_loader)
 
+        rank = self.config.dist_info["RANK"]
+
+        print(f"[rank={rank}] before barrier", flush=True)
         if self.config.dist_info["IS_DDP_INITIALIZED"]:
             dist.barrier()
 
+        print(f"[rank={rank}] after barrier / before prefetch", flush=True)
+
         x, y, dataloader_state = next(train_iter) # prefetch
 
+        print(f"[rank={rank}] after prefetch", flush=True)
         log_dict("First dataloader_state", dataloader_state.__dict__, logger=logger)
 
         # Prepare for training
