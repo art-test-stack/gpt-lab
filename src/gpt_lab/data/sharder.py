@@ -90,10 +90,14 @@ class ShardManager:
         self.world_size = dist_info.get("WORLD_SIZE", 1)
 
         self._session = None
-        if self.base_url == "":
-            self.base_url = None
-        if self.base_url is not None:
+
+        if self.base_url is not None and self.base_url != "":
             self._session = self._create_session()
+
+        if self.base_url is None:
+            self.base_url = ""
+            base_url = ""
+
 
         if shard_limit is not None and max_shards is not None:
             assert shard_limit <= max_shards, f"shard_limit ({shard_limit}) must be <= max_shards ({max_shards}). Got {shard_limit=}, {max_shards=}."
