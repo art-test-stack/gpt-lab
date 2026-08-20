@@ -330,7 +330,7 @@ class Trainer:
 
         x, y, dataloader_state = next(train_iter) # prefetch
 
-        log_dict("First dataloader_state", dataloader_state, logger=logger)
+        log_dict("First dataloader_state", dataloader_state.__dict__, logger=logger)
 
         # Prepare for training
         self._compiled_model.train()
