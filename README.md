@@ -39,15 +39,6 @@
 
 *\*This name is quite pompous and vague, I admit it. Any suggestions for a better one are welcomed!* 
 
-<div align="center">
-  <img
-    src="assets/a100x4_d12_ic1.svg"
-    width="600"
-    alt="d12 model training on 4 A100 GPUs"
-  />
-  <p><em>422M-parameter model (depth 12) training loss on 4 A100 GPUs.</em></p>
-</div>
-
 ## Table of Contents
 
 - [Table of Contents](#table-of-contents)
@@ -71,6 +62,16 @@
 - [Contact](#contact)
 
 ## About The Project
+
+<div align="center">
+  <img
+    src="assets/a100x4_d12_ic1.svg"
+    width="600"
+    alt="d12 model training on 4 A100 GPUs"
+  />
+  <p><em>422M-parameter model (depth 12) training loss on 4 A100 GPUs.</em></p>
+</div>
+
 
 ### Purpose
 
