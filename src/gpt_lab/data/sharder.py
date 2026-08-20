@@ -113,13 +113,26 @@ class ShardManager:
 
         self.prepare_shards(warn=self.ddp_rank == 0)
 
+        expected_metadata = {
+            "name": name, 
+            "base_url": base_url,
+            "column_name": column_name,
+            "max_shards": self.max_shards,
+        }
+
         if self.ddp_rank == 0:
-            self.save_metadata({
-                "name": name,
-                "base_url": base_url,
-                "column_name": column_name,
-                "max_shards": self.max_shards,
-            })
+            if not metadata:
+                self.save_metadata(expected_metadata)
+            else:
+                mismatches = {
+                    key: (metadata.get(key), expected_value)
+                    for key, expected_value in expected_metadata.items()
+                    if metadata.get(key) != expected_value
+                }
+                if mismatches:
+                    raise ValueError(
+                        f"Dataset metadata does not match configuration: {mismatches}"
+                    )
 
     def save_metadata(self, metadata: dict):
         metadata_path = self.ds_path / "meta.json"
