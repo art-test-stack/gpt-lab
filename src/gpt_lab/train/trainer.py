@@ -29,8 +29,8 @@ from torch.amp import autocast, GradScaler
 from gpt_lab.utils.board import Board
 from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
 from gpt_lab.utils.distributed import _DTYPE_MAP, get_dist_info
-from gpt_lab.utils.common import print0, print0_dict
-from gpt_lab.utils.logging import log_error, log_critical, log0
+from gpt_lab.utils.common import print0
+from gpt_lab.utils.logging import log_error, log_critical, log0, log_dict
 from gpt_lab.utils.schemas import (
     CheckpointState,
     COREMetrics,
@@ -324,7 +324,13 @@ class Trainer:
             self._compiled_model = self.model
 
         train_iter = iter(self.train_loader)
+
+        if dist.is_initialized():
+            dist.barrier()
+
         x, y, dataloader_state = next(train_iter) # prefetch
+
+        log_dict("First dataloader_state", dataloader_state, logger=logger)
 
         # Prepare for training
         self._compiled_model.train()
@@ -392,14 +398,14 @@ class Trainer:
                         ):
                         self.save_checkpoint()
                 
-                log_dict = {
+                board_dict = {
                     "eval/loss": val_res['loss'],
                     "eval/bpb": val_res['bpb'],
                     "eval/best_bpb": self.ckpt_state.best_eval_value,
                     "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
                 }
-                self.board.log(log_dict, step=step)
-                self.eval_metrics.append(log_dict, step=step)
+                self.board.log(board_dict, step=step)
+                self.eval_metrics.append(board_dict, step=step)
                 self._compiled_model.train()
 
             # ================================================================
@@ -427,7 +433,7 @@ class Trainer:
                        f"Max per task: {int(results['core/max_per_task'])} | "
                        f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
                        f"Max throughput: {max_throughput:,.0f} tok/s")
-                log_dict = {
+                board_dict = {
                     "core/core": results["core/core"],
                     "core/accuracy": results["core/accuracy"],
                     "core/max_per_task": results["core/max_per_task"],
@@ -435,14 +441,14 @@ class Trainer:
                 }
                 for task_label, task_results in results.get("all_core_results", {}).items():
                     for task_metric, task_value in task_results.items():
-                        log_dict[f"core/{task_label}/{task_metric}"] = task_value
+                        board_dict[f"core/{task_label}/{task_metric}"] = task_value
                 if (
                     (self.ckpt_state.best_core_value is None) or 
                     (results["core/core"] > self.ckpt_state.best_core_value)
                 ):
                     self.ckpt_state.best_core_value = results["core/core"]
                     self.ckpt_state.best_core_step = step
-                self.board.log(log_dict, step=step)
+                self.board.log(board_dict, step=step)
                 self.core_metrics.append(results, step=step)
                 self.model.train()
             
@@ -590,7 +596,7 @@ class Trainer:
                     f"tok/s: {tokens_per_sec:,.0f}"
                     f"{eta_str}"
                 )
-                log_dict = {
+                board_dict = {
                     "epochs": self.state.n_epochs,
                     "train/loss": debiased_smooth_loss,
                     "train/raw_loss": loss_accum,
@@ -607,8 +613,8 @@ class Trainer:
                     "train/eta_seconds": eta_seconds if len(total_dt) > 10 else float("inf"),
                 }
 
-                self.metrics.append(log_dict, step)
-                self.board.log(log_dict, step=step)
+                self.metrics.append(board_dict, step)
+                self.board.log(board_dict, step=step)
             
             # ================================================================
             # Checkpointing
