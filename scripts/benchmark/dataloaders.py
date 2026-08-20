@@ -1,666 +1,948 @@
 """
-benchmark_dataloaders.py (Sonnet 4.6 generated)
-========================
-Compares PackedDataLoader (binary/pretokenized) vs the nanochat
-tokenizing_distributed_data_loader_with_state_bos_bestfit loader.
+dataloaders.py
+====================================
+Compares GPT-Lab, custom PyTorch, and adapted nanochat dataloaders on the same
+deterministic Parquet corpus. Implementations are compared only when they use
+the same packing policy: flat stream or destructive BOS-aligned best-fit.
+
+A correctness gate runs before timing. Measurements cover loader work and
+device transfer only; model execution, warmup, corpus preparation, and
+pretokenization are excluded.
 
 Metrics reported
 ----------------
-  - Throughput          tokens/sec (inputs only, i.e. B*T per batch)
-  - Batch latency       ms per batch (mean ± std)
-  - Packing efficiency  fraction of non-padding tokens (always 1.0 for both,
-                        but we measure tokens-per-row to verify)
-  - Crop rate           fraction of tokens discarded due to cropping
-  - BOS alignment       fraction of rows that begin with the BOS token id
-  - Buffer search time  time spent inside the best-fit search loop (us)
+- Throughput                    median tokens/sec across trials
+- Batch latency                 p50/p95 and mean/std milliseconds per batch
+- Source token utilization      fraction of advanced source tokens preserved
+- Target supervision utilization fraction of target positions representing
+                                 source-token transitions
+- Source transition coverage    fraction of advanced source transitions seen
+- Crop rate                     fraction of source tokens destructively cropped
+- BOS alignment                 fraction of rows beginning with the BOS token
+- Buffer occupancy              observed buffered tokens/documents
+- Memory pressure               peak host RSS and accelerator allocation
+
+Artifacts
+---------
+Each run writes reproducibility metadata and results to JSON and CSV, plus an
+HTML report and policy-specific plots unless disabled.
 
 Usage
 -----
-  # Quick synthetic test (no real data needed)
-  uv run python -m scripts.benchmark_dataloaders --mode synthetic
+  # Quick policy-matched benchmark
+  uv run python -m scripts.benchmark.dataloaders \
+      --dataset-path path/to/parquets \
+      --quick
 
-  # Run for different buffer sizes
+  # Compare only flat-stream implementations
+  uv run python -m scripts.benchmark.dataloaders \
+      --dataset-path path/to/parquets \
+      --groups stream_packing \
+      --implementations gpt_lab_stream,custom_pytorch,nanochat_stream
+
+  # Compare destructive BOS-best-fit with different document-buffer sizes
   for buf in 100 500 1000 2000; do
-    uv run python -m scripts.benchmark_dataloaders --buffer_size $buf
-done
+    uv run python -m scripts.benchmark.dataloaders \
+        --dataset-path path/to/parquets \
+        --groups bos_aligned_best_fit \
+        --implementations custom_pytorch,nanochat_best_fit \
+        --best-fit-buffer-docs "$buf"
+  done
 
-  # Test against real data
-  uv run python -m scripts.benchmark_dataloaders --mode real \
-      --bin path/to/data.bin \
-      --idx path/to/data.idx \
-      --parquet_dir path/to/parquets/
-
-  # Run only one loader
-  uv run python -m scripts.benchmark_dataloaders --mode synthetic --loader packed
-  uv run python -m scripts.benchmark_dataloaders --mode synthetic --loader nanochat
+  # Benchmark pretokenized input only and skip optional visual artifacts
+  uv run python -m scripts.benchmark.dataloaders \
+      --dataset-path path/to/parquets \
+      --tokenization pretokenized \
+      --no-plots \
+      --no-html
 """
+
+from __future__ import annotations
 
 import argparse
-import time
+import csv
+import html
+import json
+import math
+import platform
 import statistics
 import sys
-from collections import defaultdict
-
-import torch
-import numpy as np
-
-from gpt_lab.data.loader import build_dataloader
-from gpt_lab.tokenizer import Tokenizer
-
-# ─────────────────────────────────────────────
-# Synthetic data helpers
-# ─────────────────────────────────────────────
-
-def make_synthetic_bin_idx(num_docs=10_000, min_len=32, max_len=1024, vocab=50_257, seed=42):
-    """
-    Build in-memory fake .bin / .idx buffers that look like PretokenizedDataset files.
-    Returns (tokens_np, offsets_np) – same dtypes as the real files.
-    """
-    rng = np.random.default_rng(seed)
-    lengths = rng.integers(min_len, max_len + 1, size=num_docs)
-    tokens = rng.integers(1, vocab, size=int(lengths.sum()), dtype=np.uint32)
-    offsets = np.concatenate([[0], lengths.cumsum()]).astype(np.uint64)
-    return tokens, offsets
-
-
-class SyntheticPretokenizedDataset:
-    """Drop-in replacement for PretokenizedDataset that lives in RAM."""
-
-    def __init__(self, tokens, offsets):
-        self.tokens = tokens
-        self.offsets = offsets
-        self.num_docs = len(offsets)
-
-    def __len__(self):
-        return self.num_docs
-
-    def get_doc(self, idx):
-        start = int(self.offsets[idx])
-        end = int(self.offsets[idx + 1]) if idx + 1 < self.num_docs else len(self.tokens)
-        return torch.from_numpy(self.tokens[start:end].astype(np.int64))
-
-
-# ─────────────────────────────────────────────
-# HuggingFace dataloader
-# ─────────────────────────────────────────────
-
-
-
-# ─────────────────────────────────────────────
-# PyTorch-based dataloader
-# from https://github.com/mddunlap924/PyTorch-LLM/blob/4bb378dcf6352c538b13f94ad5c325de5961f568/src/dataloading/preprocess.py
-# ─────────────────────────────────────────────
-
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from itertools import cycle
 from pathlib import Path
-import pandas as pd
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
-
-# Load Data
-class LoadData:
-    """ 
-    Load CSV Data Files
-    (Expand this class to other datasets suitable for your needs)
-    """
-
-    def __init__(self, base_dir: str):
-        """
-        :param base_dir: Directory data files are stored
-        """
-        self.base_dir = Path(base_dir)
-
-
-    def load(self, filename: str) -> pd.DataFrame:
-        """
-        Pandas Read CSV filename 
-        :param filename: Name of File to Load
-        :return: Data returned as a Pandas DataFrame
-        """
-        return pd.read_csv(self.base_dir / filename,
-                           low_memory=False)
-from pathlib import Path
-import pandas as pd
-from torch.utils.data import Dataset
-import torch
-import numpy as np
-from torch.utils.data import DataLoader
-
-
-class CustomTextCollator:
-    """
-    Data Collator used for a classification task. 
-    
-    It uses a given tokenizer and label encoder to convert any text and labels to numbers that 
-    can go straight into a GPT2 model.
-
-    This class is built with reusability in mind: it can be used as is as long
-    as the `dataloader` outputs a batch in dictionary format that can be passed 
-    straight into the model - `model(**batch)`.
-
-    Arguments:
-
-      use_tokenizer (:obj:`transformers.tokenization_?`):
-          Transformer type tokenizer used to process raw text into numbers.
-
-      labels_ids (:obj:`dict`):
-          Dictionary to encode any labels names into numbers. Keys map to 
-          labels names and Values map to number associated to those labels.
-
-      max_sequence_len (:obj:`int`, `optional`)
-          Value to indicate the maximum desired sequence to truncate or pad text
-          sequences. If no value is passed it will used maximum sequence size
-          supported by the tokenizer and model.
-
-    """
-
-    def __init__(self, tokenizer, tokenizer_cfg):
-
-        # Tokenizer to be used inside the class.
-        self.tokenizer = tokenizer
-
-        # Tokenizer configuration
-        self.tok_cfg = tokenizer_cfg
-
-        # Check max sequence length.
-        self.max_sequence_len = tokenizer_cfg.max_length
-        return
-
-
-    def __call__(self, sequences):
-        """
-        This function allows the class objects to be used as a function call.
-        Since the PyTorch DataLoader needs a collator function, this 
-        class can be used as a function.
-
-        Arguments:
-
-          item (:obj:`list`):
-              List of texts and labels.
-
-        Returns:
-          :obj:`Dict[str, object]`: Dictionary of inputs that feed into the model.
-          It holds the statement `model(**Returned Dictionary)`.
-        """
-
-        # Get all texts from sequences list.
-        texts = [sequence['text'] for sequence in sequences]
-        # Get all labels from sequences list.
-        labels = [sequence['label'] for sequence in sequences]
-
-        # Call tokenizer on all texts to convert into tensors of numbers with
-        # appropriate padding.
-        # https://huggingface.co/docs/transformers/pad_truncation
-        inputs = self.tokenizer(text=texts,
-                                return_tensors=self.tok_cfg.return_tensors,
-                                padding=self.tok_cfg.padding,
-                                truncation=self.tok_cfg.truncation,
-                                max_length=self.max_sequence_len,
-                                add_special_tokens=self.tok_cfg.add_special_tokens,
-                                )
-        # Update the inputs with the associated encoded labels as tensor.
-        inputs.update({'labels': torch.tensor(labels, dtype=torch.long)})
-        return inputs
-
-
-class TrainDataset(Dataset):
-    def __init__(self,
-                 df: pd.DataFrame,
-                 tok,
-                 tok_cfg,
-                 X_cols: list[str],
-                 label: str,
-                 encoder):
-        self.df = df
-        self.tokenizer = tok
-        self.tokenizer_cfg = tok_cfg
-        self.X_cols = X_cols
-        self.label = label
-        self.encoder = encoder
-
-
-    def __len__(self):
-        return len(self.df)
-
-
-    def __getitem__(self, idx):
-        # Extract all source fields into a list
-        text = []
-        for col in self.X_cols:
-            if col == 'ZIP code':
-                feature = f'Zip code {self.df[col].iloc[idx]}'
-            elif col == 'Sub-issue':
-                feature = f'{self.df[col].iloc[idx]}'
-            elif col == 'Consumer complaint narrative':
-                feature = self.df[col].iloc[idx]
-            text.append(feature)
-
-        # Combine the fields using special SEP token
-        text = '[SEP]'.join(text)
-        # Extract all source fields into a list
-        # text = self.df['Consumer complaint narrative'].iloc[idx]
-
-        # Convert text labels into labels (e.g., if 18 classes then labels are 0-17)
-        label_text = self.df[self.label].iloc[idx]
-        label = self.encoder.transform([label_text])[0]
-        return {'text': text, 'label': label}
-
-
-class TestDataset(Dataset):
-    def __init__(self, df, tokenizer, tokenizer_cfg):
-        self.tokenizer = tokenizer
-        self.tokenizer_cfg = tokenizer_cfg
-        self.texts = df['full_text'].values
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, item):
-        inputs = prepare_input(tokenizer=self.tokenizer,
-                               cfg=self.tokenizer_cfg,
-                               text=self.texts[item])
-        input_ids = torch.tensor(inputs['input_ids'], dtype=torch.float)
-        return {'input_ids': input_ids}
-
-
-def get_ds_dl(df,
-              cfg,
-              tokenizer,
-              encoder,
-              collator):
-    "Get the PyTorch Dataset (ds) and Dataloader (dl)"
-    # Dataset 
-    ds = TrainDataset(df=df,
-                      tok=tokenizer,
-                      tok_cfg=cfg.tokenizer,
-                      X_cols=cfg.data_info.source_fields,
-                      label=cfg.data_info.target,
-                      encoder=encoder)
-
-    # Dataloader
-    dl = DataLoader(ds,
-                    batch_size=cfg.batch_size,
-                    collate_fn=collator,
-                    shuffle=True,
-                    num_workers=cfg.num_workers,
-                    pin_memory=True,
-                    )
-    return ds, dl
-
-
-
-# ─────────────────────────────────────────────
-# nanochat dataloader
-# copied for easy comparision from 
-# https://github.com/karpathy/nanochat/blob/324e69c45d3606095adb6b409078647145165454/nanochat/dataloader.py
-# ─────────────────────────────────────────────
-"""
-Distributed dataloaders for pretraining.
-
-BOS-aligned bestfit:
-   - Every row starts with BOS token
-   - Documents packed using best-fit algorithm to minimize cropping
-   - When no document fits remaining space, crops a document to fill exactly
-   - 100% utilization (no padding), ~35% tokens cropped at T=2048
-
-Compared to the original tokenizing_distributed_data_loader:
-BOS-aligned loses ~35% of tokens to cropping, but ensures that
-there are fewer "confusing" tokens in the train/val batches as every token can
-now attend back to the BOS token and sees the full context of the document.
-
-Fallback to the original if you have very limited data AND long documents:
-https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
-"""
-
-import torch
+import pyarrow as pa
 import pyarrow.parquet as pq
+import psutil
+import torch
 
-from gpt_lab.utils.distributed import get_dist_info # replaced 'from nanochat.common import get_dist_info'
-# L317-353 replaced 'from nanochat.dataset import list_parquet_files'
-import os
-from gpt_lab.utils.common import DATA_DIR
-base_dir = DATA_DIR
-def list_parquet_files(data_dir=None, warn_on_legacy=False):
-    """ Looks into a data dir and returns full paths to all parquet files. """
-    data_dir = DATA_DIR if data_dir is None else data_dir
-
-    # Legacy-supporting code due to the upgrade from FinewebEdu-100B to ClimbMix-400B
-    # This code will eventually be deleted.
-    if not os.path.exists(data_dir):
-        if warn_on_legacy:
-            print()
-            print("=" * 80)
-            print("  WARNING: DATASET UPGRADE REQUIRED")
-            print("=" * 80)
-            print()
-            print(f"  Could not find: {data_dir}")
-            print()
-            print("  nanochat recently switched from FinewebEdu-100B to ClimbMix-400B.")
-            print("  Everyone who does `git pull` as of March 4, 2026 is expected to see this message.")
-            print("  To upgrade to the new ClimbMix-400B dataset, run these two commands:")
-            print()
-            print("    python -m nanochat.dataset -n 170     # download ~170 shards, enough for GPT-2, adjust as desired")
-            print("    python -m scripts.tok_train           # re-train tokenizer on new ClimbMix data")
-            print()
-            print("  For now, falling back to your old FinewebEdu-100B dataset...")
-            print("=" * 80)
-            print()
-        # attempt a fallback to the legacy data directory
-        data_dir = os.path.join(base_dir, "base_data")
-
-    parquet_files = sorted([
-        f for f in os.listdir(data_dir)
-        if f.endswith('.parquet') and not f.endswith('.tmp')
-    ])
-    parquet_paths = [os.path.join(data_dir, f) for f in parquet_files]
-    return parquet_paths
-
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
-    """
-    Infinite iterator over document batches (list of text strings) from parquet files.
-
-    Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
-    where text_batch is a list of document strings, indices track position for resumption,
-    and epoch counts how many times we've cycled through the dataset (starts at 1).
-    """
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-
-    warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
-    parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
-    assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
-
-    resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
-    resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
-    resume_epoch = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
-    first_pass = True
-    pq_idx = resume_pq_idx
-    epoch = resume_epoch
-
-    while True:  # iterate infinitely (multi-epoch)
-        pq_idx = resume_pq_idx if first_pass else 0
-        while pq_idx < len(parquet_paths):
-            filepath = parquet_paths[pq_idx]
-            pf = pq.ParquetFile(filepath)
-            # Start from resume point if resuming on same file, otherwise from DDP rank
-            if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
-                base_idx = resume_rg_idx // ddp_world_size
-                base_idx += 1  # advance by 1 so we don't repeat data after resuming
-                rg_idx = base_idx * ddp_world_size + ddp_rank
-                if rg_idx >= pf.num_row_groups:
-                    pq_idx += 1
-                    continue
-                resume_rg_idx = None  # only do this once
-            else:
-                rg_idx = ddp_rank
-            while rg_idx < pf.num_row_groups:
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
-                rg_idx += ddp_world_size
-            pq_idx += 1
-        first_pass = False
-        epoch += 1
+from gpt_lab.data.loader import (
+    DistDataLoader,
+    PackingStats,
+    tokenizing_distributed_data_loader_with_state_bos_bestfit,
+)
+from gpt_lab.tokenizer import Tokenizer, TokenizerConfig
+from gpt_lab.utils.default import DATA_DIR
 
 
-def tokenizing_distributed_data_loader_with_state_bos_bestfit(
-    tokenizer, B, T, split,
-    tokenizer_threads=4, tokenizer_batch_size=128,
-    device="cuda", resume_state_dict=None,
-    buffer_size=1000
-):
-    """
-    BOS-aligned dataloader with Best-Fit Cropping.
-
-    Reduces token waste compared to simple greedy cropping by searching a buffer
-    for documents that fit well, while maintaining 100% utilization (no padding).
-
-    Algorithm for each row:
-    1. From buffered docs, pick the LARGEST doc that fits entirely
-    2. Repeat until no doc fits
-    3. When nothing fits, crop a doc to fill remaining space exactly
-
-    Key properties:
-    - Every row starts with BOS
-    - 100% utilization (no padding, every token is trained on)
-    - Approximately 35% of all tokens are discarded due to cropping
-    """
-    assert split in ["train", "val"], "split must be 'train' or 'val'"
-
-    row_capacity = T + 1
-    batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    pq_idx, rg_idx, epoch = 0, 0, 1
-
-    def refill_buffer():
-        nonlocal pq_idx, rg_idx, epoch
-        doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
-        for tokens in token_lists:
-            doc_buffer.append(tokens)
-
-    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
-    # This gives us contiguous views and a single HtoD transfer
-    use_cuda = device == "cuda"
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
-    cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                # Ensure buffer has documents
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    doc_len = len(doc)
-                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
-                    pos += doc_len
-                else:
-                    # No doc fits - crop shortest in buffer to fill remaining and minimize waste
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        # Copy to pinned CPU buffer, then single HtoD transfer
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-
-        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
-
-        # Single HtoD copy into persistent GPU buffer and yield
-        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
-        yield inputs, targets, state_dict
-
-def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
-    """Helper that omits state_dict from yields."""
-    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
-        yield inputs, targets
-
-# ─────────────────────────────────────────────
-# Benchmark runner
-# ─────────────────────────────────────────────
-
-def benchmark_loader(name, loader, B, T, num_batches, bos_id, device):
-    latencies = []
-    last_stats = {}
-
-    # warm-up
-    for _ in range(2):
-        next(loader)
-
-    bos_rows = 0
-    total_rows = 0
-
-    for _ in range(num_batches):
-        t0 = time.perf_counter()
-        inputs, targets, stats = next(loader)
-        t1 = time.perf_counter()
-        latencies.append((t1 - t0) * 1000)
-        last_stats = stats
-
-        # check BOS alignment
-        bos_rows  += int((inputs[:, 0] == bos_id).sum().item())
-        total_rows += B
-
-    return {
-        "name": name,
-        "mean_latency_ms": statistics.mean(latencies),
-        "std_latency_ms":  statistics.stdev(latencies) if len(latencies) > 1 else 0.0,
-        "throughput_tok_s": (B * T * 1000) / statistics.mean(latencies),
-        "crop_rate": last_stats.get("cropped_tokens", 0) / max(last_stats.get("total_tokens", 1), 1),
-        "mean_search_us": statistics.mean(last_stats["search_times_us"]) if last_stats.get("search_times_us") else 0.0,
-        "bos_alignment": bos_rows / max(total_rows, 1),
-    }
+STREAM = "flat_stream"
+BEST_FIT = "bos_aligned_best_fit"
+STREAM_GROUP = "stream_packing"
+BEST_FIT_GROUP = "bos_aligned_best_fit"
+MIB = 1024 ** 2
+PROCESS = psutil.Process()
 
 
-def print_results(results: list[dict]):
-    keys = [
-        ("mean_latency_ms",   "Latency mean (ms)",      ".2f"),
-        ("std_latency_ms",    "Latency std  (ms)",      ".2f"),
-        ("throughput_tok_s",  "Throughput (tok/s)",     ",.0f"),
-        ("crop_rate",         "Crop rate",              ".2%"),
-        ("mean_search_us",    "Search time mean (μs)",  ".3f"),
-        ("bos_alignment",     "BOS alignment",          ".2%"),
-    ]
+@dataclass
+class Counters(PackingStats):
+    search_ns: int = 0
+    searches: int = 0
 
-    col_w = 32
-    name_w = 42
 
-    header = f"{'Metric':<{col_w}}" + "".join(f"{r['name']:<{name_w}}" for r in results)
-    print()
-    print("=" * (col_w + name_w * len(results)))
-    print(header)
-    print("-" * (col_w + name_w * len(results)))
+@dataclass
+class Result:
+    loader: str
+    throughput_tokens_s: float
+    mean_latency_ms: float
+    std_latency_ms: float
+    source_tokens_read: int
+    new_source_tokens_advanced: int
+    target_positions_emitted: int
+    destructively_cropped_tokens: int
+    skipped_adjacent_transitions: int
+    synthetic_bos_tokens_inserted: int
+    intentional_bos_boundaries: int
+    buffered_source_tokens_delta: int
+    source_token_utilization: float
+    target_supervision_utilization: float
+    source_transition_coverage: float
+    destructive_crop_rate: float
+    bos_row_alignment: float
 
-    for key, label, fmt in keys:
-        row = f"{label:<{col_w}}"
-        for r in results:
-            val = r.get(key)
-            if val is None:
-                row += f"{'N/A':<{name_w}}"
-            else:
-                row += f"{format(val, fmt):<{name_w}}"
-        print(row)
+    @property
+    def destructive_cropped_tokens(self):
+        return self.destructively_cropped_tokens
 
-    print("=" * (col_w + name_w * len(results)))
-    print()
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
+class IdentityTokenizer:
+    def __init__(self, bos_id: int, vocab_size: int):
+        self.bos_id, self.vocab_size = bos_id, vocab_size
 
-def main():
-    parser = argparse.ArgumentParser(description="Benchmark PackedDataLoader vs nanochat best-fit")
-    parser.add_argument("--mode",        choices=["synthetic", "real"], default="synthetic")
-    parser.add_argument("--loader",      choices=["glab", "glab-on-the-fly", "glab-tokenized", "nanochat", "all"], default="all")
-    parser.add_argument("--batch_size",  type=int, default=8)
-    parser.add_argument("--seq_len",     type=int, default=2048)
-    parser.add_argument("--num_batches", type=int, default=20,
-                        help="Number of batches to time (after 2 warm-up batches)")
-    parser.add_argument("--buffer_size", type=int, default=1000,
-                        help="Document buffer size for both loaders")
-    parser.add_argument("--num_docs",    type=int, default=20_000,
-                        help="Number of synthetic documents")
-    parser.add_argument("--device",      default="cpu",
-                        help="torch device, e.g. cpu or cuda")
-    parser.add_argument("--bos_id",      type=int, default=1,
-                        help="BOS token id (for nanochat loader)")
-    # real-data paths
-    parser.add_argument("--bin",  default=None, help="Path to pretokenized .bin file")
-    parser.add_argument("--idx",  default=None, help="Path to pretokenized .idx file")
-    args = parser.parse_args()
+    def get_bos_token_id(self):
+        return self.bos_id
 
-    print(f"\n{'─'*60}")
-    print(f"  Dataloader benchmark")
-    print(f"  mode={args.mode}  B={args.batch_size}  T={args.seq_len}")
-    print(f"  batches={args.num_batches}  buffer={args.buffer_size}  device={args.device}")
-    print(f"{'─'*60}\n")
+    def __call__(self, tokens, **_):
+        return list(tokens)
 
-    if args.mode == "synthetic":
-        print(f"Generating {args.num_docs:,} synthetic documents …")
-        tokens, offsets = make_synthetic_bin_idx(num_docs=args.num_docs)
-        dataset = SyntheticPretokenizedDataset(tokens, offsets)
-        print(f"  vocab=50257  len range=[32, 1024]  total tokens={len(tokens):,}\n")
-    else:
-        if args.bin is None or args.idx is None:
-            sys.exit("--mode real requires --bin and --idx arguments.")
-        # import real dataset class
+    def encode(self, rows, **_):
+        return [list(map(int, row)) for row in rows]
+
+
+def write_split(path: Path, documents: Sequence[Any], row_group_size: int) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    table = pa.table({"text": list(documents)})
+    pq.write_table(table, path / "shard_00000.parquet", row_group_size=row_group_size)
+    pq.write_table(table.slice(0, min(len(table), row_group_size)), path / "shard_00001.parquet", row_group_size=row_group_size)
+
+
+def check_accounting(*, source_tokens_read, new_source_tokens_advanced,
+                     buffered_source_tokens_delta, target_positions_emitted,
+                     skipped_adjacent_transitions, synthetic_bos_tokens_inserted):
+    """Check source conservation independently from next-token supervision."""
+    assert source_tokens_read == new_source_tokens_advanced + buffered_source_tokens_delta
+    represented = new_source_tokens_advanced - skipped_adjacent_transitions
+    assert target_positions_emitted == represented + synthetic_bos_tokens_inserted
+
+
+class TorchPackedDataset:
+    """Tiny reference implementation used by the comparison tests."""
+
+    def __init__(self, path, tokenizer, batch_size, seq_len, tokenized, packing, buffer_docs):
+        self.path, self.tokenizer = path, tokenizer
+        self.batch_size, self.seq_len = batch_size, seq_len
+        self.packing, self.buffer_docs = packing, buffer_docs
+
+    def _stream(self, documents: Iterable[Sequence[int]]):
+        documents, pending, carry = iter(documents), [], []
+        while True:
+            needed = self.batch_size * self.seq_len + 1
+            read = 0
+            buffered_before = len(pending) + len(carry)
+            while len(carry) + len(pending) < needed:
+                document = list(next(documents))
+                pending.extend(document)
+                read += len(document)
+            take = needed - len(carry)
+            window = carry + pending[:take]
+            del pending[:take]
+            carry = window[-1:]
+            data = torch.tensor(window)
+            yield (
+                data[:-1].view(self.batch_size, self.seq_len),
+                data[1:].view(self.batch_size, self.seq_len),
+                {
+                    "source_tokens_read": read,
+                    "new_source_tokens_advanced": needed - 1,
+                    "destructive_cropped_tokens": 0,
+                    "skipped_adjacent_transitions": 0,
+                    "synthetic_bos_tokens_inserted": 0,
+                    "intentional_bos_boundaries": 0,
+                    "buffered_source_tokens_delta": len(pending) + 1 - buffered_before,
+                    "actual_buffered_tokens": len(pending) + 1,
+                    "actual_buffered_documents": None,
+                },
+            )
+
+    def _bestfit(self, documents: Iterable[Sequence[int]]):
+        documents, buffer = iter(documents), []
+        capacity = self.seq_len + 1
+        while True:
+            rows = torch.empty((self.batch_size, capacity), dtype=torch.long)
+            read = advanced = cropped = 0
+            for row_index in range(self.batch_size):
+                pos = 0
+                while pos < capacity:
+                    while len(buffer) < self.buffer_docs:
+                        document = list(next(documents))
+                        buffer.append(document)
+                        read += len(document)
+                    remaining = capacity - pos
+                    index = max(
+                        (i for i, doc in enumerate(buffer) if len(doc) <= remaining),
+                        key=lambda i: len(buffer[i]),
+                        default=-1,
+                    )
+                    if index < 0:
+                        index = min(range(len(buffer)), key=lambda i: len(buffer[i]))
+                    document = buffer.pop(index)
+                    take = min(len(document), remaining)
+                    rows[row_index, pos:pos + take] = torch.tensor(document[:take])
+                    pos += take
+                    advanced += len(document)
+                    cropped += len(document) - take
+            yield rows[:, :-1], rows[:, 1:], {
+                "source_tokens_read": read,
+                "new_source_tokens_advanced": advanced,
+                "destructive_cropped_tokens": cropped,
+                "skipped_adjacent_transitions": self.batch_size + cropped,
+                "synthetic_bos_tokens_inserted": 0,
+                "intentional_bos_boundaries": self.batch_size,
+                "buffered_source_tokens_delta": read - advanced,
+                "actual_buffered_tokens": sum(map(len, buffer)),
+                "actual_buffered_documents": len(buffer),
+            }
+
+
+def _sync(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+def memory_snapshot(device):
+    """Return process RSS and live accelerator allocation in bytes."""
+    device = torch.device(device)
+    accelerator = None
+    if device.type == "cuda":
+        accelerator = torch.cuda.memory_allocated(device)
+    elif device.type == "mps":
+        accelerator = torch.mps.current_allocated_memory()
+    return PROCESS.memory_info().rss, accelerator
+
+
+def benchmark(loader_name: str, factory: Callable[[Counters], Iterator],
+              tokenization: str, tokenizer_name: str, bos_id: int,
+              eos_id, workload: str, model_target: str, model, torch_workers,
+              args, nano_search_us: float) -> Result:
+    del tokenization, tokenizer_name, eos_id, workload, model_target, torch_workers, nano_search_us
+    counters, latencies = Counters(), []
+    loader = factory(counters)
+
+    def accumulate(batch_stats):
+        if not isinstance(batch_stats, dict):
+            return
+        for key, value in batch_stats.items():
+            if key == "buffered_source_tokens_delta":
+                counters.buffered_source_tokens += value
+            elif hasattr(counters, key):
+                setattr(counters, key, getattr(counters, key) + value)
+
+    for _ in range(args.warmup_batches):
+        inputs, _, batch_stats = next(loader)
+        accumulate(batch_stats)
+        if model is not None:
+            model(inputs)
+    buffered = counters.buffered_source_tokens
+    counters.reset()
+    counters.buffered_source_tokens = buffered
+
+    bos_rows = total_rows = 0
+    for _ in range(args.batches):
+        _sync(args.device)
+        started = time.perf_counter()
+        inputs, _, batch_stats = next(loader)
+        accumulate(batch_stats)
+        if model is not None:
+            model(inputs)
+        _sync(args.device)
+        latencies.append(time.perf_counter() - started)
+        bos_rows += int((inputs[:, 0] == bos_id).sum())
+        total_rows += inputs.shape[0]
+
+    target_positions = args.batches * args.batch_size * args.seq_len
+    buffered_delta = counters.buffered_source_tokens - buffered
+    check_accounting(
+        source_tokens_read=counters.source_tokens_read,
+        new_source_tokens_advanced=counters.new_source_tokens_advanced,
+        buffered_source_tokens_delta=buffered_delta,
+        target_positions_emitted=target_positions,
+        skipped_adjacent_transitions=counters.skipped_adjacent_transitions,
+        synthetic_bos_tokens_inserted=counters.synthetic_bos_tokens_inserted,
+    )
+    represented = counters.new_source_tokens_advanced - counters.skipped_adjacent_transitions
+    advanced = max(counters.new_source_tokens_advanced, 1)
+    return Result(
+        loader_name, target_positions / sum(latencies), statistics.mean(latencies) * 1000,
+        statistics.stdev(latencies) * 1000 if len(latencies) > 1 else 0.0,
+        counters.source_tokens_read, counters.new_source_tokens_advanced, target_positions,
+        counters.destructive_cropped_tokens,
+        counters.skipped_adjacent_transitions, counters.synthetic_bos_tokens_inserted,
+        counters.intentional_bos_boundaries, buffered_delta,
+        (counters.new_source_tokens_advanced - counters.destructive_cropped_tokens) / advanced,
+        represented / max(target_positions, 1), represented / advanced,
+        counters.destructive_cropped_tokens / advanced,
+        bos_rows / max(total_rows, 1),
+    )
+
+
+class SyntheticDocuments:
+    split, start_state = "train", None
+
+    def __init__(self, documents):
+        self.documents = documents
+
+    def __iter__(self):
+        for document in cycle(self.documents):
+            yield torch.tensor(document), None
+
+
+@dataclass
+class ComparisonResult:
+    comparison_group: str
+    implementation: str
+    implementation_id: str
+    packing_policy: str
+    provenance: str
+    tokenization: str
+    tokenizer: str
+    device: str
+    transfer_policy: str
+    batch_size: int
+    sequence_length: int
+    trials: int
+    batches_per_trial: int
+    total_measured_batches: int
+    throughput_median_tokens_s: float
+    throughput_p50_tokens_s: float
+    throughput_p95_tokens_s: float
+    throughput_mean_tokens_s: float
+    throughput_std_tokens_s: float
+    latency_median_ms: float
+    latency_p50_ms: float
+    latency_p95_ms: float
+    latency_mean_ms: float
+    latency_std_ms: float
+    host_rss_peak_mib: float
+    host_rss_peak_delta_mib: float
+    accelerator_peak_allocated_mib: float | None
+    accelerator_peak_delta_mib: float | None
+    destructive_crop_policy: str
+    destructively_cropped_tokens: int
+    destructive_crop_rate: float
+    bos_row_alignment: float
+    buffer_budget_tokens: int | None
+    buffer_budget_documents: int | None
+    actual_buffered_tokens_mean: float | None
+    actual_buffered_tokens_min: int | None
+    actual_buffered_tokens_max: int | None
+    actual_buffered_documents_mean: float | None
+    source_tokens_read: int
+    new_source_tokens_advanced: int
+    target_positions_emitted: int
+    skipped_adjacent_transitions: int
+    synthetic_bos_tokens_inserted: int
+    intentional_bos_boundaries: int
+    buffered_source_tokens_delta: int
+    source_token_utilization: float
+    target_supervision_utilization: float
+    source_transition_coverage: float
+    correctness_status: str
+    correctness_batches: int
+    pretokenization_seconds: float
+
+    @property
+    def destructive_cropped_tokens(self):
+        return self.destructively_cropped_tokens
+
+
+@dataclass
+class LoaderSpec:
+    implementation: str
+    implementation_id: str
+    packing_policy: str
+    comparison_group: str
+    provenance: str
+    factory: Callable[[], Iterator]
+
+
+class BenchmarkTokenizer:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    @property
+    def vocab_size(self):
+        return int(self.tokenizer.vocab_size)
+
+    def get_bos_token_id(self):
+        return int(self.tokenizer.get_bos_token_id())
+
+    def encode_one(self, text):
+        return list(self.tokenizer.encode(text, prepend_bos=True))
+
+    def encode(self, texts, prepend=None, num_threads=1, **_):
         try:
-            from gpt_lab.data.loader import ...   # adjust import path as needed
+            rows = self.tokenizer.encode(list(texts), num_threads=num_threads)
+        except TypeError:
+            rows = [self.tokenizer.encode(text) for text in texts]
+        return [([prepend] if prepend is not None else []) + list(row) for row in rows]
+
+
+class CorpusDocuments:
+    split, start_state = "train", None
+
+    def __init__(self, raw, tokens, tokenizer, on_the_fly):
+        self.raw, self.tokens = raw, tokens
+        self.tokenizer, self.on_the_fly = tokenizer, on_the_fly
+
+    def __iter__(self):
+        for index in cycle(range(len(self.raw))):
+            row = self.tokenizer.encode_one(self.raw[index]) if self.on_the_fly else self.tokens[index]
+            yield torch.tensor(row, dtype=torch.long), None
+
+
+class TransferIterator:
+    def __init__(self, iterator, device):
+        self.iterator, self.device = iter(iterator), torch.device(device)
+        self.use_cuda = torch.device(device).type == "cuda"
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        inputs, targets, stats = next(self.iterator)
+        if self.use_cuda:
+            inputs, targets = inputs.pin_memory(), targets.pin_memory()
+        return (
+            inputs.to(self.device, non_blocking=self.use_cuda),
+            targets.to(self.device, non_blocking=self.use_cuda),
+            stats,
+        )
+
+
+class StatsAdapter:
+    """Expose per-batch deltas from production aggregate PackingStats."""
+
+    FIELDS = (
+        "source_tokens_read", "new_source_tokens_advanced",
+        "destructive_cropped_tokens", "skipped_adjacent_transitions",
+        "synthetic_bos_tokens_inserted", "intentional_bos_boundaries",
+    )
+
+    def __init__(self, iterator, stats):
+        self.iterator, self.stats = iter(iterator), stats
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        before = {field: getattr(self.stats, field) for field in self.FIELDS}
+        buffered_before = self.stats.buffered_source_tokens
+        inputs, targets, _ = next(self.iterator)
+        values = {field: getattr(self.stats, field) - before[field] for field in self.FIELDS}
+        values["buffered_source_tokens_delta"] = self.stats.buffered_source_tokens - buffered_before
+        values["actual_buffered_tokens"] = self.stats.buffered_source_tokens
+        values["actual_buffered_documents"] = None
+        return inputs, targets, values
+
+
+def nanochat_flat_stream(documents, batch_size, seq_len, device):
+    documents, token_buffer = iter(documents), []
+    device, use_cuda = torch.device(device), torch.device(device).type == "cuda"
+    advance = batch_size * seq_len
+    while True:
+        buffered_before, source_read = len(token_buffer), 0
+        while len(token_buffer) < advance + 1:
+            document = list(next(documents))
+            token_buffer.extend(document)
+            source_read += len(document)
+        values = token_buffer[:advance + 1]
+        token_buffer = token_buffer[advance:]
+        scratch = torch.tensor(values, dtype=torch.long, pin_memory=use_cuda)
+        stats = {
+            "source_tokens_read": source_read,
+            "new_source_tokens_advanced": advance,
+            "destructive_cropped_tokens": 0,
+            "skipped_adjacent_transitions": 0,
+            "synthetic_bos_tokens_inserted": 0,
+            "intentional_bos_boundaries": 0,
+            "buffered_source_tokens_delta": len(token_buffer) - buffered_before,
+            "actual_buffered_tokens": len(token_buffer),
+            "actual_buffered_documents": None,
+        }
+        yield (
+            scratch[:-1].view(batch_size, seq_len).to(device, non_blocking=use_cuda),
+            scratch[1:].view(batch_size, seq_len).to(device, non_blocking=use_cuda),
+            stats,
+        )
+
+
+def percentile(values, fraction):
+    values = sorted(values)
+    index = (len(values) - 1) * fraction
+    low, high = math.floor(index), math.ceil(index)
+    return values[low] if low == high else values[low] + (values[high] - values[low]) * (index - low)
+
+
+def read_documents(path, column, limit):
+    documents = []
+    for shard in sorted(path.glob("*.parquet")):
+        parquet = pq.ParquetFile(shard)
+        if column not in parquet.schema_arrow.names:
+            raise ValueError(f"{column!r} is missing from {shard}")
+        for row_group in range(parquet.num_row_groups):
+            documents.extend(parquet.read_row_group(row_group, columns=[column]).column(0).to_pylist())
+            if len(documents) >= limit:
+                return documents[:limit]
+    if not documents or not all(isinstance(value, str) for value in documents):
+        raise ValueError("The selected corpus must contain text documents")
+    return documents
+
+
+def find_dataset(path):
+    path = path.expanduser().resolve()
+    if any(path.glob("*.parquet")):
+        return path
+    candidates = sorted({item.parent for item in path.rglob("*.parquet")}) if path.exists() else []
+    if len(candidates) != 1:
+        raise ValueError(f"Expected one Parquet dataset under {path}; found {len(candidates)}")
+    return candidates[0]
+
+
+def token_rows(raw, tokens, tokenizer, on_the_fly):
+    for index in cycle(range(len(raw))):
+        yield tokenizer.encode_one(raw[index]) if on_the_fly else list(tokens[index])
+
+
+def build_specs(raw, tokens, tokenizer, on_the_fly, raw_path, token_path, policy, selected, args):
+    group, specs = (STREAM_GROUP if policy == STREAM else BEST_FIT_GROUP), []
+    rows = lambda: token_rows(raw, tokens, tokenizer, on_the_fly)
+    if policy == STREAM and "gpt_lab_stream" in selected:
+        def gpt_lab():
+            stats = PackingStats()
+            loader = DistDataLoader(
+                CorpusDocuments(raw, tokens, tokenizer, on_the_fly),
+                args.batch_size, args.seq_len, device=args.device,
+                packing_strategy="stream", bos_token_id=tokenizer.get_bos_token_id(),
+                packing_stats=stats,
+            )
+            return StatsAdapter(loader, stats)
+        specs.append(LoaderSpec("GPT-Lab DistDataLoader", "gpt_lab_stream", policy, group, "gpt_lab.data.loader.DistDataLoader", gpt_lab))
+    if "custom_pytorch" in selected:
+        def custom():
+            dataset = TorchPackedDataset(None, None, args.batch_size, args.seq_len, True, "stream" if policy == STREAM else "bestfit", args.best_fit_buffer_docs)
+            iterator = dataset._stream(rows()) if policy == STREAM else dataset._bestfit(rows())
+            return TransferIterator(iterator, args.device)
+        specs.append(LoaderSpec("Custom PyTorch packer", "custom_pytorch", policy, group, "benchmark-local implementation; not PyTorch generally", custom))
+    nano_id = "nanochat_stream" if policy == STREAM else "nanochat_best_fit"
+    if nano_id in selected:
+        if policy == STREAM:
+            factory = lambda: nanochat_flat_stream(rows(), args.batch_size, args.seq_len, args.device)
+            name = "nanochat flat stream (adapted)"
+        else:
+            def factory():
+                stats = PackingStats()
+                path = raw_path if on_the_fly else token_path
+                active_tokenizer = tokenizer if on_the_fly else IdentityTokenizer(tokenizer.get_bos_token_id(), tokenizer.vocab_size)
+                loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+                    active_tokenizer, B=args.batch_size, T=args.seq_len, split="train",
+                    tokenizer_threads=1, tokenizer_batch_size=1, device=args.device,
+                    buffer_size=args.best_fit_buffer_docs, base_path=path, packing_stats=stats,
+                )
+                return StatsAdapter(loader, stats)
+            name = "nanochat BOS best-fit (adapted)"
+        specs.append(LoaderSpec(name, nano_id, policy, group, "vendored/adapted from nanochat 3c3a3d7; no upstream runtime import", factory))
+    return specs
+
+
+def correctness_gate(specs, documents, bos, args):
+    reference_dataset = TorchPackedDataset(None, None, args.batch_size, args.seq_len, True, "stream" if specs[0].packing_policy == STREAM else "bestfit", args.best_fit_buffer_docs)
+    reference = reference_dataset._stream(cycle(documents)) if specs[0].packing_policy == STREAM else reference_dataset._bestfit(cycle(documents))
+    expected = [(x.clone(), y.clone(), stats) for x, y, stats in (next(reference) for _ in range(args.correctness_batches))]
+    alignments = {}
+    for spec in specs:
+        loader, previous, bos_rows, total_rows = spec.factory(), None, 0, 0
+        for batch_index, (expected_inputs, expected_targets, expected_stats) in enumerate(expected):
+            inputs, targets, stats = next(loader)
+            _sync(args.device)
+            inputs, targets = inputs.detach().cpu().clone(), targets.detach().cpu().clone()
+            label = f"{spec.implementation} correctness batch {batch_index}"
+            if inputs.shape != (args.batch_size, args.seq_len) or targets.shape != inputs.shape:
+                raise RuntimeError(f"{label}: invalid shapes")
+            if not torch.equal(inputs, expected_inputs) or not torch.equal(targets, expected_targets):
+                raise RuntimeError(f"{label}: differs from independent {spec.packing_policy} reference")
+            if spec.packing_policy == STREAM:
+                if not torch.equal(inputs.flatten()[1:], targets.flatten()[:-1]):
+                    raise RuntimeError(f"{label}: invalid flat shift")
+                if previous is not None and inputs.flatten()[0] != previous.flatten()[-1]:
+                    raise RuntimeError(f"{label}: invalid one-token carry")
+                if stats["destructive_cropped_tokens"]:
+                    raise RuntimeError(f"{label}: stream destructively cropped tokens")
+                if stats["skipped_adjacent_transitions"]:
+                    raise RuntimeError(f"{label}: stream skipped adjacent transitions")
+            else:
+                if not torch.equal(inputs[:, 1:], targets[:, :-1]) or not bool(torch.all(inputs[:, 0] == bos)):
+                    raise RuntimeError(f"{label}: invalid BOS alignment or row shift")
+                if stats["destructive_cropped_tokens"] != expected_stats["destructive_cropped_tokens"]:
+                    raise RuntimeError(f"{label}: crop accounting differs from reference")
+            try:
+                check_accounting(
+                    source_tokens_read=stats["source_tokens_read"],
+                    new_source_tokens_advanced=stats["new_source_tokens_advanced"],
+                    buffered_source_tokens_delta=stats["buffered_source_tokens_delta"],
+                    target_positions_emitted=args.batch_size * args.seq_len,
+                    skipped_adjacent_transitions=stats["skipped_adjacent_transitions"],
+                    synthetic_bos_tokens_inserted=stats["synthetic_bos_tokens_inserted"],
+                )
+            except AssertionError as error:
+                raise RuntimeError(f"{label}: aggregate accounting failed") from error
+            bos_rows += int((inputs[:, 0] == bos).sum()); total_rows += inputs.shape[0]
+            previous = targets
+        alignments[spec.implementation_id] = bos_rows / total_rows
+    return alignments
+
+
+def benchmark_trial(spec, args):
+    _sync(args.device)
+    host_baseline, accelerator_baseline = memory_snapshot(args.device)
+    if args.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(args.device)
+    host_peak, accelerator_peak = host_baseline, accelerator_baseline
+
+    def sample_memory():
+        nonlocal host_peak, accelerator_peak
+        host, accelerator = memory_snapshot(args.device)
+        host_peak = max(host_peak, host)
+        if accelerator is not None:
+            accelerator_peak = max(accelerator_peak or 0, accelerator)
+
+    loader = spec.factory()
+    sample_memory()
+    for _ in range(args.warmup_batches):
+        next(loader)
+        _sync(args.device)
+        sample_memory()
+    _sync(args.device)
+    latencies, stats = [], []
+    for _ in range(args.batches):
+        _sync(args.device); started = time.perf_counter()
+        inputs, targets, batch_stats = next(loader)
+        _sync(args.device); latencies.append((time.perf_counter() - started) * 1000)
+        sample_memory()
+        stats.append(batch_stats)
+    del inputs, targets
+    if args.device.type == "cuda":
+        accelerator_peak = max(accelerator_peak or 0, torch.cuda.max_memory_allocated(args.device))
+    tokens = args.batches * args.batch_size * args.seq_len
+    for batch_stats in stats:
+        check_accounting(
+            source_tokens_read=batch_stats["source_tokens_read"],
+            new_source_tokens_advanced=batch_stats["new_source_tokens_advanced"],
+            buffered_source_tokens_delta=batch_stats["buffered_source_tokens_delta"],
+            target_positions_emitted=args.batch_size * args.seq_len,
+            skipped_adjacent_transitions=batch_stats["skipped_adjacent_transitions"],
+            synthetic_bos_tokens_inserted=batch_stats["synthetic_bos_tokens_inserted"],
+        )
+    memory = {
+        "host_rss_peak_mib": host_peak / MIB,
+        "host_rss_peak_delta_mib": max(0, host_peak - host_baseline) / MIB,
+        "accelerator_peak_allocated_mib": None if accelerator_peak is None else accelerator_peak / MIB,
+        "accelerator_peak_delta_mib": None if accelerator_peak is None else max(0, accelerator_peak - (accelerator_baseline or 0)) / MIB,
+    }
+    return tokens / (sum(latencies) / 1000), latencies, stats, memory
+
+
+def aggregate(spec, trials, alignment, mode, tokenizer_name, pretokenization_seconds, args):
+    throughputs = [trial[0] for trial in trials]
+    latencies = [latency for _, values, _, _ in trials for latency in values]
+    stats = [value for _, _, values, _ in trials for value in values]
+    memories = [memory for _, _, _, memory in trials]
+    token_samples = [row["actual_buffered_tokens"] for row in stats if row.get("actual_buffered_tokens") is not None]
+    document_samples = [row["actual_buffered_documents"] for row in stats if row.get("actual_buffered_documents") is not None]
+    cropped = sum(row["destructive_cropped_tokens"] for row in stats)
+    advanced = sum(row["new_source_tokens_advanced"] for row in stats)
+    source_read = sum(row["source_tokens_read"] for row in stats)
+    target_positions = len(stats) * args.batch_size * args.seq_len
+    skipped = sum(row["skipped_adjacent_transitions"] for row in stats)
+    synthetic = sum(row["synthetic_bos_tokens_inserted"] for row in stats)
+    intentional = sum(row["intentional_bos_boundaries"] for row in stats)
+    buffered_delta = sum(row["buffered_source_tokens_delta"] for row in stats)
+    represented = advanced - skipped
+    check_accounting(
+        source_tokens_read=source_read,
+        new_source_tokens_advanced=advanced,
+        buffered_source_tokens_delta=buffered_delta,
+        target_positions_emitted=target_positions,
+        skipped_adjacent_transitions=skipped,
+        synthetic_bos_tokens_inserted=synthetic,
+    )
+    return ComparisonResult(
+        spec.comparison_group, spec.implementation, spec.implementation_id,
+        spec.packing_policy, spec.provenance, mode, tokenizer_name, str(args.device),
+        "pinned CPU + non-blocking CUDA copy; regular copy otherwise",
+        args.batch_size, args.seq_len, args.trials, args.batches, args.trials * args.batches,
+        statistics.median(throughputs), percentile(throughputs, .5), percentile(throughputs, .95),
+        statistics.mean(throughputs), statistics.stdev(throughputs) if len(throughputs) > 1 else 0.0,
+        statistics.median(latencies), percentile(latencies, .5), percentile(latencies, .95),
+        statistics.mean(latencies), statistics.stdev(latencies) if len(latencies) > 1 else 0.0,
+        max(row["host_rss_peak_mib"] for row in memories),
+        max(row["host_rss_peak_delta_mib"] for row in memories),
+        max((row["accelerator_peak_allocated_mib"] for row in memories if row["accelerator_peak_allocated_mib"] is not None), default=None),
+        max((row["accelerator_peak_delta_mib"] for row in memories if row["accelerator_peak_delta_mib"] is not None), default=None),
+        "none" if spec.packing_policy == STREAM else "discard selected document remainder",
+        cropped, cropped / max(advanced, 1), alignment,
+        args.batch_size * args.seq_len + 1 if spec.packing_policy == STREAM else None,
+        args.best_fit_buffer_docs if spec.packing_policy == BEST_FIT else None,
+        statistics.mean(token_samples) if token_samples else None,
+        min(token_samples) if token_samples else None, max(token_samples) if token_samples else None,
+        statistics.mean(document_samples) if document_samples else None,
+        source_read, advanced, target_positions,
+        skipped, synthetic, intentional, buffered_delta,
+        (advanced - cropped) / max(advanced, 1),
+        represented / max(target_positions, 1), represented / max(advanced, 1),
+        "passed", args.correctness_batches, pretokenization_seconds,
+    )
+
+
+def write_outputs(results, metadata, output, plots, html_report):
+    rows = [asdict(result) for result in results]
+    (output / "results.json").write_text(json.dumps({"metadata": metadata, "results": rows}, indent=2))
+    with (output / "results.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    images = []
+    if plots:
+        try:
+            import matplotlib.pyplot as plt
+            for policy in (STREAM, BEST_FIT):
+                selected = [row for row in results if row.packing_policy == policy]
+                if not selected: continue
+                labels = [f"{row.implementation}\n{row.tokenization}" for row in selected]
+                figure, axes = plt.subplots(1, 5, figsize=(max(22, len(selected) * 3), 5))
+                axes[0].bar(labels, [row.throughput_median_tokens_s for row in selected])
+                axes[1].bar(labels, [row.latency_p50_ms for row in selected], yerr=[row.latency_p95_ms - row.latency_p50_ms for row in selected], capsize=4)
+                axes[0].set_ylabel("tokens/s (trial median)"); axes[1].set_ylabel("latency p50, whisker to p95 (ms)")
+                x, width = list(range(len(selected))), 0.25
+                for offset, field_name, label in (
+                    (-1, "source_token_utilization", "source preserved"),
+                    (0, "source_transition_coverage", "source transitions covered"),
+                    (1, "target_supervision_utilization", "targets supervising source"),
+                ):
+                    axes[2].bar(
+                        [value + offset * width for value in x],
+                        [getattr(row, field_name) for row in selected],
+                        width,
+                        label=label,
+                    )
+                axes[2].set_xticks(x, labels); axes[2].set_ylim(0, 1.05)
+                axes[2].set_ylabel("utilization fraction"); axes[2].legend(fontsize=8)
+                axes[3].bar(labels, [row.destructive_crop_rate for row in selected])
+                axes[3].set_ylim(0, 1.05)
+                axes[3].set_ylabel("destructive crop rate")
+                memory_width = 0.35
+                axes[4].bar(
+                    [value - memory_width / 2 for value in x],
+                    [row.host_rss_peak_delta_mib for row in selected],
+                    memory_width,
+                    label="host RSS",
+                )
+                if any(row.accelerator_peak_delta_mib is not None for row in selected):
+                    axes[4].bar(
+                        [value + memory_width / 2 for value in x],
+                        [row.accelerator_peak_delta_mib or 0 for row in selected],
+                        memory_width,
+                        label="accelerator",
+                    )
+                axes[4].set_xticks(x, labels)
+                axes[4].set_ylabel("peak above baseline (MiB)")
+                axes[4].legend(fontsize=8)
+                for axis in axes: axis.tick_params(axis="x", labelrotation=20); axis.grid(axis="y", alpha=.25)
+                figure.suptitle(f"Matched policy: {policy}"); figure.tight_layout()
+                path = output / f"{policy}.png"; figure.savefig(path, dpi=150); plt.close(figure); images.append(path)
         except ImportError:
-            sys.exit("Could not import PretokenizedDataset. "
-                     "Make sure dataloader.py is on sys.path.")
-        dataset = PretokenizedDataset(args.bin, args.idx)
-        print(f"Loaded dataset: {len(dataset):,} docs\n")
+            print("matplotlib unavailable; skipping plots", file=sys.stderr)
+    if html_report:
+        columns = [
+            "comparison_group", "packing_policy", "implementation", "tokenization",
+            "throughput_median_tokens_s", "latency_p50_ms", "latency_p95_ms",
+            "host_rss_peak_mib", "host_rss_peak_delta_mib",
+            "accelerator_peak_allocated_mib", "accelerator_peak_delta_mib",
+            "source_tokens_read", "new_source_tokens_advanced", "target_positions_emitted",
+            "destructively_cropped_tokens", "skipped_adjacent_transitions",
+            "synthetic_bos_tokens_inserted", "intentional_bos_boundaries",
+            "source_token_utilization",
+            "target_supervision_utilization", "source_transition_coverage",
+            "destructive_crop_rate", "bos_row_alignment", "actual_buffered_tokens_mean",
+        ]
+        heading = "".join(f"<th>{column}</th>" for column in columns)
+        body = "".join("<tr>" + "".join(f"<td>{html.escape(str(asdict(row)[column]))}</td>" for column in columns) + "</tr>" for row in results)
+        pictures = "".join(f'<img src="{path.name}" alt="{path.stem}">' for path in images)
+        (output / "report.html").write_text(f"<h1>Policy-matched dataloaders</h1><pre>{html.escape(json.dumps(metadata, indent=2))}</pre><table><tr>{heading}</tr>{body}</table>{pictures}")
 
-    results = []
 
-    if args.loader in ("glab", "both"):
-        print("Running DataLoader with tokenized data…")
-        t0 = time.perf_counter()
-        glab_loader = build_dataloader(
-            dataset, batch_size=args.batch_size, seq_len=args.seq_len,
-            buffer_size=args.buffer_size, device=args.device,
+def parse_args():
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--dataset-path", type=Path, default=DATA_DIR); parser.add_argument("--column", default="text")
+    parser.add_argument("--output-dir", type=Path, default=Path("benchmark-results") / datetime.now().strftime("dataloaders-%Y%m%d-%H%M%S"))
+    parser.add_argument("--tokenizers", default="gpt2"); parser.add_argument("--tokenization", choices=("on-the-fly", "pretokenized", "both"), default="both")
+    parser.add_argument("--groups", default=f"{STREAM_GROUP},{BEST_FIT_GROUP}")
+    parser.add_argument("--implementations", default="gpt_lab_stream,custom_pytorch,nanochat_stream,nanochat_best_fit")
+    parser.add_argument("--device", type=torch.device, default=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    parser.add_argument("--batch-size", type=int, default=4); parser.add_argument("--seq-len", type=int, default=128)
+    parser.add_argument("--batches", type=int, default=300); parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--warmup-batches", type=int, default=20); parser.add_argument("--correctness-batches", type=int, default=3)
+    parser.add_argument("--max-docs", type=int, default=4096); parser.add_argument("--row-group-size", type=int, default=256)
+    parser.add_argument("--best-fit-buffer-docs", type=int, default=1000)
+    parser.add_argument("--no-plots", action="store_true"); parser.add_argument("--html", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--quick", action="store_true")
+    args = parser.parse_args()
+    if args.quick:
+        args.max_docs, args.batches, args.trials, args.warmup_batches = min(args.max_docs, 256), 10, 2, 3
+        args.best_fit_buffer_docs = min(args.best_fit_buffer_docs, 64)
+    args.output_dir = args.output_dir.expanduser().resolve()
+    if args.device.type == "cuda" and not torch.cuda.is_available(): parser.error("CUDA unavailable")
+    if args.device.type == "mps" and not torch.backends.mps.is_available(): parser.error("MPS unavailable")
+    if min(args.batches, args.trials, args.warmup_batches, args.correctness_batches) < 1: parser.error("timing counts must be positive")
+    return args
+
+
+def load_tokenizer(name):
+    try:
+        return Tokenizer.from_pretrained(name)
+    except UnboundLocalError:
+        return Tokenizer.from_config(TokenizerConfig(name=name, source="tiktoken"))
+
+
+def main() -> None:
+    args = parse_args(); args.output_dir.mkdir(parents=True, exist_ok=True)
+    dataset = find_dataset(args.dataset_path); raw = read_documents(dataset, args.column, args.max_docs)
+    selected, groups = set(filter(None, args.implementations.split(","))), set(filter(None, args.groups.split(",")))
+    known = {"gpt_lab_stream", "custom_pytorch", "nanochat_stream", "nanochat_best_fit"}
+    if selected - known: raise ValueError(f"Unknown implementations: {sorted(selected - known)}")
+    if groups - {STREAM_GROUP, BEST_FIT_GROUP}: raise ValueError(f"Unknown groups: {sorted(groups)}")
+    modes = ("on-the-fly", "pretokenized") if args.tokenization == "both" else (args.tokenization,)
+    results, execution_orders, pretokenization = [], [], {}
+    for tokenizer_name in filter(None, args.tokenizers.split(",")):
+        tokenizer = BenchmarkTokenizer(load_tokenizer(tokenizer_name)); bos = tokenizer.get_bos_token_id()
+        started = time.perf_counter(); tokens = tokenizer.encode(raw, prepend=bos); elapsed = time.perf_counter() - started
+        pretokenization[tokenizer_name] = {"seconds": elapsed, "documents": len(raw), "tokens": sum(map(len, tokens))}
+        corpus = args.output_dir / "corpus" / tokenizer_name.replace("/", "_")
+        raw_path, token_path = corpus / "raw", corpus / "pretokenized"
+        write_split(raw_path, raw, args.row_group_size); write_split(token_path, tokens, args.row_group_size)
+        for mode in modes:
+            for policy, group in ((STREAM, STREAM_GROUP), (BEST_FIT, BEST_FIT_GROUP)):
+                if group not in groups: continue
+                specs = build_specs(raw, tokens, tokenizer, mode == "on-the-fly", raw_path, token_path, policy, selected, args)
+                if len(specs) < 2: continue
+                print(f"Correctness gate: {group} / {mode} / {tokenizer_name}")
+                alignments = correctness_gate(specs, tokens, bos, args)
+                trials = {spec.implementation_id: [] for spec in specs}
+                for trial in range(args.trials):
+                    offset = trial % len(specs); order = [*specs[offset:], *specs[:offset]]
+                    execution_orders.append({"tokenizer": tokenizer_name, "tokenization": mode, "packing_policy": policy, "trial": trial, "order": [spec.implementation_id for spec in order]})
+                    for spec in order:
+                        print(f"Trial {trial + 1}/{args.trials}: {spec.implementation} / {policy} / {mode}")
+                        trials[spec.implementation_id].append(benchmark_trial(spec, args))
+                results.extend(aggregate(spec, trials[spec.implementation_id], alignments[spec.implementation_id], mode, tokenizer_name, elapsed, args) for spec in specs)
+    if not results: raise RuntimeError("No selected matched group contains at least two implementations")
+    metadata = {
+        "created_at": datetime.now().astimezone().isoformat(), "command": sys.argv,
+        "python": sys.version, "platform": platform.platform(), "torch": torch.__version__, "device": str(args.device),
+        "corpus": {"path": str(dataset), "documents": len(raw), "order": "sorted shards/row groups/rows, repeated exactly"},
+        "config": {"batch_size": args.batch_size, "sequence_length": args.seq_len, "trials": args.trials, "batches_per_trial": args.batches, "warmup_batches": args.warmup_batches, "correctness_batches": args.correctness_batches, "best_fit_buffer_documents": args.best_fit_buffer_docs, "tokenization": args.tokenization, "tokenizers": args.tokenizers},
+        "pretokenization": pretokenization,
+        "matched_groups": {STREAM_GROUP: ["GPT-Lab", "Custom PyTorch", "nanochat adapted"], BEST_FIT_GROUP: ["Custom PyTorch", "nanochat adapted"]},
+        "gpt_lab_best_fit": "Unavailable: GPT-Lab bos_aligned retains suffixes and is not destructive best-fit, so it is excluded.",
+        "invalid_previous_comparisons": ["stream versus destructive BOS-best-fit", "B*(T+1) row stream versus flat B*T+1 carry stream", "loader timing obscured by model execution"],
+        "timing": {"scope": "loader-only next() and device transfer", "excluded": ["construction", "correctness", "warmup", "pretokenization", "model execution"], "accelerator_sync": "before/after each measured batch", "rotated_orders": execution_orders},
+        "memory": {
+            "scope": "loader construction, warmup, and measured batches",
+            "host": "process RSS sampled before construction and after construction/warmup/batches",
+            "accelerator": "CUDA allocator peak; live allocation samples on MPS; unavailable on CPU",
+            "aggregation": "maximum peak and peak-above-baseline across trials",
+        },
+        "metric_definitions": {
+            "source_tokens_read": "Tokenized source tokens entering the packer during measured batches, including original document BOS tokens; excludes warmup and synthetic BOS.",
+            "new_source_tokens_advanced": "Unique source-stream tokens permanently advanced during measured batches, including discarded tokens and excluding a retained carry token.",
+            "target_positions_emitted": "Language-model target tensor positions produced; exactly trials * batches * B * T.",
+            "host_rss_peak_mib": "Maximum process resident memory observed during a trial, in MiB.",
+            "host_rss_peak_delta_mib": "Maximum process RSS above the pre-construction trial baseline, in MiB.",
+            "accelerator_peak_allocated_mib": "Maximum live tensor memory allocated on the selected accelerator, in MiB; null on CPU.",
+            "accelerator_peak_delta_mib": "Maximum accelerator allocation above the pre-construction trial baseline, in MiB; null on CPU.",
+            "destructively_cropped_tokens": (
+                "Original tokenized source tokens permanently discarded by the packing algorithm "
+                "and never emitted or retained for a future batch. Excludes the shifted-batch carry, "
+                "synthetic BOS, temporarily buffered tails, and separately reported skipped "
+                "adjacent transitions."
+            ),
+            "skipped_adjacent_transitions": "Adjacent source-token pairs not emitted as (input, target), including crop loss and intentional row segmentation at BOS.",
+            "synthetic_bos_tokens_inserted": "Continuation BOS tokens absent from the source; never counted as source read or advanced.",
+            "intentional_bos_boundaries": "Subset of skipped transitions deliberately segmented because a row starts at an original source BOS.",
+            "buffered_source_tokens_delta": "Final minus initial buffered source tokens over measured batches, including retained carry tokens.",
+            "bos_row_alignment": "Fraction of rows whose first input token is BOS.",
+            "source_token_utilization": "(advanced - destructively cropped) / advanced; source preservation.",
+            "target_supervision_utilization": "Represented adjacent source transitions / emitted target positions; excludes synthetic supervision.",
+            "source_transition_coverage": "Represented adjacent source transitions / advanced source tokens.",
+            "destructive_crop_rate": "Destructively cropped source tokens / advanced source tokens.",
+        },
+        "accounting_invariants": {
+            "source_balance": "source_tokens_read = new_source_tokens_advanced + buffered_source_tokens_delta",
+            "supervision_balance": "target_positions_emitted = new_source_tokens_advanced - skipped_adjacent_transitions + synthetic_bos_tokens_inserted",
+            "target_capacity": "target_positions_emitted = trials * batches * B * T",
+            "fifo": "Flat B*T+1 stream retains one carry and has zero destructive crop and zero skipped adjacent transitions.",
+        },
+        "instrumentation": "Packing paths emit aggregate integer deltas only. Exact discarded suffix provenance is enabled only by debug tests and is outside throughput timing.",
+        "interpretation": "Implementation-level, policy-matched results; not a global framework ranking.",
+    }
+    write_outputs(results, metadata, args.output_dir, not args.no_plots, args.html)
+    for result in results:
+        print(
+            f"{result.packing_policy:24} {result.implementation:34} {result.tokenization:12} "
+            f"{result.throughput_median_tokens_s:12,.0f} tok/s  "
+            f"source={result.source_token_utilization:.2%} "
+            f"coverage={result.source_transition_coverage:.2%} "
+            f"supervision={result.target_supervision_utilization:.2%} "
+            f"crop={result.destructive_crop_rate:.2%} "
+            f"skips={result.skipped_adjacent_transitions:,} "
+            f"synth_BOS={result.synthetic_bos_tokens_inserted:,} "
+            f"BOS_rows={result.bos_row_alignment:.2%} "
+            f"host_peak={result.host_rss_peak_mib:.1f}MiB "
+            f"host_delta={result.host_rss_peak_delta_mib:.1f}MiB "
+            f"accelerator_delta={'n/a' if result.accelerator_peak_delta_mib is None else f'{result.accelerator_peak_delta_mib:.1f}MiB'}"
         )
-        init_time = time.perf_counter() - t0
-        print(f"  initialization time: {init_time:.2f}s")
-        r = benchmark_loader("DataLoader (O log N) - tokenized data", glab_loader, args.batch_size, args.seq_len,
-                             args.num_batches, args.buffer_size, args.bos_id, args.device)
-        r["initialization_time_s"] = init_time
-        results.append(r)
-        print("  done.\n")
-    
-    if args.loader in ("glab", "both") :
-        print("Running DataLoader with data tokenization on-flight…")
-        t0 = time.perf_counter()
-        tokenizer = Tokenizer.from_pretrained("gpt2")  # or your custom tokenizer
-        glab_loader = build_dataloader(
-            dataset, batch_size=args.batch_size, seq_len=args.seq_len,
-            buffer_size=args.buffer_size, device=args.device, tokenizer=tokenizer
-        )
-        r = benchmark_loader("DataLoader (O log N) - tokenization on-flight", glab_loader, args.batch_size, args.seq_len,
-                             args.num_batches, args.buffer_size, args.bos_id, args.device)
-        init_time = time.perf_counter() - t0
-        r["initialization_time_s"] = init_time
-        results.append(r)
-        print("  done.\n")
-
-    if args.loader in ("nanochat", "both"):
-        print("Running nanochat BOS best-fit …")
-        r = benchmark_loader("nanochat BOS best-fit (O N)", dataset, args.batch_size, args.seq_len,
-                               args.num_batches, args.buffer_size,
-                               args.bos_id, args.device)
-        results.append(r)
-        print("  done.\n")
-
-    print_results(results)
-
-    if len(results) == 2:
-        ratio = results[0]["mean_latency_ms"] / results[1]["mean_latency_ms"]
-        faster = results[0]["name"] if ratio < 1 else results[1]["name"]
-        slower = results[1]["name"] if ratio < 1 else results[0]["name"]
-        print(f"  {faster} is {abs(1 - ratio):.1%} {'faster' if ratio < 1 else 'slower'} "
-              f"than {slower} on average.\n")
+    print(f"Artifacts: {args.output_dir}")
 
 
 if __name__ == "__main__":
