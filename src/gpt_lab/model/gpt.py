@@ -404,8 +404,15 @@ class DenseTransformer(BaseTransformer):
 
         logits = logits[..., :self.config.vocab_size] 
 
-        logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
+
+        # Keep the full training/evaluation logits in the autocast dtype. A
+        # float32 copy of (batch, sequence, vocabulary) can consume several
+        # additional GiB for large vocabularies. Generation only materializes
+        # the final-token logits, so retaining its historical float32 output is
+        # inexpensive and convenient for sampling.
+        if labels is None:
+            logits = logits.float()
         
         # logits = torch.clamp(logits, min=-softcap, max=softcap)
         temperature = 1.0 # TODO: add temperature support to forward method and generation method

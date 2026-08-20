@@ -1,6 +1,7 @@
 from gpt_lab.utils.logging import log0
 import torch
 import torch.distributed as dist
+from torch import nn
 import os, warnings
 from functools import lru_cache
 
@@ -157,6 +158,18 @@ def init_dist_groups(device_type: str | None = None, random_seed: int = 42):
     dist_info = get_dist_info(device_type=device_type, base_dist_info=(is_requested, world_size, rank, local_rank, tp_size))
 
     return dist_info
+
+def broadcast_model(model: nn.Module, dist_info: dict) -> None:
+    if not dist_info["IS_DDP_INITIALIZED"]:
+        return
+
+    with torch.no_grad():
+        for param in model.parameters():
+            dist.broadcast(param, src=0)
+
+    # TODO
+    # torch.manual_seed(random_seed + rank)
+    # torch.cuda.manual_seed(random_seed + rank)
 
 def cleanup_dist_groups():
     if is_ddp_initialized():

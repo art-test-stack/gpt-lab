@@ -1,8 +1,11 @@
+import json
 import os
+import tempfile
 import warnings
+import errno
 from pathlib import Path
 from typing import Union, List, Optional, Tuple, Iterator, Dict
-import time, json
+import time
  
 import pyarrow.parquet as pq
 from requests import Session
@@ -87,10 +90,14 @@ class ShardManager:
         self.world_size = dist_info.get("WORLD_SIZE", 1)
 
         self._session = None
-        if self.base_url == "":
-            self.base_url = None
-        if self.base_url is not None:
+
+        if self.base_url is not None and self.base_url != "":
             self._session = self._create_session()
+
+        if self.base_url is None:
+            self.base_url = ""
+            base_url = ""
+
 
         if shard_limit is not None and max_shards is not None:
             assert shard_limit <= max_shards, f"shard_limit ({shard_limit}) must be <= max_shards ({max_shards}). Got {shard_limit=}, {max_shards=}."
@@ -110,25 +117,64 @@ class ShardManager:
 
         self.prepare_shards(warn=self.ddp_rank == 0)
 
+        expected_metadata = {
+            "name": name, 
+            "base_url": base_url,
+            "column_name": column_name,
+            "max_shards": self.max_shards,
+        }
+
         if self.ddp_rank == 0:
-            self.save_metadata({
-                "name": name,
-                "base_url": base_url,
-                "column_name": column_name,
-                "max_shards": self.max_shards,
-            })
+            if not metadata:
+                self.save_metadata(expected_metadata)
+            else:
+                mismatches = {
+                    key: (metadata.get(key), expected_value)
+                    for key, expected_value in expected_metadata.items()
+                    if metadata.get(key) != expected_value
+                }
+                if mismatches:
+                    raise ValueError(
+                        f"Dataset metadata does not match configuration: {mismatches}"
+                    )
 
     def save_metadata(self, metadata: dict):
         metadata_path = self.ds_path / "meta.json"
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f)
+        tmp_path = None
+        try:
+            # Write beside the destination so os.replace() is atomic.  A direct
+            # open(..., "w") briefly exposes an empty file to other ranks while
+            # they construct their train/validation ShardManagers.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.ds_path,
+                prefix=f".{metadata_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_path = Path(f.name)
+                json.dump(metadata, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, metadata_path)
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     def load_metadata(self) -> dict:
         metadata_path = self.ds_path / "meta.json"
         if not metadata_path.exists():
             return {}
-        with open(metadata_path, "r") as f:
-            return json.load(f)
+        payload = metadata_path.read_text(encoding="utf-8")
+        # Recover metadata files left empty by the previous non-atomic writer.
+        # Rank 0 will regenerate the file after deriving values from the shards.
+        if not payload.strip():
+            return {}
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid dataset metadata in {metadata_path}") from exc
         
     def get_shard_path(self, shard_idx: int) -> Path:
         return self.ds_path / SHARD_FILENAME_TEMPLATE.format(shard_idx)
@@ -201,14 +247,19 @@ class ShardManager:
         if shards_to_download and self.base_url is not None:
             self.download(shards_to_download, verbose=warn)
             
-        self.shard_paths = [
+        shard_paths = [
             p for p in self.list_local_shards()
             if int(p.stem.split("_")[1]) in self.shard_idx
         ]
         if self.split == "train":
-            assert len(self.shard_idx) == len(self.shard_paths), f"Expected {self.target_shard} shards but found {len(self.shard_idx)}. Got {self.shard_idx=}, {local_shard_paths=}."
+            assert len(self.shard_idx) == len(shard_paths), f"Expected {self.target_shard} shards but found {len(self.shard_idx)}. Got {self.shard_idx=}, {local_shard_paths=}."
+            self.shard_paths = [
+                p for p in shard_paths
+                if int(p.stem.split("_")[1]) % self.world_size == self.ddp_rank
+            ]
         else:
-            assert len(self.shard_paths) == 1 and self.shard_idx[0] == self.target_shard, f"Expected exactly 1 validation shard but found {len(self.shard_paths)}. Got {self.shard_paths=}."
+            assert len(shard_paths) == 1 and self.shard_idx[0] == self.target_shard, f"Expected exactly 1 validation shard but found {len(shard_paths)}. Got {shard_paths=}."
+            self.shard_paths = shard_paths
     
     def download(
         self,
@@ -245,7 +296,6 @@ class ShardManager:
                         os.remove(tmp)
                     time.sleep(2 ** attempt)
 
-
     def iterate(
         self,
         start_state: Optional[DataLoaderState] = None,
@@ -253,46 +303,133 @@ class ShardManager:
     ) -> Iterator[Tuple[List[str], DataLoaderState]]:
         is_resuming = start_state is not None
         state = start_state or DataLoaderState()
+        max_read_retries = 5
+        row_group_start = 0 if self.split == "train" else self.ddp_rank
+        row_group_stride = 1 if self.split == "train" else self.world_size
 
         while True:
             while state.shard_idx < len(self.shard_paths):
                 shard_path = self.shard_paths[state.shard_idx]
-                state.global_shard_idx = int(shard_path.stem.split("_")[1]) # for debugging - we keep track of original shard idx
+                state.global_shard_idx = int(
+                    shard_path.stem.split("_")[1]
+                )
 
                 pf = pq.ParquetFile(shard_path)
 
-                if is_resuming:
-                    base = state.row_group_idx // self.world_size
-                    state.row_group_idx = (base + 1) * self.world_size + self.ddp_rank      
-                    if state.row_group_idx >= pf.num_row_groups:
-                        state.shard_idx += 1 # go to resuming shard id
-                        state.row_group_idx = self.ddp_rank # start at the first row group for the next shard
-                        state.offset_in_row_group = 0
-                        continue
-                else:
-                    state.row_group_idx = self.ddp_rank
-
-                while state.row_group_idx < pf.num_row_groups:
-                    rg = pf.read_row_group(state.row_group_idx)
-                    batch = rg.column(self.column_name).to_pylist()
-                    for i in range(0, len(batch), batch_size):
-                        if is_resuming and i < state.offset_in_row_group:
-                            continue
-                        if is_resuming:
-                            is_resuming = False  # only do this once
-                        yield batch[i:i+batch_size], DataLoaderState(
-                            shard_idx=state.shard_idx,                            
-                            global_shard_idx=state.global_shard_idx, # for debbugging - we keep track of original shard idx
-                            row_group_idx=state.row_group_idx,
-                            offset_in_row_group=i,
-                            epoch=state.epoch,
+                try:
+                    if is_resuming:
+                        base = state.row_group_idx // row_group_stride
+                        state.row_group_idx = (
+                            (base + 1) * row_group_stride + row_group_start
                         )
-                    state.offset_in_row_group = 0
-                    state.row_group_idx += self.world_size
+
+                        if state.row_group_idx >= pf.num_row_groups:
+                            state.shard_idx += 1
+                            state.row_group_idx = row_group_start
+                            state.offset_in_row_group = 0
+                            continue
+                    else:
+                        state.row_group_idx = row_group_start
+
+                    while state.row_group_idx < pf.num_row_groups:
+                        for attempt in range(max_read_retries):
+                            try:
+                                # `pf` is set to None after a failed read.
+                                # Reopening here means open failures are retried too.
+                                if pf is None:
+                                    pf = pq.ParquetFile(shard_path)
+
+                                rg = pf.read_row_group(
+                                    state.row_group_idx,
+                                    columns=[self.column_name],
+                                )
+                                break
+
+                            except OSError as exc:
+                                is_io_error = exc.errno == errno.EIO
+
+                                if pf is not None:
+                                    try:
+                                        pf.close()
+                                    except Exception:
+                                        pass
+                                    pf = None
+
+                                if (
+                                    not is_io_error
+                                    or attempt == max_read_retries - 1
+                                ):
+                                    raise OSError(
+                                        "Failed to read Parquet row group: "
+                                        f"path={shard_path}, "
+                                        f"global_shard="
+                                        f"{state.global_shard_idx}, "
+                                        f"row_group="
+                                        f"{state.row_group_idx}, "
+                                        f"rank={self.ddp_rank}, "
+                                        f"attempt={attempt + 1}/"
+                                        f"{max_read_retries}"
+                                    ) from exc
+
+                                delay = 2**attempt
+
+                                warnings.warn(
+                                    "Transient Parquet I/O error; "
+                                    "reopening and retrying: "
+                                    f"path={shard_path}, "
+                                    f"global_shard="
+                                    f"{state.global_shard_idx}, "
+                                    f"row_group="
+                                    f"{state.row_group_idx}, "
+                                    f"rank={self.ddp_rank}, "
+                                    f"retry_in={delay}s"
+                                )
+
+                                time.sleep(delay)
+
+                        batch = rg.column(self.column_name).to_pylist()
+
+                        for i in range(0, len(batch), batch_size):
+                            if (
+                                is_resuming
+                                and i < state.offset_in_row_group
+                            ):
+                                continue
+
+                            if is_resuming:
+                                is_resuming = False
+
+                            yield (
+                                batch[i:i + batch_size],
+                                DataLoaderState(
+                                    shard_idx=state.shard_idx,
+                                    global_shard_idx=(
+                                        state.global_shard_idx
+                                    ),
+                                    row_group_idx=(
+                                        state.row_group_idx
+                                    ),
+                                    offset_in_row_group=i,
+                                    epoch=state.epoch,
+                                ),
+                            )
+
+                        state.offset_in_row_group = 0
+                        state.row_group_idx += row_group_stride
+
+                finally:
+                    # Also executes for resume `continue`, exceptions and
+                    # generator shutdown.
+                    if pf is not None:
+                        try:
+                            pf.close()
+                        except Exception:
+                            pass
+
                 state.shard_idx += 1
-                state.row_group_idx = self.ddp_rank
-    
+                state.row_group_idx = row_group_start
+
             state.shard_idx = 0
-            state.row_group_idx = self.ddp_rank
+            state.row_group_idx = row_group_start
             state.offset_in_row_group = 0
             state.epoch += 1

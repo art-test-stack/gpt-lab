@@ -42,7 +42,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 from gpt_lab.utils.common import get_banner, print0_dict
 from gpt_lab.utils.logging import init_logger, log0
 from gpt_lab.utils.default import MODELS_FOLDER
-from gpt_lab.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups
+from gpt_lab.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups, broadcast_model
 from gpt_lab.utils.system import get_git_info, get_gpu_info, get_system_info
 from gpt_lab.utils.schemas import GPTConfig, TrainerConfig
 
@@ -285,6 +285,7 @@ if __name__ == "__main__":
         model_run=meta_config.run_name,
         model_cachedir=args.model_dir,
         dist_info=dist_info,
+        mode="shard" if dist_info["IS_DDP_INITIALIZED"] else "ddp",
     )
     model = build_meta_model(meta_config.model_cfg)
     tokenizer = Tokenizer.from_config(meta_config.tokenizer_cfg)
@@ -292,6 +293,7 @@ if __name__ == "__main__":
     if args.model_init == "auto":
         model = model.to_empty(device=device)    
         model.init_weights()
+        broadcast_model(model, dist_info)
     elif is_resumed:
         log0("Resuming training from checkpoint.", logger=logger)
         model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(
@@ -349,7 +351,7 @@ if __name__ == "__main__":
             weight_decay=args.weight_decay * weight_decay_scale,
             lr_warmup_steps=args.warmup_steps,
             lr_warmdown_ratio=args.warmdown_ratio,
-            final_lr_frac=args.final_lr_frac,
+            final_lr_ratio=args.final_lr_frac,
             target_time=args.target_time,
             dist_info=dist_info,
             optim_config_path=args.optim_config_path,
@@ -409,7 +411,15 @@ if __name__ == "__main__":
         train_loader=train_loader, val_loader=val_loader,
         config=trainer_config, board=board, checkpoint_manager=ckpt_manager, 
         resume_state=ckpt_data.trainer_state if is_resumed else None,
+        best_state=ckpt_data.checkpoint_state if is_resumed else None,
     )
+    if is_resumed and ckpt_data.scaler_state is not None:
+        if trainer.scaler is None:
+            raise ValueError(
+                "Checkpoint contains GradScaler state but the resumed trainer "
+                "did not create a scaler. Check GPTLAB_DTYPE."
+            )
+        trainer.scaler.load_state_dict(ckpt_data.scaler_state)
     trainer.train()
 
     # ------------------------------------------------------------------------------

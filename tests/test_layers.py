@@ -12,6 +12,13 @@ from gpt_lab.utils.schemas import GPTConfig
 import torch
 import torch.nn.functional as F
 import time
+import sys
+from types import SimpleNamespace
+
+from gpt_lab.model.flash_attn import (
+    _sdpa_fallback,
+    flash_attn_qkvpacked_func,
+)
 
 
 @pytest.mark.fast
@@ -121,6 +128,93 @@ class TestSDPA:
         assert torch.allclose(output, ref), "Custom SDPA output does not match reference output."
 
 
+@pytest.mark.fast
+def test_flash_fallback_local_attention_is_causal_and_uses_keep_mask():
+    q = torch.zeros(1, 4, 1, 2)
+    k = torch.zeros_like(q)
+    v = torch.arange(4, dtype=torch.float32).view(1, 4, 1, 1).expand(-1, -1, -1, 2)
+    qkv = torch.stack((q, k, v), dim=2)
+
+    output = flash_attn_qkvpacked_func(
+        qkv,
+        causal=True,
+        window_size=(1, 0),
+    )
+
+    allowed = torch.tensor(
+        [
+            [True, False, False, False],
+            [True, True, False, False],
+            [False, True, True, False],
+            [False, False, True, True],
+        ]
+    )
+    expected = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=allowed,
+    ).transpose(1, 2)
+
+    assert torch.allclose(output, expected)
+
+
+@pytest.mark.fast
+def test_flash_fallback_aligns_cached_queries_to_bottom_right():
+    q = torch.zeros(1, 2, 1, 2)
+    k = torch.zeros(1, 5, 1, 2)
+    v = torch.arange(5, dtype=torch.float32).view(1, 5, 1, 1).expand(-1, -1, -1, 2)
+
+    output = _sdpa_fallback(
+        q,
+        k,
+        v,
+        causal=True,
+        window_size=(2, 0),
+    )
+
+    allowed = torch.tensor(
+        [
+            [False, True, True, True, False],
+            [False, False, True, True, True],
+        ]
+    )
+    expected = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=allowed,
+    ).transpose(1, 2)
+
+    assert torch.allclose(output, expected)
+
+
+@pytest.mark.fast
+def test_missing_flash_kernel_does_not_recurse(monkeypatch):
+    import gpt_lab.utils.import_utils as import_utils
+
+    calls = 0
+
+    def fail_get_kernel(_name):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("missing kernel")
+
+    monkeypatch.setattr(import_utils, "is_torch_cuda_available", lambda: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "kernels",
+        SimpleNamespace(get_kernel=fail_get_kernel),
+    )
+    import_utils.is_flash_attn3_available_from_kernel.cache_clear()
+    try:
+        with pytest.warns(UserWarning, match="Falling back to PyTorch SDPA"):
+            assert not import_utils.is_flash_attn3_available_from_kernel()
+        assert calls == 1
+    finally:
+        import_utils.is_flash_attn3_available_from_kernel.cache_clear()
+
+
 class TestRoPE:
     _bs = 4
     seq_len = 16
@@ -156,4 +250,3 @@ class TestRoPE:
         x = torch.randn(_bs, seq_len, n_head, d_head) 
         x_rope = apply_rope(x, rope_cache)
         assert x_rope.shape == x.shape, f"Output shape mismatch: {x_rope.shape} != {x.shape}"
-

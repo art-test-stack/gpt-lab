@@ -2,6 +2,7 @@ import pytest
 import torch
 from gpt_lab.model.wrapper import Engine
 from gpt_lab.model.utils import KVCache
+from gpt_lab.model.gpt import DenseTransformer
 
 from gpt_lab.utils.schemas import (
     GPTConfig, 
@@ -12,6 +13,32 @@ from gpt_lab.utils.schemas import (
     ModelOutput,
 )
 import tempfile, warnings
+
+
+@pytest.mark.fast
+def test_training_logits_remain_in_autocast_dtype():
+    config = TransformerConfig(
+        vocab_size=300,
+        max_context=4,
+        d_model=16,
+        d_ffn=32,
+        n_heads=2,
+        n_kv_heads=2,
+        n_layers=1,
+        d_head=8,
+        window_pattern="L",
+        attn_impl="sdpa",
+    )
+    model = DenseTransformer(config)
+    model.init_weights()
+    input_ids = torch.randint(0, config.vocab_size, (2, config.max_context))
+    labels = torch.randint(0, config.vocab_size, (2, config.max_context))
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = model(input_ids, labels)
+
+    assert output.logits.dtype == torch.bfloat16
+    assert torch.isfinite(output.loss)
 
 # TODO: use fixtures for config and model initialization
 # @pytest.fixture(scope="module")
@@ -328,4 +355,3 @@ class TestGPTModel:
             assert k_cache.shape == k_memory[layer_idx].shape, f"Key cache and Key memory do not match at layer {layer_idx}. Got {k_cache.shape} and {k_memory[layer_idx].shape}"
             assert (k_cache == k_memory[layer_idx]).all(), f"Got key cache mismatching k memory at layer {layer_idx}."
             assert (v_cache == v_memory[layer_idx]).all(), f"Got value cache mismatching v memory at layer {layer_idx}."
-
