@@ -40,7 +40,7 @@
 *\*This name is quite pompous and vague, I admit it. Any suggestions for a better one are welcomed!* 
 
 <div align="center">
-  <img src="/Users/arthurtestard/my-gpt/assets/a100x4_d12_ic1.png" width="300" alt="d12 model training on 4 A100 GPUs"/>
+  <img src="assets/a100x4_d12_ic1.svg" width="300" alt="d12 model training on 4 A100 GPUs"/>
   <figcaption>422M params model (depth 12) training loss on 4 A100 GPUs.</figcaption>
 
 </div>
