@@ -325,7 +325,7 @@ class Trainer:
 
         train_iter = iter(self.train_loader)
 
-        if dist.is_initialized():
+        if self.config.dist_info["IS_DDP_INITIALIZED"]:
             dist.barrier()
 
         x, y, dataloader_state = next(train_iter) # prefetch
