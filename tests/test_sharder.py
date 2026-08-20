@@ -66,6 +66,7 @@ def test_empty_legacy_metadata_is_regenerated(tmp_path):
 
     assert manager.load_metadata() == {}
 
+
 @pytest.mark.fast
 def test_training_workers_retrieve_disjoint_shards(tmp_path):
     dataset_name = "synthetic"
