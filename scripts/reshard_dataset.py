@@ -34,13 +34,13 @@ uv sync
 ```
 
 # Bucket mode (recommended for very large datasets)
-`uv run python -m scripts.reshard --mode bucket --repo-id ai-teststack/llm-factory-storage --streaming`
+`uv run python -m scripts.reshard_dataset --mode bucket --repo-id ai-teststack/llm-factory-storage --ds-name climbmix --output-dir climbmix-base --streaming`
 
 # Dataset repo mode
-`uv run python -m scripts.reshard --mode dataset --repo-id ai-teststack/my-dataset`
+`uv run python -m scripts.reshard_dataset --mode dataset --repo-id ai-teststack/my-dataset`
 
 # Local-only rewrite
-`uv run python -m scripts.reshard --mode local`
+`uv run python -m scripts.reshard_dataset --mode local`
 
 # Clean bucket memory:
 
@@ -56,10 +56,10 @@ import time
 import yaml
 import argparse
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from tempfile import mkdtemp
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -68,7 +68,7 @@ from datasets import load_dataset, load_dataset_builder
 from huggingface_hub import HfApi, batch_bucket_files
 
 from gpt_lab.utils.common import get_banner
-from gpt_lab.utils.default import CACHE_DIR, DATA_DIR
+from gpt_lab.utils.default import DATA_DIR
 from gpt_lab.utils.schemas import DatasetConfig
 
 logging.basicConfig(
@@ -102,18 +102,27 @@ class LocalWriter(BaseWriter):
         os.rename(shard_path, final_path)
 
 class BucketWriter(BaseWriter):
-    def __init__(self, repo_id: str, token: str, max_retries=3, retry_timeout=10):
+    def __init__(
+        self,
+        repo_id: str,
+        token: str,
+        output_prefix: str,
+        max_retries=3,
+        retry_timeout=10,
+    ):
         self.repo_id = repo_id
         self.token = token
+        self.output_prefix = output_prefix.strip("/")
         self.max_retries = max_retries
         self.retry_timeout = retry_timeout
 
     def write(self, shard_path: str, shard_name: str):
+        destination = f"{self.output_prefix}/{shard_name}"
         for attempt in range(self.max_retries):
             try:
                 batch_bucket_files(
                     bucket_id=self.repo_id,
-                    add=[(shard_path, shard_name)],
+                    add=[(shard_path, destination)],
                     token=self.token,
                 )
                 return
@@ -123,18 +132,27 @@ class BucketWriter(BaseWriter):
                 time.sleep(self.retry_timeout * (2 ** attempt))
 
 class DatasetWriter(BaseWriter):
-    def __init__(self, repo_id: str, token: str, max_retries=3, retry_timeout=10):
+    def __init__(
+        self,
+        repo_id: str,
+        token: str,
+        output_prefix: str,
+        max_retries=3,
+        retry_timeout=10,
+    ):
         self.repo_id = repo_id
         self.api = HfApi(token=token)
+        self.output_prefix = output_prefix.strip("/")
         self.max_retries = max_retries
         self.retry_timeout = retry_timeout
 
     def write(self, shard_path: str, shard_name: str):
+        destination = f"{self.output_prefix}/{shard_name}"
         for attempt in range(self.max_retries):
             try:
                 self.api.upload_large_file(
                     path_or_fileobj=shard_path,
-                    path_in_repo=shard_name,
+                    path_in_repo=destination,
                     repo_id=self.repo_id,
                     repo_type="dataset"
                 )
@@ -157,6 +175,12 @@ def reshard_dataset(
     retry_timeout: int = 10,
     log_every: int = 1,
 ):
+    output_dir = PurePosixPath(ds_config.output_dir)
+    if output_dir.is_absolute() or ".." in output_dir.parts:
+        raise ValueError(
+            f"output_dir must be a relative path without '..': {ds_config.output_dir!r}"
+        )
+    output_prefix = (PurePosixPath("data") / output_dir).as_posix()
 
     builder_kwargs = {"path": ds_config.hfkwargs.get("path")}
     if ds_config.hfkwargs.get("name"):
@@ -175,14 +199,34 @@ def reshard_dataset(
         postprocess_fn = lambda x: tokenizer.decode(x)
 
     if mode == "bucket":
-        writer = BucketWriter(repo_id, hf_token, max_retries, retry_timeout)
+        if not repo_id:
+            raise ValueError("--repo-id is required in bucket mode")
+        writer = BucketWriter(
+            repo_id,
+            hf_token,
+            output_prefix,
+            max_retries,
+            retry_timeout,
+        )
     elif mode == "dataset":
-        writer = DatasetWriter(repo_id, hf_token, max_retries, retry_timeout)
+        if not repo_id:
+            raise ValueError("--repo-id is required in dataset mode")
+        writer = DatasetWriter(
+            repo_id,
+            hf_token,
+            output_prefix,
+            max_retries,
+            retry_timeout,
+        )
     else:
         writer = LocalWriter(DATA_DIR / ds_config.output_dir)
 
-    work_dir = CACHE_DIR / "data" / ds_config.name
-    work_dir.mkdir(parents=True, exist_ok=True)
+    # Never stage shards in CACHE_DIR: it can point at a mounted HF bucket, in
+    # which case writing here and uploading with BucketWriter stores every shard
+    # twice (and deleting the temporary file races the volume sync). Stage on
+    # the job's ephemeral filesystem and use the selected writer as the single
+    # destination path.
+    work_dir = Path(mkdtemp(prefix=f"gpt_lab_reshard_{ds_config.name}_"))
 
     if not ds_config.streaming:
         ndocs = len(ds)
@@ -200,9 +244,6 @@ def reshard_dataset(
 
     total_docs = 0
     total_time = 0
-
-    failed = []
-    lock = Lock()
 
     executor = ThreadPoolExecutor(max_workers=max_in_flight)
     futures = []
@@ -222,11 +263,10 @@ def reshard_dataset(
         )
 
         try:
+            # Remote writers retry while the local Parquet file still exists.
+            # If all attempts fail, propagate the error so the job cannot finish
+            # successfully with missing shards.
             writer.write(shard_path, shard_name)
-        except Exception:
-            logger.exception(f"Shard {idx} failed")
-            with lock:
-                failed.append(idx)
         finally:
             if os.path.exists(shard_path):
                 os.remove(shard_path)
@@ -279,25 +319,6 @@ def reshard_dataset(
         f.result()
     executor.shutdown()
 
-    for attempt in range(max_retries):
-        if not failed:
-            break
-
-        logger.warning(f"Retry {len(failed)} shards")
-
-        retry_failed = []
-        for idx in failed:
-            try:
-                process_shard(idx, [])
-            except Exception:
-                retry_failed.append(idx)
-
-        failed = retry_failed
-        time.sleep(retry_timeout * (2 ** attempt))
-
-    if failed:
-        logger.warning(f"Permanent failures: {failed}")
-
     logger.info(f"Done. Total docs: {total_docs}")
 
 
@@ -308,6 +329,12 @@ if __name__ == "__main__":
     parser.add_argument("--config-path", default="configs/data.yaml")
     parser.add_argument("--mode", choices=["bucket", "dataset", "local"], default="bucket")
     parser.add_argument("--repo-id", type=str, default=None)
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory name below data/ (defaults to output_dir in the dataset config)",
+    )
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--max-shards", type=int)
     parser.add_argument("--chars-per-shard", type=int, default=256_000_000)
@@ -320,6 +347,8 @@ if __name__ == "__main__":
 
     config = read_dataset_config(args.ds_name, Path(args.config_path))
 
+    if args.output_dir:
+        config.output_dir = args.output_dir
     if args.streaming:
         config.streaming = True
     if args.max_shards:

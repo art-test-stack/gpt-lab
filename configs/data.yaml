@@ -2,7 +2,7 @@ climbmix:
   hfkwargs: 
     path: "nvidia/Nemotron-ClimbMix"
     split: "train"
-  output_dir: "climbmix"
+  output_dir: "climbmix-base"
   column_name: "tokens"
   postprocess: gpt2
   upload_name: "climbmix-dev-sorted"
