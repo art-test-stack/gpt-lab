@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import warnings
+import errno
 from pathlib import Path
 from typing import Union, List, Optional, Tuple, Iterator, Dict
 import time
@@ -273,7 +274,6 @@ class ShardManager:
                         os.remove(tmp)
                     time.sleep(2 ** attempt)
 
-
     def iterate(
         self,
         start_state: Optional[DataLoaderState] = None,
@@ -281,45 +281,130 @@ class ShardManager:
     ) -> Iterator[Tuple[List[str], DataLoaderState]]:
         is_resuming = start_state is not None
         state = start_state or DataLoaderState()
+        max_read_retries = 5
 
         while True:
             while state.shard_idx < len(self.shard_paths):
                 shard_path = self.shard_paths[state.shard_idx]
-                state.global_shard_idx = int(shard_path.stem.split("_")[1]) # for debugging - we keep track of original shard idx
+                state.global_shard_idx = int(
+                    shard_path.stem.split("_")[1]
+                )
 
                 pf = pq.ParquetFile(shard_path)
 
-                if is_resuming:
-                    base = state.row_group_idx // self.world_size
-                    state.row_group_idx = (base + 1) * self.world_size + self.ddp_rank      
-                    if state.row_group_idx >= pf.num_row_groups:
-                        state.shard_idx += 1 # go to resuming shard id
-                        state.row_group_idx = self.ddp_rank # start at the first row group for the next shard
-                        state.offset_in_row_group = 0
-                        continue
-                else:
-                    state.row_group_idx = self.ddp_rank
-
-                while state.row_group_idx < pf.num_row_groups:
-                    rg = pf.read_row_group(state.row_group_idx)
-                    batch = rg.column(self.column_name).to_pylist()
-                    for i in range(0, len(batch), batch_size):
-                        if is_resuming and i < state.offset_in_row_group:
-                            continue
-                        if is_resuming:
-                            is_resuming = False  # only do this once
-                        yield batch[i:i+batch_size], DataLoaderState(
-                            shard_idx=state.shard_idx,                            
-                            global_shard_idx=state.global_shard_idx, # for debbugging - we keep track of original shard idx
-                            row_group_idx=state.row_group_idx,
-                            offset_in_row_group=i,
-                            epoch=state.epoch,
+                try:
+                    if is_resuming:
+                        base = state.row_group_idx // self.world_size
+                        state.row_group_idx = (
+                            (base + 1) * self.world_size + self.ddp_rank
                         )
-                    state.offset_in_row_group = 0
-                    state.row_group_idx += self.world_size
+
+                        if state.row_group_idx >= pf.num_row_groups:
+                            state.shard_idx += 1
+                            state.row_group_idx = self.ddp_rank
+                            state.offset_in_row_group = 0
+                            continue
+                    else:
+                        state.row_group_idx = self.ddp_rank
+
+                    while state.row_group_idx < pf.num_row_groups:
+                        for attempt in range(max_read_retries):
+                            try:
+                                # `pf` is set to None after a failed read.
+                                # Reopening here means open failures are retried too.
+                                if pf is None:
+                                    pf = pq.ParquetFile(shard_path)
+
+                                rg = pf.read_row_group(
+                                    state.row_group_idx,
+                                    columns=[self.column_name],
+                                )
+                                break
+
+                            except OSError as exc:
+                                is_io_error = exc.errno == errno.EIO
+
+                                if pf is not None:
+                                    try:
+                                        pf.close()
+                                    except Exception:
+                                        pass
+                                    pf = None
+
+                                if (
+                                    not is_io_error
+                                    or attempt == max_read_retries - 1
+                                ):
+                                    raise OSError(
+                                        "Failed to read Parquet row group: "
+                                        f"path={shard_path}, "
+                                        f"global_shard="
+                                        f"{state.global_shard_idx}, "
+                                        f"row_group="
+                                        f"{state.row_group_idx}, "
+                                        f"rank={self.ddp_rank}, "
+                                        f"attempt={attempt + 1}/"
+                                        f"{max_read_retries}"
+                                    ) from exc
+
+                                delay = 2**attempt
+
+                                warnings.warn(
+                                    "Transient Parquet I/O error; "
+                                    "reopening and retrying: "
+                                    f"path={shard_path}, "
+                                    f"global_shard="
+                                    f"{state.global_shard_idx}, "
+                                    f"row_group="
+                                    f"{state.row_group_idx}, "
+                                    f"rank={self.ddp_rank}, "
+                                    f"retry_in={delay}s"
+                                )
+
+                                time.sleep(delay)
+
+                        batch = rg.column(self.column_name).to_pylist()
+
+                        for i in range(0, len(batch), batch_size):
+                            if (
+                                is_resuming
+                                and i < state.offset_in_row_group
+                            ):
+                                continue
+
+                            if is_resuming:
+                                is_resuming = False
+
+                            yield (
+                                batch[i:i + batch_size],
+                                DataLoaderState(
+                                    shard_idx=state.shard_idx,
+                                    global_shard_idx=(
+                                        state.global_shard_idx
+                                    ),
+                                    row_group_idx=(
+                                        state.row_group_idx
+                                    ),
+                                    offset_in_row_group=i,
+                                    epoch=state.epoch,
+                                ),
+                            )
+
+                        state.offset_in_row_group = 0
+                        state.row_group_idx += self.world_size
+
+                finally:
+                    # Also executes for resume `continue`, exceptions and
+                    # generator shutdown.
+                    if pf is not None:
+                        try:
+                            pf.close()
+                        except Exception:
+                            pass
+
                 state.shard_idx += 1
                 state.row_group_idx = self.ddp_rank
-    
+
             state.shard_idx = 0
             state.row_group_idx = self.ddp_rank
             state.offset_in_row_group = 0
