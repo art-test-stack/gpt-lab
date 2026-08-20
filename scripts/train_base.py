@@ -42,7 +42,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 from gpt_lab.utils.common import get_banner, print0_dict
 from gpt_lab.utils.logging import init_logger, log0
 from gpt_lab.utils.default import MODELS_FOLDER
-from gpt_lab.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups
+from gpt_lab.utils.distributed import cleanup_dist_groups, get_device_type, init_dist_groups, broadcast_model
 from gpt_lab.utils.system import get_git_info, get_gpu_info, get_system_info
 from gpt_lab.utils.schemas import GPTConfig, TrainerConfig
 
@@ -293,6 +293,7 @@ if __name__ == "__main__":
     if args.model_init == "auto":
         model = model.to_empty(device=device)    
         model.init_weights()
+        broadcast_model(model, dist_info)
     elif is_resumed:
         log0("Resuming training from checkpoint.", logger=logger)
         model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(
