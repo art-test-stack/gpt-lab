@@ -376,6 +376,7 @@ class AutoGPTConfig(BaseModel):
             n_steps=n_steps,
             n_acc_steps=n_acc_steps,
             total_batch_size=total_batch_size,
+            device_batch_size=self.device_batch_size,
             batch_lr_scale=batch_lr_scale,
             weight_decay_scale=weight_decay_ratio,
             target_tokens=target_tokens,
@@ -390,7 +391,13 @@ class AutoGPTConfig(BaseModel):
             model_cfg=model.config,
             tokenizer_cfg=tokenizer.config,
             base_train=training_config,
+            # Every distributed rank builds this object, but only rank zero
+            # should create the shared metadata file.
+            autosave=self.dist_info.get("RANK", 0) == 0,
         ))
+        if self.dist_info.get("IS_DDP_INITIALIZED", False):
+            import torch.distributed as dist
+            dist.barrier()
         # Display the generated configuration for verification
         print0_dict("AutoGPTConfig generated the following tokenizer configuration", tokenizer.config.model_dump())
         print0_dict("AutoGPTConfig generated the following model configuration", model.config.model_dump())

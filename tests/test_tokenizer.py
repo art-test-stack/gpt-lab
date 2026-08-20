@@ -533,6 +533,21 @@ def test_tokenizer_forwards_special_tokens_to_huggingface(monkeypatch):
 
 
 @pytest.mark.fast
+def test_tokenizer_auto_source_loads_tiktoken_without_scoping_error():
+    special_tokens = SpecialTokens()
+
+    tokenizer = Tokenizer.from_pretrained(
+        "gpt2",
+        special_tokens=special_tokens,
+    )
+
+    assert tokenizer.config.source == "tiktoken"
+    assert tokenizer.vocab_size == len(tokenizer.mergeable_ranks) + len(
+        special_tokens
+    )
+
+
+@pytest.mark.fast
 def test_train_huggingface_from_iterator_with_mock_tokenizers(monkeypatch):
     import gpt_lab.tokenizer.hf as tokenizer_hf
 

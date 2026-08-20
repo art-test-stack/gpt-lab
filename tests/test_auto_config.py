@@ -107,6 +107,7 @@ def test_auto_config_uses_real_architecture_and_loaded_vocab(
     assert generated.model_cfg.d_head == 64
     assert generated.model_cfg.vocab_size == tokenizer.vocab_size
     assert generated.tokenizer_cfg.vocab_size == tokenizer.vocab_size
+    assert generated.base_train["device_batch_size"] == 1
 
 
 @pytest.mark.fast
