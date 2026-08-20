@@ -48,7 +48,7 @@ class Board:
                 id=run,
                 dir=board_dir, # TODO
                 config=config,
-                resume="must" if resume else "auto",
+                resume="must" if resume else None,
             )
             
         elif self.board_type == "trackio":
