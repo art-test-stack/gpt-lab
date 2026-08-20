@@ -247,14 +247,19 @@ class ShardManager:
         if shards_to_download and self.base_url is not None:
             self.download(shards_to_download, verbose=warn)
             
-        self.shard_paths = [
+        shard_paths = [
             p for p in self.list_local_shards()
             if int(p.stem.split("_")[1]) in self.shard_idx
         ]
         if self.split == "train":
-            assert len(self.shard_idx) == len(self.shard_paths), f"Expected {self.target_shard} shards but found {len(self.shard_idx)}. Got {self.shard_idx=}, {local_shard_paths=}."
+            assert len(self.shard_idx) == len(shard_paths), f"Expected {self.target_shard} shards but found {len(self.shard_idx)}. Got {self.shard_idx=}, {local_shard_paths=}."
+            self.shard_paths = [
+                p for p in shard_paths
+                if int(p.stem.split("_")[1]) % self.world_size == self.ddp_rank
+            ]
         else:
-            assert len(self.shard_paths) == 1 and self.shard_idx[0] == self.target_shard, f"Expected exactly 1 validation shard but found {len(self.shard_paths)}. Got {self.shard_paths=}."
+            assert len(shard_paths) == 1 and self.shard_idx[0] == self.target_shard, f"Expected exactly 1 validation shard but found {len(shard_paths)}. Got {shard_paths=}."
+            self.shard_paths = shard_paths
     
     def download(
         self,
@@ -299,6 +304,8 @@ class ShardManager:
         is_resuming = start_state is not None
         state = start_state or DataLoaderState()
         max_read_retries = 5
+        row_group_start = 0 if self.split == "train" else self.ddp_rank
+        row_group_stride = 1 if self.split == "train" else self.world_size
 
         while True:
             while state.shard_idx < len(self.shard_paths):
@@ -311,18 +318,18 @@ class ShardManager:
 
                 try:
                     if is_resuming:
-                        base = state.row_group_idx // self.world_size
+                        base = state.row_group_idx // row_group_stride
                         state.row_group_idx = (
-                            (base + 1) * self.world_size + self.ddp_rank
+                            (base + 1) * row_group_stride + row_group_start
                         )
 
                         if state.row_group_idx >= pf.num_row_groups:
                             state.shard_idx += 1
-                            state.row_group_idx = self.ddp_rank
+                            state.row_group_idx = row_group_start
                             state.offset_in_row_group = 0
                             continue
                     else:
-                        state.row_group_idx = self.ddp_rank
+                        state.row_group_idx = row_group_start
 
                     while state.row_group_idx < pf.num_row_groups:
                         for attempt in range(max_read_retries):
@@ -408,7 +415,7 @@ class ShardManager:
                             )
 
                         state.offset_in_row_group = 0
-                        state.row_group_idx += self.world_size
+                        state.row_group_idx += row_group_stride
 
                 finally:
                     # Also executes for resume `continue`, exceptions and
@@ -420,9 +427,9 @@ class ShardManager:
                             pass
 
                 state.shard_idx += 1
-                state.row_group_idx = self.ddp_rank
+                state.row_group_idx = row_group_start
 
             state.shard_idx = 0
-            state.row_group_idx = self.ddp_rank
+            state.row_group_idx = row_group_start
             state.offset_in_row_group = 0
             state.epoch += 1
