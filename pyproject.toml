@@ -3,6 +3,8 @@ name = "gpt-lab"
 version = "0.1.0"
 description = "Library for training and serving LLMs from scratch, with local and Hugging Face interfaces."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "LICENSES/*", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12,<3.13"
 authors = [
     {name = "art-test-stack"}

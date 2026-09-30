@@ -1,6 +1,9 @@
 """
 Adapted from:
     - https://github.com/jettify/pytorch-optimizer
+The upstream implementation is licensed under Apache License 2.0.
+Modified for GPT-Lab by Arthur Testard.
+See LICENSES/Apache-2.0.txt.
 Reference:
     - https://arxiv.org/abs/2006.00719
 """

@@ -774,7 +774,7 @@ Here a non-exhaustive list of features that I aim to implement. Stars correspond
 <!-- LICENSE -->
 ## License
 
-Distributed under the MIT License. See `LICENSE.txt` for more information.
+GPT-Lab's original code is distributed under the [MIT License](LICENSE). Third-party components remain under their original licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
 
 <!-- CONTACT -->
 ## Contact
