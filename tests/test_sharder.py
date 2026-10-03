@@ -1,12 +1,14 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from gpt_lab.data.sharder import ShardManager
+from gpt_lab.utils.schemas import DataLoaderState
 
 
 def _metadata_manager(tmp_path):
@@ -150,3 +152,85 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
 
     assert all_retrieved_texts == expected_texts
 
+
+@pytest.mark.fast
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("row_groups_per_rank", [1, 2])
+@pytest.mark.parametrize(
+    "split,resume_shard",
+    [("train", 0), ("train", 1), ("val", 0)],
+    ids=["next-shard", "train-epoch-wrap", "val-epoch-wrap"],
+)
+def test_resume_after_last_row_group_matches_uninterrupted_iteration(
+    tmp_path, monkeypatch, rank, row_groups_per_rank, split, resume_shard
+):
+    dataset_name = "resume-boundary"
+    dataset_path = tmp_path / dataset_name
+    dataset_path.mkdir()
+    world_size = 2
+    num_train_shards = 4
+    rows_per_group = 3
+
+    for shard_idx in range(num_train_shards + 1):
+        # Training partitions files; validation partitions row groups by rank.
+        num_groups = row_groups_per_rank
+        if shard_idx == num_train_shards:
+            num_groups *= world_size
+        pq.write_table(
+            pa.table({
+                "text": [
+                    f"shard-{shard_idx}-row-{row_idx}"
+                    for row_idx in range(num_groups * rows_per_group)
+                ],
+            }),
+            dataset_path / f"shard_{shard_idx:05d}.parquet",
+            row_group_size=rows_per_group,
+        )
+
+    manager = ShardManager(
+        name=dataset_name,
+        cachedir=tmp_path,
+        split=split,
+        max_shards=num_train_shards,
+        dist_info={"RANK": rank, "WORLD_SIZE": world_size},
+    )
+    batches_per_shard = row_groups_per_rank * 2
+    following_batches = batches_per_shard + 1
+    uninterrupted = manager.iterate(batch_size=2)
+    try:
+        for _ in range((resume_shard + 1) * batches_per_shard):
+            _, checkpoint = next(uninterrupted)
+        # Save after the final partial chunk, including its nonzero offset.
+        saved_state = checkpoint.model_dump_json()
+        expected = [
+            (texts, state.model_dump())
+            for texts, state in islice(uninterrupted, following_batches)
+        ]
+    finally:
+        uninterrupted.close()
+
+    original_parquet_file = pq.ParquetFile
+    opened_paths = []
+
+    def bounded_parquet_file(path, *args, **kwargs):
+        opened_paths.append(path.name)
+        # Fail deterministically if resume loops over files without yielding.
+        assert len(opened_paths) <= following_batches + 2, (
+            f"Resume keeps reopening shards without progress: {opened_paths}"
+        )
+        return original_parquet_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "ParquetFile", bounded_parquet_file)
+    resumed = manager.iterate(
+        start_state=DataLoaderState.model_validate_json(saved_state),
+        batch_size=2,
+    )
+    try:
+        actual = [
+            (texts, state.model_dump())
+            for texts, state in islice(resumed, following_batches)
+        ]
+    finally:
+        resumed.close()
+
+    assert actual == expected

@@ -327,6 +327,8 @@ class ShardManager:
                             state.shard_idx += 1
                             state.row_group_idx = row_group_start
                             state.offset_in_row_group = 0
+                            # Resume advancement applies only to the saved shard.
+                            is_resuming = False
                             continue
                     else:
                         state.row_group_idx = row_group_start
