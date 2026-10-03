@@ -1,13 +1,15 @@
 # ByteLevel BPE Scaling Experiments
 
+See the [CLI guide](cli.md) for installation, resume, and all command options.
+
 This document describes the experiments conducted to analyze how ByteLevel BPE tokenization scales with different corpus sizes, vocabulary sizes, and split patterns. The goal is to understand the trade-offs between these factors and their impact on tokenization quality and efficiency.
 
 However, the results obtained were quite poor compared to the baselines, given that I could not reach the optimal memory budget for training the tokenizers.
 
 To run the experiments, we run the following command from the root directory of the repo:
 ```bash
-uv run python -m scripts.benchmark.tokenizer_corpus_size \
-    --seed 42 \ # for reproducibility
+uv run gpt-lab experiment tokenizer-scaling \
+    --seed 42 \
     --num-procs 16 \
     --vocab-sizes 20000,50000,100000 \
     --pat-strs gpt2,cl100k_base \
@@ -21,7 +23,7 @@ Args:
 - `--vocab-sizes`: Comma-separated list of vocabulary sizes to train tokenizers with.
 - `--pat-strs`: Comma-separated list of pattern string names to use for tokenizer training. If not specified, defaults to using the GPT-2 pattern string.
 - `--write-corpus`: Flag to indicate training mode (write corpus). If not set, the script will attempt to load an existing corpus from disk.
-- `--corpus-sizes-gb`: Comma-separated list of corpus sizes in gigabytes to use for tokenizer training. If not specified, defaults to a range of sizes based on the vocabulary size.
+- `--corpus-sizes-gb`: Comma-separated list of corpus sizes in gigabytes to use for tokenizer training. Required for a new experiment; resume can use sizes from saved metadata. Sizes use GiB (1024**3 bytes).
 - `--compare-truncated-baselines`: Whether to compare trained tokenizers with truncated versions of baseline tokenizers.
 - `--corpus-temperature-alpha`: Optional temperature parameter to control the randomness of the corpus generation. 
 

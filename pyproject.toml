@@ -35,6 +35,9 @@ dependencies = [
 homepage = "https://github.com/art-test-stack/gpt-lab"
 repository = "https://github.com/art-test-stack/gpt-lab"
 
+[project.scripts]
+gpt-lab = "gpt_lab.cli:main"
+
 [project.optional-dependencies]
 cpu = [
     "torch==2.9.1",

@@ -154,7 +154,12 @@ I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-t
 
 ### Scripts
 
-The library includes some scripts for training, evaluation, and inference. They are located in the `scripts/` folder. The main ones are the following:
+The installed `gpt-lab` command groups tokenizer training, base training/resume,
+dataloader benchmarks, tokenizer scaling experiments, data preparation, cache
+management, and chat. Start with `gpt-lab --help` (or `uv run gpt-lab --help`).
+See the [CLI guide](docs/cli.md) for commands, defaults, distributed launch,
+checkpoint resume, and extension points. Existing `scripts/` entry points remain
+compatibility wrappers.
 
 ### Data
 
@@ -375,7 +380,7 @@ In [docs/tokenizer_scaling.md](./docs/tokenizer_scaling.md), we analyze how Byte
 To experiment yourself tokenizer scaling, you can run the following command from the root directory of the repo:
 
 ```bash
-uv run python -m scripts.benchmark.tokenizer_corpus_size \
+uv run gpt-lab experiment tokenizer-scaling \
     --seed 42 \
     --num-procs 16 \
     --vocab-sizes 20000,50000,100000 \
@@ -384,10 +389,10 @@ uv run python -m scripts.benchmark.tokenizer_corpus_size \
     --corpus-sizes-gb 10,50,100,500,1000,5000,10000 
 ```
 
-More details on the arguments are given in [tokenizer_corpus_size.py](./scripts/benchmark/tokenizer_corpus_size.py) or using `--help`:
+More details on the arguments are given in the [CLI guide](docs/cli.md) or using `--help`:
 
 ```bash
-uv run python -m scripts.benchmark.tokenizer_corpus_size --help
+uv run gpt-lab experiment tokenizer-scaling --help
 ```
 
 ### Model architecture
@@ -635,19 +640,20 @@ Vizualize the training progress in the board of your choice (Tensorboard, Weight
 
 ### Chat with the model
 
-In this section, you will find instructions to run the chat interface with different models.
+Use a saved local checkpoint in the console:
 
-Under development environment (`DEVELOPMENT='1'` in `.env`), you can run the chat interface with auto-reloading, use the following command:
 ```sh
-uv run gradio scripts/chat_app.py --demo-name=app
+uv run gpt-lab chat console --model-name ic1 --run-name baseline
 ```
 
-Otherwise, if you don't want auto-reloading, use:
+The existing experimental web interface is available through:
+
 ```sh
-uv run python -m scripts.chat_app
+uv run gpt-lab chat app
 ```
 
-Then, open your browser and go to [`http://127.0.0.1:7860/`](http://127.0.0.1:7860/). It is quite straightforward to use. You can select different models (local or remote), choose some hyperparameters for inference, and chat with the model.
+See the [CLI guide](docs/cli.md#data-cache-and-chat) for UI dependency requirements,
+remote-completion configuration, and the existing Gradio compatibility limitation.
 
 ## Development Notes
 

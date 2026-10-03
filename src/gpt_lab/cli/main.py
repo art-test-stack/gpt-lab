@@ -1,20 +1,25 @@
-from gpt_lab.utils.common import get_banner
-from argparse import ArgumentParser
+"""The gpt-lab CLI. Importing this package performs no application setup."""
+
+from collections.abc import Sequence
+from importlib import import_module
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Parse explicit arguments (or sys.argv) and run exactly one workflow."""
+    from .parser import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    module_name, handler_name = args._handler.split(":")
+    handler = getattr(import_module(module_name), handler_name)
+    try:
+        return handler(args) or 0
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+
+
+__all__ = ["main"]
+
 
 if __name__ == "__main__":
-    get_banner(to_print=True)
-
-    parser = ArgumentParser(description="Main entry point for GPT training, evaluation, monitoring and inference.")
-
-    subparsers = parser.add_subparsers(dest="sub_command", help="Sub-commands for training, evaluation, monitoring and inference.")
-    
-    # TODO: think about the CLI
-
-    # read, write env vars
-    # trigger training, evaluation, monitoring, inference
-    # view logs, metrics, results
-    # launch interactive sessions (e.g. CLI or gradio interface)
-    # manage models, datasets, configs
-    # etc.
-
-
+    raise SystemExit(main())
