@@ -375,7 +375,7 @@ Training time benchmarks for different implementations and configurations. All t
 
 #### Scaling laws for tokenizer training
 
-In [docs/tokenizer_scaling.md](./docs/tokenizer_scaling.md), we analyze how ByteLevel BPE tokenization scales with different corpus sizes, vocabulary sizes, and split patterns. The goal is to understand the trade-offs between these factors and their impact on tokenization quality and efficiency.
+The tokenizer scaling experiment compares ByteLevel BPE tokenizers across corpus sizes, vocabulary sizes, and split patterns to explore their impact on tokenization quality and efficiency.
 
 To experiment yourself tokenizer scaling, you can run the following command from the root directory of the repo:
 
@@ -533,10 +533,20 @@ Both support single-GPU and multi-GPU distributed training with async communicat
 
 #### Pre training
 
-The pre-training script is located in `scripts/train_base.py`. It allows you to pre-train a GPT model from scratch on a defined corpus, using different configurations (model architecture, training hyperparameters, optimizer, etc.). You can also choose to write the corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus.
+Use `gpt-lab train base auto` to train from scratch on prepared local Parquet shards, or `gpt-lab train base resume` to restore a saved run. The `auto` mode configures the model and training parameters from depth and scaling laws; `--train-tokenizer` trains a new tokenizer. The existing `scripts/train_base.py` entry point remains a compatibility wrapper.
 
-> [!WARNING]
-> There are two sub-arguments for this script `auto` and `custom`. For now, only `auto` is implemented, which allows you to automatically load a configuration based on main (`depth`, `aspect_ratio`, `n_heads`, etc.) arguments and compute optimal training parameters, as optimal `vocab_size` if not provided. The script can then train a new tokenizer with `--train-tokenizer` flag. The `custom` argument is intended to allow you to directly pass the configuration as command-line arguments, without the need for a YAML file. This feature is under development and will be implemented in the future.
+```bash
+# Single-device training
+uv run gpt-lab train base auto --model-name ic1 --run-name baseline --depth 12
+
+# Eight GPUs on one node
+uv run torchrun --standalone --nproc-per-node=8 --no-python \
+  gpt-lab train base auto --model-name ic1 --run-name baseline --depth 12
+```
+
+`--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
+With an activated environment, omit `uv run`. See the [CLI guide](docs/cli.md#distributed-launch)
+for module-mode launches and distributed resume examples.
 
 <!-- Main arguments: 
 Argument | Description

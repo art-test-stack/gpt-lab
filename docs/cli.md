@@ -94,7 +94,8 @@ configuration and completed `.pkl` results are skipped. `--corpus-dir` overrides
 `<cache>/data/corpus/<result-directory-name>`. Without `--resume`, an existing result
 directory is preserved under a numbered sibling. `--compare-truncated-baselines`
 now uses the existing comparison helper. The `--board` option remains unused.
-See [the experimental methodology and its limitations](tokenizer_scaling.md).
+Training and evaluation sources can overlap; check for overlap before interpreting
+the experiment's results as held-out performance.
 
 Base training on prepared local `climbmix-base` shards:
 
@@ -142,18 +143,36 @@ was mentioned in old help but was never an accepted option.
 
 ## Distributed launch
 
-Use torchrun's **module mode**, with launcher arguments before `-m` and all CLI
-arguments after `gpt_lab.cli`:
+Single-device and multi-GPU training use the same CLI entry point. To launch the
+installed `gpt-lab` executable on eight GPUs on one node, use `--no-python`:
 
 ```bash
-torchrun --standalone --nproc_per_node=8 -m gpt_lab.cli \
+uv run gpt-lab train base auto --model-name ic1 --run-name baseline --depth 12
+
+uv run torchrun --standalone --nproc-per-node=8 --no-python \
+  gpt-lab train base auto --model-name ic1 --run-name baseline --depth 12
+
+uv run torchrun --standalone --nproc-per-node=8 --no-python \
+  gpt-lab train base resume --model-name ic1 --run-name baseline --checkpoint-step -1
+```
+
+`--no-python` makes torchrun execute `gpt-lab` directly through `PATH`. Without it,
+torchrun treats `gpt-lab` as a Python script path. Launcher arguments go before
+`gpt-lab`; CLI arguments go after it. Choose `auto` or `resume` after `train base`.
+
+Alternatively, use torchrun's **module mode**, with launcher arguments before `-m`
+and all CLI arguments after `gpt_lab.cli`:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=8 -m gpt_lab.cli \
   train base auto --model-name ic1 --run-name baseline --depth 12
 
-torchrun --standalone --nproc_per_node=8 -m gpt_lab.cli \
+uv run torchrun --standalone --nproc-per-node=8 -m gpt_lab.cli \
   train base resume --model-name ic1 --run-name baseline --checkpoint-step -1
 ```
 
-With uv, prefix these commands with `uv run`. Each worker reaches the same package
+With an activated environment containing `gpt-lab` and Torch, omit `uv run` from
+these examples. Each worker reaches the same package
 entry point; Torch supplies `RANK`, `LOCAL_RANK`, and `WORLD_SIZE` through the
 environment. Existing CUDA/NCCL setup and per-rank checkpoint behavior are
 preserved. CPU/MPS are single-device workflows; this change does not add distributed
@@ -201,9 +220,6 @@ supported: the wrapper no longer creates a module-global UI during import. Use
 
 The old nonfunctional `arch`/`cust` training placeholders
 are removed, and no SFT/RL placeholder is exposed.
-
-The complete [pre-migration script inventory](cli-migration.md) records original
-arguments, defaults, requirements, side effects, and necessary fixes.
 
 Parser-only modules live under `gpt_lab.cli.commands`. Each module implements
 `register(subparsers)` and stores a lazy `module:handler` target. Handlers accept
