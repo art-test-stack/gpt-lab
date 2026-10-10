@@ -49,6 +49,9 @@ limits. `-1` leaves existing-corpus training unlimited. New corpus generation
 requires a positive `--max-chars`, because the old unlimited source-writing path
 could not safely bound streaming sources. Model/tokenizer artifacts use
 `GPTLAB_CACHE_DIR`, defaulting to `~/.cache/gpt_lab`.
+Cache paths are defined in `gpt_lab.utils.paths` without filesystem access;
+environment overrides are expanded to absolute paths without resolving symlinks.
+Importing runtime defaults creates the cache root, while CLI help does not.
 
 The legacy tokenizer default remains `--trainer tiktoken` and all six trainer
 choices remain parseable. The current library only implements **huggingface**

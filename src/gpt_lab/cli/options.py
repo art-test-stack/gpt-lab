@@ -1,20 +1,8 @@
 """Shared, standard-library-only parser helpers."""
 
 import argparse
-import os
-from pathlib import Path
 
-
-def cache_dir() -> Path:
-    """Compute the cache default without importing utils or probing the disk.
-
-    Actual filesystem resolution belongs to command execution. In particular,
-    Path.resolve() must not be used here because it probes symlinks.
-    """
-    value = os.environ.get("GPTLAB_CACHE_DIR")
-    if value is not None:
-        return Path(os.path.abspath(os.path.expanduser(value)))
-    return Path.home() / ".cache" / "gpt_lab"
+from gpt_lab.utils.paths import get_cache_dir as cache_dir
 
 
 class ArgumentParser(argparse.ArgumentParser):
