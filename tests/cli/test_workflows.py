@@ -1,4 +1,4 @@
-"""Bounded workflow checks. Training and external services are mocked."""
+"""Bounded workflow checks. Model training and external services are mocked."""
 
 import argparse
 import importlib
@@ -199,6 +199,26 @@ def test_tokenizer_executes_with_local_text_and_mocked_trainer(tmp_path, monkeyp
     args.corpus_path = str(path)
     run(args)
     assert captured['texts'] == ['éあb', 'dé']
+
+
+def test_standalone_tokenizer_training_saves_loadable_local_config(tmp_path):
+    from gpt_lab.tokenizer import Tokenizer, TokenizerConfig
+    from gpt_lab.workflows.train_tokenizer import build_config
+
+    args = parse('tokenizer train --trainer huggingface --name ic1_tokenizer --vocab-size 257 --num-proc 1')
+    config = build_config(args)
+    config.dirname = tmp_path / config.name
+    config.trainer.show_progress = False
+    sample = 'Hello, world! éあ'
+    trained = Tokenizer.train_from_iterator(iter([sample]), config)
+
+    saved_config = TokenizerConfig.from_directory(args.name, cachedir=tmp_path)
+    assert saved_config.source == 'local'
+    assert saved_config.trainer.source == 'huggingface'
+    loaded = Tokenizer.from_config(saved_config)
+    assert loaded.mergeable_ranks == trained.mergeable_ranks
+    assert loaded.encode(sample) == trained.encode(sample)
+    assert loaded.decode(loaded.encode(sample)) == sample
 
 
 def test_synthetic_and_real_benchmarks_use_production_loaders(tmp_path):

@@ -26,6 +26,7 @@ def build_config(args: Namespace):
 
     return TokenizerConfig(
         name=args.name,
+        source='local',
         vocab_size=args.vocab_size,
         trainer=TokenizerTrainerConfig(
             source=args.trainer,
