@@ -15,14 +15,13 @@ and does not create directories or load runtime dependencies.
 | --- | --- |
 | Tokenization | `gpt-lab tokenizer train` |
 | Training | `gpt-lab train base auto`, `gpt-lab train base resume` |
-| Benchmarking | `gpt-lab benchmark dataloaders` |
-| Experiments | `gpt-lab experiment tokenizer-scaling` |
 | Data preparation | `gpt-lab data reshard` |
 | Cache management | `gpt-lab cache clear` |
 | Inference | `gpt-lab chat console`, `gpt-lab chat app` |
 
 Append `--help` for arguments and defaults. Groups require a subcommand;
 invalid commands or arguments exit with status 2.
+Standalone benchmarks and tokenizer scaling live in [experiments](../experiments/README.md).
 
 ## Tokenizer training
 
@@ -124,6 +123,6 @@ uv run --locked --extra cpu --group dev pytest -q tests/cli
 uv run --locked --extra cpu --group dev pytest -q -m 'not slow'
 ```
 
-CLI checks cover help, dispatch, wrappers, checkpoints, cache safety, experiment
-resume, and a tiny offline benchmark. Model training, UI, and external services
+CLI checks cover help, dispatch, wrappers, checkpoints, and cache safety.
+Model training, UI, and external services
 are mocked; the tokenizer save/load regression uses real tiny training.

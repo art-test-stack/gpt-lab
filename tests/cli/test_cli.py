@@ -20,8 +20,6 @@ LEAVES = [
     ('tokenizer train', 'tokenizer', 'run', 'train_tokenizer', 'run'),
     ('train base auto', 'base', 'run_auto', 'train_base', 'run'),
     ('train base resume', 'base', 'run_resume', 'train_base', 'run'),
-    ('benchmark dataloaders', 'benchmark', 'run', 'dataloaders', 'run'),
-    ('experiment tokenizer-scaling', 'experiment', 'run', 'tokenizer_scaling', 'run'),
     ('data reshard', 'data', 'run', 'reshard', 'run'),
     ('cache clear', 'cache', 'run', None, None),
     ('chat console', 'chat', 'run_console', 'chat', 'console'),
@@ -30,8 +28,6 @@ LEAVES = [
 WRAPPERS = {
     'scripts.train_tokenizer': 'tokenizer train',
     'scripts.train_base': 'train base',
-    'scripts.benchmark.dataloaders': 'benchmark dataloaders',
-    'scripts.benchmark.tokenizer_corpus_size': 'experiment tokenizer-scaling',
     'scripts.reshard_dataset': 'data reshard',
     'scripts.clear_gpt_lib_cache': 'cache clear',
     'scripts.chat_console': 'chat console',
@@ -39,7 +35,7 @@ WRAPPERS = {
 }
 
 
-@pytest.mark.parametrize('prefix', ['', 'tokenizer', 'train', 'benchmark', 'experiment', 'data', 'cache', 'chat', 'train base'] + [row[0] for row in LEAVES])
+@pytest.mark.parametrize('prefix', ['', 'tokenizer', 'train', 'data', 'cache', 'chat', 'train base'] + [row[0] for row in LEAVES])
 def test_help(prefix, capsys):
     with pytest.raises(SystemExit) as error:
         main(prefix.split() + ['--help'])
@@ -48,9 +44,10 @@ def test_help(prefix, capsys):
     assert 'usage: gpt-lab' in output
     assert '--help' in output
     if not prefix:
-        for name in ('tokenizer', 'train', 'benchmark', 'experiment', 'data', 'cache', 'chat'):
+        for name in ('tokenizer', 'train', 'data', 'cache', 'chat'):
             assert name in output
         assert 'sft' not in output and 'rl' not in output
+        assert '{tokenizer,train,data,cache,chat}' in output
 
 
 @pytest.mark.parametrize('prefix,module,handler,workflow,target', LEAVES)
@@ -111,24 +108,12 @@ def test_other_defaults(monkeypatch, tmp_path):
     tok = parser.parse_args('tokenizer train'.split())
     assert (tok.vocab_size, tok.max_chars, tok.chars_per_doc, tok.trainer, tok.num_proc) == (32000, -1, -1, 'tiktoken', -1)
     assert tok.corpus_path == './.data/corpus.txt' and tok.corpus_seed == 42
-    bench = parser.parse_args('benchmark dataloaders'.split())
-    assert (bench.mode, bench.loader, bench.batch_size, bench.seq_len, bench.num_batches, bench.buffer_size, bench.num_docs, bench.device, bench.bos_id) == ('synthetic', 'all', 8, 2048, 20, 1000, 20000, 'cpu', 1)
-    exp = parser.parse_args('experiment tokenizer-scaling'.split())
-    assert (exp.vocab_sizes, exp.baselines, exp.num_procs, exp.corpus_sizes_gb, exp.save_every, exp.board) == ('50000,70000,100000,200000', 'gpt2,cl100k_base,o200k_base', None, None, 10, 'dummy')
-    assert exp.result_dir == str(tmp_path / 'not-created/tokenizers/scaling_tokenizer_results')
     data = parser.parse_args('data reshard'.split())
     assert (data.ds_name, data.mode, data.chars_per_shard, data.row_group_size, data.max_in_flight) == ('climbmix', 'bucket', 256000000, 1024, 8)
     assert not (tmp_path / 'not-created').exists()
 
 
-def test_benchmark_aliases():
-    parser = build_parser()
-    old = parser.parse_args('benchmark dataloaders --batch_size 2 --seq_len 32 --num_batches 3 --buffer_size 16 --num_docs 8 --bos_id 7'.split())
-    new = parser.parse_args('benchmark dataloaders --batch-size 2 --seq-len 32 --num-batches 3 --buffer-size 16 --num-docs 8 --bos-id 7'.split())
-    assert old == new
-
-
-@pytest.mark.parametrize('argv', ['', 'train', 'train base', 'train base invalid', 'train sft', 'train rl', 'benchmark unknown', 'chat', 'unknown', 'train base auto --wat', 'train base resume --checkpoint-step nope'])
+@pytest.mark.parametrize('argv', ['', 'train', 'train base', 'train base invalid', 'train sft', 'train rl', 'benchmark dataloaders', 'experiment tokenizer-scaling', 'chat', 'unknown', 'train base auto --wat', 'train base resume --checkpoint-step nope'])
 def test_invalid_or_missing_subcommands(argv, capsys):
     with pytest.raises(SystemExit) as error:
         main(argv.split())
@@ -162,12 +147,12 @@ original_parse = argparse.ArgumentParser.parse_args
 argparse.ArgumentParser.parse_args = forbidden
 sys.argv = ['unrelated-process', '--invalid-global-flag']
 import gpt_lab.cli
-for name in ['__main__', 'main', 'parser', 'options', 'commands.base', 'commands.training', 'commands.tokenizer', 'commands.benchmark', 'commands.experiment', 'commands.data', 'commands.cache', 'commands.chat']:
+for name in ['__main__', 'main', 'parser', 'options', 'commands.base', 'commands.training', 'commands.tokenizer', 'commands.data', 'commands.cache', 'commands.chat']:
     importlib.import_module('gpt_lab.cli.' + name)
 argparse.ArgumentParser.parse_args = original_parse
 for name in ['mkdir', 'stat', 'lstat', 'resolve', 'open']:
     setattr(pathlib.Path, name, forbidden)
-for prefix in ['', 'tokenizer', 'train base auto', 'train base resume', 'benchmark dataloaders', 'experiment tokenizer-scaling', 'data reshard', 'cache clear', 'chat console', 'chat app']:
+for prefix in ['', 'tokenizer', 'train base auto', 'train base resume', 'data reshard', 'cache clear', 'chat console', 'chat app']:
     try:
         gpt_lab.cli.main(prefix.split() + ['--help'])
     except SystemExit as exc:

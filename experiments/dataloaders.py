@@ -5,6 +5,8 @@ measurement of natural-language BPE throughput. Real mode uses the original
 uint32 .bin / uint64 .idx format (offsets include the final token boundary).
 """
 
+from gpt_lab.cli.options import ArgumentParser, positive_int
+
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import statistics
@@ -168,6 +170,8 @@ def load_dataset(args):
 
 
 def run(args):
+    if args.mode == 'real' and (args.bin is None or args.idx is None):
+        raise ValueError('--mode real requires --bin and --idx')
     dataset = load_dataset(args)
     selected = {
         'all': ('glab-tokenized', 'glab-on-the-fly', 'nanochat'),
@@ -207,3 +211,37 @@ def run(args):
             results.append(result)
     print_results(results)
     return results
+
+
+def build_parser():
+    parser = ArgumentParser(
+        prog='python -m experiments.dataloaders',
+        description='Benchmark dataloaders on synthetic documents or local token files.',
+    )
+    parser.add_argument('--mode', choices=['synthetic', 'real'], default='synthetic', help='Synthetic documents or local token files.')
+    parser.add_argument('--loader', choices=['glab', 'glab-on-the-fly', 'glab-tokenized', 'nanochat', 'all'], default='all', help='glab selects both gpt-lab variants; all also includes nanochat.')
+    parser.add_argument('--batch-size', '--batch_size', type=positive_int, default=8, help='Sequences per batch.')
+    parser.add_argument('--seq-len', '--seq_len', type=positive_int, default=2048, help='Tokens per sequence.')
+    parser.add_argument('--num-batches', '--num_batches', type=positive_int, default=20, help='Number of batches to time (after 2 warm-up batches)')
+    parser.add_argument('--buffer-size', '--buffer_size', type=positive_int, default=1000, help='Token buffer budget for gpt-lab; document buffer count for nanochat')
+    parser.add_argument('--num-docs', '--num_docs', type=positive_int, default=20000, help='Number of synthetic documents')
+    parser.add_argument('--device', default='cpu', help='torch device, e.g. cpu or cuda')
+    parser.add_argument('--bos-id', '--bos_id', type=int, default=1, help='BOS token id (for nanochat loader)')
+    parser.add_argument('--bin', default=None, help='Path to pretokenized .bin file')
+    parser.add_argument('--idx', default=None, help='Path to pretokenized .idx file')
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        run(args)
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

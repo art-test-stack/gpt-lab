@@ -221,54 +221,6 @@ def test_standalone_tokenizer_training_saves_loadable_local_config(tmp_path):
     assert loaded.decode(loaded.encode(sample)) == sample
 
 
-def test_synthetic_and_real_benchmarks_use_production_loaders(tmp_path):
-    import numpy as np
-    from gpt_lab.workflows.dataloaders import run
-    args = parse('benchmark dataloaders --loader all --num-docs 8 --num-batches 2 --seq-len 8 --batch-size 1 --buffer-size 4')
-    results = run(args)
-    assert [row['name'] for row in results] == ['glab-tokenized', 'glab-on-the-fly', 'nanochat']
-    assert all(row['throughput_tok_s'] > 0 for row in results)
-    assert results[-1]['bos_alignment'] == 1
-    assert all(row['crop_rate'] is None for row in results)
-    bin_path, idx_path = tmp_path / 'tokens.bin', tmp_path / 'tokens.idx'
-    np.array([2, 3, 4, 5, 6, 7], dtype=np.uint32).tofile(bin_path)
-    np.array([0, 3, 6], dtype=np.uint64).tofile(idx_path)
-    args.mode, args.bin, args.idx = 'real', str(bin_path), str(idx_path)
-    assert len(run(args)) == 3
-
-
-def test_scaling_resume_metadata_and_no_import_downloads(tmp_path, monkeypatch):
-    # Import the moved experiment with unavailable training deps stubbed. None
-    # of the helpers exercised here should invoke training/data/network APIs.
-    monkeypatch.setitem(sys.modules, 'gpt_lab.tokenizer.tokenizer', SimpleNamespace(Tokenizer=Mock()))
-    monkeypatch.setitem(sys.modules, 'gpt_lab.tokenizer.corpus', SimpleNamespace(TokenizerCorpus=Mock()))
-    monkeypatch.setitem(sys.modules, 'regex', SimpleNamespace())
-    monkeypatch.setitem(sys.modules, 'tqdm', SimpleNamespace(tqdm=lambda iterable, **kwargs: iterable))
-    monkeypatch.setitem(sys.modules, 'requests', SimpleNamespace(get=Mock(side_effect=AssertionError('network access'))))
-    name = 'gpt_lab.workflows.tokenizer_scaling'
-    # Remove afterwards so mocked imports cannot leak into the existing suite.
-    monkeypatch.delitem(sys.modules, name, raising=False)
-    module = importlib.import_module(name)
-    try:
-        results = tmp_path / 'results'
-        results.mkdir()
-        (results / 'meta.json').write_text('{"corpus_sizes_gb":"1"}')
-        module.prepare_result_dir(results, resume=True)
-        assert (results / 'meta.json').exists()
-        module.prepare_result_dir(results, resume=False)
-        assert list(results.iterdir()) == []
-        assert (tmp_path / 'results_1/meta.json').exists()
-        with pytest.raises(ValueError, match='corpus-sizes-gb'):
-            module.validate_settings({})
-        module.validate_settings(dict(corpus_sizes_gb='0.01,0.1', vocab_sizes='512,1024'))
-        buffer = [({'score': 1}, 'run')]
-        module.store_buffered_results(buffer, results)
-        assert module.load_all_result_paths(results) == ['run']
-        assert buffer == []
-    finally:
-        sys.modules.pop(name, None)
-
-
 def test_chat_app_builds_and_launches_only_when_executed(monkeypatch):
     from gpt_lab.workflows.chat import app
     application = MagicMock()
@@ -301,55 +253,6 @@ def test_console_loads_local_checkpoint_and_exits_without_generation(monkeypatch
     assert build_model.call_args.kwargs['step'] == 0
     assert build_model.call_args.kwargs['phase'] == 'eval'
     engine.generate.assert_not_called()
-
-
-def test_experiment_resume_forwards_saved_corpus_and_process_cap(tmp_path, monkeypatch):
-    import concurrent.futures
-    import json
-    import multiprocessing
-    from concurrent.futures import Future
-
-    corpus = Mock()
-    corpus_type = Mock()
-    corpus_type.from_path.return_value = corpus
-    monkeypatch.setitem(sys.modules, 'gpt_lab.tokenizer.tokenizer', SimpleNamespace(Tokenizer=Mock()))
-    monkeypatch.setitem(sys.modules, 'gpt_lab.tokenizer.corpus', SimpleNamespace(TokenizerCorpus=corpus_type))
-    monkeypatch.setitem(sys.modules, 'regex', SimpleNamespace())
-    monkeypatch.setitem(sys.modules, 'tqdm', SimpleNamespace(tqdm=lambda iterable, **kwargs: iterable))
-    monkeypatch.setitem(sys.modules, 'tiktoken', SimpleNamespace(get_encoding=Mock()))
-    monkeypatch.setattr(multiprocessing, 'set_start_method', Mock())
-    monkeypatch.setattr('os.cpu_count', lambda: 128)
-    future = Future()
-    future.set_result({'vocab_size': 512})
-    executor = MagicMock()
-    executor.submit.return_value = future
-    pool = MagicMock()
-    pool.return_value.__enter__.return_value = executor
-    monkeypatch.setattr(concurrent.futures, 'ProcessPoolExecutor', pool)
-    module_name = 'gpt_lab.workflows.tokenizer_scaling'
-    monkeypatch.delitem(sys.modules, module_name, raising=False)
-    module = importlib.import_module(module_name)
-    try:
-        result_dir = tmp_path / 'results'
-        result_dir.mkdir()
-        corpus_dir = tmp_path / 'chosen-corpus'
-        corpus_dir.mkdir()
-        meta = dict(corpus_dir=str(corpus_dir), corpus_sizes_gb='0.01', vocab_sizes='512',
-                    pat_strs='gpt2', baselines='gpt2', num_procs=None, seed=123)
-        (result_dir / 'meta.json').write_text(json.dumps(meta))
-        module.store_single_result({'baseline': 'gpt2'}, result_dir / 'gpt2.pkl')
-        args = parse('experiment tokenizer-scaling --resume')
-        args.result_dir = str(result_dir)
-        module.run(args)
-        pool.assert_called_once_with(max_workers=32)
-        corpus_type.from_path.assert_called_once_with(corpus_dir)
-        task = executor.submit.call_args.args[1]
-        assert task[5] == corpus_dir and task[-1]['seed'] == 123
-        assert task[4] == int(0.01 * 1024**3) and isinstance(task[4], int)
-        assert len(list(result_dir.glob('*.pkl'))) == 2
-        assert json.loads((result_dir / 'meta.json').read_text()) == meta
-    finally:
-        sys.modules.pop(module_name, None)
 
 
 @pytest.mark.parametrize('run_name', ['base', 'checkpoint_step_custom'])

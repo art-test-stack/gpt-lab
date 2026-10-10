@@ -155,11 +155,13 @@ I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-t
 ### Scripts
 
 The installed `gpt-lab` command groups tokenizer training, base training/resume,
-dataloader benchmarks, tokenizer scaling experiments, data preparation, cache
-management, and chat. Start with `gpt-lab --help` (or `uv run gpt-lab --help`).
+data preparation, cache management, and chat. Start with `gpt-lab --help`
+(or `uv run gpt-lab --help`).
 See the [CLI guide](docs/cli.md) for commands, defaults, distributed launch,
 checkpoint resume, and extension points. Existing `scripts/` entry points remain
 compatibility wrappers.
+Standalone dataloader benchmarks and tokenizer scaling live in
+[experiments/](experiments/README.md).
 
 ### Data
 
@@ -380,7 +382,7 @@ The tokenizer scaling experiment compares ByteLevel BPE tokenizers across corpus
 To experiment yourself tokenizer scaling, you can run the following command from the root directory of the repo:
 
 ```bash
-uv run gpt-lab experiment tokenizer-scaling \
+uv run --extra cpu python -m experiments.tokenizer_scaling \
     --seed 42 \
     --num-procs 16 \
     --vocab-sizes 20000,50000,100000 \
@@ -389,10 +391,10 @@ uv run gpt-lab experiment tokenizer-scaling \
     --corpus-sizes-gb 10,50,100,500,1000,5000,10000 
 ```
 
-More details on the arguments are given in the [CLI guide](docs/cli.md) or using `--help`:
+More details are in the [experiment guide](experiments/README.md) or `--help`:
 
 ```bash
-uv run gpt-lab experiment tokenizer-scaling --help
+uv run --extra cpu python -m experiments.tokenizer_scaling --help
 ```
 
 ### Model architecture
