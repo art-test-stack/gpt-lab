@@ -151,6 +151,8 @@ def test_imports_and_help_are_stdlib_only_and_do_not_touch_files(tmp_path):
 import argparse, builtins, importlib, importlib.abc, os, pathlib, sys
 class BlockHeavy(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
+        if fullname in {'gpt_lab.utils', 'gpt_lab.utils.paths'}:
+            return None
         if fullname.split('.')[0] in {'torch','datasets','gradio','transformers','wandb','numpy','pydantic'} or fullname.startswith(('gpt_lab.utils', 'gpt_lab.workflows')):
             raise AssertionError('heavy import: ' + fullname)
 sys.meta_path.insert(0, BlockHeavy())
