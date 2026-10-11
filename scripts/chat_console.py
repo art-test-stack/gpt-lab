@@ -1,10 +1,14 @@
-from gpt_lab.model.wrapper import Engine
-from gpt_lab.utils.default import (
-    ModelConfig,
-    TransformerOutput,
-    ModelCompletionOutput,
-)
+"""Compatibility wrapper for gpt-lab chat console."""
 
-from transformers import AutoModelForCausalLM
-import torch
-# model = AutoModelForCausalLM.from_pretrained("mistralai/Ministral-8B-Instruct-2410", torch_dtype=torch.bfloat16, attn_implementation="sdpa", device_map="auto")
+from collections.abc import Sequence
+import sys
+
+from gpt_lab.cli import main as cli_main
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    return cli_main(['chat', 'console'] + list(sys.argv[1:] if argv is None else argv))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

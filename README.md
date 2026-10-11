@@ -154,7 +154,14 @@ I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-t
 
 ### Scripts
 
-The library includes some scripts for training, evaluation, and inference. They are located in the `scripts/` folder. The main ones are the following:
+The installed `gpt-lab` command groups tokenizer training, base training/resume,
+data preparation, cache management, and chat. Start with `gpt-lab --help`
+(or `uv run gpt-lab --help`).
+See the [CLI guide](docs/cli.md) for commands, defaults, distributed launch,
+checkpoint resume, and extension points. Existing `scripts/` entry points remain
+compatibility wrappers.
+Standalone dataloader benchmarks and tokenizer scaling live in
+[experiments/](experiments/README.md).
 
 ### Data
 
@@ -370,12 +377,12 @@ Training time benchmarks for different implementations and configurations. All t
 
 #### Scaling laws for tokenizer training
 
-In [docs/tokenizer_scaling.md](./docs/tokenizer_scaling.md), we analyze how ByteLevel BPE tokenization scales with different corpus sizes, vocabulary sizes, and split patterns. The goal is to understand the trade-offs between these factors and their impact on tokenization quality and efficiency.
+The tokenizer scaling experiment compares ByteLevel BPE tokenizers across corpus sizes, vocabulary sizes, and split patterns to explore their impact on tokenization quality and efficiency.
 
 To experiment yourself tokenizer scaling, you can run the following command from the root directory of the repo:
 
 ```bash
-uv run python -m scripts.benchmark.tokenizer_corpus_size \
+uv run --extra cpu python -m experiments.tokenizer_scaling \
     --seed 42 \
     --num-procs 16 \
     --vocab-sizes 20000,50000,100000 \
@@ -384,10 +391,10 @@ uv run python -m scripts.benchmark.tokenizer_corpus_size \
     --corpus-sizes-gb 10,50,100,500,1000,5000,10000 
 ```
 
-More details on the arguments are given in [tokenizer_corpus_size.py](./scripts/benchmark/tokenizer_corpus_size.py) or using `--help`:
+More details are in the [experiment guide](experiments/README.md) or `--help`:
 
 ```bash
-uv run python -m scripts.benchmark.tokenizer_corpus_size --help
+uv run --extra cpu python -m experiments.tokenizer_scaling --help
 ```
 
 ### Model architecture
@@ -528,10 +535,20 @@ Both support single-GPU and multi-GPU distributed training with async communicat
 
 #### Pre training
 
-The pre-training script is located in `scripts/train_base.py`. It allows you to pre-train a GPT model from scratch on a defined corpus, using different configurations (model architecture, training hyperparameters, optimizer, etc.). You can also choose to write the corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus.
+Use `gpt-lab train base auto` to train from scratch on prepared local Parquet shards, or `gpt-lab train base resume` to restore a saved run. The `auto` mode configures the model and training parameters from depth and scaling laws; `--train-tokenizer` trains a new tokenizer. The existing `scripts/train_base.py` entry point remains a compatibility wrapper.
 
-> [!WARNING]
-> There are two sub-arguments for this script `auto` and `custom`. For now, only `auto` is implemented, which allows you to automatically load a configuration based on main (`depth`, `aspect_ratio`, `n_heads`, etc.) arguments and compute optimal training parameters, as optimal `vocab_size` if not provided. The script can then train a new tokenizer with `--train-tokenizer` flag. The `custom` argument is intended to allow you to directly pass the configuration as command-line arguments, without the need for a YAML file. This feature is under development and will be implemented in the future.
+```bash
+# Single-device training
+uv run gpt-lab train base auto --model-name ic1 --run-name baseline --depth 12
+
+# Eight GPUs on one node
+uv run torchrun --standalone --nproc-per-node=8 --no-python \
+  gpt-lab train base auto --model-name ic1 --run-name baseline --depth 12
+```
+
+`--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
+With an activated environment, omit `uv run`. See the [CLI guide](docs/cli.md#distributed-launch)
+for module-mode launches and distributed resume examples.
 
 <!-- Main arguments: 
 Argument | Description
@@ -635,19 +652,20 @@ Vizualize the training progress in the board of your choice (Tensorboard, Weight
 
 ### Chat with the model
 
-In this section, you will find instructions to run the chat interface with different models.
+Use a saved local checkpoint in the console:
 
-Under development environment (`DEVELOPMENT='1'` in `.env`), you can run the chat interface with auto-reloading, use the following command:
 ```sh
-uv run gradio scripts/chat_app.py --demo-name=app
+uv run gpt-lab chat console --model-name ic1 --run-name baseline
 ```
 
-Otherwise, if you don't want auto-reloading, use:
+The existing experimental web interface is available through:
+
 ```sh
-uv run python -m scripts.chat_app
+uv run gpt-lab chat app
 ```
 
-Then, open your browser and go to [`http://127.0.0.1:7860/`](http://127.0.0.1:7860/). It is quite straightforward to use. You can select different models (local or remote), choose some hyperparameters for inference, and chat with the model.
+See the [CLI guide](docs/cli.md#data-cache-and-chat) for UI dependency requirements,
+remote-completion configuration, and the existing Gradio compatibility limitation.
 
 ## Development Notes
 
