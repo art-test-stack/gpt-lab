@@ -255,6 +255,40 @@ def test_console_loads_local_checkpoint_and_exits_without_generation(monkeypatch
     engine.generate.assert_not_called()
 
 
+def test_console_generates_from_nonempty_prompt_on_cpu(monkeypatch, capsys):
+    from gpt_lab.model.gpt import DenseTransformer
+    from gpt_lab.tokenizer import Tokenizer, TokenizerConfig
+    from gpt_lab.utils.schemas import TransformerConfig
+    from gpt_lab.workflows.chat import console
+
+    tokenizer_config = TokenizerConfig(
+        name='console-test', source='local', vocab_size=257, save_token_bytes=False,
+    )
+    tokenizer = Tokenizer(
+        mergeable_ranks={bytes([i]): i for i in range(256)},
+        special_tokens=tokenizer_config.special_tokens.list(), config=tokenizer_config,
+    )
+    model = DenseTransformer(TransformerConfig(
+        vocab_size=tokenizer.vocab_size, max_context=16, d_model=16, d_ffn=32,
+        n_heads=2, n_kv_heads=2, n_layers=1, d_head=8,
+        window_pattern='L', attn_impl='sdpa',
+    ), pad_vocab_size_to=1).to('cpu')
+    model.init_weights()
+    model.eval()
+    generated = []
+    model.register_forward_hook(
+        lambda _, inputs, output: generated.append(output.logits[0, -1].argmax().item())
+    )
+    monkeypatch.setattr('gpt_lab.model.checkpoint.build_model', lambda **kwargs: (model, tokenizer, None, None))
+    prompts = iter(['Hi', '/exit'])
+    monkeypatch.setattr('builtins.input', lambda _: next(prompts))
+
+    console(parse('chat console --model-name demo --device cpu --max-tokens 2'))
+
+    assert len(generated) == 2
+    assert 'Model: ' + tokenizer.decode(generated) in capsys.readouterr().out
+
+
 @pytest.mark.parametrize('run_name', ['base', 'checkpoint_step_custom'])
 def test_explicit_run_directory_name_does_not_override_meta_marker(tmp_path, run_name):
     run = tmp_path / 'models/demo' / run_name
