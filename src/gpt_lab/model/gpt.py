@@ -16,6 +16,7 @@ from gpt_lab.optim.factory import OptimizerFactory
 from gpt_lab.utils.schemas import (
     ModelOutput, 
     TrainerConfig,
+    OptimizerConfig,
     TransformerConfig
 )
 from gpt_lab.utils.common import print0, print0_dict
@@ -265,44 +266,12 @@ class DenseTransformer(BaseTransformer):
         num_flops_per_token = 6 * matmul_params + attn_flops
         return num_flops_per_token
     
-    def build_optimizer(self, config: TrainerConfig, optim_config_path: Optional[str] = None) -> torch.optim.Optimizer:
-        # default config, overriden by optim_config_path if provided
-        optim_config = {
-            "embeddings":       dict(opt='adamw', lr=config.lr_embeddings,       betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            "head":             dict(opt='adamw', lr=config.lr_head,             betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
-            "residual_hiddens": dict(opt='adamw', lr=config.lr_residuals * 0.01, betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
-            "residual_inputs":  dict(opt='adamw', lr=config.lr_residuals,        betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            "value_embeds":     dict(opt='adamw', lr=config.lr_embeddings * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),                    
-            "transformer":      dict(opt='muon',  lr=config.lr_transformer,      momentum=0.95, ns_steps=5, beta=.9, weight_decay=config.weight_decay),
-        }
-        optim_config_path = optim_config_path or config.optim_config_path # one or another; idc for now
-        
-        if optim_config_path is not None:
-            optim_config_path = Path(optim_config_path)
-            if optim_config_path.is_file() and optim_config_path.suffix in (".yaml", ".yml"):
-                import yaml
-                with open(optim_config_path, "r") as f:
-                    _opt_cfg = yaml.safe_load(f)
-                def clean_value(value):
-                    if isinstance(value, str):
-                        try:
-                            return float(value)
-                        except (ValueError, TypeError):
-                            return value
-                    elif isinstance(value, list):
-                        return tuple(clean_value(v) for v in value)
-                    else:
-                        return value
-                
-                # clean yaml values (e.g. '1e-2' -> 1e-2, [0.8, 0.995] -> (0.8, 0.995))
-                _opt_cfg = {name: {key: clean_value(value) for key, value in group.items()} for name, group in _opt_cfg.items()}
+    def build_optimizer(
+        self, config: TrainerConfig, optim_config: Optional[OptimizerConfig] = None,
+    ) -> torch.optim.Optimizer:
+        profile = optim_config or getattr(config, "optim_config", None) or OptimizerConfig.from_file()
+        optim_config = profile.group_configs()
 
-                # update config with values from file -> override defaults from file -> override defaults from code (and keeps defaults for any missing values in the file)
-                optim_config = {name: optim_config[name] | _opt_cfg.get("default", {}) | _opt_cfg.get(name, {}) for name in optim_config.keys()}
-
-            else:
-                raise FileNotFoundError(f"Optimizer configuration file not found at {optim_config_path}. Please provide a valid path to the optimizer configuration YAML file (ending in .yaml or .yml), or remove the --optim-config-path argument to use the default configuration.")
-            
         d_model = self.config.d_model
         # Separate out all parameters into groups
         embedding_params = list(self.embeds.parameters())
@@ -320,6 +289,7 @@ class DenseTransformer(BaseTransformer):
 
         # Scaling hparams
         for name, group in optim_config.items():
+            group["lr"] *= config.batch_lr_scale
             if name in ("embeddings", "head", "value_embeds"):
                 optim_config[name]["lr"] = group["lr"] * dmodel_lr_scale
         optim_config["transformer"]["weight_decay"] *= config.weight_decay_scale

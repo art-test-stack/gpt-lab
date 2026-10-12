@@ -394,6 +394,82 @@ class GenerationConfig(BaseModel):
         if self.seed is None or self.seed < 0:
             self.seed = 42  # Ensure seed is within valid range for torch.manual_seed
 
+class OptimizerConfig(BaseModel):
+    """Base optimizer groups loaded before batch/width/decay scaling.
+
+    ``from_file()`` loads the bundled profile; a supplied YAML file overrides
+    its groups. Pass the loaded object to ``train_base(optim_config=...)``.
+    Training horizons and schedules belong to TrainerConfig, not this profile.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    groups: Dict[str, Dict[str, Any]]
+
+    def model_post_init(self, context):
+        from gpt_lab.optim.registry import OPTIMIZER_REGISTRY, _validate_group
+
+        def clean(value):
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    return value
+            if isinstance(value, (list, tuple)):
+                return tuple(clean(item) for item in value)
+            return value
+
+        self.groups = {
+            name: {key: clean(value) for key, value in group.items()}
+            for name, group in self.groups.items()
+        }
+        expected = {"embeddings", "head", "value_embeds", "residual_hiddens", "residual_inputs", "transformer"}
+        if set(self.groups) - {"default"} != expected:
+            raise ValueError(f"Optimizer groups must be {sorted(expected)} (plus optional default)")
+        allowed = set().union(*(spec.required_keys for spec in OPTIMIZER_REGISTRY.values()))
+        for index, (name, group) in enumerate(self.group_configs().items()):
+            _validate_group(group, index)
+            if set(group) - allowed:
+                raise ValueError(f"Unsupported optimizer parameters in {name}: {sorted(set(group) - allowed)}")
+            for key in ("lr", "weight_decay"):
+                if not isinstance(group[key], (int, float)) or not math.isfinite(group[key]) or group[key] < 0:
+                    raise ValueError(f"{name}.{key} must be finite and non-negative")
+
+    def group_configs(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            name: self.groups.get("default", {}) | group
+            for name, group in self.groups.items() if name != "default"
+        }
+
+    @classmethod
+    def from_file(cls, path: str | Path | None = None) -> "OptimizerConfig":
+        import yaml
+
+        def read(filename):
+            filename = Path(filename)
+            if filename.suffix not in (".yaml", ".yml"):
+                raise ValueError("Optimizer configuration must be a YAML file")
+            try:
+                with filename.open() as file:
+                    groups = yaml.safe_load(file)
+            except yaml.YAMLError as error:
+                raise ValueError(f"Invalid optimizer YAML: {filename}") from error
+            if not isinstance(groups, dict) or any(not isinstance(group, dict) for group in groups.values()):
+                raise ValueError("Optimizer YAML must map group names to parameter mappings")
+            return groups
+
+        base = read(Path(__file__).resolve().parents[1] / "optim" / "base.yaml")
+        if path is None:
+            return cls(groups=base)
+        overrides = read(path)
+        if set(overrides) - set(base):
+            raise ValueError(f"Unknown optimizer groups: {sorted(set(overrides) - set(base))}")
+        groups = {
+            name: base.get("default", {}) | group | overrides.get("default", {}) | overrides.get(name, {})
+            for name, group in base.items() if name != "default"
+        }
+        return cls(groups=groups)
+
+
 class TrainerConfig(BaseModel):
     # model_config = ConfigDict(frozen=True)
 
@@ -409,8 +485,9 @@ class TrainerConfig(BaseModel):
     
     device_batch_size: int = 1 
 
-    # Optimization hyperparameters
-    optim_config_path: Optional[str] = None # Path to optimizer config file. If not set, will use default config based on model size.
+    optim_config: Optional[OptimizerConfig] = None
+    # Legacy fields retained for loading older trainer checkpoints.
+    optim_config_path: Optional[str] = None
     lr_embeddings: float = .3 
     lr_transformer: float = .02
     lr_head: float = .008
@@ -480,7 +557,9 @@ class TrainerConfig(BaseModel):
             return progress * 1.0 + (1 - progress) * self.final_lr_ratio
     
     def weight_decay_schedule(self, step: int) -> float:
-        return self.weight_decay_scale * 0.5 * (1 + math.cos(math.pi * step / self.n_steps))
+        # New profiles apply decay scaling when building the optimizer.
+        scale = self.weight_decay_scale if getattr(self, "optim_config", None) is None else 1.0
+        return scale * 0.5 * (1 + math.cos(math.pi * step / self.n_steps))
     
     @classmethod
     def from_disk(self, path: Union[str, Path]) -> "TrainerConfig":

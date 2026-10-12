@@ -7,8 +7,8 @@ It is mainly adapted from the sources given below, but the overall structure is 
 
 ## Usage
 
-Use `gpt-lab train base auto --help` or `gpt-lab train base resume --help`.
-Distributed entry point: `torchrun -m gpt_lab.cli train base ...`.
+Use `gpt-lab train --help` or `gpt-lab train resume --help`.
+Distributed entry point: `torchrun -m gpt_lab.cli train ...`.
 See the gpt_lab.cli.main module docstring for commands and examples.
 
 ## Aknowledgements:
@@ -23,10 +23,85 @@ Author: Arthur Testard (arthur.testard.pro@gmail.com)
 Please cite this work if the code is helpful to you.
 """
 
-from argparse import Namespace
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from gpt_lab.utils.paths import get_cache_dir
+
+if TYPE_CHECKING:
+    from gpt_lab.utils.schemas import OptimizerConfig
 
 
-def run(args: Namespace) -> None:
+def train_base(
+    *,
+    optim_config: OptimizerConfig | None = None,
+    model_init='auto',
+    model_name='ic1',
+    run_name=None,
+    model_dir=None,
+    random_seed=42,
+    device='auto',
+    board='wandb',
+    board_dir=None,
+    ds_name='climbmix-base',
+    save_on_best=False,
+    eval_bpb_every=250,
+    n_bpb_tokens=41943040,
+    eval_core_every=2000,
+    n_core_tokens=500,
+    sample_every=0,
+    save_every=-1,
+    log_every=250,
+    monitor_grad_norms=False,
+    device_batch_size=32,
+    use_nanochat_dataloader=False,
+    max_seq_len=2048,
+    tokenizer_model=None,
+    vocab_size=-1,
+    pat_str=None,
+    train_tokenizer=False,
+    depth=12,
+    aspect_ratio=64,
+    d_head=128,
+    n_kv_heads=None,
+    tie_value_embeddings=False,
+    tie_word_embeddings=False,
+    tie_all_embeddings=False,
+    window_pattern=None,
+    window_size=None,
+    softcap=18.0,
+    attn_softcap=None,
+    attn_impl='sdpa',
+    num_steps=-1,
+    target_flops=-1.0,
+    target_param_data_ratio=11.0,
+    target_time=-1.0,
+    n_acc_steps=-1,
+    total_batch_size=-1,
+    warmup_steps=40,
+    warmdown_ratio=0.65,
+    final_lr_frac=0.05,
+    checkpoint_step=None,
+    checkpoint_dir=None,
+) -> None:
+    """Train from Python keywords using a loaded base optimizer profile.
+
+    Fresh runs require optim_config; resume restores the saved architecture,
+    trainer settings, and optimizer state. The CLI only loads files and forwards
+    keywords. The profile supplies base values, which scaling laws adjust once.
+    """
+    if model_init not in ("auto", "resume"):
+        raise ValueError("model_init must be auto or resume")
+    if model_init == "auto" and optim_config is None:
+        raise ValueError("Fresh training requires a loaded OptimizerConfig")
+    if optim_config is not None:
+        from gpt_lab.utils.schemas import OptimizerConfig
+        if not isinstance(optim_config, OptimizerConfig):
+            raise TypeError("optim_config must be a loaded OptimizerConfig")
+    model_dir = str(model_dir or get_cache_dir() / "models")
+    parameters = locals().copy()
     import os
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -44,24 +119,28 @@ def run(args: Namespace) -> None:
     init_logger()
     logger = logging.getLogger(__name__)
     get_banner(to_print=True)
-    from gpt_lab.cli.commands.base import resolve_checkpoint
-    args = resolve_checkpoint(args)
-    board_args = {key: value for key, value in vars(args).items() if not key.startswith("_")}
+    if checkpoint_dir is not None:
+        resolved = resolve_checkpoint(checkpoint_dir, checkpoint_step)
+        model_name, model_dir, run_name, checkpoint_step = (
+            resolved["model_name"], resolved["model_dir"], resolved["run_name"], resolved["checkpoint_step"]
+        )
+        parameters.update(resolved)
+    board_args = parameters | {"optim_config": optim_config.model_dump() if optim_config is not None else None}
 
-    log0(f"Initializing model base training on mode {args.model_init!r}", logger=logger)
+    log0(f"Initializing model base training on mode {model_init!r}", logger=logger)
 
     # ------------------------------------------------------------------------------
     # SETUP ENVIRONEMENT
     # ------------------------------------------------------------------------------
 
-    device_type = get_device_type() if args.device == "auto" else args.device
-    dist_info = init_dist_groups(device_type=device_type)
-    board = None
+    device_type = get_device_type() if device == "auto" else device
+    dist_info = init_dist_groups(device_type=device_type, random_seed=random_seed)
+    board_instance = None
     try:
         is_master_process = dist_info["RANK"] == 0
 
         device = dist_info["DEVICE"]
-        is_resumed = args.model_init == "resume"
+        is_resumed = model_init == "resume"
         print0_dict("Environment setup", dist_info)
 
         git_info = get_git_info()
@@ -78,16 +157,16 @@ def run(args: Namespace) -> None:
         # GET MODEL CONFIG
         # ------------------------------------------------------------------------------
 
-        if args.model_init == "auto":
-            meta_config = build_auto_config(args, device, dist_info)
+        if model_init == "auto":
+            meta_config = build_auto_config(parameters, device, dist_info)
             base_training_config = meta_config.base_train
 
         elif is_resumed:
             # load config from checkpoint and override with CLI args if specified
             meta_config = load_meta_config(
-                name=args.model_name,
-                run_name=args.run_name,
-                model_cachedir=args.model_dir
+                name=model_name,
+                run_name=run_name,
+                model_cachedir=model_dir
             )
             base_training_config = meta_config.base_train
 
@@ -98,22 +177,26 @@ def run(args: Namespace) -> None:
         ckpt_manager = CheckpointManager(
             model_name=meta_config.name,
             model_run=meta_config.run_name,
-            model_cachedir=args.model_dir,
+            model_cachedir=model_dir,
             dist_info=dist_info,
             mode="shard" if dist_info["IS_DDP_INITIALIZED"] else "ddp",
         )
         model = build_meta_model(meta_config.model_cfg)
         tokenizer = Tokenizer.from_config(meta_config.tokenizer_cfg)
-        if args.model_init == "auto":
+        if model_init == "auto":
             model = model.to_empty(device=device)
             model.init_weights()
             broadcast_model(model, dist_info)
         elif is_resumed:
             log0("Resuming training from checkpoint.", logger=logger)
             model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(
-                step=args.checkpoint_step if args.checkpoint_step is not None else "latest",
+                step=checkpoint_step if checkpoint_step is not None else "latest",
                 phase="train",
             )
+            if optim_config is not None:
+                saved_profile = getattr(trainer_config, "optim_config", None)
+                if saved_profile is None or optim_config.group_configs() != saved_profile.group_configs():
+                    raise ValueError("optim_config conflicts with the saved optimizer profile; resume without an optimizer override")
         # Check just model embeddings and hope others are fine
         assert model.embeds.weight.device.type == dist_info["DEVICE_TYPE"], "Model parameters are not on the correct device after initialization."
 
@@ -132,16 +215,16 @@ def run(args: Namespace) -> None:
                 log0("No dataloader state found in checkpoint data. Resuming without dataloader state.", logger=logger, level="warning")
 
         loader_common_kwargs = dict(
-            name=args.ds_name,
+            name=ds_name,
             tokenizer=tokenizer,
             column="text",
             seq_len=model.config.max_context,
             base_url=None, # no downloading here, just load local shards
             shard_limit=None,
             max_shards=None, # TODO: configured based on configs/data.yaml
-            batch_size=base_training_config.get("device_batch_size", args.device_batch_size),
+            batch_size=base_training_config.get("device_batch_size", device_batch_size),
             dist_info=dist_info,
-            use_nanochat=args.use_nanochat_dataloader,
+            use_nanochat=use_nanochat_dataloader,
         )
         # TODO: add option to configure buffer size
         train_loader = build_dataloader(split="train", resume_state=resume_state, **loader_common_kwargs)
@@ -155,7 +238,7 @@ def run(args: Namespace) -> None:
             assert type(trainer_config) == TrainerConfig, "Trainer config loaded from checkpoint is not of type TrainerConfig. Please check the checkpoint data and trainer config."
             # TODO: add option to override some trainer config parameters from CLI args even when resuming (eg: evaluation frequency, save frequency, etc.)
         else:
-            trainer_config = build_trainer_config(args, dist_info, base_training_config)
+            trainer_config = build_trainer_config(parameters, dist_info, base_training_config)
             ckpt_manager.save_training_config(trainer_config)
         print0_dict("Trainer config", trainer_config.model_dump())
 
@@ -163,8 +246,7 @@ def run(args: Namespace) -> None:
         # OPTIMIZER
         # ------------------------------------------------------------------------------
 
-        optim_cfg_path = getattr(args, "optim_config_path", None)
-        optimizers = model.build_optimizer(trainer_config, optim_config_path=optim_cfg_path)
+        optimizers = model.build_optimizer(trainer_config, optim_config=optim_config)
         if is_resumed and ckpt_data and ckpt_data.optimizer_state is not None:
             log0("Loading optimizer state from checkpoint data.", logger=logger)
             optimizers.load_state_dict(ckpt_data.optimizer_state)
@@ -177,17 +259,17 @@ def run(args: Namespace) -> None:
 
         if is_master_process:
             board_args["dirname"] = ckpt_manager.source_dir
-            board = Board(
-                board_type=args.board,
+            board_instance = Board(
+                board_type=board,
                 # entity_name=None, # TODO: add option for wandb entity
                 project=f"trainbase_{meta_config.name}",
                 run=meta_config.run_name,
                 config=board_args | {"meta_config": meta_config.model_dump(), "training_config": trainer_config.model_dump(), "model_card": model.config.model_dump()},
-                board_dir=args.board_dir,
+                board_dir=board_dir,
                 resume=is_resumed,
             )
         else:
-            board = DummyBoard()
+            board_instance = DummyBoard()
 
         # ------------------------------------------------------------------------------
         # TRAINER: TRAINING, EVALUATION, CHECKPOINTING LOOPS
@@ -198,7 +280,7 @@ def run(args: Namespace) -> None:
         trainer = Trainer(
             model=model, tokenizer=tokenizer, optimizer=optimizers,
             train_loader=train_loader, val_loader=val_loader,
-            config=trainer_config, board=board, checkpoint_manager=ckpt_manager,
+            config=trainer_config, board=board_instance, checkpoint_manager=ckpt_manager,
             resume_state=ckpt_data.trainer_state if is_resumed else None,
             best_state=ckpt_data.checkpoint_state if is_resumed else None,
         )
@@ -213,80 +295,93 @@ def run(args: Namespace) -> None:
 
     finally:
         try:
-            if board is not None:
-                board.close()
+            if board_instance is not None:
+                board_instance.close()
         finally:
             cleanup_dist_groups()
 
 
-def build_auto_config(args: Namespace, device, dist_info: dict):
+def resolve_checkpoint(checkpoint_dir, checkpoint_step=None) -> dict:
+    """Resolve a run/base/step directory without importing the CLI."""
+    path = Path(checkpoint_dir).expanduser().resolve()
+    if not path.is_dir():
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {path}")
+    if not (path / "meta.json").is_file():
+        if path.name.startswith("checkpoint_step_"):
+            step = int(path.name.removeprefix("checkpoint_step_"))
+            if checkpoint_step is not None and checkpoint_step != step:
+                raise ValueError("--checkpoint-step conflicts with the explicit checkpoint directory")
+            checkpoint_step = step
+            path = path.parent
+        if path.name == "base":
+            path = path.parent
+    if not (path / "meta.json").is_file():
+        raise ValueError("Checkpoint directory must identify a run with meta.json, its base directory, or a checkpoint_step_N directory")
+    return dict(model_name=path.parent.name, run_name=path.name,
+                model_dir=str(path.parent.parent), checkpoint_step=checkpoint_step)
+
+
+def build_auto_config(parameters: dict, device, dist_info: dict):
     """Construct the existing auto configuration independently of training."""
     from gpt_lab.model.auto import AutoGPTConfig
 
     return AutoGPTConfig(
         # metadata
-        name=args.model_name,
-        run_name=args.run_name,
-        dirname=args.model_dir,
-        random_seed=args.random_seed,
+        name=parameters["model_name"],
+        run_name=parameters["run_name"],
+        dirname=parameters["model_dir"],
+        random_seed=parameters["random_seed"],
         dist_info=dist_info,
-        max_seq_len=args.max_seq_len,
+        max_seq_len=parameters["max_seq_len"],
         # tokenizer
-        tokenizer_model="auto" if args.train_tokenizer else args.tokenizer_model,
-        train_tokenizer=args.train_tokenizer,
-        vocab_size=args.vocab_size,
-        pat_str=args.pat_str,
+        tokenizer_model="auto" if parameters["train_tokenizer"] else parameters.get("tokenizer_model"),
+        train_tokenizer=parameters["train_tokenizer"],
+        vocab_size=parameters["vocab_size"],
+        pat_str=parameters["pat_str"],
         # model architecture
-        depth=args.depth,
-        aspect_ratio=args.aspect_ratio,
-        d_head=args.d_head,
-        n_kv_heads=args.n_kv_heads,
-        tie_value_embeddings=args.tie_value_embeddings,
-        tie_word_embeddings=args.tie_word_embeddings,
-        tie_all_embeddings=args.tie_all_embeddings,
-        window_pattern=args.window_pattern,
-        window_size=args.window_size,
-        softcap=args.softcap,
-        attn_softcap=args.attn_softcap,
-        attn_impl=args.attn_impl, # for now, only support 'sdpa' and 'fused'
+        depth=parameters["depth"],
+        aspect_ratio=parameters["aspect_ratio"],
+        d_head=parameters["d_head"],
+        n_kv_heads=parameters["n_kv_heads"],
+        tie_value_embeddings=parameters["tie_value_embeddings"],
+        tie_word_embeddings=parameters["tie_word_embeddings"],
+        tie_all_embeddings=parameters["tie_all_embeddings"],
+        window_pattern=parameters["window_pattern"],
+        window_size=parameters["window_size"],
+        softcap=parameters["softcap"],
+        attn_softcap=parameters["attn_softcap"],
+        attn_impl=parameters["attn_impl"], # for now, only support 'sdpa' and 'fused'
         # training horizon targets
-        n_steps=args.num_steps,
-        target_flops=args.target_flops,
-        target_param_data_ratio=args.target_param_data_ratio,
+        n_steps=parameters["num_steps"],
+        target_flops=parameters["target_flops"],
+        target_param_data_ratio=parameters["target_param_data_ratio"],
         # training params
-        n_acc_steps=args.n_acc_steps,
-        device_batch_size=args.device_batch_size,
-        total_batch_size=args.total_batch_size,
+        n_acc_steps=parameters["n_acc_steps"],
+        device_batch_size=parameters["device_batch_size"],
+        total_batch_size=parameters["total_batch_size"],
     ).generate_gpt_config(device)
 
 
-def build_trainer_config(args: Namespace, dist_info: dict, base_training_config: dict):
+def build_trainer_config(parameters: dict, dist_info: dict, base_training_config: dict):
     """Translate CLI and scaling-law settings into the existing TrainerConfig."""
     from gpt_lab.utils.schemas import TrainerConfig
 
-    lr_scale = base_training_config.get("batch_lr_scale", 1.0)
-    weight_decay_scale = base_training_config.get("weight_decay_scale", 1.0)
     return TrainerConfig(
-        lr_embeddings=args.lr_embeddings * lr_scale,
-        lr_transformer=args.lr_transformer * lr_scale,
-        lr_head=args.lr_head * lr_scale,
-        lr_residuals=args.lr_residuals * lr_scale,
-        weight_decay=args.weight_decay * weight_decay_scale,
-        lr_warmup_steps=args.warmup_steps,
-        lr_warmdown_ratio=args.warmdown_ratio,
-        final_lr_ratio=args.final_lr_frac,
-        target_time=args.target_time,
+        optim_config=parameters["optim_config"],
+        lr_warmup_steps=parameters["warmup_steps"],
+        lr_warmdown_ratio=parameters["warmdown_ratio"],
+        final_lr_ratio=parameters["final_lr_frac"],
+        target_time=parameters["target_time"],
         dist_info=dist_info,
-        optim_config_path=args.optim_config_path,
-        eval_bpb_every=args.eval_bpb_every,
-        n_bpb_tokens=args.n_bpb_tokens,
-        eval_core_every=args.eval_core_every,
-        n_core_tokens=args.n_core_tokens,
-        sample_every=args.sample_every,
-        save_every=args.save_every,
-        log_every=args.log_every,
-        monitor_grad_norms=args.monitor_grad_norms,
-        save_on_best=args.save_on_best,
+        eval_bpb_every=parameters["eval_bpb_every"],
+        n_bpb_tokens=parameters["n_bpb_tokens"],
+        eval_core_every=parameters["eval_core_every"],
+        n_core_tokens=parameters["n_core_tokens"],
+        sample_every=parameters["sample_every"],
+        save_every=parameters["save_every"],
+        log_every=parameters["log_every"],
+        monitor_grad_norms=parameters["monitor_grad_norms"],
+        save_on_best=parameters["save_on_best"],
         # training horizon args from meta config
         **base_training_config
     )

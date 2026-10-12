@@ -9,8 +9,8 @@ perform no application setup; help loads no runtime dependencies.
 
 Commands (append --help for arguments and defaults):
     gpt-lab tokenizer train --trainer huggingface --corpus-path ./.data/corpus.txt
-    gpt-lab train base auto --model-name ic1 --depth 12 --board dummy
-    gpt-lab train base resume --model-name ic1 --run-name baseline
+    gpt-lab train --model-name ic1 --depth 12 --board dummy
+    gpt-lab train resume --model-name ic1 --run-name baseline
     gpt-lab data reshard --ds-name climbmix --mode local --max-shards 2
     gpt-lab cache clear --subdirs tokenizer
     gpt-lab chat console --model-name ic1 --run-name baseline
@@ -25,6 +25,16 @@ Base training requires prepared local shards (--ds-name defaults to climbmix-bas
 Defaults: depth 12, context 2048, device batch 32, data-to-parameter ratio 11,
 and automatic batch/step horizons. --board dummy disables the default wandb board.
 Tokenizer resolution and evaluation may access external data.
+No auto subcommand is required. Explicit vocabulary, batch, step, and accumulation
+values replace inference. Optimizer values come from the bundled base YAML;
+--optim-config-path supplies file overrides before scaling. Learning-rate and
+weight-decay CLI overrides are not supported. Resume accepts checkpoint/runtime
+options, not architecture flags, and rejects conflicting optimizer profiles.
+
+Python entry point (file loading stays outside the workflow):
+    from gpt_lab.utils.schemas import OptimizerConfig
+    from gpt_lab.workflows.train_base import train_base
+    train_base(depth=12, optim_config=OptimizerConfig.from_file("custom.yaml"))
 
 Tying defaults off: --tie-value-embeddings shares values across eligible layers;
 --tie-word-embeddings ties input/head weights. Together they create two tables.
@@ -42,7 +52,7 @@ Changing tying modes on resume is not a checkpoint conversion.
 
 Distributed CUDA/NCCL launch (CPU/MPS remain single-device):
     uv run --extra gpu torchrun --standalone --nproc-per-node=8 -m gpt_lab.cli \\
-      train base auto --model-name ic1 --depth 12
+      train --model-name ic1 --depth 12
 Use module mode or --no-python for the installed executable. Launcher arguments
 precede the entry point; CLI arguments follow it. Checkpoint world-size limits apply.
 
@@ -59,8 +69,8 @@ openai/python-dotenv and uses arguments incompatible with pinned Gradio 3.18.0.
 Unused flags: tokenizer --fast; training --fp8, --truncate-tokenizer,
 --ds-config-path. Legacy scripts delegate to the CLI; app autoreload is unsupported.
 Benchmarks and tokenizer scaling live in experiments/. Parser command modules
-register lazy module:handler targets; workflows handle orchestration. Add training
-stages through TRAINING_STAGES with parser/dispatch tests. Invalid arguments exit 2.
+register lazy module:handler targets; workflows handle orchestration. Add commands
+with parser/dispatch tests. Invalid arguments exit 2.
 CLI checks: uv run --locked --extra cpu --group dev pytest -q tests/cli
 Training, UI, and external services are mocked; tiny tokenizer save/load is real.
 """
