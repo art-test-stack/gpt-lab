@@ -76,6 +76,9 @@ class AutoGPTConfig(BaseModel):
     aspect_ratio: int = 64
     d_head: int = 2**9 # 512
     n_kv_heads: Optional[int] = None
+    tie_value_embeddings: bool = False
+    tie_word_embeddings: bool = False
+    tie_all_embeddings: bool = False
     # Deprecated compatibility alias. The old field was named as a dimension
     # but was always consumed as a head count.
     d_kv_head: Optional[int] = Field(default=None, exclude=True)
@@ -186,6 +189,9 @@ class AutoGPTConfig(BaseModel):
             n_layers=depth,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
+            tie_value_embeddings=self.tie_value_embeddings,
+            tie_word_embeddings=self.tie_word_embeddings,
+            tie_all_embeddings=self.tie_all_embeddings,
             d_head=self.d_head,
             window_pattern=self.window_pattern or "SSSL",
             window_size=self.window_size,

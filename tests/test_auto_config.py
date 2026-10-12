@@ -187,6 +187,15 @@ def test_deprecated_kv_head_alias_maps_to_head_count(tmp_path):
     assert config.n_kv_heads == 2
 
 
+@pytest.mark.parametrize("flag", ["tie_value_embeddings", "tie_word_embeddings", "tie_all_embeddings"])
+def test_auto_config_forwards_embedding_tying(tmp_path, flag):
+    config = _auto_config(tmp_path, **{flag: True})
+    for depth in (config.depth, config.reference_depth()):
+        model_cfg = config.build_transformer_config(depth, 4096)
+        assert getattr(model_cfg, flag)
+        assert model_cfg.model_dump()[flag]
+
+
 @pytest.mark.fast
 def test_default_scaling_methods(tmp_path):
     from gpt_lab.tokenizer.auto import compute_optimal_vocab_size, round_vocab_size

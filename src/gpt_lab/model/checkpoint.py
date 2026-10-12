@@ -340,7 +340,12 @@ def load_meta_config(
         log_error(f"Checkpoint path {run_dir} is not a directory.", logger=logger, error_type=ValueError)
 
     _meta_cfg = _load_json(run_dir, "meta.json")
-    meta_cfg = MetaConfig.model_validate_json(_meta_cfg)
+    metadata = json.loads(_meta_cfg)
+    model_cfg = metadata["model_cfg"]
+    if "tie_value_embeddings" not in model_cfg and "tie_all_embeddings" not in model_cfg:
+        # The legacy tie_word_embeddings flag was a no-op.
+        model_cfg["tie_word_embeddings"] = False
+    meta_cfg = MetaConfig.model_validate(metadata)
     
     log0(f"Loaded meta config from {run_dir / 'meta.json'}", logger=logger)
     

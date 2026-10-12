@@ -93,20 +93,22 @@ class DenseTransformer(BaseTransformer):
 
         kv_dim = config.n_kv_heads * config.d_head
 
-        # TODO: same as karpathy
         # Value embeddings (ResFormer-style): alternating layers, last layer always include
+        shared_value_embedding = None
+        if config.tie_all_embeddings:
+            shared_value_embedding = self.embeds
+        elif config.tie_value_embeddings:
+            shared_value_embedding = nn.Embedding(padded_vocab_size, kv_dim)
         self.value_embeds = nn.ModuleDict({
-            str(layer_idx): nn.Embedding(padded_vocab_size, kv_dim)
+            str(layer_idx): (
+                shared_value_embedding if shared_value_embedding is not None
+                else nn.Embedding(padded_vocab_size, kv_dim)
+            )
             for layer_idx in range(config.n_layers) if has_ve(layer_idx, config.n_layers)
         })
 
         self.lm_head = Linear(config.d_model, padded_vocab_size, bias=False)
-
-        if config.tie_word_embeddings:
-            # not sure if this works / maybe have to check dtype - at least
-            # self.lm_head.weight = self.blocks .emb.weight.T # E -> V
-            # TODO: solve this naive solution
-            pass
+        self._tie_embedding_weights()
 
         self.res_x0 = torch.nn.Parameter(torch.ones(self.config.n_layers), requires_grad=True)
         self.res_h = torch.nn.Parameter(torch.zeros(self.config.n_layers), requires_grad=True)
@@ -117,11 +119,26 @@ class DenseTransformer(BaseTransformer):
         # default loss_fn, can be overridden by trainer or by passing a different loss_fn to the model if needed
         self.loss_fn = build_loss() 
 
+    def _tie_embedding_weights(self):
+        if self.config.tie_word_embeddings or self.config.tie_all_embeddings:
+            self.lm_head.weight = self.embeds.weight
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        # Device/dtype moves can replace the shared Parameter objects.
+        self._tie_embedding_weights()
+        return result
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        self._tie_embedding_weights()
+        return result
 
     @torch.no_grad()
     def init_weights(self):
         torch.nn.init.normal_(self.embeds.weight, mean=0.0, std=0.8)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if self.lm_head.weight is not self.embeds.weight:
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         d_model = self.config.d_model
         s = 3**0.5 * d_model**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
@@ -144,8 +161,9 @@ class DenseTransformer(BaseTransformer):
             self.res_x0.data[i] = 0.20 - (0.15 * i / max(n_layers - 1, 1))
 
         # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+        for ve in self.value_embeds.children():
+            if ve.weight is not self.embeds.weight:
+                torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.blocks:
@@ -216,16 +234,17 @@ class DenseTransformer(BaseTransformer):
         nb_of_params = dict(
             embeds=sum(p.numel() for p in self.embeds.parameters()),
             blocks=sum(p.numel() for p in self.blocks.parameters()),
-            lm_head=sum(p.numel() for p in self.lm_head.parameters()),
+            lm_head=sum(p.numel() for p in self.lm_head.parameters() if p is not self.embeds.weight),
             residuals=self.res_x0.numel() + self.res_h.numel(),
-            value_embeds=sum(p.numel() for p in self.value_embeds.parameters()),
+            value_embeds=sum(p.numel() for p in self.value_embeds.parameters() if p is not self.embeds.weight),
         )
         nb_of_params["total"] = sum(nb_of_params.values())
         return nb_of_params
 
     def n_scaling_params(self) -> int:
+        """Count blocks and the output table, including a tied output table once."""
         nb_of_params = self.n_params_per_layer()
-        return sum(nb_of_params[tab] for tab in ["blocks", "lm_head"])
+        return nb_of_params["blocks"] + self.lm_head.weight.numel()
     
     def estimate_flops(self) -> float:
         """Estimate FLOPs per token based on model configuration.
@@ -233,11 +252,8 @@ class DenseTransformer(BaseTransformer):
         Adapted from: karpathy/nanochat
         """
         n_params_per_layer = self.n_params_per_layer()
-        nparams = n_params_per_layer["total"]
-        # Exclude non-matmul params: embeddings and per-layer scalars
-        nparams_exclude = sum([
-            _nparams for layer, _nparams in n_params_per_layer.items() 
-            if layer in ("embeds", "residuals", "value_embeds")])
+        # Tying saves storage, but the output projection still does the same work.
+        matmul_params = n_params_per_layer["blocks"] + self.lm_head.weight.numel()
         
         h, q, t = self.config.n_heads, self.config.d_model // self.config.n_heads, self.config.max_context
         # Sum attention FLOPs per layer, accounting for sliding window
@@ -246,7 +262,7 @@ class DenseTransformer(BaseTransformer):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        num_flops_per_token = 6 * matmul_params + attn_flops
         return num_flops_per_token
     
     def build_optimizer(self, config: TrainerConfig, optim_config_path: Optional[str] = None) -> torch.optim.Optimizer:
@@ -291,8 +307,8 @@ class DenseTransformer(BaseTransformer):
         # Separate out all parameters into groups
         embedding_params = list(self.embeds.parameters())
         blocks_params = list(self.blocks.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        value_embeds_params = [p for p in self.value_embeds.parameters() if p is not self.embeds.weight]
+        lm_head_params = [p for p in self.lm_head.parameters() if p is not self.embeds.weight]
         residual_h_params = [self.res_h]
         residual_x0_params = [self.res_x0]
 
