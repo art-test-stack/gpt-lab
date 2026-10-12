@@ -18,8 +18,8 @@ from gpt_lab.cli.parser import build_parser
 ROOT = Path(__file__).resolve().parents[2]
 LEAVES = [
     ('tokenizer train', 'tokenizer', 'run', 'train_tokenizer', 'run'),
-    ('train base auto', 'base', 'run_auto', 'train_base', 'run'),
-    ('train base resume', 'base', 'run_resume', 'train_base', 'run'),
+    ('train', 'base', 'run', 'train_base', 'train_base'),
+    ('train resume', 'base', 'run', 'train_base', 'train_base'),
     ('data reshard', 'data', 'run', 'reshard', 'run'),
     ('cache clear', 'cache', 'run', None, None),
     ('chat console', 'chat', 'run_console', 'chat', 'console'),
@@ -27,7 +27,7 @@ LEAVES = [
 ]
 WRAPPERS = {
     'scripts.train_tokenizer': 'tokenizer train',
-    'scripts.train_base': 'train base',
+    'scripts.train_base': 'train',
     'scripts.reshard_dataset': 'data reshard',
     'scripts.clear_gpt_lib_cache': 'cache clear',
     'scripts.chat_console': 'chat console',
@@ -35,7 +35,7 @@ WRAPPERS = {
 }
 
 
-@pytest.mark.parametrize('prefix', ['', 'tokenizer', 'train', 'data', 'cache', 'chat', 'train base'] + [row[0] for row in LEAVES])
+@pytest.mark.parametrize('prefix', ['', 'tokenizer', 'train', 'data', 'cache', 'chat'] + [row[0] for row in LEAVES])
 def test_help(prefix, capsys):
     with pytest.raises(SystemExit) as error:
         main(prefix.split() + ['--help'])
@@ -59,8 +59,8 @@ def test_dispatch_only_selected_handler(prefix, module, handler, workflow, targe
     run.assert_called_once()
     args = run.call_args.args[0]
     assert isinstance(args, argparse.Namespace)
-    if prefix.startswith('train base'):
-        assert args.model_init == prefix.split()[-1]
+    if prefix.startswith('train'):
+        assert args.model_init == ('resume' if prefix.endswith('resume') else 'auto')
 
 
 @pytest.mark.parametrize('prefix,module,handler,workflow,target', [row for row in LEAVES if row[3]])
@@ -70,11 +70,20 @@ def test_handlers_forward_to_packaged_workflow(prefix, module, handler, workflow
     args = build_parser().parse_args(prefix.split() + (['--mode', 'local'] if module == 'data' else []))
     command = importlib.import_module(f'gpt_lab.cli.commands.{module}')
     getattr(command, handler)(args)
-    execute.assert_called_once_with(args)
+    if module == 'base':
+        execute.assert_called_once()
+        keywords = execute.call_args.kwargs
+        assert keywords['model_init'] == args.model_init
+        assert keywords['model_name'] == args.model_name
+        assert '_handler' not in keywords and 'optim_config_path' not in keywords
+        if args.model_init == 'auto':
+            assert keywords['optim_config'] is not None
+    else:
+        execute.assert_called_once_with(args)
 
 
 def test_important_training_defaults():
-    args = build_parser().parse_args(['train', 'base', 'auto'])
+    args = build_parser().parse_args(['train'])
     expected = dict(model_init='auto', model_name='ic1', run_name=None, max_seq_len=2048,
                     random_seed=42, board='wandb', ds_name='climbmix-base', depth=12,
                     aspect_ratio=64, d_head=128, n_kv_heads=None, softcap=18.0,
@@ -82,25 +91,49 @@ def test_important_training_defaults():
                     attn_softcap=None, attn_impl='sdpa', device_batch_size=32,
                     vocab_size=-1, num_steps=-1, target_param_data_ratio=11.0,
                     n_acc_steps=-1, total_batch_size=-1, warmup_steps=40,
-                    lr_embeddings=.3, lr_transformer=.02, lr_head=.008, lr_residuals=.5,
-                    weight_decay=.28, warmdown_ratio=.65, final_lr_frac=.05,
+                    warmdown_ratio=.65, final_lr_frac=.05,
                     eval_bpb_every=250, n_bpb_tokens=80 * 524288, eval_core_every=2000,
                     sample_every=0, save_every=-1, log_every=250)
     assert vars(args) | expected == vars(args)
 
 
 def test_auto_parsing_and_deprecated_alias():
-    args = build_parser().parse_args('train base auto --model-name test --depth 4 --d-kv-head 2 --train-tokenizer --vocab-size 512 --num-steps 10 --device cpu --board dummy --window-size 128'.split())
+    args = build_parser().parse_args('train --model-name test --depth 4 --d-kv-head 2 --train-tokenizer --vocab-size 512 --num-steps 10 --device cpu --board dummy --window-size 128'.split())
     assert (args.depth, args.n_kv_heads, args.vocab_size, args.num_steps) == (4, 2, 512, 10)
     assert args.train_tokenizer and args.window_size == '128'
 
 
 @pytest.mark.parametrize('value,expected', [('120', 120), ('0', 0), ('-1', -1), ('-2', -2), ('latest', 'latest'), ('best', 'best')])
 def test_resume_step_parsing(value, expected):
-    args = build_parser().parse_args(['train', 'base', 'resume', '--checkpoint-step', value, '--checkpoint-dir', '/missing/run/base'])
+    args = build_parser().parse_args(['train', 'resume', '--checkpoint-step', value, '--checkpoint-dir', '/missing/run/base'])
     assert args.checkpoint_step == expected
     assert args.checkpoint_dir == '/missing/run/base'
     assert not hasattr(args, 'depth')
+    assert not hasattr(args, 'max_seq_len')
+
+
+@pytest.mark.parametrize('option', [
+    '--depth 4', '--max-seq-len 128', '--d-head 64', '--n-kv-heads 2',
+    '--vocab-size 4096', '--tokenizer-model gpt2', '--tie-all-embeddings',
+])
+def test_resume_rejects_architecture_options(option):
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(('train resume ' + option).split())
+    assert error.value.code == 2
+
+
+def test_optional_auto_spelling_preserves_training_defaults():
+    parser = build_parser()
+    assert vars(parser.parse_args(['train'])) == vars(parser.parse_args(['train', 'auto']))
+
+
+@pytest.mark.parametrize('option', [
+    '--lr-embeddings', '--lr-transformer', '--lr-head', '--lr-residuals', '--weight-decay',
+])
+def test_optimizer_values_are_not_cli_overrides(option):
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(['train', option, '0.1'])
+    assert error.value.code == 2
 
 
 def test_other_defaults(monkeypatch, tmp_path):
@@ -114,7 +147,7 @@ def test_other_defaults(monkeypatch, tmp_path):
     assert not (tmp_path / 'not-created').exists()
 
 
-@pytest.mark.parametrize('argv', ['', 'train', 'train base', 'train base invalid', 'train sft', 'train rl', 'benchmark dataloaders', 'experiment tokenizer-scaling', 'chat', 'unknown', 'train base auto --wat', 'train base resume --checkpoint-step nope'])
+@pytest.mark.parametrize('argv', ['', 'train base', 'train base invalid', 'train sft', 'train rl', 'benchmark dataloaders', 'experiment tokenizer-scaling', 'chat', 'unknown', 'train --wat', 'train resume --checkpoint-step nope'])
 def test_invalid_or_missing_subcommands(argv, capsys):
     with pytest.raises(SystemExit) as error:
         main(argv.split())
@@ -153,7 +186,7 @@ for name in ['__main__', 'main', 'parser', 'options', 'commands.base', 'commands
 argparse.ArgumentParser.parse_args = original_parse
 for name in ['mkdir', 'stat', 'lstat', 'resolve', 'open']:
     setattr(pathlib.Path, name, forbidden)
-for prefix in ['', 'tokenizer', 'train base auto', 'train base resume', 'data reshard', 'cache clear', 'chat console', 'chat app']:
+for prefix in ['', 'tokenizer', 'train', 'train resume', 'data reshard', 'cache clear', 'chat console', 'chat app']:
     try:
         gpt_lab.cli.main(prefix.split() + ['--help'])
     except SystemExit as exc:
@@ -167,15 +200,6 @@ for prefix in ['', 'tokenizer', 'train base auto', 'train base resume', 'data re
 
 def test_module_smoke_outside_repository(tmp_path):
     env = dict(os.environ, PYTHONPATH=str(ROOT / 'src'), PYTHONDONTWRITEBYTECODE='1')
-    result = subprocess.run([sys.executable, '-S', '-m', 'gpt_lab.cli', 'train', 'base', 'resume', '--help'], cwd=tmp_path, env=env, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, '-S', '-m', 'gpt_lab.cli', 'train', 'resume', '--help'], cwd=tmp_path, env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert '--checkpoint-step' in result.stdout
-
-
-def test_future_stage_registration_requires_no_root_change(monkeypatch):
-    from gpt_lab.cli.commands import training
-    def register(stages):
-        stage = stages.add_parser('test-stage')
-        stage.set_defaults(_handler='test:run')
-    monkeypatch.setattr(training, 'TRAINING_STAGES', training.TRAINING_STAGES + (SimpleNamespace(register=register),))
-    assert build_parser().parse_args('train test-stage'.split())._handler == 'test:run'

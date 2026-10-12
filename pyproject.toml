@@ -72,6 +72,9 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"gpt_lab.optim" = ["*.yaml"]
+
 [tool.uv]
 managed = true
 package = true

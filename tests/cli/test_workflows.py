@@ -25,7 +25,7 @@ def test_explicit_checkpoint_resolves_location_without_mutating_args(tmp_path, s
     checkpoint = run / 'base/checkpoint_step_000120'
     checkpoint.mkdir(parents=True)
     (run / 'meta.json').write_text('{}')
-    args = parse('train base resume')
+    args = parse('train resume')
     args.checkpoint_dir = str(run) + suffix
     resolved = resolve_checkpoint(args)
     assert (resolved.model_dir, resolved.model_name, resolved.run_name, resolved.checkpoint_step) == (str(tmp_path / 'models'), 'demo', 'run-1', step)
@@ -37,7 +37,7 @@ def test_explicit_checkpoint_resolves_location_without_mutating_args(tmp_path, s
 
 
 def test_missing_checkpoint_fails_before_execution(tmp_path):
-    args = parse('train base resume')
+    args = parse('train resume')
     args.checkpoint_dir = str(tmp_path / 'missing')
     with pytest.raises(FileNotFoundError):
         resolve_checkpoint(args)
@@ -86,6 +86,12 @@ def training_dependencies(monkeypatch):
         def model_dump(self):
             return vars(self)
 
+        def group_configs(self):
+            return self.groups
+
+    profile = Config(groups={})
+    Config.from_file = Mock(return_value=profile)
+
     model = MagicMock()
     model.embeds.weight.device.type = 'cpu'
     model.config.max_context = 64
@@ -116,7 +122,7 @@ def training_dependencies(monkeypatch):
         'gpt_lab.utils.logging': dict(init_logger=Mock(), log0=Mock()),
         'gpt_lab.utils.system': dict(get_git_info=Mock(return_value={}), get_gpu_info=Mock(return_value={}), get_system_info=Mock(return_value={})),
         'gpt_lab.utils.distributed': dict(get_device_type=Mock(return_value='cpu'), init_dist_groups=init_dist, cleanup_dist_groups=cleanup, broadcast_model=Mock()),
-        'gpt_lab.utils.schemas': dict(TrainerConfig=Config),
+        'gpt_lab.utils.schemas': dict(TrainerConfig=Config, OptimizerConfig=Config),
         'gpt_lab.tokenizer': dict(Tokenizer=SimpleNamespace(from_config=Mock(return_value=tokenizer))),
         'gpt_lab.model.auto': dict(AutoGPTConfig=auto),
         'gpt_lab.model.checkpoint': dict(CheckpointManager=factory, build_meta_model=Mock(return_value=model), load_meta_config=load_meta),
@@ -132,9 +138,9 @@ def training_dependencies(monkeypatch):
 
 @pytest.mark.parametrize('step', [None, 0, 120, -2, 'best'])
 def test_resume_restores_all_states_through_existing_pipeline(training_dependencies, step):
-    from gpt_lab.workflows.train_base import run
+    from gpt_lab.cli.commands.base import run
     deps = training_dependencies
-    args = parse('train base resume --model-name demo --run-name run-1 --device cpu --board dummy')
+    args = parse('train resume --model-name demo --run-name run-1 --device cpu --board dummy')
     args.checkpoint_step = step
     run(args)
     deps.manager.load.assert_called_once_with(step='latest' if step is None else step, phase='train')
@@ -152,10 +158,10 @@ def test_resume_restores_all_states_through_existing_pipeline(training_dependenc
 
 
 def test_auto_preserves_configuration_and_cleanup_on_failure(training_dependencies):
-    from gpt_lab.workflows.train_base import run
+    from gpt_lab.cli.commands.base import run
     deps = training_dependencies
     deps.trainer.train.side_effect = RuntimeError('simulated failure')
-    args = parse('train base auto --depth 4 --train-tokenizer --vocab-size 512 --n-kv-heads 2 --board dummy --tie-value-embeddings --tie-word-embeddings --tie-all-embeddings')
+    args = parse('train --depth 4 --train-tokenizer --vocab-size 512 --n-kv-heads 2 --board dummy --tie-value-embeddings --tie-word-embeddings --tie-all-embeddings')
     with pytest.raises(RuntimeError, match='simulated failure'):
         run(args)
     cfg = deps.auto.call_args.kwargs
@@ -170,10 +176,10 @@ def test_auto_preserves_configuration_and_cleanup_on_failure(training_dependenci
 def test_torchrun_module_argument_forwarding():
     # Only parse torchrun's arguments; never call its launcher or rendezvous.
     from torch.distributed.run import parse_args
-    args = parse_args('--standalone --nproc_per_node=2 -m gpt_lab.cli train base resume --checkpoint-step -2'.split())
+    args = parse_args('--standalone --nproc_per_node=2 -m gpt_lab.cli train resume --checkpoint-step -2'.split())
     assert args.module
     assert args.training_script == 'gpt_lab.cli'
-    assert args.training_script_args == ['train', 'base', 'resume', '--checkpoint-step', '-2']
+    assert args.training_script_args == ['train', 'resume', '--checkpoint-step', '-2']
 
 
 def test_tokenizer_config_and_unicode_limits():
@@ -295,6 +301,37 @@ def test_explicit_run_directory_name_does_not_override_meta_marker(tmp_path, run
     run = tmp_path / 'models/demo' / run_name
     run.mkdir(parents=True)
     (run / 'meta.json').write_text('{}')
-    args = parse('train base resume')
+    args = parse('train resume')
     args.checkpoint_dir = str(run)
     assert resolve_checkpoint(args).run_name == run_name
+
+
+def test_training_is_callable_without_argparse(training_dependencies, monkeypatch):
+    from gpt_lab.workflows.train_base import train_base
+    deps = training_dependencies
+    monkeypatch.setattr('gpt_lab.cli.parser.build_parser', Mock(side_effect=AssertionError('Python training must not parse CLI arguments')))
+    train_base(optim_config=deps.profile, depth=4, total_batch_size=128, num_steps=7,
+               device='cpu', board='dummy', random_seed=123)
+    assert deps.auto.call_args.kwargs['depth'] == 4
+    assert deps.auto.call_args.kwargs['total_batch_size'] == 128
+    assert deps.auto.call_args.kwargs['n_steps'] == 7
+    deps.init_dist.assert_called_once_with(device_type='cpu', random_seed=123)
+    assert deps.model.build_optimizer.call_args.kwargs['optim_config'] is deps.profile
+    deps.trainer.train.assert_called_once()
+    deps.cleanup.assert_called_once()
+
+
+@pytest.mark.parametrize('conflict', [False, True])
+def test_python_resume_rejects_optimizer_profile_conflicts(training_dependencies, conflict):
+    from gpt_lab.workflows.train_base import train_base
+    deps = training_dependencies
+    deps.saved_config.optim_config = deps.profile
+    profile = deps.Config(groups={'changed': {}}) if conflict else deps.profile
+    if conflict:
+        with pytest.raises(ValueError, match='conflicts with the saved optimizer profile'):
+            train_base(model_init='resume', optim_config=profile, device='cpu', board='dummy')
+        deps.trainer.train.assert_not_called()
+    else:
+        train_base(model_init='resume', optim_config=profile, device='cpu', board='dummy')
+        deps.trainer.train.assert_called_once()
+    deps.cleanup.assert_called_once()

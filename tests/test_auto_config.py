@@ -196,6 +196,35 @@ def test_auto_config_forwards_embedding_tying(tmp_path, flag):
         assert model_cfg.model_dump()[flag]
 
 
+def test_cli_batch_and_horizon_override_automatic_sizing(monkeypatch, tmp_path):
+    from gpt_lab.cli.parser import build_parser
+    from gpt_lab.workflows.train_base import build_auto_config
+
+    args = build_parser().parse_args([
+        'train', '--model-name', 'test', '--run-name', 'run',
+        '--model-dir', str(tmp_path), '--depth', '3', '--aspect-ratio', '64',
+        '--d-head', '64', '--vocab-size', '4096', '--max-seq-len', '8',
+        '--device-batch-size', '1', '--total-batch-size', '64', '--num-steps', '7',
+    ])
+    def reject_automatic_sizing(*_args):
+        pytest.fail('Explicit CLI value must bypass automatic sizing')
+
+    monkeypatch.setattr(AutoGPTConfig, 'compute_batch_size', reject_automatic_sizing)
+    monkeypatch.setattr(AutoGPTConfig, 'compute_vocab_size', reject_automatic_sizing)
+    monkeypatch.setattr('gpt_lab.model.auto.resolve_tokenizer', lambda *_args: 'dummy')
+    monkeypatch.setattr(
+        'gpt_lab.model.auto.load_tokenizer',
+        lambda *_args, **kwargs: _DummyTokenizer(4096, kwargs['special_tokens']),
+    )
+    generated = build_auto_config(vars(args), 'cpu', {'WORLD_SIZE': 1, 'LOCAL_RANK': 0})
+    assert generated.model_cfg.n_layers == 3
+    assert generated.model_cfg.vocab_size == 4096
+    assert generated.base_train['total_batch_size'] == 64
+    assert generated.base_train['n_steps'] == 7
+    assert generated.base_train['n_acc_steps'] == 8
+    assert generated.base_train['n_total_tokens'] == 448
+
+
 @pytest.mark.fast
 def test_default_scaling_methods(tmp_path):
     from gpt_lab.tokenizer.auto import compute_optimal_vocab_size, round_vocab_size

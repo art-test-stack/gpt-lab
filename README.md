@@ -229,7 +229,7 @@ The library provides a minimalistic automatic configuration system that computes
 
 Subclass `AutoGPTConfig` to override individual scaling rules; see its [class docstring](./src/gpt_lab/model/auto.py) for the methods and an example.
 
-The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used in [`scripts/train_base.py`](./scripts/train_base.py) via the --auto flag.
+The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used by `gpt-lab train`; [`scripts/train_base.py`](./scripts/train_base.py) delegates to the same command.
 
 It automatically determines:
 - model depth scaling
@@ -426,8 +426,6 @@ model = DenseTransformer(cfg)
 
 The optimizer system uses a **registry-based, strategy-pattern architecture** that decouples optimizer logic from execution mode (single-GPU vs. distributed). Optimizers are built and configured by calling `DenseTransformer.build_optimizer` in the `Trainer` class (available in [`gpt_lab.train.trainer`](./src/gpt_lab/train/trainer.py)) using the optimizer configuration from [`configs/optim.yaml`](./configs/optim.yaml), which can specify mixed optimizer groups.
 
-> [!WARNING]
-> This is maybe the most critical part of the library, regarding model training, and it is also the part that I have less implemented myself. I used a lot of external repositories for code baseline, and used LLMs back and fourth to enhance it. My goal was to make it work, while being more modular. However, my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in [`gpt_lab.optim.factory`](./src/gpt_lab/optim/factory.py) and the corresponding subfolders for the different optimizers.
 
 #### Optimizer Architecture
 
@@ -537,15 +535,27 @@ Both support single-GPU and multi-GPU distributed training with async communicat
 
 #### Pre training
 
-Use `gpt-lab train base auto` to train from scratch on prepared local Parquet shards, or `gpt-lab train base resume` to restore a saved run. The `auto` mode configures the model and training parameters from depth and scaling laws; `--train-tokenizer` trains a new tokenizer. The existing `scripts/train_base.py` entry point remains a compatibility wrapper.
+Use `gpt-lab train` to train from scratch on prepared local Parquet shards, or `gpt-lab train resume` to restore a saved run. Training automatically configures the model and training parameters from depth and scaling laws; `--train-tokenizer` trains a new tokenizer. The existing `scripts/train_base.py` entry point remains a compatibility wrapper.
+
+Explicit batch, vocabulary, and horizon options override automatic values. Optimizer base values come from YAML and are scaled once; use `--optim-config-path` to override them through a file. Resume restores the saved architecture and rejects architecture options.
+
+The same workflow accepts Python keyword arguments:
+
+```python
+from gpt_lab.utils.schemas import OptimizerConfig
+from gpt_lab.workflows.train_base import train_base
+
+optim_config = OptimizerConfig.from_file("configs/optim.yaml")
+train_base(depth=12, total_batch_size=524288, optim_config=optim_config)
+```
 
 ```bash
 # Single-device training
-uv run gpt-lab train base auto --model-name ic1 --run-name baseline --depth 12
+uv run gpt-lab train --model-name ic1 --run-name baseline --depth 12
 
 # Eight GPUs on one node
 uv run torchrun --standalone --nproc-per-node=8 --no-python \
-  gpt-lab train base auto --model-name ic1 --run-name baseline --depth 12
+  gpt-lab train --model-name ic1 --run-name baseline --depth 12
 ```
 
 `--no-python` tells torchrun to execute the installed `gpt-lab` command directly.

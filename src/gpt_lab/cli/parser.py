@@ -1,4 +1,4 @@
-"""Root registration is independent of training stages and workflow imports."""
+"""Root command registration is independent of workflow imports."""
 
 from .commands import cache, chat, data, tokenizer, training
 from .options import ArgumentParser
