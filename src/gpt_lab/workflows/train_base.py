@@ -9,7 +9,7 @@ It is mainly adapted from the sources given below, but the overall structure is 
 
 Use `gpt-lab train base auto --help` or `gpt-lab train base resume --help`.
 Distributed entry point: `torchrun -m gpt_lab.cli train base ...`.
-See docs/cli.md for full examples.
+See the gpt_lab.cli.main module docstring for commands and examples.
 
 ## Aknowledgements:
 This code is inspired by and adapted from the following sources:
