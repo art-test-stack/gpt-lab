@@ -157,7 +157,7 @@ I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-t
 The installed `gpt-lab` command groups tokenizer training, base training/resume,
 data preparation, cache management, and chat. Start with `gpt-lab --help`
 (or `uv run gpt-lab --help`).
-See the [CLI guide](docs/cli.md) for commands, defaults, distributed launch,
+See the [CLI docstring](src/gpt_lab/cli/main.py) for commands, defaults, distributed launch,
 checkpoint resume, and extension points. Existing `scripts/` entry points remain
 compatibility wrappers.
 Standalone dataloader benchmarks and tokenizer scaling live in
@@ -226,6 +226,8 @@ The critical point regarding model training, is that we must make sure to have a
 ### Automatic configuration
 
 The library provides a minimalistic automatic configuration system that computes optimal model architecture, tokenizer settings, and training hyperparameters using scaling laws.
+
+Subclass `AutoGPTConfig` to override individual scaling rules; see its [class docstring](./src/gpt_lab/model/auto.py) for the methods and an example.
 
 The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used in [`scripts/train_base.py`](./scripts/train_base.py) via the --auto flag.
 
@@ -547,8 +549,8 @@ uv run torchrun --standalone --nproc-per-node=8 --no-python \
 ```
 
 `--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
-With an activated environment, omit `uv run`. See the [CLI guide](docs/cli.md#distributed-launch)
-for module-mode launches and distributed resume examples.
+With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)
+for module-mode launches and checkpoint selection.
 
 <!-- Main arguments: 
 Argument | Description
@@ -664,7 +666,7 @@ The existing experimental web interface is available through:
 uv run gpt-lab chat app
 ```
 
-See the [CLI guide](docs/cli.md#data-cache-and-chat) for UI dependency requirements,
+See the [CLI docstring](src/gpt_lab/cli/main.py) for UI dependency requirements,
 remote-completion configuration, and the existing Gradio compatibility limitation.
 
 ## Development Notes

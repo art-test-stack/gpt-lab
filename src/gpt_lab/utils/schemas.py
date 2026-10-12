@@ -247,7 +247,7 @@ class DownloadConfig(BaseConfig):
     max_shards: int = 1000
 
 class TransformerConfig(BaseModel):
-    # model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True)
     tf_type: TfTypes = "dense"
 
     vocab_size: int = VOCAB_SIZE
@@ -265,7 +265,9 @@ class TransformerConfig(BaseModel):
     n_kv_heads: Optional[int] = None # GQA
     n_layers: int = NUM_LAYERS
     d_head: int = DIM_HEAD  # dim_model // num_heads
-    tie_word_embeddings: bool = True # TODO: implement it in model
+    tie_value_embeddings: bool = False
+    tie_word_embeddings: bool = False
+    tie_all_embeddings: bool = False
 
     dropout: float = .0 # DROPOUT
     attention_dropout: Optional[float] = None
@@ -299,15 +301,23 @@ class TransformerConfig(BaseModel):
             log0(f"d_head ({self.d_head}) is not equal to d_model/n_heads ({self.d_model // self.n_heads}). "
                  "This may lead to unexpected behavior in attention mechanisms.", level="warning", logger=logger)
         
-        self.n_kv_heads = self.n_kv_heads or self.n_heads
+        object.__setattr__(self, "n_kv_heads", self.n_kv_heads or self.n_heads)
+        if self.tie_all_embeddings and self.n_kv_heads * self.d_head != self.d_model:
+            raise ValueError(
+                "tie_all_embeddings requires n_kv_heads * d_head == d_model; "
+                "value and input embedding widths must match"
+            )
         if self.n_kv_heads != self.n_heads:
-            self.use_gqa = True
+            object.__setattr__(self, "use_gqa", True)
         if self.use_gqa and self.attn_impl == "fused":
             log0("Fused attention implementation does not support GQA. "
                  "Falling back to standard attention. ",
                     level="warning", logger=logger)
-            self.attn_impl = "sdpa"
-        self.attention_dropout = self.attention_dropout if self.attention_dropout is not None else self.dropout
+            object.__setattr__(self, "attn_impl", "sdpa")
+        object.__setattr__(
+            self, "attention_dropout",
+            self.attention_dropout if self.attention_dropout is not None else self.dropout,
+        )
 
         if not self.norm_before_attn:
             log0("Using post-attention normalization (norm_before_attn=False) may lead to training instability.", level="warning", logger=logger)
@@ -325,11 +335,9 @@ class TransformerConfig(BaseModel):
         # if self.attn_impl == "impl":
         #     warnings.warn("Using 'impl' attention type is not recommended for production use. Only use for experimentation or retrieve attention weights.")
         if self.window_pattern is None:
-            self.window_pattern = "L"
-        self.window_size = self.window_size or (self.max_context // 4)  # Default short window size is 1/4 of max context
+            object.__setattr__(self, "window_pattern", "L")
+        object.__setattr__(self, "window_size", self.window_size or (self.max_context // 4))
         self._window_sizes = self._compute_window()
-        # freeze model_config manually to prevent issues with nested models
-        self.model_config["frozen"] = True
         
 
     def _compute_window(self) -> str:

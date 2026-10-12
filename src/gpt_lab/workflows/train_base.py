@@ -9,7 +9,7 @@ It is mainly adapted from the sources given below, but the overall structure is 
 
 Use `gpt-lab train base auto --help` or `gpt-lab train base resume --help`.
 Distributed entry point: `torchrun -m gpt_lab.cli train base ...`.
-See docs/cli.md for full examples.
+See the gpt_lab.cli.main module docstring for commands and examples.
 
 ## Aknowledgements:
 This code is inspired by and adapted from the following sources:
@@ -241,6 +241,9 @@ def build_auto_config(args: Namespace, device, dist_info: dict):
         aspect_ratio=args.aspect_ratio,
         d_head=args.d_head,
         n_kv_heads=args.n_kv_heads,
+        tie_value_embeddings=args.tie_value_embeddings,
+        tie_word_embeddings=args.tie_word_embeddings,
+        tie_all_embeddings=args.tie_all_embeddings,
         window_pattern=args.window_pattern,
         window_size=args.window_size,
         softcap=args.softcap,
