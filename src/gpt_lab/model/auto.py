@@ -29,6 +29,30 @@ import logging
 logger = logging.getLogger(__name__)
 
 class AutoGPTConfig(BaseModel):
+    """Generate model, tokenizer, and training settings from scaling rules.
+
+    Set inputs as fields, then call generate_gpt_config(device) to build and
+    save a MetaConfig. Subclass this class to override selected rules:
+
+        class CustomAutoConfig(AutoGPTConfig):
+            def compute_ffn_width(self, d_model: int) -> int:
+                return 3 * d_model
+
+    Override compute_model_width, compute_ffn_width, or build_transformer_config
+    for architecture; compute_vocab_size or choose_pattern for tokenization;
+    reference_depth or reference_batch_size for the scaling baseline; and
+    compute_target_tokens, compute_batch_size, compute_learning_rate_scale,
+    compute_weight_decay_scale, compute_training_steps, or
+    compute_accumulation_steps for training. Other rules remain inherited.
+
+    Explicit vocabulary and batch sizes bypass automatic sizing. The loaded
+    tokenizer determines the final vocabulary. Training horizon priority is
+    explicit steps, then target FLOPs, then the data-to-parameter ratio.
+    Architecture overrides apply to probe, target, and reference models.
+    Defaults use dense transformers; other architectures need a compatible
+    model builder and parameter/FLOPs accounting.
+    """
+
     name: str = "ic1" # useless actually lol
     dirname: str | Path = MODELS_FOLDER
     run_name: Optional[str] = None # if None, will be set to {device_name}_{basename}_{depth}_{git_commit}_{date} in model_post_init
@@ -131,64 +155,80 @@ class AutoGPTConfig(BaseModel):
             self.tokenizer_dir = Path(self.tokenizer_dir)
 
 
-    def generate_gpt_config(self, device) -> MetaConfig:
-        # Models are built on the meta device below; keep this argument for API
-        # compatibility with existing callers.
-        _ = device
+    def compute_model_width(self, depth: int) -> int:
+        """Round the depth-scaled width up to a whole number of heads."""
+        base_dim = depth * self.aspect_ratio
+        return ((base_dim + self.d_head - 1) // self.d_head) * self.d_head
+
+    def compute_ffn_width(self, d_model: int) -> int:
+        return 4 * d_model
+
+    def build_transformer_config(self, depth: int, vocab_size: int) -> TransformerConfig:
+        d_model = self.compute_model_width(depth)
+        n_heads = d_model // self.d_head
+        n_kv_heads = (
+            self.n_kv_heads
+            if self.n_kv_heads is not None
+            else n_heads
+        )
+        if n_heads % n_kv_heads != 0:
+            raise ValueError(
+                f"n_heads ({n_heads}) must be divisible by n_kv_heads "
+                f"({n_kv_heads})"
+            )
+
+        return TransformerConfig(
+            tf_type="dense",
+            vocab_size=vocab_size,
+            max_context=self.max_seq_len,
+            d_model=d_model,
+            d_ffn=self.compute_ffn_width(d_model),
+            n_layers=depth,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            d_head=self.d_head,
+            window_pattern=self.window_pattern or "SSSL",
+            window_size=self.window_size,
+            attn_impl=self.attn_impl,
+            softcap=self.softcap if self.softcap is not None else 18.0,
+            quantization=self.quantization,
+        )
+
+    def build_meta_model_from_depth(
+        self, depth: int, vocab_size: int,
+    ) -> DenseTransformer:
+        return build_meta_model(self.build_transformer_config(depth, vocab_size))
+
+    def choose_pattern(self, vocab_size: int) -> str:
+        if self.pat_str is not None:
+            return self.pat_str
+        if vocab_size < 64_000:
+            return "gpt2"
+        if vocab_size < 150_000:
+            return "cl100k_base"
+        return "o200k_base"
+
+    def compute_vocab_size(self, n_non_vocab_params: int, d_model: int) -> int:
+        """Apply the vocabulary scaling law and round to a usable target."""
+        raw_vocab_size = compute_optimal_vocab_size(
+            n_non_vocab_params=n_non_vocab_params,
+            d_model=d_model,
+        )
+        vocab_size = round_vocab_size(
+            raw_vocab_size,
+            multiple=128,
+            minimum=256 + len(self.special_tokens),
+        )
+        print0(
+            "Approach-1 vocabulary estimate for "
+            f"N_nv={n_non_vocab_params:.2e}: {raw_vocab_size:,.0f}; "
+            f"rounded target: {vocab_size:,}"
+        )
+        return vocab_size
+
+    def build_tokenizer(self):
         special_tokens = self.special_tokens
         min_vocab_size = 256 + len(special_tokens)
-
-        def build_transformer_config(depth: int, vocab_size: int) -> TransformerConfig:
-            base_dim = depth * self.aspect_ratio
-            d_model = (
-                (base_dim + self.d_head - 1) // self.d_head
-            ) * self.d_head
-            n_heads = d_model // self.d_head
-            n_kv_heads = (
-                self.n_kv_heads
-                if self.n_kv_heads is not None
-                else n_heads
-            )
-            if n_heads % n_kv_heads != 0:
-                raise ValueError(
-                    f"n_heads ({n_heads}) must be divisible by n_kv_heads "
-                    f"({n_kv_heads})"
-                )
-
-            return TransformerConfig(
-                tf_type="dense",
-                vocab_size=vocab_size,
-                max_context=self.max_seq_len,
-                d_model=d_model,
-                d_ffn=4 * d_model,
-                n_layers=depth,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                d_head=self.d_head,
-                window_pattern=self.window_pattern or "SSSL",
-                window_size=self.window_size,
-                attn_impl=self.attn_impl,
-                softcap=self.softcap if self.softcap is not None else 18.0,
-                quantization=self.quantization,
-            )
-
-        def build_meta_model_from_depth(
-            depth: int,
-            vocab_size: int,
-        ) -> DenseTransformer:
-            return build_meta_model(
-                build_transformer_config(depth, vocab_size)
-            )
-
-        def choose_pattern(vocab_size: int) -> str:
-            if self.pat_str is not None:
-                return self.pat_str
-            if vocab_size < 64_000:
-                return "gpt2"
-            if vocab_size < 150_000:
-                return "cl100k_base"
-            return "o200k_base"
-
         explicit_tokenizer = self.tokenizer_model not in (None, "auto")
         requested_vocab_size = self.vocab_size
 
@@ -211,27 +251,15 @@ class AutoGPTConfig(BaseModel):
         else:
             vocab_size = requested_vocab_size
             if vocab_size == -1:
-                probe_model = build_meta_model_from_depth(
+                probe_model = self.build_meta_model_from_depth(
                     self.depth,
                     vocab_size=min_vocab_size,
                 )
                 n_non_vocab_params = probe_model.n_non_vocab_params()
-                raw_vocab_size = compute_optimal_vocab_size(
-                    n_non_vocab_params=n_non_vocab_params,
-                    d_model=probe_model.config.d_model,
+                vocab_size = self.compute_vocab_size(
+                    n_non_vocab_params, probe_model.config.d_model
                 )
                 del probe_model
-
-                vocab_size = round_vocab_size(
-                    raw_vocab_size,
-                    multiple=128,
-                    minimum=min_vocab_size,
-                )
-                print0(
-                    "Approach-1 vocabulary estimate for "
-                    f"N_nv={n_non_vocab_params:.2e}: {raw_vocab_size:,.0f}; "
-                    f"rounded target: {vocab_size:,}"
-                )
                 if self.n_steps > 0 or self.target_flops > 0:
                     log0(
                         "Automatic vocabulary sizing assumes compute-optimal "
@@ -242,7 +270,7 @@ class AutoGPTConfig(BaseModel):
                     )
 
             if self.train_tokenizer:
-                pat_str = choose_pattern(vocab_size)
+                pat_str = self.choose_pattern(vocab_size)
                 vocab_label = (
                     f"{vocab_size // 1_000}k"
                     if vocab_size < 1_000_000
@@ -286,44 +314,40 @@ class AutoGPTConfig(BaseModel):
                 f"match final model vocabulary size {vocab_size}."
             )
 
-        d12_model = build_meta_model_from_depth(12, vocab_size=vocab_size)
-        model = build_meta_model_from_depth(self.depth, vocab_size=vocab_size)
+        return tokenizer
 
-        param_counts = model.n_params_per_layer()
+    def reference_depth(self) -> int:
+        return 12
 
-        n_flops_per_token = model.estimate_flops()
-        
-        # model config:
-        d12_n_scaling_params = d12_model.n_scaling_params()
-        n_scaling_params = model.n_scaling_params()    
+    def reference_batch_size(self) -> int:
+        """Reference batch size in tokens."""
+        return 2**19
 
-        target_tokens = int(self.target_param_data_ratio * n_scaling_params) # optimal tokens for the model we are about to train
+    def compute_target_tokens(self, n_scaling_params: int) -> float:
+        return self.target_param_data_ratio * n_scaling_params
 
-        # ref model training horizon and batch size (µP paper: )
-        d12_th = self.target_param_data_ratio * d12_n_scaling_params
-        d12_bs = 2**19
+    def compute_batch_size(
+        self, target_tokens: int, reference_tokens: float, reference_batch_size: int,
+    ) -> int:
+        # Optimal batch size: https://arxiv.org/abs/2505.13738
+        predicted = reference_batch_size * (target_tokens / reference_tokens) ** 0.383
+        return 2 ** round(math.log2(predicted))
 
-        # optimal batch size (https://arxiv.org/abs/2505.13738)
-        total_batch_size = self.total_batch_size # total batch size = n tokens per step (1 step = (n forwardbackward . world size^-1 n_acc_steps^-1) . world size . n acc_steps))
-        if total_batch_size == -1:
-            batch_size_ratio = target_tokens / d12_th
-            predicted_batch_size = d12_bs * batch_size_ratio ** 0.383
-            total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
-            print0(f"AutoGPTConfig computed optimal batch size: {total_batch_size:,} tokens")
+    def compute_learning_rate_scale(
+        self, total_batch_size: int, reference_batch_size: int,
+    ) -> float:
+        return math.sqrt(total_batch_size / reference_batch_size)
 
-        # learning rate correction
-        batch_lr_scale = 1.0
-        batch_ratio = total_batch_size / d12_bs # η ∝ √(B/B_ref)
-        if not batch_ratio == 1.0:
-            batch_lr_scale = math.sqrt(batch_ratio)
-            print0(f"Scaling learning rate by {batch_lr_scale=:.6f} based on batch size scaling law for total batch size {total_batch_size:,} tokens")
-        
-        # weight decay correction (https://arxiv.org/abs/2405.13698) λ = λ_ref · √(B/B_ref) · (D_ref/D)
-        # TODO: https://arxiv.org/abs/2505.13738
-        weight_decay_ratio = math.sqrt(total_batch_size / d12_bs) * (d12_th / target_tokens)
-        if not weight_decay_ratio == 1.0:
-            print0(f"Scaling weight decay by {weight_decay_ratio=:.6f} for {self.depth=}")
-        
+    def compute_weight_decay_scale(
+        self, total_batch_size: int, reference_batch_size: int,
+        target_tokens: int, reference_tokens: float,
+    ) -> float:
+        # Weight decay correction: https://arxiv.org/abs/2405.13698
+        return math.sqrt(total_batch_size / reference_batch_size) * (reference_tokens / target_tokens)
+
+    def compute_training_steps(
+        self, target_tokens: int, total_batch_size: int, n_flops_per_token: float,
+    ) -> int:
         if not (
             self.n_steps > 0
             or self.target_param_data_ratio > 0
@@ -351,8 +375,9 @@ class AutoGPTConfig(BaseModel):
         else:
             raise ValueError("No training horizon specified")
         
-        n_total_tokens = total_batch_size * n_steps 
-        
+        return n_steps
+
+    def compute_accumulation_steps(self, total_batch_size: int) -> int:
         n_acc_steps = self.n_acc_steps
         if n_acc_steps == -1: # recommended
             tokens_per_accstep_per_rank = self.device_batch_size * self.max_seq_len
@@ -372,7 +397,38 @@ class AutoGPTConfig(BaseModel):
                          "Recommended to set n_acc_steps to -1 for automatic configuration based on "
                          "scaling laws.", level="warning", logger=logger)
 
-        training_config = dict(
+        return n_acc_steps
+
+    def build_training_config(
+        self, model: DenseTransformer, reference_model: DenseTransformer,
+    ) -> dict:
+        n_flops_per_token = model.estimate_flops()
+        target_tokens = int(self.compute_target_tokens(model.n_scaling_params()))
+        reference_tokens = self.compute_target_tokens(reference_model.n_scaling_params())
+        reference_batch_size = self.reference_batch_size()
+
+        total_batch_size = self.total_batch_size
+        if total_batch_size == -1:
+            total_batch_size = self.compute_batch_size(
+                target_tokens, reference_tokens, reference_batch_size,
+            )
+            print0(f"AutoGPTConfig computed optimal batch size: {total_batch_size:,} tokens")
+
+        batch_lr_scale = self.compute_learning_rate_scale(total_batch_size, reference_batch_size)
+        if batch_lr_scale != 1.0:
+            print0(f"Scaling learning rate by {batch_lr_scale=:.6f} based on batch size scaling law for total batch size {total_batch_size:,} tokens")
+
+        weight_decay_ratio = self.compute_weight_decay_scale(
+            total_batch_size, reference_batch_size, target_tokens, reference_tokens,
+        )
+        if weight_decay_ratio != 1.0:
+            print0(f"Scaling weight decay by {weight_decay_ratio=:.6f} for {self.depth=}")
+
+        n_steps = self.compute_training_steps(target_tokens, total_batch_size, n_flops_per_token)
+        n_total_tokens = total_batch_size * n_steps
+        n_acc_steps = self.compute_accumulation_steps(total_batch_size)
+
+        return dict(
             n_steps=n_steps,
             n_acc_steps=n_acc_steps,
             total_batch_size=total_batch_size,
@@ -384,6 +440,17 @@ class AutoGPTConfig(BaseModel):
             n_flops_per_token=n_flops_per_token,
             n_total_tokens=n_total_tokens,
         )
+
+    def generate_gpt_config(self, device) -> MetaConfig:
+        # Models are built on the meta device below; keep this argument for API
+        # compatibility with existing callers.
+        _ = device
+        tokenizer = self.build_tokenizer()
+        reference_model = self.build_meta_model_from_depth(
+            self.reference_depth(), tokenizer.vocab_size,
+        )
+        model = self.build_meta_model_from_depth(self.depth, tokenizer.vocab_size)
+        training_config = self.build_training_config(model, reference_model)
         meta_config = MetaConfig.model_validate(dict(
             name=self.name,
             run_name=self.run_name,
@@ -402,7 +469,7 @@ class AutoGPTConfig(BaseModel):
         print0_dict("AutoGPTConfig generated the following tokenizer configuration", tokenizer.config.model_dump())
         print0_dict("AutoGPTConfig generated the following model configuration", model.config.model_dump())
         
-        print0_dict("Model Parameter counts", param_counts)
-        print0(f"Estimated FLOPS per token: {n_flops_per_token:.2e}")
-        del model, tokenizer, d12_model
+        print0_dict("Model Parameter counts", model.n_params_per_layer())
+        print0(f"Estimated FLOPS per token: {training_config['n_flops_per_token']:.2e}")
+        del model, tokenizer, reference_model
         return meta_config

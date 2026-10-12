@@ -227,6 +227,8 @@ The critical point regarding model training, is that we must make sure to have a
 
 The library provides a minimalistic automatic configuration system that computes optimal model architecture, tokenizer settings, and training hyperparameters using scaling laws.
 
+Subclass `AutoGPTConfig` to override individual scaling rules; see its [class docstring](./src/gpt_lab/model/auto.py) for the methods and an example.
+
 The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used in [`scripts/train_base.py`](./scripts/train_base.py) via the --auto flag.
 
 It automatically determines:

@@ -185,3 +185,109 @@ def test_deprecated_kv_head_alias_maps_to_head_count(tmp_path):
         config = _auto_config(tmp_path, d_kv_head=2)
 
     assert config.n_kv_heads == 2
+
+
+@pytest.mark.fast
+def test_default_scaling_methods(tmp_path):
+    from gpt_lab.tokenizer.auto import compute_optimal_vocab_size, round_vocab_size
+
+    config = _auto_config(tmp_path, n_acc_steps=-1)
+    assert config.compute_model_width(3) == 256
+    assert config.compute_ffn_width(256) == 1024
+    assert config.reference_depth() == 12
+    assert config.reference_batch_size() == 2**19
+    assert config.compute_target_tokens(100) == 1100.0
+    assert config.compute_batch_size(1600, 100, 512) == 2048
+    assert config.compute_learning_rate_scale(64, 256) == 0.5
+    assert config.compute_weight_decay_scale(64, 256, 1600, 100) == 0.03125
+    assert config.compute_accumulation_steps(64) == 8
+    assert config.compute_vocab_size(100_000, 256) == round_vocab_size(
+        compute_optimal_vocab_size(n_non_vocab_params=100_000, d_model=256),
+        multiple=128,
+        minimum=256 + len(config.special_tokens),
+    )
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"n_steps": 7, "target_flops": 1024}, 7),
+        ({"n_steps": -1, "target_flops": 1024}, 8),
+        ({"n_steps": -1}, 4),
+        ({"n_steps": -1, "target_param_data_ratio": -1}, None),
+    ],
+)
+def test_training_steps_preserve_target_priority(tmp_path, overrides, expected):
+    config = _auto_config(tmp_path, **overrides)
+    if expected is None:
+        with pytest.raises(ValueError, match="positive value"):
+            config.compute_training_steps(256, 64, 2)
+    else:
+        assert config.compute_training_steps(256, 64, 2) == expected
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("explicit_sizes", [False, True])
+def test_generation_uses_overridden_rules(monkeypatch, tmp_path, explicit_sizes):
+    calls = []
+
+    class CustomAutoConfig(AutoGPTConfig):
+        def compute_model_width(self, depth):
+            calls.append(("width", depth))
+            return depth * self.d_head
+
+        def compute_ffn_width(self, d_model):
+            return 3 * d_model
+
+        def compute_vocab_size(self, n_non_vocab_params, d_model):
+            calls.append(("vocab", d_model))
+            return 4096
+
+        def reference_depth(self):
+            return 2
+
+        def reference_batch_size(self):
+            return 128
+
+        def compute_batch_size(self, target_tokens, reference_tokens, reference_batch_size):
+            calls.append(("batch", reference_batch_size))
+            return 64
+
+    config = CustomAutoConfig(**_auto_config(
+        tmp_path,
+        n_steps=-1,
+        n_acc_steps=-1,
+        vocab_size=4096 if explicit_sizes else -1,
+        total_batch_size=64 if explicit_sizes else -1,
+    ).model_dump())
+    tokenizer = _DummyTokenizer(4096, config.special_tokens)
+    monkeypatch.setattr("gpt_lab.model.auto.resolve_tokenizer", lambda *_args: "dummy")
+    monkeypatch.setattr("gpt_lab.model.auto.load_tokenizer", lambda *_args, **_kwargs: tokenizer)
+
+    generated = config.generate_gpt_config("cpu")
+    assert generated.model_cfg.d_model == 192
+    assert generated.model_cfg.d_ffn == 576
+    assert generated.model_cfg.n_heads == 3
+    assert generated.model_cfg.vocab_size == 4096
+    assert ("width", 3) in calls
+    assert ("width", 2) in calls
+    assert (("vocab", 192) in calls) is (not explicit_sizes)
+    assert (("batch", 128) in calls) is (not explicit_sizes)
+
+    # Unchanged rules still use the overridden architecture and reference batch.
+    model = build_meta_model(generated.model_cfg)
+    reference = config.build_meta_model_from_depth(2, 4096)
+    target_tokens = int(11 * model.n_scaling_params())
+    reference_tokens = 11 * reference.n_scaling_params()
+    training = generated.base_train
+    assert training["target_tokens"] == target_tokens
+    assert training["total_batch_size"] == 64
+    assert training["n_steps"] == target_tokens // 64
+    assert training["n_total_tokens"] == 64 * (target_tokens // 64)
+    assert training["n_acc_steps"] == 8
+    assert training["n_flops_per_token"] == model.estimate_flops()
+    assert training["batch_lr_scale"] == pytest.approx((64 / 128) ** 0.5)
+    assert training["weight_decay_scale"] == pytest.approx(
+        (64 / 128) ** 0.5 * reference_tokens / target_tokens
+    )
