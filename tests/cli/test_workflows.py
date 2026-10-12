@@ -157,6 +157,18 @@ def test_resume_restores_all_states_through_existing_pipeline(training_dependenc
     assert '_handler' not in deps.board_factory.call_args.kwargs['config']
 
 
+@pytest.mark.parametrize('mode', ['auto', 'resume'])
+@pytest.mark.parametrize('backend', ['wandb', 'tensorboard', 'dummy'])
+def test_training_forwards_logging_backend(training_dependencies, mode, backend):
+    from gpt_lab.cli.commands.base import run
+    deps = training_dependencies
+    run(parse(f'train {mode} --device cpu --board {backend}'))
+    assert deps.board_factory.call_args.kwargs['board_type'] == backend
+    assert deps.board_factory.call_args.kwargs['resume'] is (mode == 'resume')
+    assert deps.trainer_factory.call_args.kwargs['board'] is deps.board
+    deps.board.close.assert_called_once()
+
+
 def test_auto_preserves_configuration_and_cleanup_on_failure(training_dependencies):
     from gpt_lab.cli.commands.base import run
     deps = training_dependencies

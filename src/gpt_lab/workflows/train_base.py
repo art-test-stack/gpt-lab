@@ -135,7 +135,7 @@ def train_base(
 
     device_type = get_device_type() if device == "auto" else device
     dist_info = init_dist_groups(device_type=device_type, random_seed=random_seed)
-    board = None
+    board_instance = None
     try:
         is_master_process = dist_info["RANK"] == 0
 
@@ -259,7 +259,7 @@ def train_base(
 
         if is_master_process:
             board_args["dirname"] = ckpt_manager.source_dir
-            board = Board(
+            board_instance = Board(
                 board_type=board,
                 # entity_name=None, # TODO: add option for wandb entity
                 project=f"trainbase_{meta_config.name}",
@@ -269,7 +269,7 @@ def train_base(
                 resume=is_resumed,
             )
         else:
-            board = DummyBoard()
+            board_instance = DummyBoard()
 
         # ------------------------------------------------------------------------------
         # TRAINER: TRAINING, EVALUATION, CHECKPOINTING LOOPS
@@ -280,7 +280,7 @@ def train_base(
         trainer = Trainer(
             model=model, tokenizer=tokenizer, optimizer=optimizers,
             train_loader=train_loader, val_loader=val_loader,
-            config=trainer_config, board=board, checkpoint_manager=ckpt_manager,
+            config=trainer_config, board=board_instance, checkpoint_manager=ckpt_manager,
             resume_state=ckpt_data.trainer_state if is_resumed else None,
             best_state=ckpt_data.checkpoint_state if is_resumed else None,
         )
@@ -295,8 +295,8 @@ def train_base(
 
     finally:
         try:
-            if board is not None:
-                board.close()
+            if board_instance is not None:
+                board_instance.close()
         finally:
             cleanup_dist_groups()
 
