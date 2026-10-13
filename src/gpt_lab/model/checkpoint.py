@@ -39,6 +39,7 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Union, Tuple, Dict, Literal, Mapping, Callable, List
 from pathlib import Path
+from packaging.version import Version
 from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.utils.default import MODELS_FOLDER
 from gpt_lab.utils.distributed import get_dist_info
@@ -317,9 +318,20 @@ def save_meta_config(
 
     log0(f"Saved meta config in {str(run_dir)}.", logger=logger)
 
-def _migrate_model_config(model_cfg: Dict) -> None:
-    """Update legacy checkpoint model config in place before validation."""
-    if "tie_value_embeddings" not in model_cfg and "tie_all_embeddings" not in model_cfg:
+def _migrate_model_config(model_cfg: Dict, version: Optional[str]) -> None:
+    """Migrate using the saved project version before metadata validation.
+
+    Functional embedding tying starts at 0.1.1. For ambiguous 0.1.0 or
+    unversioned metadata, missing tying fields identify the old no-op flag.
+    """
+    saved_version = Version(version) if version is not None else None
+    if saved_version is not None and saved_version >= Version("0.1.1"):
+        return
+    # 0.1.0 and unversioned checkpoints may predate or include functional tying.
+    if (
+        (saved_version is not None and saved_version < Version("0.1.0"))
+        or ("tie_value_embeddings" not in model_cfg and "tie_all_embeddings" not in model_cfg)
+    ):
         # The legacy tie_word_embeddings flag was a no-op.
         model_cfg["tie_word_embeddings"] = False
 
@@ -347,7 +359,7 @@ def load_meta_config(
 
     _meta_cfg = _load_json(run_dir, "meta.json")
     metadata = json.loads(_meta_cfg)
-    _migrate_model_config(metadata["model_cfg"])
+    _migrate_model_config(metadata["model_cfg"], metadata.get("version"))
     meta_cfg = MetaConfig.model_validate(metadata)
     
     log0(f"Loaded meta config from {run_dir / 'meta.json'}", logger=logger)

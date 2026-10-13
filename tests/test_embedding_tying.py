@@ -124,23 +124,39 @@ def test_partial_tying_supports_gqa(flags):
     assert torch.isfinite(model(ids, ids).loss)
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_checkpoint_metadata_preserves_tying_mode(tmp_path, legacy):
+@pytest.mark.parametrize("version,missing_fields,expected_tie", [
+    ("0.0.9", False, False),
+    ("0.1.0", True, False),
+    ("0.1.0", False, True),
+    ("0.1.1", True, True),
+    ("0.1.1", False, True),
+    ("0.2.0", True, True),
+    (None, True, False),
+    (None, False, True),
+])
+def test_checkpoint_metadata_preserves_tying_mode(tmp_path, version, missing_fields, expected_tie):
     run_dir = tmp_path / "demo" / "run"
     meta = MetaConfig(
         name="demo", run_name="run", dirname=run_dir,
         model_cfg=_config(tie_word_embeddings=True),
         base_train={},
     )
+    assert meta.version == "0.1.1"
     metadata = meta.model_dump(mode="json")
-    if legacy:
+    if version is None:
+        metadata.pop("version")
+    else:
+        metadata["version"] = version
+    if missing_fields:
         metadata["model_cfg"].pop("tie_value_embeddings")
         metadata["model_cfg"].pop("tie_all_embeddings")
     path = run_dir / "meta.json"
     path.write_text(json.dumps(json.dumps(metadata)))
     saved = path.read_text()
     restored = load_meta_config("demo", run_name="run", model_cachedir=tmp_path)
-    assert restored.model_cfg.tie_word_embeddings == (not legacy)
+    assert restored.model_cfg.tie_word_embeddings == expected_tie
     assert not restored.model_cfg.tie_value_embeddings
     assert not restored.model_cfg.tie_all_embeddings
+    assert restored.version == (version or "0.1.1")
+    assert restored.git_info == metadata["git_info"]
     assert path.read_text() == saved
