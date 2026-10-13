@@ -103,7 +103,7 @@ class ComputeContext:
         return get_peak_flops(self.device_name) if self.device_type == "cuda" else float("inf")
 
 
-def _get_dist_info(device_type: str) -> ComputeContext:
+def _get_comp_info(device_type: str) -> ComputeContext:
     assert device_type in ("cuda", "mps", "cpu"), f"Unsupported device type: {device_type!r}."
     assert not is_ddp_requested() or int(os.environ["WORLD_SIZE"]) == 1 or is_ddp_initialized(), (
         "Distributed training requested but process group not initialized. Call init_dist_groups() first."
@@ -124,10 +124,10 @@ def _get_dist_info(device_type: str) -> ComputeContext:
 _context: ComputeContext | None = None
 
 
-def get_dist_info(device_type: str | None = None) -> ComputeContext:
+def get_comp_info(device_type: str | None = None) -> ComputeContext:
     global _context
     if _context is None or (device_type is not None and device_type != _context.device_type):
-        _context = _get_dist_info(device_type or get_device_type())
+        _context = _get_comp_info(device_type or get_device_type())
     return _context
 
 def init_dist_groups(device_type: str | None = None, random_seed: int = 42) -> ComputeContext:
@@ -150,10 +150,10 @@ def init_dist_groups(device_type: str | None = None, random_seed: int = 42) -> C
             dist.init_process_group(backend="nccl" if device_type == "cuda" else "gloo")
     global _context
     _context = None
-    return get_dist_info(device_type)
+    return get_comp_info(device_type)
 
-def broadcast_model(model: nn.Module, dist_info: ComputeContext) -> None:
-    if not dist_info.is_distributed:
+def broadcast_model(model: nn.Module, comp_info: ComputeContext) -> None:
+    if not comp_info.is_distributed:
         return
 
     with torch.no_grad():

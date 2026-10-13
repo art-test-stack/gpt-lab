@@ -100,7 +100,7 @@ def training_dependencies(monkeypatch):
     tokenizer = Mock()
     meta = Config(name='demo', run_name='run-1', model_cfg=model.config, tokenizer_cfg=object(),
                   base_train={'device_batch_size': 3, 'n_steps': 10})
-    saved_config = Config(dist_info={})
+    saved_config = Config(comp_info={})
     state = SimpleNamespace(train_loader_state=object())
     checkpoint = SimpleNamespace(trainer_state=state, checkpoint_state=object(), optimizer_state=object(), scaler_state=object())
     manager = Mock()
@@ -113,8 +113,8 @@ def training_dependencies(monkeypatch):
     trainer_factory = Mock(return_value=trainer)
     board = Mock()
     board_factory = Mock(return_value=board)
-    dist_info = SimpleNamespace(rank=0, world_size=2, device='cpu', is_distributed=True, device_type='cpu')
-    init_dist = Mock(return_value=dist_info)
+    comp_info = SimpleNamespace(rank=0, world_size=2, device='cpu', is_distributed=True, device_type='cpu')
+    init_dist = Mock(return_value=comp_info)
     cleanup = Mock()
     load_meta = Mock(return_value=meta)
     modules = {

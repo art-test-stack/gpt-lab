@@ -34,7 +34,7 @@ def _make_trainer(tmp_path, compute_dtype=torch.bfloat16, monitor=False):
         device_batch_size=2,
         log_every=1,
         monitor_grad_norms=monitor,
-        dist_info=ComputeContext(device=torch.device("cpu"), compute_dtype=compute_dtype),
+        comp_info=ComputeContext(device=torch.device("cpu"), compute_dtype=compute_dtype),
     )
     trainer = Trainer(
         model=model,

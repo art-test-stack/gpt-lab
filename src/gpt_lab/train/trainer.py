@@ -28,7 +28,7 @@ from torch.amp import autocast, GradScaler
 
 from gpt_lab.utils.board import Board
 from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
-from gpt_lab.utils.distributed import ComputeContext, _DTYPE_MAP, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, _DTYPE_MAP, get_comp_info
 from gpt_lab.utils.common import print0
 from gpt_lab.utils.logging import log_error, log_critical, log0, log_dict
 from gpt_lab.utils.schemas import (
@@ -153,13 +153,13 @@ class Trainer:
         if checkpoint_manager is None:
             model_name = self.model.__class__.__name__
             depth = getattr(self.model.config, "n_layers", "unknown")
-            model_run = make_default_run_name(depth, model_name, self.config.dist_info)
+            model_run = make_default_run_name(depth, model_name, self.config.comp_info)
             checkpoint_manager = CheckpointManager(
                 model_name=self.model.__class__.__name__,
                 model_run=model_run,
                 source=self.training_type, 
-                dist_info=self.config.dist_info,
-                mode="shard" if self.config.dist_info.is_distributed else "ddp", # naming is a bit dummy
+                comp_info=self.config.comp_info,
+                mode="shard" if self.config.comp_info.is_distributed else "ddp", # naming is a bit dummy
             )
         self.ckpt_manager = checkpoint_manager 
         self.dirname = self.ckpt_manager.source_dir
@@ -189,11 +189,11 @@ class Trainer:
         self.eval_metrics = EvalMetrics()   # TODO
         self.core_metrics = COREMetrics()   # TODO
         
-        # Device and mixed precision. get_dist_info() stores a torch.dtype, but
+        # Device and mixed precision. get_comp_info() stores a torch.dtype, but
         # accept legacy string values when resuming older checkpoints.
-        self.device_type = config.dist_info.device_type
-        self.device = torch.device(config.dist_info.device)
-        raw_dtype = self.config.dist_info.compute_dtype
+        self.device_type = config.comp_info.device_type
+        self.device = torch.device(config.comp_info.device)
+        raw_dtype = self.config.comp_info.compute_dtype
         self.dtype = _DTYPE_MAP.get(raw_dtype, raw_dtype)
         if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(f"Unsupported compute dtype: {raw_dtype!r}")
@@ -278,12 +278,12 @@ class Trainer:
             return
 
         stats_tensor = torch.stack(stats)
-        world_size = self.config.dist_info.world_size
-        if self.config.dist_info.is_distributed:
+        world_size = self.config.comp_info.world_size
+        if self.config.comp_info.is_distributed:
             dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
 
         logs = {}
-        if self.config.dist_info.rank == 0:
+        if self.config.comp_info.rank == 0:
             # One device synchronization for the complete statistics table,
             # rather than one .item() synchronization per metric.
             stats_cpu = stats_tensor.detach().cpu()
@@ -315,7 +315,7 @@ class Trainer:
         total_batch_size = self.config.total_batch_size
         n_acc_steps = self.config.n_acc_steps
 
-        world_size = self.config.dist_info.world_size
+        world_size = self.config.comp_info.world_size
         
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
@@ -325,9 +325,9 @@ class Trainer:
 
         train_iter = iter(self.train_loader)
 
-        rank = self.config.dist_info.rank
+        rank = self.config.comp_info.rank
 
-        if self.config.dist_info.is_distributed:
+        if self.config.comp_info.is_distributed:
             dist.barrier()
 
         x, y, dataloader_state = next(train_iter) # prefetch
@@ -369,7 +369,7 @@ class Trainer:
                 tokens_per_eval_step = (
                     self.config.device_batch_size
                     * self.model.config.max_context
-                    * self.config.dist_info.world_size
+                    * self.config.comp_info.world_size
                 )
                 eval_steps = max(
                     1,
@@ -380,7 +380,7 @@ class Trainer:
                         self._compiled_model, 
                         self.val_loader(), 
                         eval_steps,
-                        dist_info=self.config.dist_info,
+                        comp_info=self.config.comp_info,
                         token_bytes=self.tokenizer.token_bytes
                     )
                 print0(f"Step {step:05d} | "\
@@ -429,7 +429,7 @@ class Trainer:
                         self.device,
                         max_per_task=self.config.n_core_tokens,
                     )
-                max_throughput = results.get("core/max_per_task", 0) * self.config.dist_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
+                max_throughput = results.get("core/max_per_task", 0) * self.config.comp_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
                 print0(f"Step {step:05d}/{n_steps:05d} | "
                        f"CORE: {results['core/core']:.4f} | "
                        f"Accuracy: {results['core/accuracy']:.4f} | "
@@ -460,7 +460,7 @@ class Trainer:
             # ================================================================
 
             if (
-                self.config.dist_info.rank == 0 and
+                self.config.comp_info.rank == 0 and
                 ((self.config.sample_every == -1 and last_step) or
                 (self.config.sample_every > 0 and 
                 (last_step or (step > 0 and step % self.config.sample_every == 0))))
@@ -530,7 +530,7 @@ class Trainer:
 
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-                if self.config.dist_info.is_distributed:
+                if self.config.comp_info.is_distributed:
                     for g in self.scaler._found_inf_per_device(self.optimizer).values():
                         dist.all_reduce(g, op=dist.ReduceOp.MAX)
 
@@ -554,7 +554,7 @@ class Trainer:
             
             step_dt_tensor = torch.tensor(step_end_time - step_start_time, device=self.device)
 
-            if self.config.dist_info.is_distributed:
+            if self.config.comp_info.is_distributed:
                 dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
 
             step_dt = step_dt_tensor.item()
@@ -571,7 +571,7 @@ class Trainer:
             tokens_per_sec = eff_global_tokens / step_dt
 
             step_flops_per_sec = n_flops_per_token * tokens_per_sec
-            mfu = step_flops_per_sec / self.config.dist_info.gpu_peak_flops * 100 / world_size
+            mfu = step_flops_per_sec / self.config.comp_info.gpu_peak_flops * 100 / world_size
             
             total_dt.append(step_dt)
             self.state.n_tokens += eff_global_tokens
@@ -701,15 +701,15 @@ class Trainer:
         step: Union[int, str] = "latest",
         cache_dir: Optional[Union[str, Path]] = None,
         board: Optional[Board] = None,
-        dist_info: Optional[ComputeContext] = None,
+        comp_info: Optional[ComputeContext] = None,
     ):
-        dist_info = dist_info or get_dist_info()
+        comp_info = comp_info or get_comp_info()
         ckpt_manager = CheckpointManager(
             model_name=model_name,
             model_run=model_run,
             source="base", # TODO: make this dynamic based on training type
-            dist_info=dist_info,
-            mode="shard" if dist_info.is_distributed else "ddp",
+            comp_info=comp_info,
+            mode="shard" if comp_info.is_distributed else "ddp",
             model_cachedir=cache_dir,
         )
         model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(step=step, phase="train")

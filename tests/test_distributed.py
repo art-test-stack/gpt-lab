@@ -13,7 +13,7 @@ from gpt_lab.utils.distributed import (
     ComputeContext,
     broadcast_model,
     cleanup_dist_groups,
-    get_dist_info,
+    get_comp_info,
     init_dist_groups,
 )
 from gpt_lab.utils.schemas import TrainerConfig
@@ -31,14 +31,14 @@ def test_single_device_and_legacy_config(monkeypatch, tmp_path):
     assert not context.is_distributed and not dist.is_initialized()
     with pytest.raises(FrozenInstanceError):
         context.device = torch.device("mps")
-    config = TrainerConfig(dist_info=context)
+    config = TrainerConfig(comp_info=context)
     path = tmp_path / "config.safetensors"
     save_tensor_state(config.model_dump(), path)
     saved = load_tensor_state(path)
-    assert "dist_info" not in saved
-    assert TrainerConfig.model_validate(saved).dist_info.device == context.device
+    assert "comp_info" not in saved
+    assert TrainerConfig.model_validate(saved).comp_info.device == context.device
     saved["dist_info"] = {"RANK": 7, "WORLD_SIZE": 8, "DEVICE": "cuda:7"}
-    assert TrainerConfig.model_validate(saved).dist_info.rank == 0
+    assert TrainerConfig.model_validate(saved).comp_info.rank == 0
     cleanup_dist_groups()
 
 
@@ -55,12 +55,12 @@ def _mesh_worker(rank, port, output_dir):
             assert context.world_size == 2 and context.is_distributed
             assert context.mesh.mesh_dim_names == ("dp",)
             assert context.dp_mesh.size() == 2
-            assert get_dist_info("cpu") is context
-            config = TrainerConfig(dist_info=context)
-            assert "dist_info" not in config.model_dump()
+            assert get_comp_info("cpu") is context
+            config = TrainerConfig(comp_info=context)
+            assert "comp_info" not in config.model_dump()
             path = output_dir / f"config-{rank}-{cycle}.safetensors"
             save_tensor_state(config.model_dump(), path)
-            assert TrainerConfig.model_validate(load_tensor_state(path)).dist_info.rank == rank
+            assert TrainerConfig.model_validate(load_tensor_state(path)).comp_info.rank == rank
             model = torch.nn.Linear(1, 1, bias=False)
             with torch.no_grad():
                 model.weight.fill_(rank + 1)

@@ -100,7 +100,7 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
             cachedir=tmp_path,
             split="train",
             max_shards=num_train_shards,
-            dist_info=SimpleNamespace(rank=rank, world_size=world_size, device=torch.device("cpu"), is_distributed=False),
+            comp_info=SimpleNamespace(rank=rank, world_size=world_size, device=torch.device("cpu"), is_distributed=False),
         )
         expected_shard_ids = set(range(rank, num_train_shards, world_size))
         assigned_shard_ids = {

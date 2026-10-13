@@ -41,7 +41,7 @@ def test_compute_bpb_reports_mean_loss_per_token():
         batches,
         steps,
         token_bytes,
-        dist_info=ComputeContext(device=torch.device("cpu")),
+        comp_info=ComputeContext(device=torch.device("cpu")),
     )
 
     assert result["loss"] == pytest.approx(loss_per_token)

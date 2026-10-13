@@ -42,7 +42,7 @@ from pathlib import Path
 from packaging.version import Version
 from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.utils.default import MODELS_FOLDER
-from gpt_lab.utils.distributed import ComputeContext, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import (
     CheckpointState, 
     MetaConfig,
@@ -93,7 +93,7 @@ class CheckpointConfig:
     run_name: Optional[Union[str, int]] = None
     model_cachedir: Optional[Union[str, Path]] = None
     source: _ModelSources = "base"
-    dist_info: Optional[ComputeContext] = None
+    comp_info: Optional[ComputeContext] = None
     mode: _Mode = "ddp"
     model_config: Optional[TransformerConfig] = None
     tokenizer_config: Optional[TokenizerConfig] = None
@@ -283,11 +283,11 @@ def set_rng_state(
     random.setstate(rng_state["python"])
 
 # api functions
-def make_default_run_name(depth, name, dist_info):
-    if dist_info is None:
-        dist_info = get_dist_info()
-    is_distributed = dist_info.is_distributed
-    rank = dist_info.rank
+def make_default_run_name(depth, name, comp_info):
+    if comp_info is None:
+        comp_info = get_comp_info()
+    is_distributed = comp_info.is_distributed
+    rank = comp_info.rank
     run_name = None
 
     if not is_distributed or rank == 0:
@@ -295,7 +295,7 @@ def make_default_run_name(depth, name, dist_info):
         git_commit = run_command("git rev-parse --short HEAD") or "unkcommit"
         from datetime import datetime
         date = datetime.now().strftime("%Y%m%d_%H-%M-%S")
-        device_name = (str(dist_info.device_name)
+        device_name = (str(comp_info.device_name)
             .lower().split(" ")[-1].replace(" ", "_").replace("/", "_").replace("-", "_"))
         if name is None:
             name = "model"
@@ -462,7 +462,7 @@ def save_checkpoint(
         optimizer: Optional[torch.optim.Optimizer] = None, # should be the state dict
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
         mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[ComputeContext] = None,
+        comp_info: Optional[ComputeContext] = None,
     ):
     if mode not in _OPT_DEFAULT_FILENAME:
         raise ValueError(f"Unsupported checkpoint mode: {mode!r}")
@@ -470,16 +470,16 @@ def save_checkpoint(
 
     step_dir = checkpoint_dir.joinpath(_STEP_DIRNAME(step))
 
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info.rank
-    world_size = dist_info.world_size
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
+    world_size = comp_info.world_size
 
     # All ranks may enter concurrently. mkdir(exist_ok=True) is safe on the
     # shared filesystem, and the barriers make a checkpoint visible only after
     # every optimizer/RNG/data-loader shard has completed.
     step_dir.mkdir(parents=True, exist_ok=True)
-    if dist_info.is_distributed:
+    if comp_info.is_distributed:
         torch.distributed.barrier()
 
     if rank == 0:
@@ -516,7 +516,7 @@ def save_checkpoint(
     if optimizer is not None and (mode == "shard" or rank == 0):
         _save_state_dict(optimizer.state_dict(), step_dir, _OPT_DEFAULT_FILENAME[mode](rank))
 
-    if dist_info.is_distributed:
+    if comp_info.is_distributed:
         torch.distributed.barrier()
 
 def load_checkpoint(
@@ -528,14 +528,14 @@ def load_checkpoint(
         load_scaler: bool = True,
         load_rng: bool = True,
         mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[ComputeContext] = None,
+        comp_info: Optional[ComputeContext] = None,
     ) -> CheckpointData:
     # Load the model state
     checkpoint_dir = _solve_path(checkpoint_dir)
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info.rank
-    device = dist_info.device
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
+    device = comp_info.device
 
     step = _get_checkpoint_step(checkpoint_dir, step)
     step_dir = checkpoint_dir / _STEP_DIRNAME(step)
@@ -552,12 +552,12 @@ def load_checkpoint(
         if (
             load_optim
             and mode == "shard"
-            and metadata.get("world_size") != dist_info.world_size
+            and metadata.get("world_size") != comp_info.world_size
         ):
             raise ValueError(
                 "Sharded optimizer checkpoints must be resumed with the same "
                 f"world size: saved {metadata.get('world_size')}, current "
-                f"{dist_info.world_size}"
+                f"{comp_info.world_size}"
             )
 
     # Load the model state parameters
@@ -626,15 +626,15 @@ def build_model(
         step: Union[int, str] = -1, 
         phase: str = "train",
         source: _ModelSources = "base",
-        dist_info: Optional[ComputeContext] = None,
+        comp_info: Optional[ComputeContext] = None,
         mode: Optional[_Mode] = None,
      ) -> tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
-    if dist_info is None:
-        dist_info = get_dist_info()
+    if comp_info is None:
+        comp_info = get_comp_info()
     if mode is None:
-        mode = "shard" if dist_info.is_distributed else "ddp"
-    device: torch.device = dist_info.device
+        mode = "shard" if comp_info.is_distributed else "ddp"
+    device: torch.device = comp_info.device
     model_cachedir = _solve_model_cache_dir(model_cachedir)
     run_name = _solve_run_name(model_cachedir / model_name, run_name=run_name)
     # get metaconfig
@@ -644,15 +644,15 @@ def build_model(
     ckpt_dir = model_cachedir / model_name / run_name / source
     if phase == "train":
         raw = _load_state_dict(ckpt_dir, "training_config.safetensors", map_location="cpu", weight_only=False)
-        trainer_config = TrainerConfig.model_validate(raw | {"dist_info": dist_info})
+        trainer_config = TrainerConfig.model_validate(raw | {"comp_info": comp_info})
     load_scaler = (
-        dist_info.compute_dtype == torch.float16
+        comp_info.compute_dtype == torch.float16
         and device.type == "cuda"
     )
     checkpoint_data = load_checkpoint(
         ckpt_dir,
         step,
-        dist_info=dist_info,
+        comp_info=comp_info,
         load_model=True,
         load_optim=phase == "train",
         load_trainer=True,
@@ -700,11 +700,11 @@ def load_model_from_dir(
         phase: Literal["train", "eval"] = "train",
         model_cachedir: Optional[Union[str, Path]] = None,
         source: _ModelSources = "base",
-        dist_info: Optional[ComputeContext] = None,
+        comp_info: Optional[ComputeContext] = None,
     ) -> Tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
-    if dist_info is None:
-        dist_info = get_dist_info()
-    device = dist_info.device
+    if comp_info is None:
+        comp_info = get_comp_info()
+    device = comp_info.device
     model_cachedir = _solve_model_cache_dir(model_cachedir)
     model_dir = model_cachedir / model_name
     if run_name is None:
@@ -717,7 +717,7 @@ def load_model_from_dir(
         step = find_last_step(ckpt_dir)
     assert step is not None, f"No checkpoints found in {ckpt_dir}"
     # build the model
-    model, tokenizer, ckpt_data, trainer_config = build_model(model_name=model_name, run_name=run_name, model_cachedir=model_cachedir, step=step, phase=phase, source=source, dist_info=dist_info)
+    model, tokenizer, ckpt_data, trainer_config = build_model(model_name=model_name, run_name=run_name, model_cachedir=model_cachedir, step=step, phase=phase, source=source, comp_info=comp_info)
     log0(f"Loaded model from {ckpt_dir} with step {step}", logger=logger)
     return model, tokenizer, ckpt_data, trainer_config
 
@@ -728,12 +728,12 @@ def load_optimizer_state(
         model_cachedir: Optional[Union[str, Path]] = None, # should not be needed -> this should be CACHE_DIR / models
         step: Optional[int] = None,
         mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[ComputeContext] = None,
+        comp_info: Optional[ComputeContext] = None,
     ) -> Optional[Dict]:
     """Load just the optimizer shard for a given rank, without re-loading the model."""
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info.rank
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
     # resolve general checkpoint path
     model_dir = _solve_model_cache_dir(model_cachedir).joinpath(model_name)
 
@@ -753,7 +753,7 @@ def load_optimizer_state(
         log0(f"Optimizer checkpoint not found: {optimizer_path}")
         return None
     log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = _load_state_dict(optimizer_path, map_location=dist_info.device)
+    optimizer_data = _load_state_dict(optimizer_path, map_location=comp_info.device)
     return optimizer_data
 
 # general class api to simply checkpoint management 
@@ -769,7 +769,7 @@ class CheckpointManager:
         model_run: Optional[Union[str, int]] = None,
         model_cachedir: Optional[Union[str, Path]] = None,
         source: _ModelSources = "base",
-        dist_info: Optional[ComputeContext] = None,
+        comp_info: Optional[ComputeContext] = None,
         mode: _Mode = "ddp",
     ) -> None:
         self.model_name = model_name
@@ -778,10 +778,10 @@ class CheckpointManager:
         self.run_name = _solve_run_name(self.model_cachedir / self.model_name, run_name=model_run)
         self.source_dir = self.model_cachedir / self.model_name / self.run_name / source
         
-        self.dist_info = dist_info or get_dist_info()
+        self.comp_info = comp_info or get_comp_info()
         self.mode = mode
-        self._rank = self.dist_info.rank
-        self._device = self.dist_info.device
+        self._rank = self.comp_info.rank
+        self._device = self.comp_info.device
  
         self._ckpt_state: Optional[CheckpointState] = self._load_checkpoint_state()
     
@@ -798,7 +798,7 @@ class CheckpointManager:
             log0(f"No training config found at {path}.", logger=logger, level="warning")
             return None
         raw = _load_state_dict(path, map_location="cpu", weight_only=False)
-        return TrainerConfig.model_validate(raw | {"dist_info": self.dist_info})
+        return TrainerConfig.model_validate(raw | {"comp_info": self.comp_info})
     
     def save(
         self,
@@ -826,7 +826,7 @@ class CheckpointManager:
             checkpoint_state=self._ckpt_state,
             scaler=scaler,
             mode=self.mode,
-            dist_info=self.dist_info,
+            comp_info=self.comp_info,
         )
         if self._rank == 0:
             self._save_checkpoint_state()
@@ -841,7 +841,7 @@ class CheckpointManager:
         load_scaler: bool = True,
     ) -> CheckpointData:
         step = _get_checkpoint_step(self.source_dir, step)
-        ckpt_data = load_checkpoint(self.source_dir, step=step, dist_info=self.dist_info,
+        ckpt_data = load_checkpoint(self.source_dir, step=step, comp_info=self.comp_info,
             load_model=load_model, load_optim=load_optim, load_rng=load_rng,
             load_scaler=load_scaler, mode=self.mode)
         return ckpt_data 
@@ -855,7 +855,7 @@ class CheckpointManager:
             step=step,
             phase=phase,
             source=self.source_dir.name,
-            dist_info=self.dist_info,
+            comp_info=self.comp_info,
             mode=self.mode,
         )
         return model, tokenizer, ckpt_data, trainer_config
@@ -898,7 +898,7 @@ class CheckpointManager:
             model_name=meta_config.name,
             run_name=meta_config.run_name,
             model_cachedir=meta_config.dirname,
-            dist_info=self.dist_info,
+            comp_info=self.comp_info,
             mode=self.mode,
             model_config=meta_config.model_cfg,
             tokenizer_config=meta_config.tokenizer_cfg,

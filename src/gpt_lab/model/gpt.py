@@ -310,7 +310,7 @@ class DenseTransformer(BaseTransformer):
             param_groups.append(dict(
                 name=f"block.{shape}", params=group_params, **optim_config["transformer"]
             ))
-        optimizer = OptimizerFactory(param_groups, dist_info=config.dist_info)
+        optimizer = OptimizerFactory(param_groups, comp_info=config.comp_info)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pathlib import Path
 import os, time
 import json, pickle
-from gpt_lab.utils.distributed import ComputeContext, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.common import print0
 from gpt_lab.utils.logging import log0, log_all
 from gpt_lab.utils.default import (
@@ -476,13 +476,13 @@ class TrainerConfig(BaseModel):
 
     # Training settings
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    dist_info: ComputeContext = Field(default_factory=get_dist_info, exclude=True)
+    comp_info: ComputeContext = Field(default_factory=get_comp_info, exclude=True)
 
-    @field_validator("dist_info", mode="before")
+    @field_validator("comp_info", mode="before")
     @classmethod
     def restore_runtime_context(cls, value):
         # Older checkpoints stored a dictionary describing the previous launch.
-        return get_dist_info() if isinstance(value, dict) else value
+        return get_comp_info() if isinstance(value, dict) else value
 
     # Training hparams
     n_steps: int = 1 # TODO: decide whether step = #forward pass or #tokens seen by model

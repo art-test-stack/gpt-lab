@@ -126,7 +126,7 @@ def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
             checkpoint_state=checkpoint_state,
             optimizer=_MarkerOptimizer(rank),
             mode="shard",
-            dist_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"), is_distributed=False),
+            comp_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"), is_distributed=False),
         )
 
     step_dir = tmp_path / "checkpoint_step_000007"
@@ -144,7 +144,7 @@ def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
             step=7,
             mode="shard",
             load_scaler=False,
-            dist_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"), is_distributed=False),
+            comp_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"), is_distributed=False),
         )
         assert loaded.optimizer_state["marker"].item() == rank
         assert loaded.trainer_state.n_tokens == 1000 + rank
@@ -164,7 +164,7 @@ def test_sharded_checkpoint_rejects_world_size_change(tmp_path):
         checkpoint_state=CheckpointState(),
         optimizer=_MarkerOptimizer(0),
         mode="shard",
-        dist_info=SimpleNamespace(rank=0, world_size=2, device=torch.device("cpu"), is_distributed=False),
+        comp_info=SimpleNamespace(rank=0, world_size=2, device=torch.device("cpu"), is_distributed=False),
     )
 
     with pytest.raises(ValueError, match="same world size"):
@@ -173,7 +173,7 @@ def test_sharded_checkpoint_rejects_world_size_change(tmp_path):
             step=1,
             mode="shard",
             load_scaler=False,
-            dist_info=SimpleNamespace(rank=0, world_size=4, device=torch.device("cpu"), is_distributed=False),
+            comp_info=SimpleNamespace(rank=0, world_size=4, device=torch.device("cpu"), is_distributed=False),
         )
 
 
@@ -188,7 +188,7 @@ def test_default_run_name_is_broadcast_from_rank_zero(monkeypatch):
     run_name = make_default_run_name(
         depth=12,
         name="ic1",
-        dist_info=SimpleNamespace(rank=1, world_size=1, device=torch.device("cpu"), is_distributed=True, device_name="GPU"),
+        comp_info=SimpleNamespace(rank=1, world_size=1, device=torch.device("cpu"), is_distributed=True, device_name="GPU"),
     )
 
     assert run_name == "shared-run-name"
@@ -198,12 +198,12 @@ def test_default_run_name_is_broadcast_from_rank_zero(monkeypatch):
 def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, legacy):
     from gpt_lab.optim.factory import OptimizerFactory
 
-    dist_info = ComputeContext(device=torch.device("cpu"))
+    comp_info = ComputeContext(device=torch.device("cpu"))
     model = torch.nn.Linear(2, 2)
 
     def optimizer_for(model):
         return OptimizerFactory([dict(params=list(model.parameters()), opt="adamw", lr=0.01,
-                                      betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)], dist_info=dist_info)
+                                      betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)], comp_info=comp_info)
 
     optimizer = optimizer_for(model)
     scaler = torch.amp.GradScaler("cpu")
@@ -220,7 +220,7 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
     checkpoint_state = CheckpointState(best_eval_step=7, best_eval_value=1.5)
     saved_rng = capture_rng_state()
     save_checkpoint(model, checkpoint_dir, step=7, trainer_state=TrainerState(step=7),
-                    checkpoint_state=checkpoint_state, optimizer=optimizer, scaler=scaler, dist_info=dist_info)
+                    checkpoint_state=checkpoint_state, optimizer=optimizer, scaler=scaler, comp_info=comp_info)
     step_dir = checkpoint_dir / "checkpoint_step_000007"
     if legacy:
         for name, state in (("model", model.state_dict()), ("optim", optimizer.state_dict()),
@@ -235,7 +235,7 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
     originals = {path: path.read_bytes() for path in step_dir.iterdir() if path.suffix in (".pt", ".pkl")}
 
     expected_random = (torch.rand(3), np.random.random(3), random.random())
-    loaded = load_checkpoint(checkpoint_dir, step=7, dist_info=dist_info)
+    loaded = load_checkpoint(checkpoint_dir, step=7, comp_info=comp_info)
     for path, original in originals.items():
         assert path.with_suffix(".safetensors").exists()
         assert path.read_bytes() == original
@@ -253,7 +253,7 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
     restored.load_state_dict(loaded.model_state)
     restored_optimizer = optimizer_for(restored)
     restored_optimizer.load_state_dict(load_optimizer_state(
-        "demo", run_name="run", model_cachedir=tmp_path, step=7, dist_info=dist_info,
+        "demo", run_name="run", model_cachedir=tmp_path, step=7, comp_info=comp_info,
     ))
     restored_scaler = torch.amp.GradScaler("cpu")
     restored_scaler.load_state_dict(loaded.scaler_state)
@@ -265,11 +265,11 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
 
 @pytest.mark.parametrize("legacy", [False, True])
 def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, legacy):
-    dist_info = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
+    comp_info = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
     run_dir = tmp_path / "demo" / "run"
     MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=TransformerConfig(), base_train={})
-    manager = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, dist_info=dist_info)
-    trainer_config = TrainerConfig(dist_info=dist_info)
+    manager = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, comp_info=comp_info)
+    trainer_config = TrainerConfig(comp_info=comp_info)
     manager.save_training_config(trainer_config)
     path = manager.source_dir / "training_config.safetensors"
     assert TrainerConfig.from_disk(path).model_dump() == trainer_config.model_dump()
@@ -284,9 +284,9 @@ def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, 
     if legacy:
         manager._ckpt_state_path.unlink()
         torch.save(manager._ckpt_state.model_dump(), manager.source_dir / "checkpoint_state.pkl")
-    reloaded = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, dist_info=dist_info)
+    reloaded = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, comp_info=comp_info)
     assert reloaded._ckpt_state.best_eval_step == 8
     assert (manager.source_dir / "checkpoint_state.safetensors").exists()
-    assert CheckpointManager("demo", model_run="best", model_cachedir=tmp_path, dist_info=dist_info).run_name == "run"
+    assert CheckpointManager("demo", model_run="best", model_cachedir=tmp_path, comp_info=comp_info).run_name == "run"
     model_state = manager.load_states("best", load_optim=False)
     assert model_state.trainer_state.step == 8

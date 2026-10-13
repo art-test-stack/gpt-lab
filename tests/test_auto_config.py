@@ -38,7 +38,7 @@ def _auto_config(tmp_path: Path, **overrides) -> AutoGPTConfig:
         "total_batch_size": 64,
         "n_acc_steps": 1,
         "device_batch_size": 1,
-        "dist_info": ComputeContext(device=torch.device("cpu")),
+        "comp_info": ComputeContext(device=torch.device("cpu")),
     }
     values.update(overrides)
     return AutoGPTConfig(**values)
