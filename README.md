@@ -563,7 +563,9 @@ Distributed utilities return a frozen `ComputeContext` through the
 use attributes such as `.rank`, `.world_size`, `.device`, and `.compute_dtype`.
 Distributed runs use a one-dimensional PyTorch `DeviceMesh` named `"dp"`, exposed
 as `.dp_mesh`; single-device runs have no mesh or process group. CPU runs use
-Gloo and CUDA runs use NCCL. Trainer configs exclude this runtime object when saved; loading a checkpoint
+Gloo and CUDA runs use NCCL. Distributed AdamW and Muon wait on async `Work`
+handles; Gloo gradients use SUM followed by averaging, while NCCL retains AVG.
+Trainer configs exclude this runtime object when saved; loading a checkpoint
 attaches the current launch context, including for older dictionary metadata.
 Sharded optimizer resumes still require the original world size.
 

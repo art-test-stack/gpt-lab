@@ -124,3 +124,61 @@ def test_two_process_cpu_mesh(tmp_path):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     mp.spawn(_mesh_worker, args=(port, tmp_path), nprocs=2, join=True)
+
+
+def _optimizer_worker(rank, port):
+    from gpt_lab.optim.factory import OptimizerFactory
+
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2",
+                      MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
+                      GLOO_SOCKET_IFNAME="lo0" if sys.platform == "darwin" else "lo")
+    dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+    context = init_dist_groups("cpu")
+    try:
+        shapes = [(8,), (32, 32), (2, 3), (2, 3), (2, 3)]
+        parameters = [torch.nn.Parameter(torch.linspace(-0.3, 0.7, torch.Size(shape).numel()).reshape(shape))
+                      for shape in shapes]
+        reference = [torch.nn.Parameter(parameter.detach().clone()) for parameter in parameters]
+
+        def groups(params):
+            return [
+                dict(params=params[:2], opt="adamw", lr=0.01, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1),
+                dict(params=params[2:], opt="muon", lr=0.01, momentum=0.95, beta=0.9, ns_steps=2, weight_decay=0.1),
+            ]
+
+        optimizer = OptimizerFactory(groups(parameters), comp_info=context)
+        local = OptimizerFactory(groups(reference), comp_info=ComputeContext(device=torch.device("cpu")))
+        # Exercise real optimizer kernels without testing the compiler toolchain.
+        with torch.compiler.set_stance("force_eager"):
+            for step in range(2):
+                for index, (parameter, expected) in enumerate(zip(parameters, reference)):
+                    base = torch.arange(parameter.numel(), dtype=torch.float32).reshape(parameter.shape)
+                    gradients = [torch.sin(base + index + step + worker) * (worker + 1) for worker in range(2)]
+                    parameter.grad = gradients[rank].clone()
+                    expected.grad = (gradients[0] + gradients[1]) / 2
+                optimizer.step()
+                local.step()
+                for parameter, expected in zip(parameters, reference):
+                    torch.testing.assert_close(parameter, expected, rtol=1e-5, atol=1e-6)
+                for index in range(2):
+                    actual_state = optimizer.state[parameters[index]]
+                    expected_state = local.state[reference[index]]
+                    assert actual_state["step"] == expected_state["step"] == step + 1
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        expected = expected_state[key]
+                        if index == 1:
+                            expected = expected.chunk(2)[rank]
+                        torch.testing.assert_close(actual_state[key], expected)
+                owned = 2 if rank == 0 else 1
+                for key in ("momentum_buffer", "second_momentum_buffer"):
+                    expected = local.state[reference[2]][key][rank * 2:rank * 2 + owned]
+                    torch.testing.assert_close(optimizer.state[parameters[2]][key][:owned], expected)
+    finally:
+        cleanup_dist_groups()
+
+
+def test_two_process_gloo_optimizer_matches_averaged_local_updates():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    mp.spawn(_optimizer_worker, args=(port,), nprocs=2, join=True)

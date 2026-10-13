@@ -54,7 +54,10 @@ class MuonStrategy(OptimizerStrategy):
     def dist_reduce(self, group: dict, world_size: int) -> dict:
         params = group["params"]
         if not params:
-            return {"future": None, "grad_chunk": None}
+            return {"work": None, "grad_chunk": None}
+
+        average = dist.get_backend() == "gloo"
+        reduce_op = dist.ReduceOp.SUM if average else dist.ReduceOp.AVG
         
         chunk_size = (len(params) + world_size - 1) // world_size
         padded = chunk_size * world_size
@@ -68,12 +71,13 @@ class MuonStrategy(OptimizerStrategy):
             stacked_grads[len(params):].zero_()
         
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        future = dist.reduce_scatter_tensor(
-            grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
-        ).get_future()
+        work = dist.reduce_scatter_tensor(
+            grad_chunk, stacked_grads, op=reduce_op, async_op=True
+        )
         
         return {
-            "future": future,
+            "work": work,
+            "average": average,
             "grad_chunk": grad_chunk,
             "stacked_grads": stacked_grads,
             "chunk_size": chunk_size,
@@ -82,10 +86,12 @@ class MuonStrategy(OptimizerStrategy):
     def dist_compute(
         self, group: dict, info: dict, gather_list: list, rank: int, world_size: int,
     ) -> None:
-        if info["future"] is None:
+        if info["work"] is None:
             return
         
-        info["future"].wait()
+        info["work"].wait()
+        if info["average"]:
+            info["grad_chunk"].div_(world_size)
         params = group["params"]
         chunk_size = info["chunk_size"]
         p = params[0]
@@ -132,11 +138,11 @@ class MuonStrategy(OptimizerStrategy):
             updated_params[num_owned:].zero_()
         
         gathered_buffer = info["stacked_grads"]
-        future = dist.all_gather_into_tensor(
+        work = dist.all_gather_into_tensor(
             gathered_buffer, updated_params, async_op=True
-        ).get_future()
+        )
         gather_list.append({
-            "future": future,
+            "work": work,
             "stacked_params": gathered_buffer,
             "params": params,
         })
