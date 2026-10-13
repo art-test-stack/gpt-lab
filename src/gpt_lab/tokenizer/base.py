@@ -1,6 +1,6 @@
 from gpt_lab.utils.schemas import TokenizerConfig
 from gpt_lab.utils.logging import log0
-from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
+from gpt_lab.utils.tensor_io import load_tensor_state, migrate_legacy_tensor_state, save_tensor_state
 from pathlib import Path
 from typing import Optional
 import torch
@@ -65,11 +65,14 @@ class _BaseTokenizer:
         if getattr(self, "_token_bytes", None) is not None:
             return self._token_bytes
 
-        if token_bytes_path.exists():
-            token_bytes = load_tensor_state(token_bytes_path)["token_bytes"]
+        legacy_path = next((token_bytes_path.with_suffix(suffix) for suffix in (".pt", ".pth")
+                            if token_bytes_path.with_suffix(suffix).exists()), None)
+        if token_bytes_path.exists() or legacy_path is not None:
+            if not token_bytes_path.exists():
+                migrate_legacy_tensor_state(legacy_path)
+            state = load_tensor_state(token_bytes_path)
+            token_bytes = state if isinstance(state, torch.Tensor) else state["token_bytes"]
             log0(f"Loaded token_bytes from {token_bytes_path}", logger=logger)
-        elif token_bytes_path.with_suffix(".pt").exists():
-            token_bytes = torch.load(token_bytes_path.with_suffix(".pt"), weights_only=True)
         else:
             # Compute byte lengths directly from mergeable_ranks keys (which are bytes)
             mergeable = self.mergeable_ranks or {}

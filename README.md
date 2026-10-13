@@ -657,7 +657,7 @@ The framework provides a simple checkpointing system that is integrated with the
                 └── ...
 ```
 
-Model, optimizer, RNG, scaler, and trainer configuration files use safetensors. Nested state is described by JSON metadata inside each file; model weights keep their original state-dict keys. Tokenizer tensor caches and diagnostic batches also use safetensors. Legacy `.pt`, `.pth`, and checkpoint `.pkl` files remain readable, with safetensors preferred when both exist.
+Model, optimizer, RNG, scaler, and trainer configuration files use safetensors. Nested state is described by JSON metadata inside each file; model weights keep their original state-dict keys. Tokenizer tensor caches and diagnostic batches also use safetensors. On first load, legacy `.pt`, `.pth`, and checkpoint `.pkl` files are converted to safetensors beside the originals, then loaded through the new format. Conversion requires a writable directory; originals are retained, and existing safetensors files take precedence.
 
 ### Board 
 

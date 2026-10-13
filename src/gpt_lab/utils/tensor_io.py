@@ -3,9 +3,11 @@
 import json
 import math
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import numpy as np
 import torch
+from pydantic import BaseModel
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -87,3 +89,23 @@ def load_tensor_state(path: str | Path, device="cpu"):
         raise ValueError(f"Unsupported tensor state metadata type: {kind!r}")
 
     return decode(payload["state"])
+
+
+def migrate_legacy_tensor_state(path: str | Path, *, weights_only=True) -> Path:
+    """Convert once, retain the original, and publish a complete safetensors file."""
+    path = Path(path)
+    target = path.with_suffix(".safetensors")
+    if target.exists():
+        return target
+    state = torch.load(path, map_location="cpu", weights_only=weights_only)
+    if isinstance(state, BaseModel):
+        state = state.model_dump()
+    # Ranks can migrate shared files concurrently; readers must see a complete file.
+    with NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.", suffix=".safetensors", delete=False) as file:
+        temporary = Path(file.name)
+    try:
+        save_tensor_state(state, temporary)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target

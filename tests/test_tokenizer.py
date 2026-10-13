@@ -444,14 +444,19 @@ def test_local_config_reads_saved_msgpack_vocabulary(tmp_path):
     torch.testing.assert_close(reloaded.token_bytes, expected_bytes, rtol=0, atol=0)
 
 
-def test_token_bytes_read_legacy_cache_and_prefer_safetensors(tmp_path):
+@pytest.mark.parametrize("extension", ["pt", "pth"])
+def test_token_bytes_read_legacy_cache_and_prefer_safetensors(tmp_path, extension):
     from gpt_lab.tokenizer.base import _BaseTokenizer
     from gpt_lab.utils.tensor_io import save_tensor_state
 
     config = SimpleNamespace(dirname=tmp_path, save_token_bytes=True)
     legacy = torch.tensor([1, 2, 0], dtype=torch.int32)
-    torch.save(legacy, tmp_path / "token_bytes.pt")
+    legacy_path = tmp_path / f"token_bytes.{extension}"
+    torch.save(legacy, legacy_path)
+    original = legacy_path.read_bytes()
     torch.testing.assert_close(_BaseTokenizer(config).token_bytes, legacy)
+    assert (tmp_path / "token_bytes.safetensors").exists()
+    assert legacy_path.read_bytes() == original
     current = torch.tensor([2, 3, 0], dtype=torch.int32)
     save_tensor_state({"token_bytes": current}, tmp_path / "token_bytes.safetensors")
     torch.testing.assert_close(_BaseTokenizer(config).token_bytes, current)

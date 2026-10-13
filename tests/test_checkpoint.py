@@ -254,9 +254,13 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
     else:
         assert not list(step_dir.glob("*.pt"))
         assert not list(step_dir.glob("*.pkl"))
+    originals = {path: path.read_bytes() for path in step_dir.iterdir() if path.suffix in (".pt", ".pkl")}
 
     expected_random = (torch.rand(3), np.random.random(3), random.random())
     loaded = load_checkpoint(checkpoint_dir, step=7, dist_info=dist_info)
+    for path, original in originals.items():
+        assert path.with_suffix(".safetensors").exists()
+        assert path.read_bytes() == original
     assert_rng_state_consistency(saved_rng, loaded.rng_state)
     set_rng_state(loaded.rng_state)
     torch.testing.assert_close(torch.rand(3), expected_random[0], rtol=0, atol=0)
@@ -296,6 +300,7 @@ def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, 
         path.unlink()
         torch.save(trainer_config, manager.source_dir / "training_config.pkl")
     assert manager.load_training_config() == trainer_config
+    assert path.exists()
     manager.save(7, torch.nn.Linear(2, 2), checkpoint_state=CheckpointState(best_eval_step=7, best_eval_value=1.5))
     manager.save(8, torch.nn.Linear(2, 2), trainer_state=TrainerState(step=8))
     manager.mark_best_bpb(8, 1.0)
@@ -304,6 +309,7 @@ def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, 
         torch.save(manager._ckpt_state.model_dump(), manager.source_dir / "checkpoint_state.pkl")
     reloaded = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, dist_info=dist_info)
     assert reloaded._ckpt_state.best_eval_step == 8
+    assert (manager.source_dir / "checkpoint_state.safetensors").exists()
     assert CheckpointManager("demo", model_run="best", model_cachedir=tmp_path, dist_info=dist_info).run_name == "run"
     model_state = manager.load_states("best", load_optim=False)
     assert model_state.trainer_state.step == 8

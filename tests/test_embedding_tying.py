@@ -187,6 +187,7 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
     step_dir = run_dir / "base" / "checkpoint_step_000007"
     step_dir.mkdir(parents=True)
     torch.save(model.state_dict(), step_dir / f"model.{extension}")
+    original = (step_dir / f"model.{extension}").read_bytes()
     torch.save(capture_rng_state(), step_dir / "rng_state.pt")
     (step_dir / "trainer_state.json").write_text(TrainerState(step=7).model_dump_json())
     monkeypatch.setattr("gpt_lab.model.checkpoint.build_tokenizer", lambda _: SimpleNamespace(vocab_size=config.vocab_size))
@@ -196,8 +197,16 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
         dist_info={"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False},
     )
     assert not restored.config.tie_word_embeddings
+    assert (step_dir / "model.safetensors").exists()
+    assert (step_dir / f"model.{extension}").read_bytes() == original
     _assert_sharing(restored)
     for name, weight in model.state_dict().items():
         torch.testing.assert_close(restored.state_dict()[name], weight, rtol=0, atol=0)
     ids = torch.tensor([[0, 1, 2, 3]])
     torch.testing.assert_close(restored(ids).logits, model(ids).logits, rtol=0, atol=0)
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: pytest.fail("Converted checkpoints must use safetensors"))
+    reloaded, _, _, _ = build_model(
+        "demo", run_name="run", model_cachedir=tmp_path, step=7, phase="eval",
+        dist_info={"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False},
+    )
+    torch.testing.assert_close(reloaded(ids).logits, model(ids).logits, rtol=0, atol=0)

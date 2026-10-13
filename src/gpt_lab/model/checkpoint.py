@@ -52,7 +52,7 @@ from gpt_lab.utils.schemas import (
     TransformerConfig, 
 )
 from gpt_lab.utils.system import get_git_info
-from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
+from gpt_lab.utils.tensor_io import load_tensor_state, migrate_legacy_tensor_state, save_tensor_state
 from gpt_lab.tokenizer import build_tokenizer, Tokenizer, TokenizerConfig
 from gpt_lab.model.gpt import DenseTransformer
 
@@ -213,10 +213,9 @@ def _load_state_dict(ckpt_dir, filename=None, map_location=None, weight_only=Tru
     ckpt_dir = _resolve_state_path(ckpt_dir)
     if not ckpt_dir.exists():
         log_error(f"Checkpoint file {ckpt_dir} does not exist.", logger=logger, error_type=FileNotFoundError)
-    if ckpt_dir.suffix == ".safetensors":
-        state_dict = load_tensor_state(ckpt_dir, device=map_location or "cpu")
-    else:
-        state_dict = torch.load(ckpt_dir, map_location=map_location, weights_only=weight_only)
+    if ckpt_dir.suffix != ".safetensors":
+        ckpt_dir = migrate_legacy_tensor_state(ckpt_dir, weights_only=weight_only)
+    state_dict = load_tensor_state(ckpt_dir, device=map_location or "cpu")
     log0(f"Loaded {filename} from {ckpt_dir}.", logger=logger)
     return state_dict
 
