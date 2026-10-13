@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import json
 from gpt_lab.utils.distributed import ComputeContext
 import pytest
 import torch
@@ -112,7 +113,8 @@ class _MarkerOptimizer:
 
 
 @pytest.mark.fast
-def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
+@pytest.mark.parametrize("legacy_metadata", [False, True])
+def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path, legacy_metadata):
     model = torch.nn.Linear(2, 2)
     checkpoint_state = CheckpointState(best_eval_step=7, best_eval_value=1.5)
 
@@ -125,11 +127,15 @@ def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
             trainer_state=TrainerState(step=7, n_tokens=1000 + rank),
             checkpoint_state=checkpoint_state,
             optimizer=_MarkerOptimizer(rank),
-            mode="shard",
+            optimizer_state_layout="sharded",
             comp_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"), is_distributed=False),
         )
 
     step_dir = tmp_path / "checkpoint_step_000007"
+    metadata_path = step_dir / "checkpoint_meta.json"
+    assert json.loads(metadata_path.read_text()) == {"optimizer_state_layout": "sharded", "world_size": 2}
+    if legacy_metadata:
+        metadata_path.write_text(json.dumps({"mode": "shard", "world_size": 2}))
     assert (step_dir / "model.safetensors").exists()
     assert (step_dir / "optim_rank0.safetensors").exists()
     assert (step_dir / "optim_rank1.safetensors").exists()
@@ -142,7 +148,7 @@ def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
         loaded = load_checkpoint(
             tmp_path,
             step=7,
-            mode="shard",
+            optimizer_state_layout="sharded",
             load_scaler=False,
             comp_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"), is_distributed=False),
         )
@@ -163,7 +169,7 @@ def test_sharded_checkpoint_rejects_world_size_change(tmp_path):
         trainer_state=TrainerState(step=1),
         checkpoint_state=CheckpointState(),
         optimizer=_MarkerOptimizer(0),
-        mode="shard",
+        optimizer_state_layout="sharded",
         comp_info=SimpleNamespace(rank=0, world_size=2, device=torch.device("cpu"), is_distributed=False),
     )
 
@@ -171,7 +177,7 @@ def test_sharded_checkpoint_rejects_world_size_change(tmp_path):
         load_checkpoint(
             tmp_path,
             step=1,
-            mode="shard",
+            optimizer_state_layout="sharded",
             load_scaler=False,
             comp_info=SimpleNamespace(rank=0, world_size=4, device=torch.device("cpu"), is_distributed=False),
         )
@@ -239,7 +245,10 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
     save_checkpoint(model, checkpoint_dir, step=7, trainer_state=TrainerState(step=7),
                     checkpoint_state=checkpoint_state, optimizer=optimizer, scaler=scaler, comp_info=comp_info)
     step_dir = checkpoint_dir / "checkpoint_step_000007"
+    metadata_path = step_dir / "checkpoint_meta.json"
+    assert json.loads(metadata_path.read_text()) == {"optimizer_state_layout": "full", "world_size": 1}
     if legacy:
+        metadata_path.write_text(json.dumps({"mode": "ddp", "world_size": 1}))
         for name, state in (("model", model.state_dict()), ("optim", optimizer.state_dict()),
                             ("rng_state", saved_rng), ("scaler", scaler.state_dict())):
             (step_dir / f"{name}.safetensors").unlink()

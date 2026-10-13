@@ -180,7 +180,7 @@ def train_base(
             model_run=meta_config.run_name,
             model_cachedir=model_dir,
             comp_info=comp_info,
-            mode="shard" if comp_info.is_distributed else "ddp",
+            optimizer_state_layout="sharded" if comp_info.is_distributed else "full",
         )
         model = build_meta_model(meta_config.model_cfg)
         tokenizer = Tokenizer.from_config(meta_config.tokenizer_cfg)

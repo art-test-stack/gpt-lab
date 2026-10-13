@@ -145,7 +145,7 @@ def test_resume_restores_all_states_through_existing_pipeline(training_dependenc
     run(args)
     deps.manager.load.assert_called_once_with(step='latest' if step is None else step, phase='train')
     deps.auto.assert_not_called()
-    assert deps.factory.call_args.kwargs['mode'] == 'shard'
+    assert deps.factory.call_args.kwargs['optimizer_state_layout'] == 'sharded'
     assert deps.loader.call_args_list[0].kwargs['resume_state'] is deps.state.train_loader_state
     deps.model.build_optimizer.return_value.load_state_dict.assert_called_once_with(deps.checkpoint.optimizer_state)
     assert deps.trainer_factory.call_args.kwargs['config'] is deps.saved_config

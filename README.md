@@ -476,7 +476,7 @@ optimizer = OptimizerFactory(param_groups)
 
 The factory automatically:
 - Validates all required keys for each optimizer at construction (fails fast on config errors)
-- Detects DDP mode and selects single-GPU or distributed backend
+- Selects local or distributed optimizer execution
 - Manages a reusable scalar cache for torch.compile stability
 - Routes parameter groups to the correct strategy at each step
 
@@ -568,9 +568,12 @@ handles; Gloo gradients use SUM followed by averaging, while NCCL retains AVG.
 Trainer configs exclude this runtime object when saved; loading a checkpoint
 attaches the current launch context, including for older dictionary metadata.
 Sharded optimizer resumes still require the original world size.
-Older one-worker `shard` checkpoints can resume in single-device runs: loaders
-read their rank-0 files, while subsequent checkpoints use `ddp`. Distributed
-optimizer state continues to use `shard`.
+Checkpoint APIs use `optimizer_state_layout="full"` or `"sharded"`, independently
+of local or distributed optimizer execution. The current distributed optimizer
+shards its state, so its checkpoints use `"sharded"`; local runs use `"full"`.
+Readers accept legacy `mode="ddp"` / `"shard"` metadata. One-worker sharded
+checkpoints contain full optimizer state and can resume locally: loaders read
+the rank-0 files, while subsequent local checkpoints use `"full"`.
 
 `--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
 With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)

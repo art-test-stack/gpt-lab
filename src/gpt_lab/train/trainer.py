@@ -159,7 +159,7 @@ class Trainer:
                 model_run=model_run,
                 source=self.training_type, 
                 comp_info=self.config.comp_info,
-                mode="shard" if self.config.comp_info.is_distributed else "ddp", # naming is a bit dummy
+                optimizer_state_layout="sharded" if self.config.comp_info.is_distributed else "full",
             )
         self.ckpt_manager = checkpoint_manager 
         self.dirname = self.ckpt_manager.source_dir
@@ -709,7 +709,7 @@ class Trainer:
             model_run=model_run,
             source="base", # TODO: make this dynamic based on training type
             comp_info=comp_info,
-            mode="shard" if comp_info.is_distributed else "ddp",
+            optimizer_state_layout="sharded" if comp_info.is_distributed else "full",
             model_cachedir=cache_dir,
         )
         model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(step=step, phase="train")
