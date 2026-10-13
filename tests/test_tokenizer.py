@@ -3,6 +3,9 @@ import random
 import string
 from pathlib import Path
 import json
+from types import SimpleNamespace
+
+import torch
 
 from gpt_lab.tokenizer.serialization import (
     load_mergeable_ranks,
@@ -425,7 +428,11 @@ def test_local_config_reads_saved_msgpack_vocabulary(tmp_path):
     assert config.get_mergeable_ranks() == ranks
     tokenizer = Tokenizer.from_config(config)
     assert tokenizer.vocab_size == len(ranks) + len(special_tokens)
-    config.save_to_directory()
+    expected_bytes = tokenizer.token_bytes.clone()
+    tokenizer.save_to_directory()
+    tokenizer.update_token_bytes()
+    assert (tokenizer_dir / "token_bytes.safetensors").exists()
+    assert not (tokenizer_dir / "token_bytes.pt").exists()
 
     reloaded = tokenizer_auto.load_tokenizer(
         "local_tok",
@@ -434,6 +441,20 @@ def test_local_config_reads_saved_msgpack_vocabulary(tmp_path):
     )
     assert reloaded.mergeable_ranks == ranks
     assert reloaded.vocab_size == tokenizer.vocab_size
+    torch.testing.assert_close(reloaded.token_bytes, expected_bytes, rtol=0, atol=0)
+
+
+def test_token_bytes_read_legacy_cache_and_prefer_safetensors(tmp_path):
+    from gpt_lab.tokenizer.base import _BaseTokenizer
+    from gpt_lab.utils.tensor_io import save_tensor_state
+
+    config = SimpleNamespace(dirname=tmp_path, save_token_bytes=True)
+    legacy = torch.tensor([1, 2, 0], dtype=torch.int32)
+    torch.save(legacy, tmp_path / "token_bytes.pt")
+    torch.testing.assert_close(_BaseTokenizer(config).token_bytes, legacy)
+    current = torch.tensor([2, 3, 0], dtype=torch.int32)
+    save_tensor_state({"token_bytes": current}, tmp_path / "token_bytes.safetensors")
+    torch.testing.assert_close(_BaseTokenizer(config).token_bytes, current)
 
 
 @pytest.mark.fast

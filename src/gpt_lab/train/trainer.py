@@ -508,7 +508,8 @@ class Trainer:
                 loss_accum.add_(loss.detach().float())
 
                 if torch.isnan(loss_accum) or torch.isinf(loss_accum):
-                    torch.save(x, self.dirname / "bad_batch.pt")
+                    from gpt_lab.utils.tensor_io import save_tensor_state
+                    save_tensor_state({"inputs": x}, self.dirname / "bad_batch.safetensors")
                     log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
                         f"Loss is NaN or Inf at {step=}.\n" \
                         f"Dataloader state: {dataloader_state.__dict__}.\n" \

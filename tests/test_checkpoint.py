@@ -3,13 +3,15 @@ import torch
 import numpy as np
 import random
 from gpt_lab.model.checkpoint import (
+    CheckpointManager,
     capture_rng_state,
     load_checkpoint,
+    load_optimizer_state,
     make_default_run_name,
     save_checkpoint,
     set_rng_state,
 )
-from gpt_lab.utils.schemas import CheckpointState, TrainerState
+from gpt_lab.utils.schemas import CheckpointState, MetaConfig, TrainerConfig, TrainerState, TransformerConfig
 
 def numpy_rng_equal(s1, s2):
     if s1[0] != s2[0]:  # algorithm name
@@ -132,12 +134,12 @@ def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
 
     step_dir = tmp_path / "checkpoint_step_000007"
     assert (step_dir / "model.safetensors").exists()
-    assert (step_dir / "optim_rank0.pt").exists()
-    assert (step_dir / "optim_rank1.pt").exists()
+    assert (step_dir / "optim_rank0.safetensors").exists()
+    assert (step_dir / "optim_rank1.safetensors").exists()
     assert (step_dir / "trainer_state_rank0.json").exists()
     assert (step_dir / "trainer_state_rank1.json").exists()
-    assert (step_dir / "rng_state_rank0.pt").exists()
-    assert (step_dir / "rng_state_rank1.pt").exists()
+    assert (step_dir / "rng_state_rank0.safetensors").exists()
+    assert (step_dir / "rng_state_rank1.safetensors").exists()
 
     for rank in range(2):
         loaded = load_checkpoint(
@@ -212,3 +214,96 @@ def test_default_run_name_is_broadcast_from_rank_zero(monkeypatch):
     )
 
     assert run_name == "shared-run-name"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, legacy):
+    from gpt_lab.optim.factory import OptimizerFactory
+
+    dist_info = {"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False}
+    model = torch.nn.Linear(2, 2)
+
+    def optimizer_for(model):
+        return OptimizerFactory([dict(params=list(model.parameters()), opt="adamw", lr=0.01,
+                                      betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)], dist_info=dist_info)
+
+    optimizer = optimizer_for(model)
+    scaler = torch.amp.GradScaler("cpu")
+    inputs = torch.tensor([[0.5, -0.2]])
+
+    def step(model, optimizer, scaler):
+        optimizer.zero_grad()
+        scaler.scale(model(inputs).square().mean()).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+    step(model, optimizer, scaler)
+    checkpoint_dir = tmp_path / "demo" / "run" / "base"
+    checkpoint_state = CheckpointState(best_eval_step=7, best_eval_value=1.5)
+    saved_rng = capture_rng_state()
+    save_checkpoint(model, checkpoint_dir, step=7, trainer_state=TrainerState(step=7),
+                    checkpoint_state=checkpoint_state, optimizer=optimizer, scaler=scaler, dist_info=dist_info)
+    step_dir = checkpoint_dir / "checkpoint_step_000007"
+    if legacy:
+        for name, state in (("model", model.state_dict()), ("optim", optimizer.state_dict()),
+                            ("rng_state", saved_rng), ("scaler", scaler.state_dict())):
+            (step_dir / f"{name}.safetensors").unlink()
+            torch.save(state, step_dir / f"{name}.pt")
+        (step_dir / "checkpoint_state.safetensors").unlink()
+        torch.save(checkpoint_state.model_dump(), step_dir / "checkpoint_state.pkl")
+    else:
+        assert not list(step_dir.glob("*.pt"))
+        assert not list(step_dir.glob("*.pkl"))
+
+    expected_random = (torch.rand(3), np.random.random(3), random.random())
+    loaded = load_checkpoint(checkpoint_dir, step=7, dist_info=dist_info)
+    assert_rng_state_consistency(saved_rng, loaded.rng_state)
+    set_rng_state(loaded.rng_state)
+    torch.testing.assert_close(torch.rand(3), expected_random[0], rtol=0, atol=0)
+    np.testing.assert_array_equal(np.random.random(3), expected_random[1])
+    assert random.random() == expected_random[2]
+    assert loaded.checkpoint_state == checkpoint_state
+    assert loaded.scaler_state == scaler.state_dict()
+    assert isinstance(loaded.optimizer_state["param_groups"][0]["betas"], tuple)
+    assert all(isinstance(key, int) for key in loaded.optimizer_state["state"])
+
+    restored = torch.nn.Linear(2, 2)
+    restored.load_state_dict(loaded.model_state)
+    restored_optimizer = optimizer_for(restored)
+    restored_optimizer.load_state_dict(load_optimizer_state(
+        "demo", run_name="run", model_cachedir=tmp_path, step=7, dist_info=dist_info,
+    ))
+    restored_scaler = torch.amp.GradScaler("cpu")
+    restored_scaler.load_state_dict(loaded.scaler_state)
+    step(model, optimizer, scaler)
+    step(restored, restored_optimizer, restored_scaler)
+    for name, weight in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], weight, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, legacy):
+    dist_info = {"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False,
+                 "compute_dtype": torch.float32}
+    run_dir = tmp_path / "demo" / "run"
+    MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=TransformerConfig(), base_train={})
+    manager = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, dist_info=dist_info)
+    trainer_config = TrainerConfig(dist_info=dist_info)
+    manager.save_training_config(trainer_config)
+    path = manager.source_dir / "training_config.safetensors"
+    assert TrainerConfig.from_disk(path) == trainer_config
+    if legacy:
+        path.unlink()
+        torch.save(trainer_config, manager.source_dir / "training_config.pkl")
+    assert manager.load_training_config() == trainer_config
+    manager.save(7, torch.nn.Linear(2, 2), checkpoint_state=CheckpointState(best_eval_step=7, best_eval_value=1.5))
+    manager.save(8, torch.nn.Linear(2, 2), trainer_state=TrainerState(step=8))
+    manager.mark_best_bpb(8, 1.0)
+    if legacy:
+        manager._ckpt_state_path.unlink()
+        torch.save(manager._ckpt_state.model_dump(), manager.source_dir / "checkpoint_state.pkl")
+    reloaded = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, dist_info=dist_info)
+    assert reloaded._ckpt_state.best_eval_step == 8
+    assert CheckpointManager("demo", model_run="best", model_cachedir=tmp_path, dist_info=dist_info).run_name == "run"
+    model_state = manager.load_states("best", load_optim=False)
+    assert model_state.trainer_state.step == 8

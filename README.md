@@ -337,7 +337,7 @@ Expects the directory structure:
 <TOKENIZERS_FOLDER>/my_tokenizer/
 ├── tokenizer_config.json       # includes SHA-256 fingerprint
 ├── mergeable_ranks.msgpack
-└── token_bytes.pt
+└── token_bytes.safetensors
 ```
 
 #### Automatic tokenizer resolution
@@ -638,25 +638,26 @@ The framework provides a simple checkpointing system that is integrated with the
 ```
 <CACHE_DIR>/
 └── models/
-    └── <model_name>/                          # e.g., "ic1", "gpt2-small", "llama2"
+    └── <model_name>/                               # e.g., "ic1", "gpt2-small", "llama2"
         └── <run_name>/
-            ├── meta.pskl                      # immutable (model, tokenizer, git)
-            └── <source>/                      # base / sft / rl
-                ├── training_config.pkl        # per-phase config
-                ├── checkpoint_state.pkl       # best bpb/core steps and values
+            ├── meta.pskl                           # immutable (model, tokenizer, git)
+            └── <source>/                           # base / sft / rl
+                ├── training_config.safetensors     # per-phase config
+                ├── checkpoint_state.safetensors    # best bpb/core steps and values
                 ├── checkpoint_step_000000/
                 │   ├── model.safetensors
-                │   ├── optim_rank0.pt         # optimizer state dict (optim_rank{rank}.pt if sharded, otherwise optim.pt)
-                │   ├── optim_rank1.pt
-                │   ├── ...                    # more optimizer shards if needed
-                │   ├── trainer_state.pkl      # training state, rng state, data state, best bpb/core steps
+                │   ├── optim_rank0.safetensors     # optimizer state (otherwise optim.safetensors)
+                │   ├── optim_rank1.safetensors
+                │   ├── ...                         # more optimizer shards if needed
+                │   ├── trainer_state_rank0.json
+                │   ├── rng_state_rank0.safetensors
                 │   └── metrics.pkl
                 ├── checkpoint_step_000100/
                 │   └── ...
                 └── ...
 ```
 
-Model weights use safetensors; loading also accepts legacy `model.pt` and `model.pth` files. Optimizer, RNG, and scaler states retain their existing formats.
+Model, optimizer, RNG, scaler, and trainer configuration files use safetensors. Nested state is described by JSON metadata inside each file; model weights keep their original state-dict keys. Tokenizer tensor caches and diagnostic batches also use safetensors. Legacy `.pt`, `.pth`, and checkpoint `.pkl` files remain readable, with safetensors preferred when both exist.
 
 ### Board 
 
