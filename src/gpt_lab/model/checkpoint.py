@@ -523,6 +523,18 @@ def save_checkpoint(
     if comp_info.is_distributed:
         torch.distributed.barrier()
 
+def _checkpoint_read_mode(mode: _Mode, metadata: dict, world_size: int) -> _Mode:
+    # A one-worker shard contains the full optimizer state and can resume locally.
+    if (
+        mode == "ddp"
+        and world_size == 1
+        and metadata.get("mode") == "shard"
+        and metadata.get("world_size") == 1
+    ):
+        return "shard"
+    return mode
+
+
 def load_checkpoint(
         checkpoint_dir: Union[str, Path], # should be <model_dir>/<model_name>/<run_name>/<source>/<checkpoint_dir>
         step: Union[int, str] = -1, 
@@ -548,6 +560,7 @@ def load_checkpoint(
     metadata_path = step_dir / "checkpoint_meta.json"
     if metadata_path.exists():
         metadata = _load_json(step_dir, "checkpoint_meta.json")
+        mode = _checkpoint_read_mode(mode, metadata, comp_info.world_size)
         if load_optim and metadata.get("mode") != mode:
             raise ValueError(
                 "Checkpoint optimizer mode does not match the requested mode: "
@@ -748,9 +761,11 @@ def load_optimizer_state(
     if step is None:
         step = find_last_step(checkpoints_dir)
     
-    optimizer_path = (checkpoints_dir
-        .joinpath(_STEP_DIRNAME(step))
-        .joinpath(_OPT_DEFAULT_FILENAME[mode](rank)))
+    step_dir = checkpoints_dir / _STEP_DIRNAME(step)
+    if (step_dir / "checkpoint_meta.json").exists():
+        metadata = _load_json(step_dir, "checkpoint_meta.json")
+        mode = _checkpoint_read_mode(mode, metadata, comp_info.world_size)
+    optimizer_path = step_dir / _OPT_DEFAULT_FILENAME[mode](rank)
     
     optimizer_path = _resolve_state_path(optimizer_path)
     if not optimizer_path.exists():
