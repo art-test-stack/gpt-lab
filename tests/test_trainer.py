@@ -1,4 +1,4 @@
-from gpt_lab.utils.distributed import DistributedContext
+from gpt_lab.utils.distributed import ComputeContext
 import pytest
 import torch
 from gpt_lab.model.wrapper import Engine
@@ -34,7 +34,7 @@ def _make_trainer(tmp_path, compute_dtype=torch.bfloat16, monitor=False):
         device_batch_size=2,
         log_every=1,
         monitor_grad_norms=monitor,
-        dist_info=DistributedContext(device=torch.device("cpu"), compute_dtype=compute_dtype),
+        dist_info=ComputeContext(device=torch.device("cpu"), compute_dtype=compute_dtype),
     )
     trainer = Trainer(
         model=model,

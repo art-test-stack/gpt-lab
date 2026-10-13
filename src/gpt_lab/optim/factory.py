@@ -12,7 +12,7 @@ import torch
 from gpt_lab.optim.registry import OPTIMIZER_REGISTRY, OptimizerSpec, _validate_group, register_optimizer
 from gpt_lab.optim.strategy import ScalarCache, _DistributedBackend, _LocalBackend
 from gpt_lab.optim.strategies import AdamWStrategy, MuonStrategy
-from gpt_lab.utils.distributed import DistributedContext, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_dist_info
 
 # ── Register built-in optimizers ──────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ class OptimizerFactory(torch.optim.Optimizer):
     """
     
     def __init__(
-        self, param_groups: list[dict[str, Any]], dist_info: Optional[DistributedContext] = None
+        self, param_groups: list[dict[str, Any]], dist_info: Optional[ComputeContext] = None
     ) -> None:
         # Validate all groups early — fail before training starts
         for idx, group in enumerate(param_groups):

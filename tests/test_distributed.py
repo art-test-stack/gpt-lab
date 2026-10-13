@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from gpt_lab.utils.distributed import (
-    DistributedContext,
+    ComputeContext,
     broadcast_model,
     cleanup_dist_groups,
     get_dist_info,

@@ -1,4 +1,4 @@
-from gpt_lab.utils.distributed import DistributedContext
+from gpt_lab.utils.distributed import ComputeContext
 import math
 from types import SimpleNamespace
 
@@ -41,7 +41,7 @@ def test_compute_bpb_reports_mean_loss_per_token():
         batches,
         steps,
         token_bytes,
-        dist_info=DistributedContext(device=torch.device("cpu")),
+        dist_info=ComputeContext(device=torch.device("cpu")),
     )
 
     assert result["loss"] == pytest.approx(loss_per_token)

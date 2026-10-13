@@ -558,7 +558,7 @@ uv run torchrun --standalone --nproc-per-node=8 --no-python \
   gpt-lab train --model-name ic1 --run-name baseline --depth 12
 ```
 
-Distributed utilities return a frozen `DistributedContext` through the existing
+Distributed utilities return a frozen `ComputeContext` through the existing
 `init_dist_groups()` and `get_dist_info()` functions. Pass it as `dist_info` and
 use attributes such as `.rank`, `.world_size`, `.device`, and `.compute_dtype`.
 Distributed runs use a one-dimensional PyTorch `DeviceMesh` named `"dp"`, exposed

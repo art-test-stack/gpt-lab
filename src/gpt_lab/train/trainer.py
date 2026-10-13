@@ -28,7 +28,7 @@ from torch.amp import autocast, GradScaler
 
 from gpt_lab.utils.board import Board
 from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
-from gpt_lab.utils.distributed import DistributedContext, _DTYPE_MAP, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, _DTYPE_MAP, get_dist_info
 from gpt_lab.utils.common import print0
 from gpt_lab.utils.logging import log_error, log_critical, log0, log_dict
 from gpt_lab.utils.schemas import (
@@ -701,7 +701,7 @@ class Trainer:
         step: Union[int, str] = "latest",
         cache_dir: Optional[Union[str, Path]] = None,
         board: Optional[Board] = None,
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
     ):
         dist_info = dist_info or get_dist_info()
         ckpt_manager = CheckpointManager(

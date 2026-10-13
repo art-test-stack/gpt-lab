@@ -60,7 +60,7 @@ def is_ddp_initialized() -> bool:
     return dist.is_initialized() and dist.is_available()
 
 @dataclass(frozen=True)
-class DistributedContext:
+class ComputeContext:
     device: torch.device
     mesh: DeviceMesh | None = None
     compute_dtype: torch.dtype = field(default_factory=lambda: detect_compute_dtype()[0])
@@ -103,7 +103,7 @@ class DistributedContext:
         return get_peak_flops(self.device_name) if self.device_type == "cuda" else float("inf")
 
 
-def _get_dist_info(device_type: str) -> DistributedContext:
+def _get_dist_info(device_type: str) -> ComputeContext:
     assert device_type in ("cuda", "mps", "cpu"), f"Unsupported device type: {device_type!r}."
     assert not is_ddp_requested() or int(os.environ["WORLD_SIZE"]) == 1 or is_ddp_initialized(), (
         "Distributed training requested but process group not initialized. Call init_dist_groups() first."
@@ -118,19 +118,19 @@ def _get_dist_info(device_type: str) -> DistributedContext:
         if device_type == "mps":
             raise ValueError("Distributed execution requires CPU/Gloo or CUDA/NCCL")
         mesh = init_device_mesh(device_type, (dist.get_world_size(),), mesh_dim_names=("dp",))
-    return DistributedContext(device=device, mesh=mesh)
+    return ComputeContext(device=device, mesh=mesh)
 
 
-_context: DistributedContext | None = None
+_context: ComputeContext | None = None
 
 
-def get_dist_info(device_type: str | None = None) -> DistributedContext:
+def get_dist_info(device_type: str | None = None) -> ComputeContext:
     global _context
     if _context is None or (device_type is not None and device_type != _context.device_type):
         _context = _get_dist_info(device_type or get_device_type())
     return _context
 
-def init_dist_groups(device_type: str | None = None, random_seed: int = 42) -> DistributedContext:
+def init_dist_groups(device_type: str | None = None, random_seed: int = 42) -> ComputeContext:
     assert int(os.environ.get("WORLD_SIZE", 1)) > 0, "WORLD_SIZE must be positive"
     device_type = device_type or get_device_type()
     assert device_type in ("cuda", "mps", "cpu"), f"Unsupported device type: {device_type!r}."
@@ -152,7 +152,7 @@ def init_dist_groups(device_type: str | None = None, random_seed: int = 42) -> D
     _context = None
     return get_dist_info(device_type)
 
-def broadcast_model(model: nn.Module, dist_info: DistributedContext) -> None:
+def broadcast_model(model: nn.Module, dist_info: ComputeContext) -> None:
     if not dist_info.is_distributed:
         return
 

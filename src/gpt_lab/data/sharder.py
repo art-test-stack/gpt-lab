@@ -14,7 +14,7 @@ from urllib3.util.retry import Retry
  
 from gpt_lab.utils.default import DATA_DIR
 from gpt_lab.utils.schemas import DataLoaderState
-from gpt_lab.utils.distributed import DistributedContext, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_dist_info
  
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.parquet"
 
@@ -63,7 +63,7 @@ class ShardManager:
         refresh_interval: float = 5.0,
         download_poll_interval: float = 1.0,
         # dist settings
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
     ):
         assert split in ["train", "val"], f"split must be 'train' or 'val'. Got {split=!r}."
         if cachedir is None:

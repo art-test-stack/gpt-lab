@@ -32,7 +32,7 @@ from gpt_lab.utils.paths import get_cache_dir
 
 if TYPE_CHECKING:
     from gpt_lab.utils.schemas import OptimizerConfig
-    from gpt_lab.utils.distributed import DistributedContext
+    from gpt_lab.utils.distributed import ComputeContext
 
 
 def train_base(
@@ -322,7 +322,7 @@ def resolve_checkpoint(checkpoint_dir, checkpoint_step=None) -> dict:
                 model_dir=str(path.parent.parent), checkpoint_step=checkpoint_step)
 
 
-def build_auto_config(parameters: dict, device, dist_info: DistributedContext):
+def build_auto_config(parameters: dict, device, dist_info: ComputeContext):
     """Construct the existing auto configuration independently of training."""
     from gpt_lab.model.auto import AutoGPTConfig
 
@@ -363,7 +363,7 @@ def build_auto_config(parameters: dict, device, dist_info: DistributedContext):
     ).generate_gpt_config(device)
 
 
-def build_trainer_config(parameters: dict, dist_info: DistributedContext, base_training_config: dict):
+def build_trainer_config(parameters: dict, dist_info: ComputeContext, base_training_config: dict):
     """Translate CLI and scaling-law settings into the existing TrainerConfig."""
     from gpt_lab.utils.schemas import TrainerConfig
 

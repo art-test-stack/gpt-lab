@@ -1,5 +1,5 @@
 import torch
-from gpt_lab.utils.distributed import DistributedContext
+from gpt_lab.utils.distributed import ComputeContext
 import math
 
 import pytest
@@ -17,7 +17,7 @@ def test_optimizer_profile_is_scaled_once_without_mutation(tmp_path, custom):
     profile = OptimizerConfig.from_file(path)
     snapshot = profile.model_dump()
     config = TrainerConfig(
-        optim_config=profile, dist_info=DistributedContext(device=torch.device("cpu")),
+        optim_config=profile, dist_info=ComputeContext(device=torch.device("cpu")),
         batch_lr_scale=4.0, weight_decay_scale=3.0, n_steps=8,
     )
     model = build_meta_model(TransformerConfig(

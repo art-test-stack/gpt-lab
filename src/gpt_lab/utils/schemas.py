@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pathlib import Path
 import os, time
 import json, pickle
-from gpt_lab.utils.distributed import DistributedContext, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_dist_info
 from gpt_lab.utils.common import print0
 from gpt_lab.utils.logging import log0, log_all
 from gpt_lab.utils.default import (
@@ -476,7 +476,7 @@ class TrainerConfig(BaseModel):
 
     # Training settings
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    dist_info: DistributedContext = Field(default_factory=get_dist_info, exclude=True)
+    dist_info: ComputeContext = Field(default_factory=get_dist_info, exclude=True)
 
     @field_validator("dist_info", mode="before")
     @classmethod

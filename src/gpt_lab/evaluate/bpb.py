@@ -5,10 +5,10 @@ import torch.nn.functional as F
 import math 
 from typing import Optional
 
-from gpt_lab.utils.distributed import DistributedContext, is_ddp_initialized
+from gpt_lab.utils.distributed import ComputeContext, is_ddp_initialized
 
 @torch.no_grad()
-def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info: Optional[DistributedContext]) -> float:
+def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info: Optional[ComputeContext]) -> float:
     """
     Compute bits-per-byte (bpb) over the given batches.
     
@@ -28,7 +28,7 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, dist_info
         - batches: An iterable of yielding batches (x,y).
         - step: Number of batches to evaluate.
         - token_bytes (torch.int64): Tensor of shape (V,) containing the byte lengths of each token in the vocabulary; 0 for special tokens.
-        - dist_info (Optional[DistributedContext]): Runtime device and data-parallel mesh.
+        - dist_info (Optional[ComputeContext]): Runtime device and data-parallel mesh.
     Returns:
         - bpb (float): The computed bits-per-byte metric.
         - loss (float): The average loss per token, for debugging.

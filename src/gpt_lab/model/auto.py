@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from pathlib import Path
 from typing import Optional
 
-from gpt_lab.utils.distributed import DistributedContext
+from gpt_lab.utils.distributed import ComputeContext
 from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, TOKENIZERS_FOLDER
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.schemas import (
@@ -60,7 +60,7 @@ class AutoGPTConfig(BaseModel):
     dirname: str | Path = MODELS_FOLDER
     run_name: Optional[str] = None # if None, will be set to {device_name}_{basename}_{depth}_{git_commit}_{date} in model_post_init
     random_seed: int = 42
-    dist_info: Optional[DistributedContext] = Field(default=None, exclude=True) # if None, will be initialized in model_post_init based on the current distributed environment
+    dist_info: Optional[ComputeContext] = Field(default=None, exclude=True) # if None, will be initialized in model_post_init based on the current distributed environment
 
     # Tokenizer config
     # If None, will be set to vocab size scaling law based on Tao et al. 2O24 (https://arxiv.org/abs/2407.13623)

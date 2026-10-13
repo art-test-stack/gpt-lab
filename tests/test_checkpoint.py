@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from gpt_lab.utils.distributed import DistributedContext
+from gpt_lab.utils.distributed import ComputeContext
 import pytest
 import torch
 import numpy as np
@@ -198,7 +198,7 @@ def test_default_run_name_is_broadcast_from_rank_zero(monkeypatch):
 def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, legacy):
     from gpt_lab.optim.factory import OptimizerFactory
 
-    dist_info = DistributedContext(device=torch.device("cpu"))
+    dist_info = ComputeContext(device=torch.device("cpu"))
     model = torch.nn.Linear(2, 2)
 
     def optimizer_for(model):
@@ -265,7 +265,7 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
 
 @pytest.mark.parametrize("legacy", [False, True])
 def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, legacy):
-    dist_info = DistributedContext(device=torch.device("cpu"), compute_dtype=torch.float32)
+    dist_info = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
     run_dir = tmp_path / "demo" / "run"
     MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=TransformerConfig(), base_train={})
     manager = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, dist_info=dist_info)

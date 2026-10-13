@@ -42,7 +42,7 @@ from pathlib import Path
 from packaging.version import Version
 from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.utils.default import MODELS_FOLDER
-from gpt_lab.utils.distributed import DistributedContext, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_dist_info
 from gpt_lab.utils.schemas import (
     CheckpointState, 
     MetaConfig,
@@ -93,7 +93,7 @@ class CheckpointConfig:
     run_name: Optional[Union[str, int]] = None
     model_cachedir: Optional[Union[str, Path]] = None
     source: _ModelSources = "base"
-    dist_info: Optional[DistributedContext] = None
+    dist_info: Optional[ComputeContext] = None
     mode: _Mode = "ddp"
     model_config: Optional[TransformerConfig] = None
     tokenizer_config: Optional[TokenizerConfig] = None
@@ -462,7 +462,7 @@ def save_checkpoint(
         optimizer: Optional[torch.optim.Optimizer] = None, # should be the state dict
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
         mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
     ):
     if mode not in _OPT_DEFAULT_FILENAME:
         raise ValueError(f"Unsupported checkpoint mode: {mode!r}")
@@ -528,7 +528,7 @@ def load_checkpoint(
         load_scaler: bool = True,
         load_rng: bool = True,
         mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
     ) -> CheckpointData:
     # Load the model state
     checkpoint_dir = _solve_path(checkpoint_dir)
@@ -626,7 +626,7 @@ def build_model(
         step: Union[int, str] = -1, 
         phase: str = "train",
         source: _ModelSources = "base",
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
         mode: Optional[_Mode] = None,
      ) -> tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
@@ -700,7 +700,7 @@ def load_model_from_dir(
         phase: Literal["train", "eval"] = "train",
         model_cachedir: Optional[Union[str, Path]] = None,
         source: _ModelSources = "base",
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
     ) -> Tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
     if dist_info is None:
         dist_info = get_dist_info()
@@ -728,7 +728,7 @@ def load_optimizer_state(
         model_cachedir: Optional[Union[str, Path]] = None, # should not be needed -> this should be CACHE_DIR / models
         step: Optional[int] = None,
         mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
     ) -> Optional[Dict]:
     """Load just the optimizer shard for a given rank, without re-loading the model."""
     if dist_info is None:
@@ -769,7 +769,7 @@ class CheckpointManager:
         model_run: Optional[Union[str, int]] = None,
         model_cachedir: Optional[Union[str, Path]] = None,
         source: _ModelSources = "base",
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
         mode: _Mode = "ddp",
     ) -> None:
         self.model_name = model_name

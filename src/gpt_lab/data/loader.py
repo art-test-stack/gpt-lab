@@ -5,7 +5,7 @@ from typing import Callable, Iterator, Optional, Tuple, Union, Literal
 import torch
 
 from gpt_lab.utils.default import DATA_DIR
-from gpt_lab.utils.distributed import DistributedContext, get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_dist_info
 from gpt_lab.utils.schemas import DataLoaderState
 from gpt_lab.data.sharder import ShardManager
 
@@ -33,7 +33,7 @@ class ShardedDataset:
         shard_limit: Optional[int] = None,
         max_shards: Optional[int] = None,
         cachedir: Union[str, Path] = DATA_DIR,
-        dist_info: Optional[DistributedContext] = None,
+        dist_info: Optional[ComputeContext] = None,
         tokenizer_threads: int = 4,
     ):
         if isinstance(cachedir, str):
@@ -402,7 +402,7 @@ def build_dataloader(
     cachedir: Optional[Union[str, Path]] = None,
     datadir: Optional[Union[str, Path]] = None,
     resume_state: Optional[DataLoaderState] = None,
-    dist_info: Optional[DistributedContext] = None,
+    dist_info: Optional[ComputeContext] = None,
     tokenizer_threads: int = 4,
     use_nanochat: bool = False,
 ) -> DistDataLoader:
