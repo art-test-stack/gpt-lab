@@ -190,6 +190,7 @@ def cleanup_dist_groups():
 # inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py
 # and PR: https://github.com/karpathy/nanochat/pull/147
 def get_peak_flops(device_name: str) -> float:
+    # TODO: Select peak FLOPs by compute dtype; CUDA entries currently assume BF16 and M2 assumes FP32.
     name = device_name.lower()
 
     # Apple advertises 3.6 TFLOPS for the 10-core M2 GPU; other variants stay unknown.
