@@ -570,6 +570,7 @@ Sharded optimizer resumes still require the original world size.
 MPS device detection includes the GPU core count. The 10-core Apple M2 uses an
 advertised 3.6 TFLOPS FP32 peak for MFU; unknown Apple GPU variants keep an
 infinite peak (MFU reports zero). This is a theoretical peak, not measured training throughput.
+Automatic run names use the Apple chip label, such as `apple_m2` or `apple_m2_pro`, as their device prefix.
 
 `--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
 With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)

@@ -41,6 +41,7 @@ from typing import Optional, Union, Tuple, Dict, Literal, Mapping, Callable, Lis
 from pathlib import Path
 from packaging.version import Version
 from gpt_lab.utils.logging import log0, log_error
+from gpt_lab.utils.common import slugify
 from gpt_lab.utils.default import MODELS_FOLDER
 from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import (
@@ -295,8 +296,11 @@ def make_default_run_name(depth, name, comp_info):
         git_commit = run_command("git rev-parse --short HEAD") or "unkcommit"
         from datetime import datetime
         date = datetime.now().strftime("%Y%m%d_%H-%M-%S")
-        device_name = (str(comp_info.device_name)
-            .lower().split(" ")[-1].replace(" ", "_").replace("/", "_").replace("-", "_"))
+        device_name = str(comp_info.device_name).lower()
+        if device_name.startswith("apple "):
+            device_name = slugify(device_name.split(" (", 1)[0])
+        else:
+            device_name = device_name.split(" ")[-1].replace(" ", "_").replace("/", "_").replace("-", "_")
         if name is None:
             name = "model"
         run_name = f"{device_name}_{name}_d{depth}_cmt_{git_commit}_dt_{date}"

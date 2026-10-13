@@ -178,6 +178,23 @@ def test_sharded_checkpoint_rejects_world_size_change(tmp_path):
 
 
 @pytest.mark.fast
+@pytest.mark.parametrize("device_name, prefix", [
+    ("Apple M2 (10-core GPU)", "apple_m2"),
+    ("Apple M2 Pro (19-core GPU)", "apple_m2_pro"),
+    ("NVIDIA GeForce RTX 4090", "4090"),
+    (None, "none"),
+])
+def test_default_run_name_preserves_apple_chip_label(monkeypatch, device_name, prefix):
+    monkeypatch.setattr("gpt_lab.utils.system.run_command", lambda _command: "abc123")
+    run_name = make_default_run_name(
+        depth=12,
+        name="ic1",
+        comp_info=SimpleNamespace(rank=0, is_distributed=False, device_name=device_name),
+    )
+    assert run_name.startswith(f"{prefix}_ic1_d12_cmt_abc123_dt_")
+
+
+@pytest.mark.fast
 def test_default_run_name_is_broadcast_from_rank_zero(monkeypatch):
     def fake_broadcast(names, src):
         assert src == 0
