@@ -1,6 +1,9 @@
 import os
+import json
 import socket
 import sys
+import subprocess
+from types import SimpleNamespace
 from dataclasses import FrozenInstanceError
 from datetime import timedelta
 
@@ -14,10 +17,52 @@ from gpt_lab.utils.distributed import (
     broadcast_model,
     cleanup_dist_groups,
     get_comp_info,
+    get_peak_flops,
     init_dist_groups,
 )
 from gpt_lab.utils.schemas import TrainerConfig
 from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
+
+
+@pytest.mark.parametrize("chip, cores, peak", [
+    ("Apple M2", "10", 3.6e12),
+    ("Apple M2", "8", float("inf")),
+    ("Apple M2 Pro", "19", float("inf")),
+])
+def test_mps_peak_matches_gpu_variant(monkeypatch, chip, cores, peak):
+    calls = []
+
+    def profile(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(stdout=json.dumps({"SPDisplaysDataType": [{
+            "spdisplays_vendor": "sppci_vendor_Apple",
+            "sppci_model": chip,
+            "sppci_cores": cores,
+        }]}))
+
+    monkeypatch.setattr("gpt_lab.utils.distributed.subprocess.run", profile)
+    context = ComputeContext(device=torch.device("mps"))
+    assert context.device_name == f"{chip} ({cores}-core GPU)"
+    assert context.gpu_peak_flops == peak
+    assert len(calls) == 1
+    assert get_peak_flops(context.device_name.upper()) == peak
+
+
+@pytest.mark.parametrize("output", ["invalid JSON", '{"SPDisplaysDataType": []}'])
+def test_unavailable_mps_metadata_keeps_unknown_peak(monkeypatch, output):
+    monkeypatch.setattr("gpt_lab.utils.distributed.subprocess.run",
+                        lambda *_args, **_kwargs: SimpleNamespace(stdout=output))
+    context = ComputeContext(device=torch.device("mps"))
+    assert context.device_name is None
+    assert context.gpu_peak_flops == float("inf")
+
+
+def test_mps_detection_timeout_keeps_unknown_peak(monkeypatch):
+    def profile(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("gpt_lab.utils.distributed.subprocess.run", profile)
+    assert ComputeContext(device=torch.device("mps")).gpu_peak_flops == float("inf")
 
 
 def test_single_device_and_legacy_config(monkeypatch, tmp_path):

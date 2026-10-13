@@ -3,6 +3,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 import os, warnings
+import json
+import subprocess
 from functools import lru_cache, cached_property
 from dataclasses import dataclass, field
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -96,11 +98,24 @@ class ComputeContext:
 
     @cached_property
     def device_name(self) -> str | None:
-        return torch.cuda.get_device_name(self.device) if self.device_type == "cuda" else None
+        if self.device_type == "cuda":
+            return torch.cuda.get_device_name(self.device)
+        if self.device_type == "mps":
+            try:
+                result = subprocess.run(
+                    ["system_profiler", "SPDisplaysDataType", "-json"],
+                    capture_output=True, text=True, check=True, timeout=10,
+                )
+                for gpu in json.loads(result.stdout)["SPDisplaysDataType"]:
+                    if gpu.get("spdisplays_vendor") == "sppci_vendor_Apple":
+                        return f"{gpu['sppci_model']} ({gpu.get('sppci_cores', 'unknown')}-core GPU)"
+            except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError) as error:
+                log0(f"Unable to identify MPS GPU: {error}", level="warning", logger=logger)
+        return None
 
     @cached_property
     def gpu_peak_flops(self) -> float:
-        return get_peak_flops(self.device_name) if self.device_type == "cuda" else float("inf")
+        return get_peak_flops(self.device_name) if self.device_name is not None else float("inf")
 
 
 def _get_comp_info(device_type: str) -> ComputeContext:
@@ -171,11 +186,16 @@ def cleanup_dist_groups():
     _context = None
 
 # from: https://github.com/karpathy/nanochat/blob/1076f97/nanochat/common.py
-# hardcoded BF16 peak flops for various GPUs
+# hardcoded BF16 peak flops for CUDA GPUs, FP32 for the Apple M2
 # inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py
 # and PR: https://github.com/karpathy/nanochat/pull/147
 def get_peak_flops(device_name: str) -> float:
     name = device_name.lower()
+
+    # Apple advertises 3.6 TFLOPS for the 10-core M2 GPU; other variants stay unknown.
+    # https://www.apple.com/newsroom/images/live-action/wwdc-2022/Apple-WWDC22-M2-SoC-220606_big.jpg.large.jpg
+    if name == "apple m2 (10-core gpu)":
+        return 3.6e12
 
     # Table order matters: more specific patterns first.
     _PEAK_FLOPS_TABLE = (

@@ -567,6 +567,9 @@ Gloo and CUDA runs use NCCL. Distributed MPS execution is unsupported.
 Trainer configs exclude this runtime object when saved; loading a checkpoint
 attaches the current launch context, including for older dictionary metadata.
 Sharded optimizer resumes still require the original world size.
+MPS device detection includes the GPU core count. The 10-core Apple M2 uses an
+advertised 3.6 TFLOPS FP32 peak for MFU; unknown Apple GPU variants keep an
+infinite peak (MFU reports zero). This is a theoretical peak, not measured training throughput.
 
 `--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
 With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)
