@@ -570,7 +570,7 @@ wheels = [
 
 [[package]]
 name = "gpt-lab"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
@@ -583,6 +583,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "requests" },
     { name = "rich" },
+    { name = "safetensors" },
     { name = "tiktoken" },
     { name = "tokenizers" },
     { name = "torch", version = "2.9.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-gpt-lab-cpu') or (extra == 'extra-7-gpt-lab-cpu' and extra == 'extra-7-gpt-lab-gpu')" },
@@ -628,6 +629,7 @@ requires-dist = [
     { name = "pydantic", specifier = "==2.12.5" },
     { name = "requests", specifier = "==2.32.5" },
     { name = "rich", specifier = "==14.2.0" },
+    { name = "safetensors", specifier = "==0.7.0" },
     { name = "tiktoken", specifier = "==0.12.0" },
     { name = "tokenizers", specifier = "==0.22.1" },
     { name = "torch", specifier = "==2.9.1" },

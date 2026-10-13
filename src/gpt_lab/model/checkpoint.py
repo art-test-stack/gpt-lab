@@ -5,19 +5,19 @@ Utilities for saving and loading model checkpoints, including the model state di
 Models should be saved in the following directory structure:
 <CACHE_DIR>/
 └── models/
-    └── <model_name>/                          # e.g., "ic1", "gpt2-small", "llama2"
+    └── <model_name>/                               # e.g., "ic1", "gpt2-small", "llama2"
         └── <run_name>/
-            ├── meta.pskl                      # immutable (model, tokenizer, git)
-            └── <source>/                      # base / sft / rl
-                ├── training_config.pkl        # per-phase config
-                ├── checkpoint_state.pkl       # best bpb/core steps and values
+            ├── meta.pskl                           # immutable (model, tokenizer, git)
+            └── <source>/                           # base / sft / rl
+                ├── training_config.safetensors     # per-phase config
+                ├── checkpoint_state.safetensors    # best bpb/core steps and values
                 ├── checkpoint_step_000000/
-                │   ├── model.pt
-                │   ├── optim_rank0.pt         # optimizer state dict (optim_rank{rank}.pt if sharded, otherwise optim.pt)
-                │   ├── optim_rank1.pt
-                │   ├── ...                    # more optimizer shards if needed
+                │   ├── model.safetensors
+                │   ├── optim_rank0.safetensors     # optimizer state (otherwise optim.safetensors)
+                │   ├── optim_rank1.safetensors
+                │   ├── ...                         # more optimizer shards if needed
                 │   ├── trainer_state_rank0.json
-                │   ├── rng_state_rank0.pt
+                │   ├── rng_state_rank0.safetensors
                 │   └── metrics.pkl
                 ├── checkpoint_step_000100/
                 │   └── ...
@@ -39,6 +39,7 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Union, Tuple, Dict, Literal, Mapping, Callable, List
 from pathlib import Path
+from packaging.version import Version
 from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.utils.default import MODELS_FOLDER
 from gpt_lab.utils.distributed import get_dist_info
@@ -51,6 +52,7 @@ from gpt_lab.utils.schemas import (
     TransformerConfig, 
 )
 from gpt_lab.utils.system import get_git_info
+from gpt_lab.utils.tensor_io import load_tensor_state, migrate_legacy_tensor_state, save_tensor_state
 from gpt_lab.tokenizer import build_tokenizer, Tokenizer, TokenizerConfig
 from gpt_lab.model.gpt import DenseTransformer
 
@@ -59,22 +61,20 @@ import logging
 logger = logging.getLogger(__name__)
 
 _MODEL_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "model.pt",
-    shard=lambda x: f"model.pt",
-    # fully_sharded=lambda x: f"model.pt",
+    ddp=lambda x: "model.safetensors",
+    shard=lambda x: "model.safetensors",
 ) # dict[mode, (rank: int) -> (filename: str)]
 _OPT_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "optim.pt",
-    shard=lambda x: f"optim_rank{x:d}.pt",
-    # fully_sharded=lambda x: f"optim.pt", 
+    ddp=lambda x: "optim.safetensors",
+    shard=lambda x: f"optim_rank{x:d}.safetensors",
 ) # dict[mode, (rank: int) -> (filename: str)]
 _TRAINER_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
     ddp=lambda x: "trainer_state.json",
     shard=lambda x: f"trainer_state_rank{x:d}.json",
 )
 _RNG_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "rng_state.pt",
-    shard=lambda x: f"rng_state_rank{x:d}.pt",
+    ddp=lambda x: "rng_state.safetensors",
+    shard=lambda x: f"rng_state_rank{x:d}.safetensors",
 )
 _STEP_GLOB_PATTERN = "checkpoint_step_*"
 _STEP_DIRNAME = lambda step: f"checkpoint_step_{step:06d}"
@@ -150,10 +150,10 @@ def _solve_run_name(model_dir: Path, run_name: Optional[Union[str, int]] = None,
         best_bpb = float('inf')
         best_run = None
         for _run_name in run_names:
-            ckpt_state_path = model_dir / _run_name / source / "checkpoint_state.pkl"
+            ckpt_state_path = _resolve_state_path(model_dir / _run_name / source / "checkpoint_state.safetensors")
             if ckpt_state_path.exists():
                 raw_ckpt_state = _load_state_dict(ckpt_state_path, map_location="cpu", weight_only=False)
-                ckpt_state = CheckpointState.model_validate_json(raw_ckpt_state)
+                ckpt_state = CheckpointState.model_validate(raw_ckpt_state)
                 if ckpt_state.best_eval_step is None:
                     log0(f"Checkpoint state in {ckpt_state_path} does not contain a best step for 'best' checkpoint selection. Skipping this checkpoint for best selection.", logger=logger, level="warning")
                 if ckpt_state.best_eval_step is not None and ckpt_state.best_eval_value < best_bpb:
@@ -170,10 +170,24 @@ def _solve_run_name(model_dir: Path, run_name: Optional[Union[str, int]] = None,
             f"Found tags: {[run_name.name for run_name in run_names]}. Please specify a valid checkpoint run name or index (e.g., '-1' for the most recent tag).", 
             logger=logger, error_type=ValueError)
 
+def _resolve_state_path(path: Path) -> Path:
+    if not path.exists() and path.suffix == ".safetensors":
+        for suffix in (".pt", ".pth", ".pkl"):
+            legacy_path = path.with_suffix(suffix)
+            if legacy_path.exists():
+                return legacy_path
+    return path
+
+
 def _save_state_dict(state_dict, ckpt_dir, filename=None):
     if filename is not None:
         ckpt_dir = ckpt_dir / filename
-    torch.save(state_dict, ckpt_dir)
+    if ckpt_dir.suffix == ".safetensors":
+        if isinstance(state_dict, TrainerConfig):
+            state_dict = state_dict.model_dump()
+        save_tensor_state(state_dict, ckpt_dir)
+    else:
+        raise ValueError("New tensor states must use a .safetensors file")
     log0(f"Saved {filename} to {ckpt_dir}", logger=logger)
 
 def _save_json(data, ckpt_dir, filename=None):
@@ -196,9 +210,12 @@ def _load_json(ckpt_dir, filename):
 def _load_state_dict(ckpt_dir, filename=None, map_location=None, weight_only=True):
     if filename is not None:
         ckpt_dir = ckpt_dir / filename
+    ckpt_dir = _resolve_state_path(ckpt_dir)
     if not ckpt_dir.exists():
         log_error(f"Checkpoint file {ckpt_dir} does not exist.", logger=logger, error_type=FileNotFoundError)
-    state_dict = torch.load(ckpt_dir, map_location=map_location, weights_only=weight_only)
+    if ckpt_dir.suffix != ".safetensors":
+        ckpt_dir = migrate_legacy_tensor_state(ckpt_dir, weights_only=weight_only)
+    state_dict = load_tensor_state(ckpt_dir, device=map_location or "cpu")
     log0(f"Loaded {filename} from {ckpt_dir}.", logger=logger)
     return state_dict
 
@@ -223,7 +240,7 @@ def _get_checkpoint_step(checkpoint_dir, step: Optional[Union[int, str]] = None)
         step = int(checkpoint_files[index].stem.split("_")[-1])
     elif step == "best":
         # TODO: look at step = -1 checkpoint_state and find the best step from there -> pb: best may not be saved under .../checkpoint_step_*/
-        raw = _load_state_dict(checkpoint_dir, "checkpoint_state.pkl", map_location="cpu", weight_only=False)
+        raw = _load_state_dict(checkpoint_dir, "checkpoint_state.safetensors", map_location="cpu", weight_only=False)
         checkpoint_state = CheckpointState.model_validate(raw)
         if not checkpoint_state.best_eval_step:
             log_error(f"Checkpoint state in {checkpoint_dir} does not contain a best step for 'best' checkpoint selection.", logger=logger, error_type=ValueError)
@@ -317,9 +334,20 @@ def save_meta_config(
 
     log0(f"Saved meta config in {str(run_dir)}.", logger=logger)
 
-def _migrate_model_config(model_cfg: Dict) -> None:
-    """Update legacy checkpoint model config in place before validation."""
-    if "tie_value_embeddings" not in model_cfg and "tie_all_embeddings" not in model_cfg:
+def _migrate_model_config(model_cfg: Dict, version: Optional[str]) -> None:
+    """Migrate using the saved project version before metadata validation.
+
+    Functional embedding tying starts at 0.1.1. For ambiguous 0.1.0 or
+    unversioned metadata, missing tying fields identify the old no-op flag.
+    """
+    saved_version = Version(version) if version is not None else None
+    if saved_version is not None and saved_version >= Version("0.1.1"):
+        return
+    # 0.1.0 and unversioned checkpoints may predate or include functional tying.
+    if (
+        (saved_version is not None and saved_version < Version("0.1.0"))
+        or ("tie_value_embeddings" not in model_cfg and "tie_all_embeddings" not in model_cfg)
+    ):
         # The legacy tie_word_embeddings flag was a no-op.
         model_cfg["tie_word_embeddings"] = False
 
@@ -347,7 +375,7 @@ def load_meta_config(
 
     _meta_cfg = _load_json(run_dir, "meta.json")
     metadata = json.loads(_meta_cfg)
-    _migrate_model_config(metadata["model_cfg"])
+    _migrate_model_config(metadata["model_cfg"], metadata.get("version"))
     meta_cfg = MetaConfig.model_validate(metadata)
     
     log0(f"Loaded meta config from {run_dir / 'meta.json'}", logger=logger)
@@ -403,7 +431,7 @@ def find_potential_run_name(model_dir: Union[str, Path], git_info: Optional[Dict
     return run_names[0].name
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
+    # Find the checkpoint directory with the highest step.
     checkpoint_dir = _solve_path(checkpoint_dir)
 
     checkpoint_files = [f for f in checkpoint_dir.glob(_STEP_GLOB_PATTERN) if f.is_dir()]
@@ -456,13 +484,13 @@ def save_checkpoint(
 
     if rank == 0:
         # Save the model state parameters
-        _save_state_dict(model.state_dict(), step_dir, "model.pt")
+        _save_state_dict(model.state_dict(), step_dir, _MODEL_DEFAULT_FILENAME[mode](rank))
         # Shared copies support evaluation and old single-rank readers. Shard
         # mode also writes rank-specific training and RNG state below.
         _save_json(trainer_state.model_dump(), step_dir, filename="trainer_state.json")
-        _save_state_dict(capture_rng_state(), step_dir, "rng_state.pt")
+        _save_state_dict(capture_rng_state(), step_dir, "rng_state.safetensors")
         # Save the checkpoint state (best bpb/core steps and values)
-        _save_state_dict(checkpoint_state.model_dump(), step_dir, "checkpoint_state.pkl")
+        _save_state_dict(checkpoint_state.model_dump(), step_dir, "checkpoint_state.safetensors")
         _save_json(
             {"mode": mode, "world_size": world_size},
             step_dir,
@@ -470,7 +498,7 @@ def save_checkpoint(
         )
         # Save scaler state if using mixed precision
         if scaler is not None:
-            _save_state_dict(scaler.state_dict(), step_dir, "scaler.pt")
+            _save_state_dict(scaler.state_dict(), step_dir, "scaler.safetensors")
 
     if mode == "shard":
         _save_json(
@@ -535,7 +563,7 @@ def load_checkpoint(
     # Load the model state parameters
     model_data = None
     if load_model:
-        model_data = _load_state_dict(step_dir, f"model.pt", map_location=device)
+        model_data = _load_state_dict(step_dir, _MODEL_DEFAULT_FILENAME[mode](rank), map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optim:
@@ -550,12 +578,12 @@ def load_checkpoint(
             _load_json(step_dir, trainer_filename)
         )
     checkpoint_state = None
-    checkpoint_state_path = step_dir / "checkpoint_state.pkl"
+    checkpoint_state_path = _resolve_state_path(step_dir / "checkpoint_state.safetensors")
     if checkpoint_state_path.exists():
         checkpoint_state = CheckpointState.model_validate(
             _load_state_dict(
                 step_dir,
-                "checkpoint_state.pkl",
+                checkpoint_state_path.name,
                 map_location="cpu",
                 weight_only=False,
             )
@@ -566,16 +594,16 @@ def load_checkpoint(
     # => we should probably also have a more general way to specify additional states to load/save in the future.
     scaler_state = None
     if load_scaler:
-        if not (step_dir / "scaler.pt").exists():
-            log0("Scaler state file scaler.pt not found in step directory. Skipping loading scaler state.", logger=logger, level="warning")
+        if not _resolve_state_path(step_dir / "scaler.safetensors").exists():
+            log0("Scaler state file not found in step directory. Skipping loading scaler state.", logger=logger, level="warning")
         else:
-            scaler_state = _load_state_dict(step_dir, "scaler.pt", map_location="cpu", weight_only=False)
+            scaler_state = _load_state_dict(step_dir, "scaler.safetensors", map_location="cpu", weight_only=False)
     # Load the RNG state if requested
     rng_state = None
     if load_rng:
         rng_filename = _RNG_DEFAULT_FILENAME[mode](rank)
-        if not (step_dir / rng_filename).exists():
-            rng_filename = "rng_state.pt"
+        if not _resolve_state_path(step_dir / rng_filename).exists():
+            rng_filename = "rng_state.safetensors"
         rng_state = _load_state_dict(
             step_dir,
             rng_filename,
@@ -615,7 +643,7 @@ def build_model(
     # get checkpoint data
     ckpt_dir = model_cachedir / model_name / run_name / source
     if phase == "train":
-        trainer_config = TrainerConfig.model_validate(_load_state_dict(ckpt_dir, "training_config.pkl", map_location="cpu", weight_only=False))
+        trainer_config = TrainerConfig.model_validate(_load_state_dict(ckpt_dir, "training_config.safetensors", map_location="cpu", weight_only=False))
     load_scaler = (
         dist_info.get("compute_dtype") == torch.float16
         and device.type == "cuda"
@@ -719,11 +747,12 @@ def load_optimizer_state(
         .joinpath(_STEP_DIRNAME(step))
         .joinpath(_OPT_DEFAULT_FILENAME[mode](rank)))
     
+    optimizer_path = _resolve_state_path(optimizer_path)
     if not optimizer_path.exists():
         log0(f"Optimizer checkpoint not found: {optimizer_path}")
         return None
     log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = torch.load(optimizer_path, map_location=dist_info["DEVICE"])
+    optimizer_data = _load_state_dict(optimizer_path, map_location=dist_info["DEVICE"])
     return optimizer_data
 
 # general class api to simply checkpoint management 
@@ -759,15 +788,15 @@ class CheckpointManager:
         if self._rank != 0:
             return
         self.source_dir.mkdir(parents=True, exist_ok=True)
-        _save_state_dict(trainer_config, self.source_dir, "training_config.pkl")
-        log0(f"Saved training config to {self.source_dir / 'training_config.pkl'}", logger=logger)
+        _save_state_dict(trainer_config, self.source_dir, "training_config.safetensors")
+        log0(f"Saved training config to {self.source_dir / 'training_config.safetensors'}", logger=logger)
 
     def load_training_config(self) -> Optional[TrainerConfig]:
-        path = self.source_dir / "training_config.pkl"
+        path = _resolve_state_path(self.source_dir / "training_config.safetensors")
         if not path.exists():
             log0(f"No training config found at {path}.", logger=logger, level="warning")
             return None
-        raw = _load_state_dict(self.source_dir, "training_config.pkl")
+        raw = _load_state_dict(path, map_location="cpu", weight_only=False)
         return TrainerConfig.model_validate(raw)
     
     def save(
@@ -895,11 +924,11 @@ class CheckpointManager:
  
     @property
     def _ckpt_state_path(self) -> Path:
-        return self.source_dir / "checkpoint_state.pkl"
+        return _resolve_state_path(self.source_dir / "checkpoint_state.safetensors")
  
     def _save_checkpoint_state(self) -> None:
         self.source_dir.mkdir(parents=True, exist_ok=True)
-        _save_state_dict(self._ckpt_state.model_dump(), self.source_dir, "checkpoint_state.pkl")
+        _save_state_dict(self._ckpt_state.model_dump(), self.source_dir, "checkpoint_state.safetensors")
  
     def _load_checkpoint_state(self) -> Optional[CheckpointState]:
         if not self._ckpt_state_path.exists():

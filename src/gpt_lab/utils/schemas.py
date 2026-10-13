@@ -568,6 +568,9 @@ class TrainerConfig(BaseModel):
         
         if not path.exists():
             raise FileNotFoundError(f"No such file: {path}")
+        if path.suffix == ".safetensors":
+            from gpt_lab.utils.tensor_io import load_tensor_state
+            return self.model_validate(load_tensor_state(path))
         with open(str(path), "rb") as f:
             data = pickle.load(f)
         return data
