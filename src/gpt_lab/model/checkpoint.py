@@ -12,7 +12,7 @@ Models should be saved in the following directory structure:
                 ├── training_config.pkl        # per-phase config
                 ├── checkpoint_state.pkl       # best bpb/core steps and values
                 ├── checkpoint_step_000000/
-                │   ├── model.pt
+                │   ├── model.safetensors
                 │   ├── optim_rank0.pt         # optimizer state dict (optim_rank{rank}.pt if sharded, otherwise optim.pt)
                 │   ├── optim_rank1.pt
                 │   ├── ...                    # more optimizer shards if needed
@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Optional, Union, Tuple, Dict, Literal, Mapping, Callable, List
 from pathlib import Path
 from packaging.version import Version
+from safetensors.torch import load_file, save_file
 from gpt_lab.utils.logging import log0, log_error
 from gpt_lab.utils.default import MODELS_FOLDER
 from gpt_lab.utils.distributed import get_dist_info
@@ -60,9 +61,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 _MODEL_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "model.pt",
-    shard=lambda x: f"model.pt",
-    # fully_sharded=lambda x: f"model.pt",
+    ddp=lambda x: "model.safetensors",
+    shard=lambda x: "model.safetensors",
 ) # dict[mode, (rank: int) -> (filename: str)]
 _OPT_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
     ddp=lambda x: "optim.pt",
@@ -174,7 +174,12 @@ def _solve_run_name(model_dir: Path, run_name: Optional[Union[str, int]] = None,
 def _save_state_dict(state_dict, ckpt_dir, filename=None):
     if filename is not None:
         ckpt_dir = ckpt_dir / filename
-    torch.save(state_dict, ckpt_dir)
+    if ckpt_dir.suffix == ".safetensors":
+        # Independent CPU copies retain every key, including tied weights.
+        tensors = {name: tensor.detach().to("cpu", copy=True).contiguous() for name, tensor in state_dict.items()}
+        save_file(tensors, ckpt_dir)
+    else:
+        torch.save(state_dict, ckpt_dir)
     log0(f"Saved {filename} to {ckpt_dir}", logger=logger)
 
 def _save_json(data, ckpt_dir, filename=None):
@@ -199,7 +204,10 @@ def _load_state_dict(ckpt_dir, filename=None, map_location=None, weight_only=Tru
         ckpt_dir = ckpt_dir / filename
     if not ckpt_dir.exists():
         log_error(f"Checkpoint file {ckpt_dir} does not exist.", logger=logger, error_type=FileNotFoundError)
-    state_dict = torch.load(ckpt_dir, map_location=map_location, weights_only=weight_only)
+    if ckpt_dir.suffix == ".safetensors":
+        state_dict = load_file(ckpt_dir, device=str(map_location or "cpu"))
+    else:
+        state_dict = torch.load(ckpt_dir, map_location=map_location, weights_only=weight_only)
     log0(f"Loaded {filename} from {ckpt_dir}.", logger=logger)
     return state_dict
 
@@ -415,7 +423,7 @@ def find_potential_run_name(model_dir: Union[str, Path], git_info: Optional[Dict
     return run_names[0].name
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
+    # Find the checkpoint directory with the highest step.
     checkpoint_dir = _solve_path(checkpoint_dir)
 
     checkpoint_files = [f for f in checkpoint_dir.glob(_STEP_GLOB_PATTERN) if f.is_dir()]
@@ -468,7 +476,7 @@ def save_checkpoint(
 
     if rank == 0:
         # Save the model state parameters
-        _save_state_dict(model.state_dict(), step_dir, "model.pt")
+        _save_state_dict(model.state_dict(), step_dir, _MODEL_DEFAULT_FILENAME[mode](rank))
         # Shared copies support evaluation and old single-rank readers. Shard
         # mode also writes rank-specific training and RNG state below.
         _save_json(trainer_state.model_dump(), step_dir, filename="trainer_state.json")
@@ -547,7 +555,11 @@ def load_checkpoint(
     # Load the model state parameters
     model_data = None
     if load_model:
-        model_data = _load_state_dict(step_dir, f"model.pt", map_location=device)
+        model_filename = next(
+            (name for name in (_MODEL_DEFAULT_FILENAME[mode](rank), "model.pt", "model.pth") if (step_dir / name).exists()),
+            _MODEL_DEFAULT_FILENAME[mode](rank),
+        )
+        model_data = _load_state_dict(step_dir, model_filename, map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optim:

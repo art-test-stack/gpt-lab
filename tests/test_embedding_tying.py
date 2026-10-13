@@ -1,11 +1,12 @@
-import io
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import load_file
 
-from gpt_lab.model.checkpoint import build_meta_model, load_meta_config
-from gpt_lab.utils.schemas import MetaConfig, TrainerConfig, TransformerConfig
+from gpt_lab.model.checkpoint import build_meta_model, build_model, capture_rng_state, load_checkpoint, load_meta_config, save_checkpoint
+from gpt_lab.utils.schemas import CheckpointState, MetaConfig, TrainerConfig, TrainerState, TransformerConfig
 
 
 def _config(**overrides):
@@ -37,7 +38,7 @@ def _assert_sharing(model):
     {"tie_all_embeddings": True},
     {"tie_all_embeddings": True, "tie_value_embeddings": True, "tie_word_embeddings": True},
 ])
-def test_embedding_tying_lifecycle(flags):
+def test_embedding_tying_lifecycle(flags, tmp_path):
     config = _config(**flags)
     model = build_meta_model(config)
     _assert_sharing(model)
@@ -80,10 +81,14 @@ def test_embedding_tying_lifecycle(flags):
         assert torch.isfinite(ve.weight.grad).all()
         assert ve.weight.grad.abs().sum() > 0
 
-    buffer = io.BytesIO()
-    torch.save(model.state_dict(), buffer)
-    buffer.seek(0)
-    state = torch.load(buffer, map_location="cpu", weights_only=True)
+    dist_info = {"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False}
+    save_checkpoint(model, tmp_path, step=7, trainer_state=TrainerState(step=7),
+                    checkpoint_state=CheckpointState(), dist_info=dist_info)
+    weights_path = tmp_path / "checkpoint_step_000007" / "model.safetensors"
+    assert not weights_path.with_suffix(".pt").exists()
+    assert set(load_file(weights_path)) == set(model.state_dict())
+    state = load_checkpoint(tmp_path, step=7, load_optim=False, load_trainer=False,
+                            load_scaler=False, load_rng=False, dist_info=dist_info).model_state
     restored = build_meta_model(config).to_empty(device="cpu")
     restored.precompute_pos_enc()
     restored.load_state_dict(state, strict=True, assign=True)
@@ -160,3 +165,39 @@ def test_checkpoint_metadata_preserves_tying_mode(tmp_path, version, missing_fie
     assert restored.version == (version or "0.1.1")
     assert restored.git_info == metadata["git_info"]
     assert path.read_text() == saved
+
+
+@pytest.mark.parametrize("extension", ["pt", "pth"])
+def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatch, extension):
+    config = _config()
+    model = build_meta_model(config).to_empty(device="cpu")
+    model.init_weights()
+    model.eval()
+    with torch.no_grad():
+        for index, table in enumerate([model.embeds, model.lm_head, *model.value_embeds.values()]):
+            table.weight.fill_(0.1 * (index + 1))
+    run_dir = tmp_path / "demo" / "run"
+    meta = MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=config, base_train={})
+    metadata = meta.model_dump(mode="json")
+    metadata["version"] = "0.1.0"
+    metadata["model_cfg"]["tie_word_embeddings"] = True
+    metadata["model_cfg"].pop("tie_value_embeddings")
+    metadata["model_cfg"].pop("tie_all_embeddings")
+    (run_dir / "meta.json").write_text(json.dumps(json.dumps(metadata)))
+    step_dir = run_dir / "base" / "checkpoint_step_000007"
+    step_dir.mkdir(parents=True)
+    torch.save(model.state_dict(), step_dir / f"model.{extension}")
+    torch.save(capture_rng_state(), step_dir / "rng_state.pt")
+    (step_dir / "trainer_state.json").write_text(TrainerState(step=7).model_dump_json())
+    monkeypatch.setattr("gpt_lab.model.checkpoint.build_tokenizer", lambda _: SimpleNamespace(vocab_size=config.vocab_size))
+
+    restored, _, _, _ = build_model(
+        "demo", run_name="run", model_cachedir=tmp_path, step=7, phase="eval",
+        dist_info={"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False},
+    )
+    assert not restored.config.tie_word_embeddings
+    _assert_sharing(restored)
+    for name, weight in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], weight, rtol=0, atol=0)
+    ids = torch.tensor([[0, 1, 2, 3]])
+    torch.testing.assert_close(restored(ids).logits, model(ids).logits, rtol=0, atol=0)

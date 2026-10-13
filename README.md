@@ -645,7 +645,7 @@ The framework provides a simple checkpointing system that is integrated with the
                 ├── training_config.pkl        # per-phase config
                 ├── checkpoint_state.pkl       # best bpb/core steps and values
                 ├── checkpoint_step_000000/
-                │   ├── model.pt
+                │   ├── model.safetensors
                 │   ├── optim_rank0.pt         # optimizer state dict (optim_rank{rank}.pt if sharded, otherwise optim.pt)
                 │   ├── optim_rank1.pt
                 │   ├── ...                    # more optimizer shards if needed
@@ -655,6 +655,8 @@ The framework provides a simple checkpointing system that is integrated with the
                 │   └── ...
                 └── ...
 ```
+
+Model weights use safetensors; loading also accepts legacy `model.pt` and `model.pth` files. Optimizer, RNG, and scaler states retain their existing formats.
 
 ### Board 
 

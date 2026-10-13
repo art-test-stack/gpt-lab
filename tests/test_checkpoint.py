@@ -131,6 +131,7 @@ def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
         )
 
     step_dir = tmp_path / "checkpoint_step_000007"
+    assert (step_dir / "model.safetensors").exists()
     assert (step_dir / "optim_rank0.pt").exists()
     assert (step_dir / "optim_rank1.pt").exists()
     assert (step_dir / "trainer_state_rank0.json").exists()
