@@ -5,7 +5,7 @@ from typing import Callable, Iterator, Optional, Tuple, Union, Literal
 import torch
 
 from gpt_lab.utils.default import DATA_DIR
-from gpt_lab.utils.distributed import get_dist_info
+from gpt_lab.utils.distributed import DistributedContext, get_dist_info
 from gpt_lab.utils.schemas import DataLoaderState
 from gpt_lab.data.sharder import ShardManager
 
@@ -33,7 +33,7 @@ class ShardedDataset:
         shard_limit: Optional[int] = None,
         max_shards: Optional[int] = None,
         cachedir: Union[str, Path] = DATA_DIR,
-        dist_info: Optional[dict] = None,
+        dist_info: Optional[DistributedContext] = None,
         tokenizer_threads: int = 4,
     ):
         if isinstance(cachedir, str):
@@ -248,8 +248,8 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, base_path=
     and epoch counts how many times we've cycled through the dataset (starts at 1).
     """
     dist_info = get_dist_info()
-    ddp_rank = dist_info["RANK"]
-    ddp_world_size = dist_info["WORLD_SIZE"]
+    ddp_rank = dist_info.rank
+    ddp_world_size = dist_info.world_size
 
     warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
     parquet_paths = list_parquet_files(base_path)
@@ -402,7 +402,7 @@ def build_dataloader(
     cachedir: Optional[Union[str, Path]] = None,
     datadir: Optional[Union[str, Path]] = None,
     resume_state: Optional[DataLoaderState] = None,
-    dist_info: Optional[dict] = None,
+    dist_info: Optional[DistributedContext] = None,
     tokenizer_threads: int = 4,
     use_nanochat: bool = False,
 ) -> DistDataLoader:
@@ -426,7 +426,7 @@ def build_dataloader(
             split=split,
             tokenizer_threads=tokenizer_threads,
             tokenizer_batch_size=128,
-            device=dist_info["DEVICE"],
+            device=dist_info.device,
             resume_state_dict=resume_state_dict,
             buffer_size=buffer_size or (batch_size * seq_len * 16),
             base_path=datadir / name
@@ -448,7 +448,7 @@ def build_dataloader(
             ds,
             batch_size=batch_size,
             seq_len=seq_len,
-            device=dist_info["DEVICE"],
+            device=dist_info.device,
             buffer_size=buffer_size,
         )
     if split == "val":

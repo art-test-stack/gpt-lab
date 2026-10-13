@@ -12,7 +12,7 @@ import torch
 from gpt_lab.optim.registry import OPTIMIZER_REGISTRY, OptimizerSpec, _validate_group, register_optimizer
 from gpt_lab.optim.strategy import ScalarCache, _DistributedBackend, _LocalBackend
 from gpt_lab.optim.strategies import AdamWStrategy, MuonStrategy
-from gpt_lab.utils.distributed import get_dist_info
+from gpt_lab.utils.distributed import DistributedContext, get_dist_info
 
 # ── Register built-in optimizers ──────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ class OptimizerFactory(torch.optim.Optimizer):
     """
     
     def __init__(
-        self, param_groups: list[dict[str, Any]], dist_info: Optional[dict] = None
+        self, param_groups: list[dict[str, Any]], dist_info: Optional[DistributedContext] = None
     ) -> None:
         # Validate all groups early — fail before training starts
         for idx, group in enumerate(param_groups):
@@ -63,7 +63,7 @@ class OptimizerFactory(torch.optim.Optimizer):
         self.dist_info = dist_info
         
         # Select backend
-        if dist_info["IS_DDP_INITIALIZED"]:
+        if dist_info.is_distributed:
             self.backend = _DistributedBackend(self)
         else:
             self.backend = _LocalBackend(self)

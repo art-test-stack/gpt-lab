@@ -32,6 +32,7 @@ from gpt_lab.utils.paths import get_cache_dir
 
 if TYPE_CHECKING:
     from gpt_lab.utils.schemas import OptimizerConfig
+    from gpt_lab.utils.distributed import DistributedContext
 
 
 def train_base(
@@ -137,11 +138,11 @@ def train_base(
     dist_info = init_dist_groups(device_type=device_type, random_seed=random_seed)
     board_instance = None
     try:
-        is_master_process = dist_info["RANK"] == 0
+        is_master_process = dist_info.rank == 0
 
-        device = dist_info["DEVICE"]
+        device = dist_info.device
         is_resumed = model_init == "resume"
-        print0_dict("Environment setup", dist_info)
+        print0_dict("Environment setup", vars(dist_info) | {"rank": dist_info.rank, "world_size": dist_info.world_size})
 
         git_info = get_git_info()
         gpu_info = get_gpu_info()
@@ -179,7 +180,7 @@ def train_base(
             model_run=meta_config.run_name,
             model_cachedir=model_dir,
             dist_info=dist_info,
-            mode="shard" if dist_info["IS_DDP_INITIALIZED"] else "ddp",
+            mode="shard" if dist_info.is_distributed else "ddp",
         )
         model = build_meta_model(meta_config.model_cfg)
         tokenizer = Tokenizer.from_config(meta_config.tokenizer_cfg)
@@ -198,7 +199,7 @@ def train_base(
                 if saved_profile is None or optim_config.group_configs() != saved_profile.group_configs():
                     raise ValueError("optim_config conflicts with the saved optimizer profile; resume without an optimizer override")
         # Check just model embeddings and hope others are fine
-        assert model.embeds.weight.device.type == dist_info["DEVICE_TYPE"], "Model parameters are not on the correct device after initialization."
+        assert model.embeds.weight.device.type == dist_info.device_type, "Model parameters are not on the correct device after initialization."
 
         # ------------------------------------------------------------------------------
         # DATASET, DATALOADERS
@@ -321,7 +322,7 @@ def resolve_checkpoint(checkpoint_dir, checkpoint_step=None) -> dict:
                 model_dir=str(path.parent.parent), checkpoint_step=checkpoint_step)
 
 
-def build_auto_config(parameters: dict, device, dist_info: dict):
+def build_auto_config(parameters: dict, device, dist_info: DistributedContext):
     """Construct the existing auto configuration independently of training."""
     from gpt_lab.model.auto import AutoGPTConfig
 
@@ -362,7 +363,7 @@ def build_auto_config(parameters: dict, device, dist_info: dict):
     ).generate_gpt_config(device)
 
 
-def build_trainer_config(parameters: dict, dist_info: dict, base_training_config: dict):
+def build_trainer_config(parameters: dict, dist_info: DistributedContext, base_training_config: dict):
     """Translate CLI and scaling-law settings into the existing TrainerConfig."""
     from gpt_lab.utils.schemas import TrainerConfig
 

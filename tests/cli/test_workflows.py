@@ -113,7 +113,7 @@ def training_dependencies(monkeypatch):
     trainer_factory = Mock(return_value=trainer)
     board = Mock()
     board_factory = Mock(return_value=board)
-    dist_info = {'RANK': 0, 'DEVICE': 'cpu', 'DEVICE_TYPE': 'cpu', 'IS_DDP_INITIALIZED': True, 'WORLD_SIZE': 2}
+    dist_info = SimpleNamespace(rank=0, world_size=2, device='cpu', is_distributed=True, device_type='cpu')
     init_dist = Mock(return_value=dist_info)
     cleanup = Mock()
     load_meta = Mock(return_value=meta)

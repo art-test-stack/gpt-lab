@@ -1,10 +1,11 @@
 import math
 import warnings
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from pathlib import Path
 from typing import Optional
 
+from gpt_lab.utils.distributed import DistributedContext
 from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, TOKENIZERS_FOLDER
 from gpt_lab.utils.special_tokens import SpecialTokens
 from gpt_lab.utils.schemas import (
@@ -53,11 +54,13 @@ class AutoGPTConfig(BaseModel):
     model builder and parameter/FLOPs accounting.
     """
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     name: str = "ic1" # useless actually lol
     dirname: str | Path = MODELS_FOLDER
     run_name: Optional[str] = None # if None, will be set to {device_name}_{basename}_{depth}_{git_commit}_{date} in model_post_init
     random_seed: int = 42
-    dist_info: Optional[dict] = None # if None, will be initialized in model_post_init based on the current distributed environment
+    dist_info: Optional[DistributedContext] = Field(default=None, exclude=True) # if None, will be initialized in model_post_init based on the current distributed environment
 
     # Tokenizer config
     # If None, will be set to vocab size scaling law based on Tao et al. 2O24 (https://arxiv.org/abs/2407.13623)
@@ -387,13 +390,13 @@ class AutoGPTConfig(BaseModel):
         n_acc_steps = self.n_acc_steps
         if n_acc_steps == -1: # recommended
             tokens_per_accstep_per_rank = self.device_batch_size * self.max_seq_len
-            tokens_per_accstep_per_world = tokens_per_accstep_per_rank * self.dist_info["WORLD_SIZE"]
+            tokens_per_accstep_per_world = tokens_per_accstep_per_rank * self.dist_info.world_size
             assert total_batch_size % tokens_per_accstep_per_world == 0, f"{total_batch_size:=,} must be divisible by tokens per accstep per world {tokens_per_accstep_per_world:=,} for automatic configuration of gradient accumulation steps."
             n_acc_steps = total_batch_size // tokens_per_accstep_per_world
         else:
             assert n_acc_steps >= 0, f"n_acc_steps must be non-negative (except n_acc_steps=-1 for automatic configuration); got {n_acc_steps=}."
 
-            if self.dist_info["LOCAL_RANK"] == 0:
+            if self.dist_info.local_rank == 0:
                 if n_acc_steps == 0:
                     log0("Gradient accumulation disabled. Model will be updated every step.", level="warning", logger=logger)
                 else:
@@ -466,9 +469,9 @@ class AutoGPTConfig(BaseModel):
             base_train=training_config,
             # Every distributed rank builds this object, but only rank zero
             # should create the shared metadata file.
-            autosave=self.dist_info.get("RANK", 0) == 0,
+            autosave=self.dist_info.rank == 0,
         ))
-        if self.dist_info.get("IS_DDP_INITIALIZED", False):
+        if self.dist_info.is_distributed:
             import torch.distributed as dist
             dist.barrier()
         # Display the generated configuration for verification

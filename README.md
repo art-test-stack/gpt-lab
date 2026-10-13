@@ -558,6 +558,16 @@ uv run torchrun --standalone --nproc-per-node=8 --no-python \
   gpt-lab train --model-name ic1 --run-name baseline --depth 12
 ```
 
+Distributed utilities return a frozen `DistributedContext` through the existing
+`init_dist_groups()` and `get_dist_info()` functions. Pass it as `dist_info` and
+use attributes such as `.rank`, `.world_size`, `.device`, and `.compute_dtype`.
+Distributed runs use a one-dimensional PyTorch `DeviceMesh` named `"dp"`, exposed
+as `.dp_mesh`; single-device runs have no mesh or process group. CPU runs use
+Gloo and CUDA runs use NCCL. Distributed MPS execution is unsupported.
+Trainer configs exclude this runtime object when saved; loading a checkpoint
+attaches the current launch context, including for older dictionary metadata.
+Sharded optimizer resumes still require the original world size.
+
 `--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
 With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)
 for module-mode launches and checkpoint selection.

@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+from gpt_lab.utils.distributed import DistributedContext
 import pytest
 import torch
 import numpy as np
@@ -124,12 +126,7 @@ def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
             checkpoint_state=checkpoint_state,
             optimizer=_MarkerOptimizer(rank),
             mode="shard",
-            dist_info={
-                "RANK": rank,
-                "WORLD_SIZE": 2,
-                "DEVICE": torch.device("cpu"),
-                "IS_DDP_INITIALIZED": False,
-            },
+            dist_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"), is_distributed=False),
         )
 
     step_dir = tmp_path / "checkpoint_step_000007"
@@ -147,12 +144,7 @@ def test_sharded_checkpoint_round_trips_each_rank_state(tmp_path):
             step=7,
             mode="shard",
             load_scaler=False,
-            dist_info={
-                "RANK": rank,
-                "WORLD_SIZE": 2,
-                "DEVICE": torch.device("cpu"),
-                "IS_DDP_INITIALIZED": False,
-            },
+            dist_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"), is_distributed=False),
         )
         assert loaded.optimizer_state["marker"].item() == rank
         assert loaded.trainer_state.n_tokens == 1000 + rank
@@ -172,12 +164,7 @@ def test_sharded_checkpoint_rejects_world_size_change(tmp_path):
         checkpoint_state=CheckpointState(),
         optimizer=_MarkerOptimizer(0),
         mode="shard",
-        dist_info={
-            "RANK": 0,
-            "WORLD_SIZE": 2,
-            "DEVICE": torch.device("cpu"),
-            "IS_DDP_INITIALIZED": False,
-        },
+        dist_info=SimpleNamespace(rank=0, world_size=2, device=torch.device("cpu"), is_distributed=False),
     )
 
     with pytest.raises(ValueError, match="same world size"):
@@ -186,12 +173,7 @@ def test_sharded_checkpoint_rejects_world_size_change(tmp_path):
             step=1,
             mode="shard",
             load_scaler=False,
-            dist_info={
-                "RANK": 0,
-                "WORLD_SIZE": 4,
-                "DEVICE": torch.device("cpu"),
-                "IS_DDP_INITIALIZED": False,
-            },
+            dist_info=SimpleNamespace(rank=0, world_size=4, device=torch.device("cpu"), is_distributed=False),
         )
 
 
@@ -206,11 +188,7 @@ def test_default_run_name_is_broadcast_from_rank_zero(monkeypatch):
     run_name = make_default_run_name(
         depth=12,
         name="ic1",
-        dist_info={
-            "RANK": 1,
-            "IS_DDP_INITIALIZED": True,
-            "DEVICE_NAME": "GPU",
-        },
+        dist_info=SimpleNamespace(rank=1, world_size=1, device=torch.device("cpu"), is_distributed=True, device_name="GPU"),
     )
 
     assert run_name == "shared-run-name"
@@ -220,7 +198,7 @@ def test_default_run_name_is_broadcast_from_rank_zero(monkeypatch):
 def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, legacy):
     from gpt_lab.optim.factory import OptimizerFactory
 
-    dist_info = {"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False}
+    dist_info = DistributedContext(device=torch.device("cpu"))
     model = torch.nn.Linear(2, 2)
 
     def optimizer_for(model):
@@ -287,15 +265,14 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
 
 @pytest.mark.parametrize("legacy", [False, True])
 def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, legacy):
-    dist_info = {"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False,
-                 "compute_dtype": torch.float32}
+    dist_info = DistributedContext(device=torch.device("cpu"), compute_dtype=torch.float32)
     run_dir = tmp_path / "demo" / "run"
     MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=TransformerConfig(), base_train={})
     manager = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, dist_info=dist_info)
     trainer_config = TrainerConfig(dist_info=dist_info)
     manager.save_training_config(trainer_config)
     path = manager.source_dir / "training_config.safetensors"
-    assert TrainerConfig.from_disk(path) == trainer_config
+    assert TrainerConfig.from_disk(path).model_dump() == trainer_config.model_dump()
     if legacy:
         path.unlink()
         torch.save(trainer_config, manager.source_dir / "training_config.pkl")

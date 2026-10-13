@@ -1,3 +1,5 @@
+import torch
+from gpt_lab.utils.distributed import DistributedContext
 from pathlib import Path
 
 import pytest
@@ -36,7 +38,7 @@ def _auto_config(tmp_path: Path, **overrides) -> AutoGPTConfig:
         "total_batch_size": 64,
         "n_acc_steps": 1,
         "device_batch_size": 1,
-        "dist_info": {"WORLD_SIZE": 1, "LOCAL_RANK": 0},
+        "dist_info": DistributedContext(device=torch.device("cpu")),
     }
     values.update(overrides)
     return AutoGPTConfig(**values)
@@ -216,7 +218,7 @@ def test_cli_batch_and_horizon_override_automatic_sizing(monkeypatch, tmp_path):
         'gpt_lab.model.auto.load_tokenizer',
         lambda *_args, **kwargs: _DummyTokenizer(4096, kwargs['special_tokens']),
     )
-    generated = build_auto_config(vars(args), 'cpu', {'WORLD_SIZE': 1, 'LOCAL_RANK': 0})
+    generated = build_auto_config(vars(args), 'cpu', DistributedContext(device=torch.device("cpu")))
     assert generated.model_cfg.n_layers == 3
     assert generated.model_cfg.vocab_size == 4096
     assert generated.base_train['total_batch_size'] == 64

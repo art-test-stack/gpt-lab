@@ -1,3 +1,4 @@
+from gpt_lab.utils.distributed import DistributedContext
 import json
 from types import SimpleNamespace
 
@@ -60,7 +61,7 @@ def test_embedding_tying_lifecycle(flags, tmp_path):
     untied = build_meta_model(_config())
     assert model.estimate_flops() == untied.estimate_flops()
 
-    optimizer = model.build_optimizer(TrainerConfig(dist_info={"IS_DDP_INITIALIZED": False}))
+    optimizer = model.build_optimizer(TrainerConfig(dist_info=DistributedContext(device=torch.device("cpu"))))
     optimized = [p for group in optimizer.param_groups for p in group["params"]]
     assert len(optimized) == len({id(p) for p in optimized}) == len(list(model.parameters()))
     assert {id(p) for p in optimized} == {id(p) for p in model.parameters()}
@@ -81,7 +82,7 @@ def test_embedding_tying_lifecycle(flags, tmp_path):
         assert torch.isfinite(ve.weight.grad).all()
         assert ve.weight.grad.abs().sum() > 0
 
-    dist_info = {"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False}
+    dist_info = DistributedContext(device=torch.device("cpu"))
     save_checkpoint(model, tmp_path, step=7, trainer_state=TrainerState(step=7),
                     checkpoint_state=CheckpointState(), dist_info=dist_info)
     weights_path = tmp_path / "checkpoint_step_000007" / "model.safetensors"
@@ -194,7 +195,7 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
 
     restored, _, _, _ = build_model(
         "demo", run_name="run", model_cachedir=tmp_path, step=7, phase="eval",
-        dist_info={"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False},
+        dist_info=DistributedContext(device=torch.device("cpu")),
     )
     assert not restored.config.tie_word_embeddings
     assert (step_dir / "model.safetensors").exists()
@@ -207,6 +208,6 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
     monkeypatch.setattr(torch, "load", lambda *args, **kwargs: pytest.fail("Converted checkpoints must use safetensors"))
     reloaded, _, _, _ = build_model(
         "demo", run_name="run", model_cachedir=tmp_path, step=7, phase="eval",
-        dist_info={"RANK": 0, "DEVICE": torch.device("cpu"), "IS_DDP_INITIALIZED": False},
+        dist_info=DistributedContext(device=torch.device("cpu")),
     )
     torch.testing.assert_close(reloaded(ids).logits, model(ids).logits, rtol=0, atol=0)
