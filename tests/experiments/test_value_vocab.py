@@ -1,25 +1,15 @@
 import json
 import math
-from pathlib import Path
-import tempfile
 
 import pytest
 import torch
 
 from experiments.value_vocab import (
-    ROOT, SHARING, CyclingBatches, evaluation_batches, parser, plan, run,
+    SHARING, CyclingBatches, evaluation_batches, parser, plan, run,
 )
 from gpt_lab.model.checkpoint import build_meta_model
 from gpt_lab.tokenizer.tokenizer import Tokenizer
 from gpt_lab.utils.schemas import TransformerConfig
-
-
-@pytest.fixture
-def workdir():
-    root = ROOT / ".tmp/codex/value-vocab-tests"
-    root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=root) as directory:
-        yield Path(directory)
 
 
 def test_sharing_accounting_and_fixed_compute():
@@ -63,12 +53,12 @@ def test_batches_cover_tail_and_cycle():
     assert y.tolist() == [[5, 99], [1, 2]]
 
 
-def test_real_smoke_sweep_and_dry_run(workdir, monkeypatch):
+def test_real_smoke_sweep_and_dry_run(tmp_path, monkeypatch):
     def no_training(*args, **kwargs):
         pytest.fail("the experiment must not train tokenizers")
 
     monkeypatch.setattr(Tokenizer, "train_from_iterator", no_training)
-    output = workdir / "results.jsonl"
+    output = tmp_path / "results.jsonl"
     argv = ["--smoke", "--vocab-sizes", "300", "320", "--seeds", "0", "1", "--output", str(output)]
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -92,7 +82,7 @@ def test_real_smoke_sweep_and_dry_run(workdir, monkeypatch):
         with pytest.raises(FileExistsError):
             run(parser().parse_args(argv))
         assert output.read_bytes() == original
-        dry = workdir / "dry.jsonl"
+        dry = tmp_path / "dry.jsonl"
         run(parser().parse_args(["--smoke", "--dry-run", "--sharing", "fully-shared", "--seeds", "0", "--output", str(dry)]))
         planned = [json.loads(line) for line in dry.read_text().splitlines()]
         assert [row["actual_vocab_size"] for row in planned] == [512, 1024, 2048]
@@ -105,7 +95,7 @@ def test_real_smoke_sweep_and_dry_run(workdir, monkeypatch):
 
 
 @pytest.mark.parametrize("name", ["gpt2", "cl100k_base", "o200k_base"])
-def test_pretrained_truncation_and_base_size_limit(name, workdir):
+def test_pretrained_truncation_and_base_size_limit(name, tmp_path):
     base = Tokenizer.from_pretrained(name, source="tiktoken")
     truncated = Tokenizer.truncated_from_pretrained(name, 320, source="tiktoken")
     expected = dict(sorted(base.mergeable_ranks.items(), key=lambda item: item[1])[:319])
@@ -116,7 +106,7 @@ def test_pretrained_truncation_and_base_size_limit(name, workdir):
     ids = truncated.encode(text)
     assert truncated.decode(ids) == text
     assert int(truncated.token_bytes[ids].sum()) == len(text.encode("utf-8"))
-    output = workdir / "too-large.jsonl"
+    output = tmp_path / "too-large.jsonl"
     with pytest.raises(ValueError, match="exceeds"):
         run(parser().parse_args(["--smoke", "--dry-run", "--base-tokenizer", name,
                                 "--vocab-sizes", str(base.vocab_size + 1), "--output", str(output)]))

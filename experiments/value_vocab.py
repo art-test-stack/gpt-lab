@@ -157,11 +157,9 @@ def run(args):
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    temp_root = ROOT / ".tmp/codex/value-vocab"
-    temp_root.mkdir(parents=True, exist_ok=True)
     comp = ComputeContext(device=torch.device(args.device), compute_dtype=torch.float32)
     # Exclusive creation preserves previous sweeps and partial results after failure.
-    with args.output.open("x") as results, tempfile.TemporaryDirectory(dir=temp_root) as work:
+    with args.output.open("x") as results, tempfile.TemporaryDirectory(prefix="value-vocab-") as work:
         for vocab in args.vocab_sizes:
             tokenizer = Tokenizer.truncated_from_pretrained(args.base_tokenizer, vocab, source="tiktoken")
             if tokenizer.vocab_size != vocab:
