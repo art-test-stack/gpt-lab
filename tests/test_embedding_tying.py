@@ -20,27 +20,43 @@ def _config(**overrides):
     return TransformerConfig(**values)
 
 
+MODES = [
+    ("embs;head", False, False, False, False),
+    ("embs;value_embs;head", False, False, False, False),
+    (";value_embs;", False, False, False, False),
+    ("embs;value_embs:;head", True, False, False, False),
+    ("embs,head", False, True, False, False),
+    ("embs,head;value_embs:", True, True, False, False),
+    ("embs,head,value_embs:", True, True, True, True),
+    ("embs,head,value_embs", True, True, True, True),
+    ("embs,value_embs", True, False, True, False),
+    ("embs,value_embs:", True, False, True, False),
+    ("embs,value_embs;head", True, False, True, False),
+    ("head,value_embs:;embs", True, False, False, True),
+    ("value_embs,head", True, False, False, True),
+    ("value_embs:", True, False, False, False),
+]
+
+
+def _sharing(config):
+    if config.tie_embeddings in ("embs;value_embs;head", "embs;head;value_embs"):
+        return False, False, False, False
+    return next(mode[1:] for mode in MODES if mode[0] == config.tie_embeddings)
+
+
 def _assert_sharing(model):
-    config = model.config
     values = list(model.value_embeds.values())
     assert list(model.value_embeds) == ["1", "3"]
-    share_values = config.tie_value_embeddings or config.tie_all_embeddings
-    share_head = config.tie_word_embeddings or config.tie_all_embeddings
+    share_values, share_head, values_input, values_head = _sharing(model.config)
     assert (values[0] is values[1]) == share_values
     assert (model.lm_head.weight is model.embeds.weight) == share_head
-    assert all((ve.weight is model.embeds.weight) == config.tie_all_embeddings for ve in values)
+    assert all((ve.weight is model.embeds.weight) == values_input for ve in values)
+    assert all((ve.weight is model.lm_head.weight) == values_head for ve in values)
 
 
-@pytest.mark.parametrize("flags", [
-    {},
-    {"tie_value_embeddings": True},
-    {"tie_word_embeddings": True},
-    {"tie_value_embeddings": True, "tie_word_embeddings": True},
-    {"tie_all_embeddings": True},
-    {"tie_all_embeddings": True, "tie_value_embeddings": True, "tie_word_embeddings": True},
-])
-def test_embedding_tying_lifecycle(flags, tmp_path):
-    config = _config(**flags)
+@pytest.mark.parametrize("mode", [mode[0] for mode in MODES])
+def test_embedding_tying_lifecycle(mode, tmp_path):
+    config = _config(tie_embeddings=mode)
     model = build_meta_model(config)
     _assert_sharing(model)
     model.to_empty(device="cpu")
@@ -53,8 +69,9 @@ def test_embedding_tying_lifecycle(flags, tmp_path):
     counts = model.n_params_per_layer()
     table_size = model.embeds.weight.numel()
     assert counts["total"] == sum(p.numel() for p in model.parameters())
-    assert counts["lm_head"] == (0 if config.tie_word_embeddings or config.tie_all_embeddings else table_size)
-    expected_value_tables = 0 if config.tie_all_embeddings else 1 if config.tie_value_embeddings else 2
+    share_values, share_head, values_input, values_head = _sharing(config)
+    assert counts["lm_head"] == (0 if share_head else table_size)
+    expected_value_tables = 0 if values_input or values_head else 1 if share_values else 2
     assert counts["value_embeds"] == expected_value_tables * table_size
     assert model.n_non_vocab_params() == counts["blocks"] + counts["residuals"]
     assert model.n_scaling_params() == counts["blocks"] + table_size
@@ -101,7 +118,7 @@ def test_embedding_tying_lifecycle(flags, tmp_path):
 
 def test_full_tying_rejects_incompatible_value_width():
     with pytest.raises(ValueError, match="value and input embedding widths must match"):
-        _config(n_kv_heads=1, tie_all_embeddings=True)
+        _config(n_kv_heads=1, tie_embeddings="embs,head,value_embs:")
 
 
 def test_frozen_configs_still_initialize_derived_fields():
@@ -116,13 +133,9 @@ def test_frozen_configs_still_initialize_derived_fields():
         config.d_model = 32
 
 
-@pytest.mark.parametrize("flags", [
-    {"tie_value_embeddings": True},
-    {"tie_word_embeddings": True},
-    {"tie_value_embeddings": True, "tie_word_embeddings": True},
-])
-def test_partial_tying_supports_gqa(flags):
-    model = build_meta_model(_config(n_kv_heads=1, **flags)).to_empty(device="cpu")
+@pytest.mark.parametrize("mode", ["embs;value_embs:;head", "embs,head", "embs,head;value_embs:"])
+def test_partial_tying_supports_gqa(mode):
+    model = build_meta_model(_config(n_kv_heads=1, tie_embeddings=mode)).to_empty(device="cpu")
     model.init_weights()
     _assert_sharing(model)
     assert next(iter(model.value_embeds.values())).weight.shape == (320, 8)
@@ -144,7 +157,7 @@ def test_checkpoint_metadata_preserves_tying_mode(tmp_path, version, missing_fie
     run_dir = tmp_path / "demo" / "run"
     meta = MetaConfig(
         name="demo", run_name="run", dirname=run_dir,
-        model_cfg=_config(tie_word_embeddings=True),
+        model_cfg=_config(tie_embeddings="embs,head"),
         base_train={},
     )
     assert meta.version == "0.1.1"
@@ -153,16 +166,15 @@ def test_checkpoint_metadata_preserves_tying_mode(tmp_path, version, missing_fie
         metadata.pop("version")
     else:
         metadata["version"] = version
-    if missing_fields:
-        metadata["model_cfg"].pop("tie_value_embeddings")
-        metadata["model_cfg"].pop("tie_all_embeddings")
+    metadata["model_cfg"].pop("tie_embeddings")
+    metadata["model_cfg"]["tie_word_embeddings"] = True
+    if not missing_fields:
+        metadata["model_cfg"].update(tie_value_embeddings=False, tie_all_embeddings=False)
     path = run_dir / "meta.json"
     path.write_text(json.dumps(json.dumps(metadata)))
     saved = path.read_text()
     restored = load_meta_config("demo", run_name="run", model_cachedir=tmp_path)
-    assert restored.model_cfg.tie_word_embeddings == expected_tie
-    assert not restored.model_cfg.tie_value_embeddings
-    assert not restored.model_cfg.tie_all_embeddings
+    assert restored.model_cfg.tie_embeddings == ("embs,head;value_embs" if expected_tie else "embs;head;value_embs")
     assert restored.version == (version or "0.1.1")
     assert restored.git_info == metadata["git_info"]
     assert path.read_text() == saved
@@ -182,8 +194,7 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
     metadata = meta.model_dump(mode="json")
     metadata["version"] = "0.1.0"
     metadata["model_cfg"]["tie_word_embeddings"] = True
-    metadata["model_cfg"].pop("tie_value_embeddings")
-    metadata["model_cfg"].pop("tie_all_embeddings")
+    metadata["model_cfg"].pop("tie_embeddings")
     (run_dir / "meta.json").write_text(json.dumps(json.dumps(metadata)))
     step_dir = run_dir / "base" / "checkpoint_step_000007"
     step_dir.mkdir(parents=True)
@@ -197,7 +208,7 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
         "demo", run_name="run", model_cachedir=tmp_path, step=7, phase="eval",
         comp_info=ComputeContext(device=torch.device("cpu")),
     )
-    assert not restored.config.tie_word_embeddings
+    assert restored.config.tie_embeddings == "embs;head;value_embs"
     assert (step_dir / "model.safetensors").exists()
     assert (step_dir / f"model.{extension}").read_bytes() == original
     _assert_sharing(restored)
@@ -211,3 +222,30 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
         comp_info=ComputeContext(device=torch.device("cpu")),
     )
     torch.testing.assert_close(reloaded(ids).logits, model(ids).logits, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["embds", "h_embds", "embs:", "value_embs:1", "embs,,head", "embs;embs", "value_embs;value_embs:"])
+def test_embedding_tying_rejects_invalid_syntax(mode):
+    with pytest.raises(ValueError):
+        _config(tie_embeddings=mode)
+
+
+@pytest.mark.parametrize("mode", ["embs,value_embs", "head,value_embs:"])
+def test_value_tying_rejects_incompatible_width(mode):
+    with pytest.raises(ValueError, match="widths must match"):
+        _config(n_kv_heads=1, tie_embeddings=mode)
+
+
+@pytest.mark.parametrize("flags,expected", [
+    ({}, "embs;head;value_embs"),
+    ({"tie_value_embeddings": True}, "embs;head;value_embs:"),
+    ({"tie_word_embeddings": True}, "embs,head;value_embs"),
+    ({"tie_value_embeddings": True, "tie_word_embeddings": True}, "embs,head;value_embs:"),
+    ({"tie_all_embeddings": True}, "embs,head,value_embs:"),
+])
+def test_checkpoint_migrates_boolean_tying(flags, expected):
+    from gpt_lab.model.checkpoint import _migrate_model_config
+
+    saved = dict(flags)
+    _migrate_model_config(saved, "0.1.1")
+    assert saved == {"tie_embeddings": expected}

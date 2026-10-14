@@ -173,12 +173,12 @@ def test_auto_preserves_configuration_and_cleanup_on_failure(training_dependenci
     from gpt_lab.cli.commands.base import run
     deps = training_dependencies
     deps.trainer.train.side_effect = RuntimeError('simulated failure')
-    args = parse('train --depth 4 --train-tokenizer --vocab-size 512 --n-kv-heads 2 --board dummy --tie-value-embeddings --tie-word-embeddings --tie-all-embeddings')
+    args = parse('train --depth 4 --train-tokenizer --vocab-size 512 --n-kv-heads 2 --board dummy --tie-embeddings embs,head,value_embs:')
     with pytest.raises(RuntimeError, match='simulated failure'):
         run(args)
     cfg = deps.auto.call_args.kwargs
     assert (cfg['depth'], cfg['vocab_size'], cfg['n_kv_heads'], cfg['tokenizer_model']) == (4, 512, 2, 'auto')
-    assert cfg['tie_value_embeddings'] and cfg['tie_word_embeddings'] and cfg['tie_all_embeddings']
+    assert cfg['tie_embeddings'] == 'embs,head,value_embs:'
     deps.manager.load.assert_not_called()
     deps.model.init_weights.assert_called_once()
     deps.board.close.assert_called_once()

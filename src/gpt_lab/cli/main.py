@@ -36,11 +36,15 @@ Python entry point (file loading stays outside the workflow):
     from gpt_lab.workflows.train_base import train_base
     train_base(depth=12, optim_config=OptimizerConfig.from_file("custom.yaml"))
 
-Tying defaults off: --tie-value-embeddings shares values across eligible layers;
---tie-word-embeddings ties input/head weights. Together they create two tables.
---tie-all-embeddings shares all three and requires n_kv_heads * d_head == d_model.
-Shared input tables use input initialization/optimizer settings. Storage is
-counted once; output-head FLOPs and scaling counts still include the output table.
+Tying defaults off: --tie-embeddings 'embs;value_embs;head'. Commas share tables;
+semicolons separate groups. 'embs,head' ties input/head; 'value_embs:' shares values;
+'embs,head;value_embs:' creates two shared tables; 'embs,head,value_embs:' shares all.
+Bare value_embs alone keeps values separate; in a comma group it ties every value
+table to the other named table, just like value_embs:. Empty semicolon groups are
+ignored; omitted names remain separate. Colon slicing is not supported yet.
+Tying values to input/head requires n_kv_heads * d_head == d_model.
+Shared tables use input settings when embs is included, otherwise head settings
+when head is included. Storage is counted once; output FLOPs still include it.
 Resume retains saved tying; legacy no-op tying flags load as disabled.
 
 Resume restores model, trainer, optimizer, dataloader, RNG, scaler, and best state.

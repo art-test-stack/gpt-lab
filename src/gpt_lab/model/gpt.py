@@ -14,6 +14,7 @@ from gpt_lab.model.utils import (
 from gpt_lab.tokenizer.tokenizer import build_tokenizer
 from gpt_lab.optim.factory import OptimizerFactory
 from gpt_lab.utils.schemas import (
+    parse_embedding_groups,
     ModelOutput, 
     TrainerConfig,
     OptimizerConfig,
@@ -96,9 +97,7 @@ class DenseTransformer(BaseTransformer):
 
         # Value embeddings (ResFormer-style): alternating layers, last layer always include
         shared_value_embedding = None
-        if config.tie_all_embeddings:
-            shared_value_embedding = self.embeds
-        elif config.tie_value_embeddings:
+        if any("value_embs" in group for group in parse_embedding_groups(config.tie_embeddings)):
             shared_value_embedding = nn.Embedding(padded_vocab_size, kv_dim)
         self.value_embeds = nn.ModuleDict({
             str(layer_idx): (
@@ -121,8 +120,18 @@ class DenseTransformer(BaseTransformer):
         self.loss_fn = build_loss() 
 
     def _tie_embedding_weights(self):
-        if self.config.tie_word_embeddings or self.config.tie_all_embeddings:
-            self.lm_head.weight = self.embeds.weight
+        for group in parse_embedding_groups(self.config.tie_embeddings):
+            if "embs" in group:
+                source = self.embeds
+            elif "head" in group:
+                source = self.lm_head
+            else:
+                source = next(iter(self.value_embeds.values()))
+            if "head" in group:
+                self.lm_head.weight = source.weight
+            if "value_embs" in group:
+                for ve in self.value_embeds.values():
+                    ve.weight = source.weight
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
@@ -163,7 +172,7 @@ class DenseTransformer(BaseTransformer):
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.children():
-            if ve.weight is not self.embeds.weight:
+            if ve.weight is not self.embeds.weight and ve.weight is not self.lm_head.weight:
                 torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init with small positive values so gates start slightly above neutral
@@ -237,7 +246,7 @@ class DenseTransformer(BaseTransformer):
             blocks=sum(p.numel() for p in self.blocks.parameters()),
             lm_head=sum(p.numel() for p in self.lm_head.parameters() if p is not self.embeds.weight),
             residuals=self.res_x0.numel() + self.res_h.numel(),
-            value_embeds=sum(p.numel() for p in self.value_embeds.parameters() if p is not self.embeds.weight),
+            value_embeds=sum(p.numel() for p in self.value_embeds.parameters() if p is not self.embeds.weight and p is not self.lm_head.weight),
         )
         nb_of_params["total"] = sum(nb_of_params.values())
         return nb_of_params
@@ -276,7 +285,7 @@ class DenseTransformer(BaseTransformer):
         # Separate out all parameters into groups
         embedding_params = list(self.embeds.parameters())
         blocks_params = list(self.blocks.parameters())
-        value_embeds_params = [p for p in self.value_embeds.parameters() if p is not self.embeds.weight]
+        value_embeds_params = [p for p in self.value_embeds.parameters() if p is not self.embeds.weight and p is not self.lm_head.weight]
         lm_head_params = [p for p in self.lm_head.parameters() if p is not self.embeds.weight]
         residual_h_params = [self.res_h]
         residual_x0_params = [self.res_x0]
