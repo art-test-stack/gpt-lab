@@ -32,6 +32,7 @@ from gpt_lab.utils.paths import get_cache_dir
 
 if TYPE_CHECKING:
     from gpt_lab.utils.schemas import OptimizerConfig
+    from gpt_lab.utils.distributed import ComputeContext
 
 
 def train_base(
@@ -134,14 +135,14 @@ def train_base(
     # ------------------------------------------------------------------------------
 
     device_type = get_device_type() if device == "auto" else device
-    dist_info = init_dist_groups(device_type=device_type, random_seed=random_seed)
+    comp_info = init_dist_groups(device_type=device_type, random_seed=random_seed)
     board_instance = None
     try:
-        is_master_process = dist_info["RANK"] == 0
+        is_master_process = comp_info.rank == 0
 
-        device = dist_info["DEVICE"]
+        device = comp_info.device
         is_resumed = model_init == "resume"
-        print0_dict("Environment setup", dist_info)
+        print0_dict("Environment setup", vars(comp_info) | {"rank": comp_info.rank, "world_size": comp_info.world_size})
 
         git_info = get_git_info()
         gpu_info = get_gpu_info()
@@ -158,7 +159,7 @@ def train_base(
         # ------------------------------------------------------------------------------
 
         if model_init == "auto":
-            meta_config = build_auto_config(parameters, device, dist_info)
+            meta_config = build_auto_config(parameters, device, comp_info)
             base_training_config = meta_config.base_train
 
         elif is_resumed:
@@ -178,15 +179,15 @@ def train_base(
             model_name=meta_config.name,
             model_run=meta_config.run_name,
             model_cachedir=model_dir,
-            dist_info=dist_info,
-            mode="shard" if dist_info["IS_DDP_INITIALIZED"] else "ddp",
+            comp_info=comp_info,
+            optimizer_state_layout="sharded" if comp_info.is_distributed else "full",
         )
         model = build_meta_model(meta_config.model_cfg)
         tokenizer = Tokenizer.from_config(meta_config.tokenizer_cfg)
         if model_init == "auto":
             model = model.to_empty(device=device)
             model.init_weights()
-            broadcast_model(model, dist_info)
+            broadcast_model(model, comp_info)
         elif is_resumed:
             log0("Resuming training from checkpoint.", logger=logger)
             model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(
@@ -198,7 +199,7 @@ def train_base(
                 if saved_profile is None or optim_config.group_configs() != saved_profile.group_configs():
                     raise ValueError("optim_config conflicts with the saved optimizer profile; resume without an optimizer override")
         # Check just model embeddings and hope others are fine
-        assert model.embeds.weight.device.type == dist_info["DEVICE_TYPE"], "Model parameters are not on the correct device after initialization."
+        assert model.embeds.weight.device.type == comp_info.device_type, "Model parameters are not on the correct device after initialization."
 
         # ------------------------------------------------------------------------------
         # DATASET, DATALOADERS
@@ -223,7 +224,7 @@ def train_base(
             shard_limit=None,
             max_shards=None, # TODO: configured based on configs/data.yaml
             batch_size=base_training_config.get("device_batch_size", device_batch_size),
-            dist_info=dist_info,
+            comp_info=comp_info,
             use_nanochat=use_nanochat_dataloader,
         )
         # TODO: add option to configure buffer size
@@ -238,7 +239,7 @@ def train_base(
             assert type(trainer_config) == TrainerConfig, "Trainer config loaded from checkpoint is not of type TrainerConfig. Please check the checkpoint data and trainer config."
             # TODO: add option to override some trainer config parameters from CLI args even when resuming (eg: evaluation frequency, save frequency, etc.)
         else:
-            trainer_config = build_trainer_config(parameters, dist_info, base_training_config)
+            trainer_config = build_trainer_config(parameters, comp_info, base_training_config)
             ckpt_manager.save_training_config(trainer_config)
         print0_dict("Trainer config", trainer_config.model_dump())
 
@@ -321,7 +322,7 @@ def resolve_checkpoint(checkpoint_dir, checkpoint_step=None) -> dict:
                 model_dir=str(path.parent.parent), checkpoint_step=checkpoint_step)
 
 
-def build_auto_config(parameters: dict, device, dist_info: dict):
+def build_auto_config(parameters: dict, device, comp_info: ComputeContext):
     """Construct the existing auto configuration independently of training."""
     from gpt_lab.model.auto import AutoGPTConfig
 
@@ -331,7 +332,7 @@ def build_auto_config(parameters: dict, device, dist_info: dict):
         run_name=parameters["run_name"],
         dirname=parameters["model_dir"],
         random_seed=parameters["random_seed"],
-        dist_info=dist_info,
+        comp_info=comp_info,
         max_seq_len=parameters["max_seq_len"],
         # tokenizer
         tokenizer_model="auto" if parameters["train_tokenizer"] else parameters.get("tokenizer_model"),
@@ -362,7 +363,7 @@ def build_auto_config(parameters: dict, device, dist_info: dict):
     ).generate_gpt_config(device)
 
 
-def build_trainer_config(parameters: dict, dist_info: dict, base_training_config: dict):
+def build_trainer_config(parameters: dict, comp_info: ComputeContext, base_training_config: dict):
     """Translate CLI and scaling-law settings into the existing TrainerConfig."""
     from gpt_lab.utils.schemas import TrainerConfig
 
@@ -372,7 +373,7 @@ def build_trainer_config(parameters: dict, dist_info: dict, base_training_config
         lr_warmdown_ratio=parameters["warmdown_ratio"],
         final_lr_ratio=parameters["final_lr_frac"],
         target_time=parameters["target_time"],
-        dist_info=dist_info,
+        comp_info=comp_info,
         eval_bpb_every=parameters["eval_bpb_every"],
         n_bpb_tokens=parameters["n_bpb_tokens"],
         eval_core_every=parameters["eval_core_every"],

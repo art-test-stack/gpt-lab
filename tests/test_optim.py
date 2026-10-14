@@ -1,3 +1,4 @@
+from gpt_lab.utils.distributed import ComputeContext
 import pytest
 import torch
 
@@ -18,7 +19,7 @@ def test_hyperparameter_schedules_preserve_group_specific_values():
                 weight_decay=0.28,
             )
         ],
-        dist_info={"IS_DDP_INITIALIZED": False},
+        comp_info=ComputeContext(device=torch.device("cpu")),
     )
 
     optimizer.update_hyperparams(lrm=0.5, muon_momentum=0.8, weight_decay=0.25)
@@ -40,7 +41,7 @@ def test_legacy_checkpoint_gets_schedule_baselines():
         ns_steps=5,
         weight_decay=0.28,
     )
-    optimizer = OptimizerFactory([config], dist_info={"IS_DDP_INITIALIZED": False})
+    optimizer = OptimizerFactory([config], comp_info=ComputeContext(device=torch.device("cpu")))
     state = optimizer.state_dict()
     for key in ("initial_lr", "initial_momentum", "initial_weight_decay"):
         state["param_groups"][0].pop(key)

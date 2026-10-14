@@ -476,7 +476,7 @@ optimizer = OptimizerFactory(param_groups)
 
 The factory automatically:
 - Validates all required keys for each optimizer at construction (fails fast on config errors)
-- Detects DDP mode and selects single-GPU or distributed backend
+- Selects local or distributed optimizer execution
 - Manages a reusable scalar cache for torch.compile stability
 - Routes parameter groups to the correct strategy at each step
 
@@ -557,6 +557,23 @@ uv run gpt-lab train --model-name ic1 --run-name baseline --depth 12
 uv run torchrun --standalone --nproc-per-node=8 --no-python \
   gpt-lab train --model-name ic1 --run-name baseline --depth 12
 ```
+
+Distributed utilities return a frozen `ComputeContext` through the
+`init_dist_groups()` and `get_comp_info()` functions. Pass it as `comp_info` and
+use attributes such as `.rank`, `.world_size`, `.device`, and `.compute_dtype`.
+Distributed runs use a one-dimensional PyTorch `DeviceMesh` named `"dp"`, exposed
+as `.dp_mesh`; single-device runs have no mesh or process group. CPU runs use
+Gloo and CUDA runs use NCCL. Distributed AdamW and Muon wait on async `Work`
+handles; Gloo gradients use SUM followed by averaging, while NCCL retains AVG.
+Trainer configs exclude this runtime object when saved; loading a checkpoint
+attaches the current launch context, including for older dictionary metadata.
+Sharded optimizer resumes still require the original world size.
+Checkpoint APIs use `optimizer_state_layout="full"` or `"sharded"`, independently
+of local or distributed optimizer execution. The current distributed optimizer
+shards its state, so its checkpoints use `"sharded"`; local runs use `"full"`.
+Readers accept legacy `mode="ddp"` / `"shard"` metadata. One-worker sharded
+checkpoints contain full optimizer state and can resume locally: loaders read
+the rank-0 files, while subsequent local checkpoints use `"full"`.
 
 `--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
 With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)

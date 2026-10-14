@@ -63,6 +63,8 @@ class AdamWStrategy(OptimizerStrategy):
         Small params (<1024 els): all_reduce, replicated update.
         Large params: reduce_scatter, sharded state (ZeRO-2 style).
         """
+        average = dist.get_backend() == "gloo"
+        reduce_op = dist.ReduceOp.SUM if average else dist.ReduceOp.AVG
         param_infos = {}
         for p in group["params"]:
             grad = p.grad
@@ -71,8 +73,8 @@ class AdamWStrategy(OptimizerStrategy):
             
             if p.numel() < 1024:
                 # Small: all_reduce (no scatter/gather)
-                future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                param_infos[p] = {"future": future, "grad_slice": grad, "is_small": True}
+                work = dist.all_reduce(grad, op=reduce_op, async_op=True)
+                param_infos[p] = {"work": work, "grad_slice": grad, "is_small": True}
             else:
                 # Large: reduce_scatter for sharding
                 assert (
@@ -80,12 +82,12 @@ class AdamWStrategy(OptimizerStrategy):
                 ), f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
-                future = dist.reduce_scatter_tensor(
-                    grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True
-                ).get_future()
-                param_infos[p] = {"future": future, "grad_slice": grad_slice, "is_small": False}
+                work = dist.reduce_scatter_tensor(
+                    grad_slice, grad, op=reduce_op, async_op=True
+                )
+                param_infos[p] = {"work": work, "grad_slice": grad_slice, "is_small": False}
         
-        return {"param_infos": param_infos}
+        return {"param_infos": param_infos, "average": average}
     
     def dist_compute(
         self,
@@ -103,8 +105,10 @@ class AdamWStrategy(OptimizerStrategy):
                 continue
             
             pinfo = param_infos[p]
-            pinfo["future"].wait()
+            pinfo["work"].wait()
             grad_slice = pinfo["grad_slice"]
+            if info["average"]:
+                grad_slice.div_(world_size)
             state = self.opt.state[p]
             
             # Determine param slice (full for small, sharded for large)
@@ -145,5 +149,5 @@ class AdamWStrategy(OptimizerStrategy):
             
             # Large params need all_gather to sync back
             if not pinfo["is_small"]:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
-                gather_list.append({"future": future, "params": None})
+                work = dist.all_gather_into_tensor(p, p_slice, async_op=True)
+                gather_list.append({"work": work, "params": None})

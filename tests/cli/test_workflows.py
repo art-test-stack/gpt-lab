@@ -100,7 +100,7 @@ def training_dependencies(monkeypatch):
     tokenizer = Mock()
     meta = Config(name='demo', run_name='run-1', model_cfg=model.config, tokenizer_cfg=object(),
                   base_train={'device_batch_size': 3, 'n_steps': 10})
-    saved_config = Config(dist_info={})
+    saved_config = Config(comp_info={})
     state = SimpleNamespace(train_loader_state=object())
     checkpoint = SimpleNamespace(trainer_state=state, checkpoint_state=object(), optimizer_state=object(), scaler_state=object())
     manager = Mock()
@@ -113,8 +113,8 @@ def training_dependencies(monkeypatch):
     trainer_factory = Mock(return_value=trainer)
     board = Mock()
     board_factory = Mock(return_value=board)
-    dist_info = {'RANK': 0, 'DEVICE': 'cpu', 'DEVICE_TYPE': 'cpu', 'IS_DDP_INITIALIZED': True, 'WORLD_SIZE': 2}
-    init_dist = Mock(return_value=dist_info)
+    comp_info = SimpleNamespace(rank=0, world_size=2, device='cpu', is_distributed=True, device_type='cpu')
+    init_dist = Mock(return_value=comp_info)
     cleanup = Mock()
     load_meta = Mock(return_value=meta)
     modules = {
@@ -145,7 +145,7 @@ def test_resume_restores_all_states_through_existing_pipeline(training_dependenc
     run(args)
     deps.manager.load.assert_called_once_with(step='latest' if step is None else step, phase='train')
     deps.auto.assert_not_called()
-    assert deps.factory.call_args.kwargs['mode'] == 'shard'
+    assert deps.factory.call_args.kwargs['optimizer_state_layout'] == 'sharded'
     assert deps.loader.call_args_list[0].kwargs['resume_state'] is deps.state.train_loader_state
     deps.model.build_optimizer.return_value.load_state_dict.assert_called_once_with(deps.checkpoint.optimizer_state)
     assert deps.trainer_factory.call_args.kwargs['config'] is deps.saved_config

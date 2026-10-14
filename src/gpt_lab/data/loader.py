@@ -5,7 +5,7 @@ from typing import Callable, Iterator, Optional, Tuple, Union, Literal
 import torch
 
 from gpt_lab.utils.default import DATA_DIR
-from gpt_lab.utils.distributed import get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import DataLoaderState
 from gpt_lab.data.sharder import ShardManager
 
@@ -33,13 +33,13 @@ class ShardedDataset:
         shard_limit: Optional[int] = None,
         max_shards: Optional[int] = None,
         cachedir: Union[str, Path] = DATA_DIR,
-        dist_info: Optional[dict] = None,
+        comp_info: Optional[ComputeContext] = None,
         tokenizer_threads: int = 4,
     ):
         if isinstance(cachedir, str):
             cachedir = Path(cachedir)
-        if dist_info is None:
-            dist_info = get_dist_info()
+        if comp_info is None:
+            comp_info = get_comp_info()
 
         self.sm = ShardManager(
             name=name,
@@ -49,7 +49,7 @@ class ShardedDataset:
             column_name=column,
             shard_limit=shard_limit,
             max_shards=max_shards,
-            dist_info=dist_info
+            comp_info=comp_info
         )
         self.tokenizer = tokenizer
         self.split = split
@@ -236,7 +236,7 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 import torch
 import pyarrow.parquet as pq
 
-from gpt_lab.utils.distributed import get_dist_info
+from gpt_lab.utils.distributed import get_comp_info
 from gpt_lab.data.sharder import list_parquet_files
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size, base_path=None):
@@ -247,9 +247,9 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, base_path=
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
     """
-    dist_info = get_dist_info()
-    ddp_rank = dist_info["RANK"]
-    ddp_world_size = dist_info["WORLD_SIZE"]
+    comp_info = get_comp_info()
+    ddp_rank = comp_info.rank
+    ddp_world_size = comp_info.world_size
 
     warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
     parquet_paths = list_parquet_files(base_path)
@@ -402,12 +402,12 @@ def build_dataloader(
     cachedir: Optional[Union[str, Path]] = None,
     datadir: Optional[Union[str, Path]] = None,
     resume_state: Optional[DataLoaderState] = None,
-    dist_info: Optional[dict] = None,
+    comp_info: Optional[ComputeContext] = None,
     tokenizer_threads: int = 4,
     use_nanochat: bool = False,
 ) -> DistDataLoader:
-    if dist_info is None:
-        dist_info = get_dist_info()
+    if comp_info is None:
+        comp_info = get_comp_info()
     if use_nanochat:
         # This is the original dataloader from nanochat, from which I derived the pipeline for gpt-lab.
         # So it is based on the same underlying data loading and on-the-fly tokenization
@@ -426,7 +426,7 @@ def build_dataloader(
             split=split,
             tokenizer_threads=tokenizer_threads,
             tokenizer_batch_size=128,
-            device=dist_info["DEVICE"],
+            device=comp_info.device,
             resume_state_dict=resume_state_dict,
             buffer_size=buffer_size or (batch_size * seq_len * 16),
             base_path=datadir / name
@@ -442,13 +442,13 @@ def build_dataloader(
             max_shards=max_shards,
             cachedir=cachedir,
             start_state=resume_state,
-            dist_info=dist_info,
+            comp_info=comp_info,
         )
         dataloader = lambda: DistDataLoader(
             ds,
             batch_size=batch_size,
             seq_len=seq_len,
-            device=dist_info["DEVICE"],
+            device=comp_info.device,
             buffer_size=buffer_size,
         )
     if split == "val":

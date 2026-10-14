@@ -14,7 +14,7 @@ from urllib3.util.retry import Retry
  
 from gpt_lab.utils.default import DATA_DIR
 from gpt_lab.utils.schemas import DataLoaderState
-from gpt_lab.utils.distributed import get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_comp_info
  
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.parquet"
 
@@ -63,7 +63,7 @@ class ShardManager:
         refresh_interval: float = 5.0,
         download_poll_interval: float = 1.0,
         # dist settings
-        dist_info: Optional[Dict] = None,
+        comp_info: Optional[ComputeContext] = None,
     ):
         assert split in ["train", "val"], f"split must be 'train' or 'val'. Got {split=!r}."
         if cachedir is None:
@@ -83,11 +83,11 @@ class ShardManager:
         self.column_name = column_name
         self.split = split
 
-        if dist_info is None:
-            dist_info = get_dist_info()
-        self.dist_info = dist_info
-        self.ddp_rank = dist_info.get("RANK", 0)
-        self.world_size = dist_info.get("WORLD_SIZE", 1)
+        if comp_info is None:
+            comp_info = get_comp_info()
+        self.comp_info = comp_info
+        self.ddp_rank = comp_info.rank
+        self.world_size = comp_info.world_size
 
         self._session = None
 

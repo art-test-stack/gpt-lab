@@ -35,14 +35,14 @@ import re
 import random, numpy as np
 import torch
 import json
-from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Union, Tuple, Dict, Literal, Mapping, Callable, List
 from pathlib import Path
 from packaging.version import Version
 from gpt_lab.utils.logging import log0, log_error
+from gpt_lab.utils.common import slugify
 from gpt_lab.utils.default import MODELS_FOLDER
-from gpt_lab.utils.distributed import get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import (
     CheckpointState, 
     MetaConfig,
@@ -61,31 +61,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 _MODEL_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "model.safetensors",
-    shard=lambda x: "model.safetensors",
-) # dict[mode, (rank: int) -> (filename: str)]
+    full=lambda x: "model.safetensors",
+    sharded=lambda x: "model.safetensors",
+) # dict[optimizer_state_layout, (rank: int) -> (filename: str)]
 _OPT_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "optim.safetensors",
-    shard=lambda x: f"optim_rank{x:d}.safetensors",
-) # dict[mode, (rank: int) -> (filename: str)]
+    full=lambda x: "optim.safetensors",
+    sharded=lambda x: f"optim_rank{x:d}.safetensors",
+) # dict[optimizer_state_layout, (rank: int) -> (filename: str)]
 _TRAINER_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "trainer_state.json",
-    shard=lambda x: f"trainer_state_rank{x:d}.json",
+    full=lambda x: "trainer_state.json",
+    sharded=lambda x: f"trainer_state_rank{x:d}.json",
 )
 _RNG_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "rng_state.safetensors",
-    shard=lambda x: f"rng_state_rank{x:d}.safetensors",
+    full=lambda x: "rng_state.safetensors",
+    sharded=lambda x: f"rng_state_rank{x:d}.safetensors",
 )
 _STEP_GLOB_PATTERN = "checkpoint_step_*"
 _STEP_DIRNAME = lambda step: f"checkpoint_step_{step:06d}"
 _ModelSources = Literal[("base")] # TODO: Add here "sft", "grpo" when implemented
-_Mode = Literal["ddp", "shard"]
+_OptimizerStateLayout = Literal["full", "sharded"]
 _Step = Union[int, str]  # int, "latest", "best", or "-k" / negative int
-
-class CheckpointMode(str, Enum):
-    FULL = "full"                    # rank0 only (DDP)
-    SHARDED = "sharded"              # optim state sharded across ranks (FSDP / ZeRO)
-    FULLY_SHARDED = "fully_sharded"  # FSDP / ZeRO with full sharding (including optimizer state)
 
 @dataclass
 class CheckpointConfig:
@@ -93,8 +88,8 @@ class CheckpointConfig:
     run_name: Optional[Union[str, int]] = None
     model_cachedir: Optional[Union[str, Path]] = None
     source: _ModelSources = "base"
-    dist_info: Optional[Dict] = None
-    mode: _Mode = "ddp"
+    comp_info: Optional[ComputeContext] = None
+    optimizer_state_layout: _OptimizerStateLayout = "full"
     model_config: Optional[TransformerConfig] = None
     tokenizer_config: Optional[TokenizerConfig] = None
     trainer_config: Optional[TrainerConfig] = None
@@ -283,11 +278,11 @@ def set_rng_state(
     random.setstate(rng_state["python"])
 
 # api functions
-def make_default_run_name(depth, name, dist_info):
-    if dist_info is None:
-        dist_info = get_dist_info()
-    is_distributed = dist_info.get("IS_DDP_INITIALIZED", False)
-    rank = dist_info.get("RANK", 0)
+def make_default_run_name(depth, name, comp_info):
+    if comp_info is None:
+        comp_info = get_comp_info()
+    is_distributed = comp_info.is_distributed
+    rank = comp_info.rank
     run_name = None
 
     if not is_distributed or rank == 0:
@@ -295,8 +290,11 @@ def make_default_run_name(depth, name, dist_info):
         git_commit = run_command("git rev-parse --short HEAD") or "unkcommit"
         from datetime import datetime
         date = datetime.now().strftime("%Y%m%d_%H-%M-%S")
-        device_name = (str(dist_info.get("DEVICE_NAME", "unkdevice"))
-            .lower().split(" ")[-1].replace(" ", "_").replace("/", "_").replace("-", "_"))
+        device_name = str(comp_info.device_name).lower()
+        if device_name.startswith("apple "):
+            device_name = slugify(device_name.split(" (", 1)[0])
+        else:
+            device_name = device_name.split(" ")[-1].replace(" ", "_").replace("/", "_").replace("-", "_")
         if name is None:
             name = "model"
         run_name = f"{device_name}_{name}_d{depth}_cmt_{git_commit}_dt_{date}"
@@ -461,38 +459,38 @@ def save_checkpoint(
         checkpoint_state: CheckpointState,
         optimizer: Optional[torch.optim.Optimizer] = None, # should be the state dict
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
-        mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[Dict] = None,
+        optimizer_state_layout: Literal["full", "sharded"] = "full",
+        comp_info: Optional[ComputeContext] = None,
     ):
-    if mode not in _OPT_DEFAULT_FILENAME:
-        raise ValueError(f"Unsupported checkpoint mode: {mode!r}")
+    if optimizer_state_layout not in _OPT_DEFAULT_FILENAME:
+        raise ValueError(f"Unsupported optimizer state layout: {optimizer_state_layout!r}")
     checkpoint_dir = _solve_path(checkpoint_dir)
 
     step_dir = checkpoint_dir.joinpath(_STEP_DIRNAME(step))
 
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info["RANK"]
-    world_size = dist_info.get("WORLD_SIZE", 1)
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
+    world_size = comp_info.world_size
 
     # All ranks may enter concurrently. mkdir(exist_ok=True) is safe on the
     # shared filesystem, and the barriers make a checkpoint visible only after
     # every optimizer/RNG/data-loader shard has completed.
     step_dir.mkdir(parents=True, exist_ok=True)
-    if dist_info.get("IS_DDP_INITIALIZED", False):
+    if comp_info.is_distributed:
         torch.distributed.barrier()
 
     if rank == 0:
         # Save the model state parameters
-        _save_state_dict(model.state_dict(), step_dir, _MODEL_DEFAULT_FILENAME[mode](rank))
+        _save_state_dict(model.state_dict(), step_dir, _MODEL_DEFAULT_FILENAME[optimizer_state_layout](rank))
         # Shared copies support evaluation and old single-rank readers. Shard
-        # mode also writes rank-specific training and RNG state below.
+        # layout also writes rank-specific training and RNG state below.
         _save_json(trainer_state.model_dump(), step_dir, filename="trainer_state.json")
         _save_state_dict(capture_rng_state(), step_dir, "rng_state.safetensors")
         # Save the checkpoint state (best bpb/core steps and values)
         _save_state_dict(checkpoint_state.model_dump(), step_dir, "checkpoint_state.safetensors")
         _save_json(
-            {"mode": mode, "world_size": world_size},
+            {"optimizer_state_layout": optimizer_state_layout, "world_size": world_size},
             step_dir,
             filename="checkpoint_meta.json",
         )
@@ -500,24 +498,43 @@ def save_checkpoint(
         if scaler is not None:
             _save_state_dict(scaler.state_dict(), step_dir, "scaler.safetensors")
 
-    if mode == "shard":
+    if optimizer_state_layout == "sharded":
         _save_json(
             trainer_state.model_dump(),
             step_dir,
-            filename=_TRAINER_DEFAULT_FILENAME[mode](rank),
+            filename=_TRAINER_DEFAULT_FILENAME[optimizer_state_layout](rank),
         )
         _save_state_dict(
             capture_rng_state(),
             step_dir,
-            _RNG_DEFAULT_FILENAME[mode](rank),
+            _RNG_DEFAULT_FILENAME[optimizer_state_layout](rank),
         )
 
     # The custom distributed optimizer keeps state shards on every rank.
-    if optimizer is not None and (mode == "shard" or rank == 0):
-        _save_state_dict(optimizer.state_dict(), step_dir, _OPT_DEFAULT_FILENAME[mode](rank))
+    if optimizer is not None and (optimizer_state_layout == "sharded" or rank == 0):
+        _save_state_dict(optimizer.state_dict(), step_dir, _OPT_DEFAULT_FILENAME[optimizer_state_layout](rank))
 
-    if dist_info.get("IS_DDP_INITIALIZED", False):
+    if comp_info.is_distributed:
         torch.distributed.barrier()
+
+def _load_checkpoint_metadata(step_dir: Path) -> dict:
+    metadata = _load_json(step_dir, "checkpoint_meta.json")
+    layout = metadata.get("optimizer_state_layout", metadata.get("mode"))
+    metadata["optimizer_state_layout"] = {"ddp": "full", "shard": "sharded"}.get(layout, layout)
+    return metadata
+
+
+def _checkpoint_read_layout(optimizer_state_layout: _OptimizerStateLayout, metadata: dict, world_size: int) -> _OptimizerStateLayout:
+    # A one-worker shard contains the full optimizer state and can resume locally.
+    if (
+        optimizer_state_layout == "full"
+        and world_size == 1
+        and metadata.get("optimizer_state_layout") == "sharded"
+        and metadata.get("world_size") == 1
+    ):
+        return "sharded"
+    return optimizer_state_layout
+
 
 def load_checkpoint(
         checkpoint_dir: Union[str, Path], # should be <model_dir>/<model_name>/<run_name>/<source>/<checkpoint_dir>
@@ -527,15 +544,15 @@ def load_checkpoint(
         load_trainer: bool = True,
         load_scaler: bool = True,
         load_rng: bool = True,
-        mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[Dict] = None,
+        optimizer_state_layout: Literal["full", "sharded"] = "full",
+        comp_info: Optional[ComputeContext] = None,
     ) -> CheckpointData:
     # Load the model state
     checkpoint_dir = _solve_path(checkpoint_dir)
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info["RANK"]
-    device = dist_info["DEVICE"]
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
+    device = comp_info.device
 
     step = _get_checkpoint_step(checkpoint_dir, step)
     step_dir = checkpoint_dir / _STEP_DIRNAME(step)
@@ -543,35 +560,36 @@ def load_checkpoint(
         log_error(f"Checkpoint directory {step_dir} does not exist for step {step}.", logger=logger, error_type=FileNotFoundError)
     metadata_path = step_dir / "checkpoint_meta.json"
     if metadata_path.exists():
-        metadata = _load_json(step_dir, "checkpoint_meta.json")
-        if load_optim and metadata.get("mode") != mode:
+        metadata = _load_checkpoint_metadata(step_dir)
+        optimizer_state_layout = _checkpoint_read_layout(optimizer_state_layout, metadata, comp_info.world_size)
+        if load_optim and metadata.get("optimizer_state_layout") != optimizer_state_layout:
             raise ValueError(
-                "Checkpoint optimizer mode does not match the requested mode: "
-                f"saved {metadata.get('mode')!r}, requested {mode!r}"
+                "Checkpoint optimizer state layout does not match the requested layout: "
+                f"saved {metadata.get('optimizer_state_layout')!r}, requested {optimizer_state_layout!r}"
             )
         if (
             load_optim
-            and mode == "shard"
-            and metadata.get("world_size") != dist_info.get("WORLD_SIZE", 1)
+            and optimizer_state_layout == "sharded"
+            and metadata.get("world_size") != comp_info.world_size
         ):
             raise ValueError(
                 "Sharded optimizer checkpoints must be resumed with the same "
                 f"world size: saved {metadata.get('world_size')}, current "
-                f"{dist_info.get('WORLD_SIZE', 1)}"
+                f"{comp_info.world_size}"
             )
 
     # Load the model state parameters
     model_data = None
     if load_model:
-        model_data = _load_state_dict(step_dir, _MODEL_DEFAULT_FILENAME[mode](rank), map_location=device)
+        model_data = _load_state_dict(step_dir, _MODEL_DEFAULT_FILENAME[optimizer_state_layout](rank), map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optim:
-        optimizer_data = _load_state_dict(step_dir, _OPT_DEFAULT_FILENAME[mode](rank), map_location=device)
+        optimizer_data = _load_state_dict(step_dir, _OPT_DEFAULT_FILENAME[optimizer_state_layout](rank), map_location=device)
     # Load the trainer state
     trainer_state = None
     if load_trainer:
-        trainer_filename = _TRAINER_DEFAULT_FILENAME[mode](rank)
+        trainer_filename = _TRAINER_DEFAULT_FILENAME[optimizer_state_layout](rank)
         if not (step_dir / trainer_filename).exists():
             trainer_filename = "trainer_state.json"
         trainer_state = TrainerState.model_validate(
@@ -601,7 +619,7 @@ def load_checkpoint(
     # Load the RNG state if requested
     rng_state = None
     if load_rng:
-        rng_filename = _RNG_DEFAULT_FILENAME[mode](rank)
+        rng_filename = _RNG_DEFAULT_FILENAME[optimizer_state_layout](rank)
         if not _resolve_state_path(step_dir / rng_filename).exists():
             rng_filename = "rng_state.safetensors"
         rng_state = _load_state_dict(
@@ -626,15 +644,15 @@ def build_model(
         step: Union[int, str] = -1, 
         phase: str = "train",
         source: _ModelSources = "base",
-        dist_info: Optional[Dict] = None,
-        mode: Optional[_Mode] = None,
+        comp_info: Optional[ComputeContext] = None,
+        optimizer_state_layout: Optional[_OptimizerStateLayout] = None,
      ) -> tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
-    if dist_info is None:
-        dist_info = get_dist_info()
-    if mode is None:
-        mode = "shard" if dist_info.get("IS_DDP_INITIALIZED", False) else "ddp"
-    device: torch.device = dist_info["DEVICE"]
+    if comp_info is None:
+        comp_info = get_comp_info()
+    if optimizer_state_layout is None:
+        optimizer_state_layout = "sharded" if comp_info.is_distributed else "full"
+    device: torch.device = comp_info.device
     model_cachedir = _solve_model_cache_dir(model_cachedir)
     run_name = _solve_run_name(model_cachedir / model_name, run_name=run_name)
     # get metaconfig
@@ -643,21 +661,22 @@ def build_model(
     # get checkpoint data
     ckpt_dir = model_cachedir / model_name / run_name / source
     if phase == "train":
-        trainer_config = TrainerConfig.model_validate(_load_state_dict(ckpt_dir, "training_config.safetensors", map_location="cpu", weight_only=False))
+        raw = _load_state_dict(ckpt_dir, "training_config.safetensors", map_location="cpu", weight_only=False)
+        trainer_config = TrainerConfig.model_validate(raw | {"comp_info": comp_info})
     load_scaler = (
-        dist_info.get("compute_dtype") == torch.float16
+        comp_info.compute_dtype == torch.float16
         and device.type == "cuda"
     )
     checkpoint_data = load_checkpoint(
         ckpt_dir,
         step,
-        dist_info=dist_info,
+        comp_info=comp_info,
         load_model=True,
         load_optim=phase == "train",
         load_trainer=True,
         load_scaler=load_scaler,
         load_rng=True,
-        mode=mode,
+        optimizer_state_layout=optimizer_state_layout,
     )
     if device.type in {"cpu", "mps"}:
         # Convert bfloat16 tensors to float for CPU inference
@@ -699,11 +718,11 @@ def load_model_from_dir(
         phase: Literal["train", "eval"] = "train",
         model_cachedir: Optional[Union[str, Path]] = None,
         source: _ModelSources = "base",
-        dist_info: Optional[Dict] = None,
+        comp_info: Optional[ComputeContext] = None,
     ) -> Tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
-    if dist_info is None:
-        dist_info = get_dist_info()
-    device = dist_info["DEVICE"]
+    if comp_info is None:
+        comp_info = get_comp_info()
+    device = comp_info.device
     model_cachedir = _solve_model_cache_dir(model_cachedir)
     model_dir = model_cachedir / model_name
     if run_name is None:
@@ -716,7 +735,7 @@ def load_model_from_dir(
         step = find_last_step(ckpt_dir)
     assert step is not None, f"No checkpoints found in {ckpt_dir}"
     # build the model
-    model, tokenizer, ckpt_data, trainer_config = build_model(model_name=model_name, run_name=run_name, model_cachedir=model_cachedir, step=step, phase=phase, source=source, dist_info=dist_info)
+    model, tokenizer, ckpt_data, trainer_config = build_model(model_name=model_name, run_name=run_name, model_cachedir=model_cachedir, step=step, phase=phase, source=source, comp_info=comp_info)
     log0(f"Loaded model from {ckpt_dir} with step {step}", logger=logger)
     return model, tokenizer, ckpt_data, trainer_config
 
@@ -726,13 +745,13 @@ def load_optimizer_state(
         run_name: Optional[Union[str, int]] = None, 
         model_cachedir: Optional[Union[str, Path]] = None, # should not be needed -> this should be CACHE_DIR / models
         step: Optional[int] = None,
-        mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[Dict] = None,
+        optimizer_state_layout: Literal["full", "sharded"] = "full",
+        comp_info: Optional[ComputeContext] = None,
     ) -> Optional[Dict]:
     """Load just the optimizer shard for a given rank, without re-loading the model."""
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info["RANK"]
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
     # resolve general checkpoint path
     model_dir = _solve_model_cache_dir(model_cachedir).joinpath(model_name)
 
@@ -743,16 +762,18 @@ def load_optimizer_state(
     if step is None:
         step = find_last_step(checkpoints_dir)
     
-    optimizer_path = (checkpoints_dir
-        .joinpath(_STEP_DIRNAME(step))
-        .joinpath(_OPT_DEFAULT_FILENAME[mode](rank)))
+    step_dir = checkpoints_dir / _STEP_DIRNAME(step)
+    if (step_dir / "checkpoint_meta.json").exists():
+        metadata = _load_checkpoint_metadata(step_dir)
+        optimizer_state_layout = _checkpoint_read_layout(optimizer_state_layout, metadata, comp_info.world_size)
+    optimizer_path = step_dir / _OPT_DEFAULT_FILENAME[optimizer_state_layout](rank)
     
     optimizer_path = _resolve_state_path(optimizer_path)
     if not optimizer_path.exists():
         log0(f"Optimizer checkpoint not found: {optimizer_path}")
         return None
     log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = _load_state_dict(optimizer_path, map_location=dist_info["DEVICE"])
+    optimizer_data = _load_state_dict(optimizer_path, map_location=comp_info.device)
     return optimizer_data
 
 # general class api to simply checkpoint management 
@@ -768,8 +789,8 @@ class CheckpointManager:
         model_run: Optional[Union[str, int]] = None,
         model_cachedir: Optional[Union[str, Path]] = None,
         source: _ModelSources = "base",
-        dist_info: Optional[Dict] = None,
-        mode: _Mode = "ddp",
+        comp_info: Optional[ComputeContext] = None,
+        optimizer_state_layout: _OptimizerStateLayout = "full",
     ) -> None:
         self.model_name = model_name
         self.model_run = model_run
@@ -777,10 +798,10 @@ class CheckpointManager:
         self.run_name = _solve_run_name(self.model_cachedir / self.model_name, run_name=model_run)
         self.source_dir = self.model_cachedir / self.model_name / self.run_name / source
         
-        self.dist_info = dist_info or get_dist_info()
-        self.mode = mode
-        self._rank = self.dist_info["RANK"]
-        self._device = self.dist_info["DEVICE"]
+        self.comp_info = comp_info or get_comp_info()
+        self.optimizer_state_layout = optimizer_state_layout
+        self._rank = self.comp_info.rank
+        self._device = self.comp_info.device
  
         self._ckpt_state: Optional[CheckpointState] = self._load_checkpoint_state()
     
@@ -797,7 +818,7 @@ class CheckpointManager:
             log0(f"No training config found at {path}.", logger=logger, level="warning")
             return None
         raw = _load_state_dict(path, map_location="cpu", weight_only=False)
-        return TrainerConfig.model_validate(raw)
+        return TrainerConfig.model_validate(raw | {"comp_info": self.comp_info})
     
     def save(
         self,
@@ -824,8 +845,8 @@ class CheckpointManager:
             optimizer=optimizer,
             checkpoint_state=self._ckpt_state,
             scaler=scaler,
-            mode=self.mode,
-            dist_info=self.dist_info,
+            optimizer_state_layout=self.optimizer_state_layout,
+            comp_info=self.comp_info,
         )
         if self._rank == 0:
             self._save_checkpoint_state()
@@ -840,9 +861,9 @@ class CheckpointManager:
         load_scaler: bool = True,
     ) -> CheckpointData:
         step = _get_checkpoint_step(self.source_dir, step)
-        ckpt_data = load_checkpoint(self.source_dir, step=step, dist_info=self.dist_info,
+        ckpt_data = load_checkpoint(self.source_dir, step=step, comp_info=self.comp_info,
             load_model=load_model, load_optim=load_optim, load_rng=load_rng,
-            load_scaler=load_scaler, mode=self.mode)
+            load_scaler=load_scaler, optimizer_state_layout=self.optimizer_state_layout)
         return ckpt_data 
     
     def load(self, step: _Step = "latest", phase: Literal["train", "eval"] = "train") -> Tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
@@ -854,8 +875,8 @@ class CheckpointManager:
             step=step,
             phase=phase,
             source=self.source_dir.name,
-            dist_info=self.dist_info,
-            mode=self.mode,
+            comp_info=self.comp_info,
+            optimizer_state_layout=self.optimizer_state_layout,
         )
         return model, tokenizer, ckpt_data, trainer_config
  
@@ -897,8 +918,8 @@ class CheckpointManager:
             model_name=meta_config.name,
             run_name=meta_config.run_name,
             model_cachedir=meta_config.dirname,
-            dist_info=self.dist_info,
-            mode=self.mode,
+            comp_info=self.comp_info,
+            optimizer_state_layout=self.optimizer_state_layout,
             model_config=meta_config.model_cfg,
             tokenizer_config=meta_config.tokenizer_cfg,
             trainer_config=trainer_config

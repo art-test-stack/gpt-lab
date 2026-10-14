@@ -5,14 +5,14 @@ def console(args):
     import torch
     from gpt_lab.model.checkpoint import build_model
     from gpt_lab.model.wrapper import Engine
-    from gpt_lab.utils.distributed import get_dist_info, get_device_type
+    from gpt_lab.utils.distributed import get_comp_info, get_device_type
     from gpt_lab.utils.schemas import GenerationConfig
 
     device = get_device_type() if args.device == 'auto' else args.device
     model, tokenizer, _, _ = build_model(
         model_name=args.model_name, run_name=args.run_name, model_cachedir=args.model_dir,
         step=args.checkpoint_step if args.checkpoint_step is not None else 'latest',
-        phase='eval', dist_info=get_dist_info(device_type=device),
+        phase='eval', comp_info=get_comp_info(device_type=device),
     )
     engine = Engine(model=model, tokenizer=tokenizer)
     print('Local greedy completion. Enter /exit or press Ctrl-D to quit.')
