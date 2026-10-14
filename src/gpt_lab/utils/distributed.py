@@ -98,6 +98,8 @@ class ComputeContext:
 
     @cached_property
     def device_name(self) -> str | None:
+        if self.device_type == "cpu":
+            return "cpu"
         if self.device_type == "cuda":
             return torch.cuda.get_device_name(self.device)
         if self.device_type == "mps":
@@ -115,6 +117,8 @@ class ComputeContext:
 
     @cached_property
     def gpu_peak_flops(self) -> float:
+        if self.device_type == "cpu":
+            return float("inf")
         return get_peak_flops(self.device_name) if self.device_name is not None else float("inf")
 
 

@@ -561,6 +561,8 @@ uv run torchrun --standalone --nproc-per-node=8 --no-python \
 Distributed utilities return a frozen `ComputeContext` through the
 `init_dist_groups()` and `get_comp_info()` functions. Pass it as `comp_info` and
 use attributes such as `.rank`, `.world_size`, `.device`, and `.compute_dtype`.
+For CPU runs, `.device_type` and `.device_name` both return `"cpu"`;
+`.gpu_peak_flops` remains unknown (`float("inf")`).
 Distributed runs use a one-dimensional PyTorch `DeviceMesh` named `"dp"`, exposed
 as `.dp_mesh`; single-device runs have no mesh or process group. CPU runs use
 Gloo and CUDA runs use NCCL. Distributed AdamW and Muon wait on async `Work`
