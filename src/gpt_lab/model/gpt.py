@@ -97,7 +97,7 @@ class DenseTransformer(BaseTransformer):
 
         # Value embeddings (ResFormer-style): alternating layers, last layer always include
         shared_value_embedding = None
-        if any("h_embs" in group for group in parse_embedding_groups(config.tie_embeddings)):
+        if any("value_embs" in group for group in parse_embedding_groups(config.tie_embeddings)):
             shared_value_embedding = nn.Embedding(padded_vocab_size, kv_dim)
         self.value_embeds = nn.ModuleDict({
             str(layer_idx): (
@@ -129,7 +129,7 @@ class DenseTransformer(BaseTransformer):
                 source = next(iter(self.value_embeds.values()))
             if "head" in group:
                 self.lm_head.weight = source.weight
-            if "h_embs" in group:
+            if "value_embs" in group:
                 for ve in self.value_embeds.values():
                     ve.weight = source.weight
 

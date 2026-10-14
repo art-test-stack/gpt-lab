@@ -22,24 +22,24 @@ def _config(**overrides):
 
 MODES = [
     ("embs;head", False, False, False, False),
-    ("embs;h_embs;head", False, False, False, False),
-    (";h_embs;", False, False, False, False),
-    ("embs;h_embs:;head", True, False, False, False),
+    ("embs;value_embs;head", False, False, False, False),
+    (";value_embs;", False, False, False, False),
+    ("embs;value_embs:;head", True, False, False, False),
     ("embs,head", False, True, False, False),
-    ("embs,head;h_embs:", True, True, False, False),
-    ("embs,head,h_embs:", True, True, True, True),
-    ("embs,head,h_embs", True, True, True, True),
-    ("embs,h_embs", True, False, True, False),
-    ("embs,h_embs:", True, False, True, False),
-    ("embs,h_embs;head", True, False, True, False),
-    ("head,h_embs:;embs", True, False, False, True),
-    ("h_embs,head", True, False, False, True),
-    ("h_embs:", True, False, False, False),
+    ("embs,head;value_embs:", True, True, False, False),
+    ("embs,head,value_embs:", True, True, True, True),
+    ("embs,head,value_embs", True, True, True, True),
+    ("embs,value_embs", True, False, True, False),
+    ("embs,value_embs:", True, False, True, False),
+    ("embs,value_embs;head", True, False, True, False),
+    ("head,value_embs:;embs", True, False, False, True),
+    ("value_embs,head", True, False, False, True),
+    ("value_embs:", True, False, False, False),
 ]
 
 
 def _sharing(config):
-    if config.tie_embeddings in ("embs;h_embs;head", "embs;head;h_embs"):
+    if config.tie_embeddings in ("embs;value_embs;head", "embs;head;value_embs"):
         return False, False, False, False
     return next(mode[1:] for mode in MODES if mode[0] == config.tie_embeddings)
 
@@ -118,7 +118,7 @@ def test_embedding_tying_lifecycle(mode, tmp_path):
 
 def test_full_tying_rejects_incompatible_value_width():
     with pytest.raises(ValueError, match="value and input embedding widths must match"):
-        _config(n_kv_heads=1, tie_embeddings="embs,head,h_embs:")
+        _config(n_kv_heads=1, tie_embeddings="embs,head,value_embs:")
 
 
 def test_frozen_configs_still_initialize_derived_fields():
@@ -133,7 +133,7 @@ def test_frozen_configs_still_initialize_derived_fields():
         config.d_model = 32
 
 
-@pytest.mark.parametrize("mode", ["embs;h_embs:;head", "embs,head", "embs,head;h_embs:"])
+@pytest.mark.parametrize("mode", ["embs;value_embs:;head", "embs,head", "embs,head;value_embs:"])
 def test_partial_tying_supports_gqa(mode):
     model = build_meta_model(_config(n_kv_heads=1, tie_embeddings=mode)).to_empty(device="cpu")
     model.init_weights()
@@ -174,7 +174,7 @@ def test_checkpoint_metadata_preserves_tying_mode(tmp_path, version, missing_fie
     path.write_text(json.dumps(json.dumps(metadata)))
     saved = path.read_text()
     restored = load_meta_config("demo", run_name="run", model_cachedir=tmp_path)
-    assert restored.model_cfg.tie_embeddings == ("embs,head;h_embs" if expected_tie else "embs;head;h_embs")
+    assert restored.model_cfg.tie_embeddings == ("embs,head;value_embs" if expected_tie else "embs;head;value_embs")
     assert restored.version == (version or "0.1.1")
     assert restored.git_info == metadata["git_info"]
     assert path.read_text() == saved
@@ -208,7 +208,7 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
         "demo", run_name="run", model_cachedir=tmp_path, step=7, phase="eval",
         comp_info=ComputeContext(device=torch.device("cpu")),
     )
-    assert restored.config.tie_embeddings == "embs;head;h_embs"
+    assert restored.config.tie_embeddings == "embs;head;value_embs"
     assert (step_dir / "model.safetensors").exists()
     assert (step_dir / f"model.{extension}").read_bytes() == original
     _assert_sharing(restored)
@@ -224,24 +224,24 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
     torch.testing.assert_close(reloaded(ids).logits, model(ids).logits, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("mode", ["embds", "h_embds", "embs:", "h_embs:1", "embs,,head", "embs;embs", "h_embs;h_embs:"])
+@pytest.mark.parametrize("mode", ["embds", "h_embds", "embs:", "value_embs:1", "embs,,head", "embs;embs", "value_embs;value_embs:"])
 def test_embedding_tying_rejects_invalid_syntax(mode):
     with pytest.raises(ValueError):
         _config(tie_embeddings=mode)
 
 
-@pytest.mark.parametrize("mode", ["embs,h_embs", "head,h_embs:"])
+@pytest.mark.parametrize("mode", ["embs,value_embs", "head,value_embs:"])
 def test_value_tying_rejects_incompatible_width(mode):
     with pytest.raises(ValueError, match="widths must match"):
         _config(n_kv_heads=1, tie_embeddings=mode)
 
 
 @pytest.mark.parametrize("flags,expected", [
-    ({}, "embs;head;h_embs"),
-    ({"tie_value_embeddings": True}, "embs;head;h_embs:"),
-    ({"tie_word_embeddings": True}, "embs,head;h_embs"),
-    ({"tie_value_embeddings": True, "tie_word_embeddings": True}, "embs,head;h_embs:"),
-    ({"tie_all_embeddings": True}, "embs,head,h_embs:"),
+    ({}, "embs;head;value_embs"),
+    ({"tie_value_embeddings": True}, "embs;head;value_embs:"),
+    ({"tie_word_embeddings": True}, "embs,head;value_embs"),
+    ({"tie_value_embeddings": True, "tie_word_embeddings": True}, "embs,head;value_embs:"),
+    ({"tie_all_embeddings": True}, "embs,head,value_embs:"),
 ])
 def test_checkpoint_migrates_boolean_tying(flags, expected):
     from gpt_lab.model.checkpoint import _migrate_model_config

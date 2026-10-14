@@ -189,7 +189,7 @@ def test_deprecated_kv_head_alias_maps_to_head_count(tmp_path):
     assert config.n_kv_heads == 2
 
 
-@pytest.mark.parametrize("mode", ["h_embs:", "embs,head", "embs,head,h_embs:"])
+@pytest.mark.parametrize("mode", ["value_embs:", "embs,head", "embs,head,value_embs:"])
 def test_auto_config_forwards_embedding_tying(tmp_path, mode):
     config = _auto_config(tmp_path, tie_embeddings=mode)
     for depth in (config.depth, config.reference_depth()):

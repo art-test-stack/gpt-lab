@@ -38,7 +38,7 @@ def add_auto_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--aspect-ratio', type=float, default=64, help='Aspect ratio for auto-configured models.')
     parser.add_argument('--d-head', type=int, default=128, help='Dimension of each attention head for auto-configured models. If not set, will be determined by aspect ratio and model depth.')
     parser.add_argument('--n-kv-heads', '--d-kv-head', dest='n_kv_heads', type=int, default=None, help='Number of key/value heads for GQA; None uses the query head count. --d-kv-head is a deprecated alias.')
-    parser.add_argument('--tie-embeddings', type=str, default='embs;h_embs;head', help='Embedding groups: comma ties, semicolon separates. Names: embs, head, h_embs. Standalone h_embs: ties all value tables; bare h_embs leaves them separate. Quote the string in the shell.')
+    parser.add_argument('--tie-embeddings', type=str, default='embs;value_embs;head', help='Embedding groups: comma ties, semicolon separates. Names: embs, head, value_embs. Standalone value_embs: ties all value tables; bare value_embs leaves them separate. Quote the string in the shell.')
     parser.add_argument('--window-pattern', type=str, default=None, help="Window pattern for sliding attention window. String of 'S' and 'L'. If 'None', will be later set as 'SSSL'.")
     parser.add_argument('--window-size', type=str, default=None, help='Window size for pattern smalls (S).')
     parser.add_argument('--softcap', type=float, default=18.0, help='Soft cap for model logits to prevent overflow.')

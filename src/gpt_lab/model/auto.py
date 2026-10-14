@@ -79,7 +79,7 @@ class AutoGPTConfig(BaseModel):
     aspect_ratio: int = 64
     d_head: int = 2**9 # 512
     n_kv_heads: Optional[int] = None
-    tie_embeddings: str = "embs;h_embs;head"
+    tie_embeddings: str = "embs;value_embs;head"
     # Deprecated compatibility alias. The old field was named as a dimension
     # but was always consumed as a head count.
     d_kv_head: Optional[int] = Field(default=None, exclude=True)

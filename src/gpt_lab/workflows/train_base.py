@@ -67,7 +67,7 @@ def train_base(
     aspect_ratio=64,
     d_head=128,
     n_kv_heads=None,
-    tie_embeddings="embs;h_embs;head",
+    tie_embeddings="embs;value_embs;head",
     window_pattern=None,
     window_size=None,
     softcap=18.0,

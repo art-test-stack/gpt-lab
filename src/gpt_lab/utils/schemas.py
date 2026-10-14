@@ -248,7 +248,7 @@ class DownloadConfig(BaseConfig):
     max_shards: int = 1000
 
 def parse_embedding_groups(value: str) -> list[tuple[str, ...]]:
-    """Return shared groups; a standalone bare h_embs leaves values separate."""
+    """Return shared groups; a standalone bare value_embs leaves values separate."""
     groups = []
     seen = set()
     for part in value.split(";"):
@@ -257,12 +257,12 @@ def parse_embedding_groups(value: str) -> list[tuple[str, ...]]:
         tokens = [token.strip() for token in part.split(",")]
         names = [token.removesuffix(":") for token in tokens]
         for token, name in zip(tokens, names):
-            if token not in ("embs", "head", "h_embs", "h_embs:"):
-                raise ValueError(f"Unknown embedding name {token!r}; use embs, head, h_embs or h_embs:")
+            if token not in ("embs", "head", "value_embs", "value_embs:"):
+                raise ValueError(f"Unknown embedding name {token!r}; use embs, head, value_embs or value_embs:")
             if name in seen:
                 raise ValueError(f"Duplicate embedding name {name!r}")
             seen.add(name)
-        if len(names) > 1 or tokens == ["h_embs:"]:
+        if len(names) > 1 or tokens == ["value_embs:"]:
             groups.append(tuple(names))
     return groups
 
@@ -286,7 +286,7 @@ class TransformerConfig(BaseModel):
     n_kv_heads: Optional[int] = None # GQA
     n_layers: int = NUM_LAYERS
     d_head: int = DIM_HEAD  # dim_model // num_heads
-    tie_embeddings: str = "embs;h_embs;head"
+    tie_embeddings: str = "embs;value_embs;head"
 
     dropout: float = .0 # DROPOUT
     attention_dropout: Optional[float] = None
@@ -322,9 +322,9 @@ class TransformerConfig(BaseModel):
         
         object.__setattr__(self, "n_kv_heads", self.n_kv_heads or self.n_heads)
         groups = parse_embedding_groups(self.tie_embeddings)
-        if any("h_embs" in group and len(group) > 1 for group in groups) and self.n_kv_heads * self.d_head != self.d_model:
+        if any("value_embs" in group and len(group) > 1 for group in groups) and self.n_kv_heads * self.d_head != self.d_model:
             raise ValueError(
-                "Tying h_embs to embs or head requires n_kv_heads * d_head == d_model; "
+                "Tying value_embs to embs or head requires n_kv_heads * d_head == d_model; "
                 "value and input embedding widths must match"
             )
         if self.n_kv_heads != self.n_heads:

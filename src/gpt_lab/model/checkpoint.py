@@ -351,10 +351,10 @@ def _migrate_model_config(model_cfg: Dict, version: Optional[str]) -> None:
     tie_word = model_cfg.pop("tie_word_embeddings", False) and not legacy_noop
     tie_all = model_cfg.pop("tie_all_embeddings", False) and not legacy_noop
     if tie_all:
-        model_cfg["tie_embeddings"] = "embs,head,h_embs:"
+        model_cfg["tie_embeddings"] = "embs,head,value_embs:"
     else:
         word_group = "embs,head" if tie_word else "embs;head"
-        value_group = "h_embs:" if tie_values and not legacy_noop else "h_embs"
+        value_group = "value_embs:" if tie_values and not legacy_noop else "value_embs"
         model_cfg["tie_embeddings"] = f"{word_group};{value_group}"
 
 def load_meta_config(
