@@ -24,6 +24,13 @@ from gpt_lab.utils.schemas import TrainerConfig
 from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
 
 
+def test_cpu_device_name():
+    context = ComputeContext(device=torch.device("cpu"))
+    assert context.device_type == "cpu"
+    assert context.device_name == "cpu"
+    assert context.gpu_peak_flops == float("inf")
+
+
 @pytest.mark.parametrize("chip, cores, peak", [
     ("Apple M2", "10", 3.6e12),
     ("Apple M2", "8", float("inf")),
