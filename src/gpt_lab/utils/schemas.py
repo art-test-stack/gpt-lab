@@ -247,6 +247,26 @@ class DownloadConfig(BaseConfig):
     num_workers: int = 4
     max_shards: int = 1000
 
+def parse_embedding_groups(value: str) -> list[tuple[str, ...]]:
+    """Return shared groups; a standalone bare h_embs leaves values separate."""
+    groups = []
+    seen = set()
+    for part in value.split(";"):
+        if not part.strip():
+            continue
+        tokens = [token.strip() for token in part.split(",")]
+        names = [token.removesuffix(":") for token in tokens]
+        for token, name in zip(tokens, names):
+            if token not in ("embs", "head", "h_embs", "h_embs:"):
+                raise ValueError(f"Unknown embedding name {token!r}; use embs, head, h_embs or h_embs:")
+            if name in seen:
+                raise ValueError(f"Duplicate embedding name {name!r}")
+            seen.add(name)
+        if len(names) > 1 or tokens == ["h_embs:"]:
+            groups.append(tuple(names))
+    return groups
+
+
 class TransformerConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     tf_type: TfTypes = "dense"
@@ -266,9 +286,7 @@ class TransformerConfig(BaseModel):
     n_kv_heads: Optional[int] = None # GQA
     n_layers: int = NUM_LAYERS
     d_head: int = DIM_HEAD  # dim_model // num_heads
-    tie_value_embeddings: bool = False
-    tie_word_embeddings: bool = False
-    tie_all_embeddings: bool = False
+    tie_embeddings: str = "embs;h_embs;head"
 
     dropout: float = .0 # DROPOUT
     attention_dropout: Optional[float] = None
@@ -303,9 +321,10 @@ class TransformerConfig(BaseModel):
                  "This may lead to unexpected behavior in attention mechanisms.", level="warning", logger=logger)
         
         object.__setattr__(self, "n_kv_heads", self.n_kv_heads or self.n_heads)
-        if self.tie_all_embeddings and self.n_kv_heads * self.d_head != self.d_model:
+        groups = parse_embedding_groups(self.tie_embeddings)
+        if any("h_embs" in group and len(group) > 1 for group in groups) and self.n_kv_heads * self.d_head != self.d_model:
             raise ValueError(
-                "tie_all_embeddings requires n_kv_heads * d_head == d_model; "
+                "Tying h_embs to embs or head requires n_kv_heads * d_head == d_model; "
                 "value and input embedding widths must match"
             )
         if self.n_kv_heads != self.n_heads:

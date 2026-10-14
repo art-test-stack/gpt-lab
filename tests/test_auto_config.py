@@ -189,13 +189,13 @@ def test_deprecated_kv_head_alias_maps_to_head_count(tmp_path):
     assert config.n_kv_heads == 2
 
 
-@pytest.mark.parametrize("flag", ["tie_value_embeddings", "tie_word_embeddings", "tie_all_embeddings"])
-def test_auto_config_forwards_embedding_tying(tmp_path, flag):
-    config = _auto_config(tmp_path, **{flag: True})
+@pytest.mark.parametrize("mode", ["h_embs:", "embs,head", "embs,head,h_embs:"])
+def test_auto_config_forwards_embedding_tying(tmp_path, mode):
+    config = _auto_config(tmp_path, tie_embeddings=mode)
     for depth in (config.depth, config.reference_depth()):
         model_cfg = config.build_transformer_config(depth, 4096)
-        assert getattr(model_cfg, flag)
-        assert model_cfg.model_dump()[flag]
+        assert model_cfg.tie_embeddings == mode
+        assert model_cfg.model_dump()["tie_embeddings"] == mode
 
 
 def test_cli_batch_and_horizon_override_automatic_sizing(monkeypatch, tmp_path):

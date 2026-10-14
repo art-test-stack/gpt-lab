@@ -338,16 +338,24 @@ def _migrate_model_config(model_cfg: Dict, version: Optional[str]) -> None:
     Functional embedding tying starts at 0.1.1. For ambiguous 0.1.0 or
     unversioned metadata, missing tying fields identify the old no-op flag.
     """
-    saved_version = Version(version) if version is not None else None
-    if saved_version is not None and saved_version >= Version("0.1.1"):
+    if "tie_embeddings" in model_cfg:
         return
-    # 0.1.0 and unversioned checkpoints may predate or include functional tying.
-    if (
+    saved_version = Version(version) if version is not None else None
+    legacy_noop = (
+        saved_version is None or saved_version < Version("0.1.1")
+    ) and (
         (saved_version is not None and saved_version < Version("0.1.0"))
         or ("tie_value_embeddings" not in model_cfg and "tie_all_embeddings" not in model_cfg)
-    ):
-        # The legacy tie_word_embeddings flag was a no-op.
-        model_cfg["tie_word_embeddings"] = False
+    )
+    tie_values = model_cfg.pop("tie_value_embeddings", False)
+    tie_word = model_cfg.pop("tie_word_embeddings", False) and not legacy_noop
+    tie_all = model_cfg.pop("tie_all_embeddings", False) and not legacy_noop
+    if tie_all:
+        model_cfg["tie_embeddings"] = "embs,head,h_embs:"
+    else:
+        word_group = "embs,head" if tie_word else "embs;head"
+        value_group = "h_embs:" if tie_values and not legacy_noop else "h_embs"
+        model_cfg["tie_embeddings"] = f"{word_group};{value_group}"
 
 def load_meta_config(
         name: str, 

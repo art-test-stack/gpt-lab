@@ -87,7 +87,7 @@ def test_important_training_defaults():
     expected = dict(model_init='auto', model_name='ic1', run_name=None, max_seq_len=2048,
                     random_seed=42, board='wandb', ds_name='climbmix-base', depth=12,
                     aspect_ratio=64, d_head=128, n_kv_heads=None, softcap=18.0,
-                    tie_value_embeddings=False, tie_word_embeddings=False, tie_all_embeddings=False,
+                    tie_embeddings="embs;h_embs;head",
                     attn_softcap=None, attn_impl='sdpa', device_batch_size=32,
                     vocab_size=-1, num_steps=-1, target_param_data_ratio=11.0,
                     n_acc_steps=-1, total_batch_size=-1, warmup_steps=40,
@@ -114,7 +114,7 @@ def test_resume_step_parsing(value, expected):
 
 @pytest.mark.parametrize('option', [
     '--depth 4', '--max-seq-len 128', '--d-head 64', '--n-kv-heads 2',
-    '--vocab-size 4096', '--tokenizer-model gpt2', '--tie-all-embeddings',
+    '--vocab-size 4096', '--tokenizer-model gpt2', '--tie-embeddings embs,head',
 ])
 def test_resume_rejects_architecture_options(option):
     with pytest.raises(SystemExit) as error:
