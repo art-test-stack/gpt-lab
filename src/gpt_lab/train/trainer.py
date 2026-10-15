@@ -436,22 +436,7 @@ class Trainer:
             
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
 
-            if self.scaler is not None:
-                self.scaler.unscale_(self.optimizer)
-                if self.config.comp_info.is_distributed:
-                    for g in self.scaler._found_inf_per_device(self.optimizer).values():
-                        dist.all_reduce(g, op=dist.ReduceOp.MAX)
-
-            if self.config.monitor_grad_norms and should_log_step:
-                self.log_gradients()
-
-            if self.scaler is not None:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-            
-            self._compiled_model.zero_grad(set_to_none=True)
+            self.optimizer_step(should_log_step)
 
             self.synchronize()
             step_end_time = time.perf_counter()
@@ -562,6 +547,29 @@ class Trainer:
         
         # Final checkpoint
         self.save_checkpoint()
+
+    def optimizer_step(self, should_log_step: bool):
+        """Apply accumulated gradients, update the scaler, and clear gradients.
+
+        Override this method to customize the optimizer update. Hyperparameter
+        scheduling stays in train(); monitoring uses unscaled gradients.
+        """
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+            if self.config.comp_info.is_distributed:
+                for g in self.scaler._found_inf_per_device(self.optimizer).values():
+                    dist.all_reduce(g, op=dist.ReduceOp.MAX)
+
+        if self.config.monitor_grad_norms and should_log_step:
+            self.log_gradients()
+
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+
+        self._compiled_model.zero_grad(set_to_none=True)
 
     def evaluate_bpb(self):
         """Run BPB validation, log metrics, and update the best checkpoint.
