@@ -13,8 +13,6 @@ from typing import Any, Optional, Callable, Union
 from pathlib import Path
 from contextlib import ExitStack, contextmanager, nullcontext
 
-import numpy as np
-
 import time
 import gc
 import math
@@ -27,10 +25,9 @@ import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 
 from gpt_lab.utils.board import Board
-from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
 from gpt_lab.utils.distributed import ComputeContext, _DTYPE_MAP, get_comp_info
 from gpt_lab.utils.common import print0
-from gpt_lab.utils.logging import log_error, log_critical, log0, log_dict
+from gpt_lab.utils.logging import log_error, log0, log_dict
 from gpt_lab.utils.schemas import (
     CheckpointState,
     COREMetrics,
