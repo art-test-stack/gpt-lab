@@ -56,19 +56,42 @@ class MuonStrategy(OptimizerStrategy):
         if not params:
             return {"work": None, "grad_chunk": None}
 
+        return self._reduce_bucket(group, list(range(len(params))), world_size)
+
+    def _reduce_bucket(
+        self, group: dict, param_indices: list[int], world_size: int,
+    ) -> dict:
+        """Reduce whole matrices to their original group owners.
+
+        All ranks must supply the same nonempty index list and collective order.
+        owner_positions maps received matrices to the existing local state slots.
+        """
+        params = group["params"]
+        if not param_indices or len(set(param_indices)) != len(param_indices):
+            raise ValueError("Muon buckets require nonempty, unique parameter indices")
+        if any(index < 0 or index >= len(params) for index in param_indices):
+            raise ValueError("Muon bucket parameter index is outside the optimizer group")
+
+        owner_chunk_size = (len(params) + world_size - 1) // world_size
+        indices_by_owner = [[] for _ in range(world_size)]
+        for index in param_indices:
+            indices_by_owner[index // owner_chunk_size].append(index)
+
         average = dist.get_backend() == "gloo"
         reduce_op = dist.ReduceOp.SUM if average else dist.ReduceOp.AVG
-        
-        chunk_size = (len(params) + world_size - 1) // world_size
+
+        chunk_size = max(len(indices) for indices in indices_by_owner)
         padded = chunk_size * world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
-        
-        grad_stack = torch.stack([p.grad for p in params])
+
         stacked_grads = torch.empty(padded, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(grad_stack)
-        if len(params) < padded:
-            stacked_grads[len(params):].zero_()
+        for owner, indices in enumerate(indices_by_owner):
+            start = owner * chunk_size
+            if indices:
+                gradients = torch.stack([params[index].grad for index in indices])
+                stacked_grads[start:start + len(indices)].copy_(gradients)
+            stacked_grads[start + len(indices):start + chunk_size].zero_()
         
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         work = dist.reduce_scatter_tensor(
@@ -81,6 +104,10 @@ class MuonStrategy(OptimizerStrategy):
             "grad_chunk": grad_chunk,
             "stacked_grads": stacked_grads,
             "chunk_size": chunk_size,
+            "owner_positions": [
+                index % owner_chunk_size
+                for index in indices_by_owner[dist.get_rank()]
+            ],
         }
     
     def dist_compute(

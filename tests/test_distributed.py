@@ -189,3 +189,51 @@ def test_two_process_gloo_optimizer_matches_averaged_local_updates():
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     mp.spawn(_optimizer_worker, args=(port,), nprocs=2, join=True)
+
+
+def _muon_bucket_worker(rank, port):
+    from gpt_lab.optim.strategies.muon import MuonStrategy
+
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2",
+                      MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
+                      GLOO_SOCKET_IFNAME="lo0" if sys.platform == "darwin" else "lo")
+    dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+    try:
+        params = [torch.nn.Parameter(torch.zeros(2, 3)) for _ in range(5)]
+        for index, parameter in enumerate(params):
+            parameter.grad = torch.full_like(parameter, index + 2 * rank)
+        strategy = MuonStrategy(None)
+        # Original owners are [0, 0, 0, 1, 1], even for reordered buckets.
+        owned_count = 3 if rank == 0 else 2
+        assembled = torch.empty(owned_count, 2, 3)
+        seen_positions = []
+        for indices in ([4, 1, 3], [2, 0]):
+            info = strategy._reduce_bucket({"params": params}, indices, 2)
+            info["work"].wait()
+            assert info["average"]
+            averaged = info["grad_chunk"] / 2
+            expected_indices = [index for index in indices if index // 3 == rank]
+            assert info["owner_positions"] == [index % 3 for index in expected_indices]
+            for slot, (index, position) in enumerate(zip(expected_indices, info["owner_positions"])):
+                torch.testing.assert_close(averaged[slot], torch.full((2, 3), index + 1.0))
+                assembled[position].copy_(averaged[slot])
+            torch.testing.assert_close(
+                averaged[len(expected_indices):],
+                torch.zeros_like(averaged[len(expected_indices):]),
+            )
+            seen_positions.extend(info["owner_positions"])
+        assert sorted(seen_positions) == list(range(owned_count))
+        expected = torch.stack([
+            torch.full((2, 3), rank * 3 + position + 1.0)
+            for position in range(owned_count)
+        ])
+        torch.testing.assert_close(assembled, expected)
+    finally:
+        cleanup_dist_groups()
+
+
+def test_two_process_gloo_muon_buckets_preserve_owners():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    mp.spawn(_muon_bucket_worker, args=(port,), nprocs=2, join=True)
