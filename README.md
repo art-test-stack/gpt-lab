@@ -583,10 +583,11 @@ for module-mode launches and checkpoint selection.
 
 #### Customizing the trainer
 
-Subclass [`Trainer`](src/gpt_lab/train/trainer.py) and override `prepare_batch`,
-`compute_loss`, `optimizer_step`, or individual `evaluate_bpb`, `evaluate_core`,
-and `evaluate_samples` methods. The main loop keeps scheduling, accumulation,
-and backward. Use `self.compiled_model` for training forwards.
+Subclass [`Trainer`](src/gpt_lab/train/trainer.py) and override `train_step` for a
+complete update, or `prepare_batch`, `compute_loss`, and `optimizer_step` for
+smaller changes. Override `evaluate_bpb`, `evaluate_core`, and `evaluate_samples`
+independently; the main loop schedules evaluations. Use `self.compiled_model`
+for training forwards.
 See the class docstring for contracts and
 [`DistillationTrainer`](src/gpt_lab/train/distillation.py) for an example.
 

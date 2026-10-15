@@ -256,6 +256,57 @@ class _PayloadTrainer(Trainer):
 
 
 @pytest.mark.fast
+def test_train_step_matches_accumulated_update_and_preserves_prefetch_state(tmp_path):
+    trainer, model, _ = _make_trainer(
+        tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer,
+    )
+    trainer.compiled_model = model
+    trainer.config = trainer.config.model_copy(update={"n_acc_steps": 2})
+    trainer.state.step = 7
+    trainer.lr_schedule = lambda step: 0.75
+    trainer.muon_momentum_schedule = lambda step: 0.95
+    trainer.weight_decay_schedule = lambda step: 0.25
+    trainer.optimizer.update_hyperparams = Mock()
+    trainer.optimizer_step = Mock(wraps=trainer.optimizer_step)
+    batches = [dict(features=torch.full((2, 2), float(i + 1)),
+                    targets=torch.zeros(2, 2), tokens=3 + i,
+                    state=DataLoaderState(epoch=i + 1, offset_in_row_group=i))
+               for i in range(4)]
+    reference = torch.nn.Linear(2, 2, bias=False)
+    reference.load_state_dict(model.state_dict())
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+    expected_loss = sum(
+        (reference(batch["features"]) - batch["targets"]).square().mean()
+        for batch in batches[:2]
+    ) / 2
+    expected_loss.backward()
+    reference_optimizer.step()
+    train_iter = iter(batches)
+    batch = trainer.prepare_batch(next(train_iter))
+
+    next_batch, metrics = trainer.train_step(train_iter, batch, should_log_step=True)
+
+    torch.testing.assert_close(model.weight, reference.weight)
+    assert model.weight.grad is None
+    torch.testing.assert_close(metrics["loss"], expected_loss.detach())
+    assert not metrics["loss"].requires_grad
+    assert metrics["tokens"] == 7
+    assert metrics["step_time"] >= 0
+    assert (metrics["lrm"], metrics["muon_momentum"], metrics["weight_decay"]) == (0.75, 0.95, 0.25)
+    trainer.optimizer.update_hyperparams.assert_called_once_with(
+        lrm=0.75, muon_momentum=0.95, weight_decay=0.25,
+    )
+    trainer.optimizer_step.assert_called_once_with(True)
+    assert trainer.state.train_loader_state is batches[1]["state"]
+    assert next_batch[0] is batches[2]
+    assert next_batch[1] is batches[2]["state"]
+    assert next_batch[2] == batches[2]["tokens"]
+    assert next(train_iter) is batches[3]
+    # Preserve the existing epoch update from the prefetched batch.
+    assert trainer.state.n_epochs == batches[2]["state"].epoch
+
+
+@pytest.mark.fast
 @pytest.mark.parametrize("with_state", [False, True])
 def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
     tmp_path, monkeypatch, caplog, with_state,

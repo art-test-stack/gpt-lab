@@ -87,6 +87,10 @@ class Trainer:
     - Memory optimization with gc management
 
     Subclass extension points:
+        train_step(train_iter, batch, should_log_step):
+            Run one complete update, including accumulation, backward, prefetch,
+            hyperparameter scheduling, optimizer update, and timing. Return the
+            next prepared batch and a step_metrics dict; see the method contract.
         prepare_batch(raw_batch):
             Return (payload, state, local_token_count) per microbatch. The default
             accepts (x, y, state) or (x, y), producing payload=(x, y) and counting
@@ -94,14 +98,14 @@ class Trainer:
             on the first batch triggers a warning; checkpoints record None for
             batches without state and cannot restore their dataloader position.
         compute_loss(payload):
-            Return a scalar loss connected to the computation graph. The loop
+            Return a scalar loss connected to the computation graph. train_step
             supplies autocast, divides by n_acc_steps, and performs backward.
             Override together with prepare_batch for custom payload formats.
         optimizer_step(should_log_step):
             Apply accumulated gradients and clear them. The default unscales
             gradients, synchronizes distributed overflow flags, optionally logs
             gradients, updates the optimizer/scaler, and clears gradients.
-            Hyperparameter scheduling stays in train().
+            Hyperparameter scheduling stays in train_step().
         evaluate_bpb(), evaluate_core(), evaluate_samples():
             Replace evaluations independently; their scheduling stays in train().
             Each override owns model modes, evaluation contexts, and any logging,
@@ -338,7 +342,6 @@ class Trainer:
         n_steps = self.config.n_steps
         n_flops_per_token = self.config.n_flops_per_token
         total_batch_size = self.config.total_batch_size
-        n_acc_steps = self.config.n_acc_steps
 
         world_size = self.config.comp_info.world_size
         
@@ -355,7 +358,8 @@ class Trainer:
         if self.config.comp_info.is_distributed:
             dist.barrier()
 
-        payload, dataloader_state, token_count = self.prepare_batch(next(train_iter)) # prefetch
+        batch = self.prepare_batch(next(train_iter)) # prefetch
+        _, dataloader_state, _ = batch
 
         print(f"[rank={rank}] after prefetch", flush=True)
         if dataloader_state is None:
@@ -430,65 +434,24 @@ class Trainer:
             # Training step with gradient accumulation
             # ================================================================
 
-            loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
+            batch, step_metrics = self.train_step(train_iter, batch, should_log_step)
 
-            eff_global_tokens = 0
-
-            self.synchronize()
-            step_start_time = time.perf_counter()
-            
-            for _ in range(n_acc_steps):
-                eff_global_tokens += token_count * world_size
-
-                self.state.train_loader_state = dataloader_state
-                with self.train_context():
-                    loss = self.compute_loss(payload)
-                loss = loss / n_acc_steps
-
-                if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-
-                loss_accum.add_(loss.detach().float())
-
-                if torch.isnan(loss_accum) or torch.isinf(loss_accum):
-                    from gpt_lab.utils.tensor_io import save_tensor_state
-                    try:
-                        save_tensor_state({"payload": payload}, self.dirname / "bad_batch.safetensors")
-                    except TypeError:
-                        log0("Bad-batch payload cannot be serialized; see the loss error for details.", level="warning", logger=logger)
-                    log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
-                        f"Loss is NaN or Inf at {step=}.\n" \
-                        f"Dataloader state: {dataloader_state}.\n" \
-                        f"Batch payload: {payload}\n" \
-                        f"Accumulated loss: {loss_accum}",
-                        error_type=ValueError, logger=logger  
-                    )
-                payload, dataloader_state, token_count = self.prepare_batch(next(train_iter))
-            
-            if dataloader_state is not None:
-                self.state.n_epochs = dataloader_state.epoch
-            
-            lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
-
-            self.optimizer_step(should_log_step)
-
-            self.synchronize()
-            step_end_time = time.perf_counter()
-            
             # ================================================================
             # Logging and metrics
             # ================================================================
             
-            step_dt_tensor = torch.tensor(step_end_time - step_start_time, device=self.device)
+            step_dt_tensor = torch.tensor(step_metrics["step_time"], device=self.device)
 
             if self.config.comp_info.is_distributed:
                 dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
 
             step_dt = step_dt_tensor.item()
 
-            loss_accum = loss_accum.item()
+            loss_accum = step_metrics["loss"].item()
+            eff_global_tokens = step_metrics["tokens"]
+            lrm = step_metrics["lrm"]
+            muon_momentum = step_metrics["muon_momentum"]
+            weight_decay = step_metrics["weight_decay"]
             
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
             debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
@@ -584,11 +547,82 @@ class Trainer:
         # Final checkpoint
         self.save_checkpoint()
 
+    def train_step(self, train_iter, batch, should_log_step: bool):
+        """Run one optimizer update and return (next_batch, step_metrics).
+
+        batch and next_batch are prepared (payload, state, local_token_count)
+        tuples. Accumulate config.n_acc_steps microbatches, preserving the last
+        consumed state for checkpoints and prefetching the next batch.
+
+        step_metrics keys are loss (detached accumulated tensor), tokens (global
+        count), step_time (local seconds), lrm, muon_momentum, and weight_decay. Timing
+        covers accumulation, prefetch, scheduling, and the optimizer update;
+        reduction across ranks remains in the metrics block in train().
+        """
+        step = self.state.step
+        n_acc_steps = self.config.n_acc_steps
+        world_size = self.config.comp_info.world_size
+        payload, dataloader_state, token_count = batch
+        loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
+
+        eff_global_tokens = 0
+
+        self.synchronize()
+        step_start_time = time.perf_counter()
+
+        for _ in range(n_acc_steps):
+            eff_global_tokens += token_count * world_size
+
+            self.state.train_loader_state = dataloader_state
+            with self.train_context():
+                loss = self.compute_loss(payload)
+            loss = loss / n_acc_steps
+
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            loss_accum.add_(loss.detach().float())
+
+            if torch.isnan(loss_accum) or torch.isinf(loss_accum):
+                from gpt_lab.utils.tensor_io import save_tensor_state
+                try:
+                    save_tensor_state({"payload": payload}, self.dirname / "bad_batch.safetensors")
+                except TypeError:
+                    log0("Bad-batch payload cannot be serialized; see the loss error for details.", level="warning", logger=logger)
+                log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
+                    f"Loss is NaN or Inf at {step=}.\n" \
+                    f"Dataloader state: {dataloader_state}.\n" \
+                    f"Batch payload: {payload}\n" \
+                    f"Accumulated loss: {loss_accum}",
+                    error_type=ValueError, logger=logger
+                )
+            payload, dataloader_state, token_count = self.prepare_batch(next(train_iter))
+
+        if dataloader_state is not None:
+            self.state.n_epochs = dataloader_state.epoch
+
+        lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
+
+        self.optimizer_step(should_log_step)
+
+        self.synchronize()
+        step_end_time = time.perf_counter()
+        return (payload, dataloader_state, token_count), {
+            "loss": loss_accum,
+            "tokens": eff_global_tokens,
+            "step_time": step_end_time - step_start_time,
+            "lrm": lrm,
+            "muon_momentum": muon_momentum,
+            "weight_decay": weight_decay,
+        }
+
     def optimizer_step(self, should_log_step: bool):
         """Apply accumulated gradients, update the scaler, and clear gradients.
 
         Override this method to customize the optimizer update. Hyperparameter
-        scheduling stays in train(); monitoring uses unscaled gradients.
+        scheduling stays in train_step(); monitoring uses unscaled gradients.
         """
         if self.scaler is not None:
             self.scaler.unscale_(self.optimizer)
@@ -745,7 +779,7 @@ class Trainer:
         """Return a scalar loss connected to the computation graph.
 
         Override this method to use a different training objective. The training
-        loop supplies autocast, gradient accumulation scaling, and backward.
+        step supplies autocast, gradient accumulation scaling, and backward.
         The payload comes from prepare_batch. By default, unpack (x, y) and use
         the model's loss or compute cross-entropy from logits.
         """
