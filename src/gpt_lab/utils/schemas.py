@@ -775,7 +775,8 @@ class TrainerState(BaseModel):
     n_epochs: float = 0.0
     total_training_time: float = 0.0
     smooth_train_loss: float = 0.0
-    train_loader_state: Union[DataLoaderState, Dict] = Field(default_factory=DataLoaderState)
+    # None explicitly records that the dataloader position cannot be resumed.
+    train_loader_state: Optional[DataLoaderState] = Field(default_factory=DataLoaderState)
 
 class CheckpointState(BaseModel):
     # Evaluation tracking
