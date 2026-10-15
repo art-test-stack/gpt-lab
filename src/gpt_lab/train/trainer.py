@@ -364,96 +364,18 @@ class Trainer:
                 (self.config.eval_bpb_every > 0 and step > 0 and # eval every eval_bpb_every steps except the first step
                 (last_step or step % self.config.eval_bpb_every == 0)) 
             ):
-                start_bpb_eval = time.time()
-                self._compiled_model.eval()
-                tokens_per_eval_step = (
-                    self.config.device_batch_size
-                    * self.model.config.max_context
-                    * self.config.comp_info.world_size
-                )
-                eval_steps = max(
-                    1,
-                    math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
-                )
-                with self.val_context(self._compiled_model):
-                    val_res = compute_bpb(
-                        self._compiled_model, 
-                        self.val_loader(), 
-                        eval_steps,
-                        comp_info=self.config.comp_info,
-                        token_bytes=self.tokenizer.token_bytes
-                    )
-                print0(f"Step {step:05d} | "\
-                       f"Validation bpb: {val_res['bpb']:.6f} | "\
-                    f"Validation loss: {val_res['loss']:.6f}")
-                
-                dt_bpb_eval = time.time() - start_bpb_eval
-
-                if (
-                    (self.ckpt_state.best_eval_value is None) or 
-                    (val_res['bpb'] < self.ckpt_state.best_eval_value)
-                ):
-                    self.ckpt_state.best_eval_value = val_res['bpb']
-                    self.ckpt_state.best_eval_step = step
-                    if (
-                        self.config.save_on_best and 
-                        not ((self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0)) # already saving this step
-                        ):
-                        self.save_checkpoint()
-                
-                board_dict = {
-                    "eval/loss": val_res['loss'],
-                    "eval/bpb": val_res['bpb'],
-                    "eval/best_bpb": self.ckpt_state.best_eval_value,
-                    "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
-                }
-                self.board.log(board_dict, step=step)
-                self.eval_metrics.append(board_dict, step=step)
-                self._compiled_model.train()
+                self.evaluate_bpb()
 
             # ================================================================
             # Validation on CORE metric every 'core_eval_every' steps
             # ================================================================
             
-            results = {}
             if (
                 (self.config.eval_core_every == -1 and last_step) or
                 (self.config.eval_core_every > 0 and (
                 last_step or (step > 0 and step % self.config.eval_core_every == 0)))
             ):
-                self.model.eval()
-                with self.val_context(self.model):
-                    results = evaluate_core(
-                        self.model,
-                        self.tokenizer,
-                        self.device,
-                        max_per_task=self.config.n_core_tokens,
-                    )
-                max_throughput = results.get("core/max_per_task", 0) * self.config.comp_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
-                print0(f"Step {step:05d}/{n_steps:05d} | "
-                       f"CORE: {results['core/core']:.4f} | "
-                       f"Accuracy: {results['core/accuracy']:.4f} | "
-                       f"Max per task: {int(results['core/max_per_task'])} | "
-                       f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
-                       f"Max throughput: {max_throughput:,.0f} tok/s")
-                board_dict = {
-                    "core/core": results["core/core"],
-                    "core/accuracy": results["core/accuracy"],
-                    "core/max_per_task": results["core/max_per_task"],
-                    "core/step_time_ms": results.get("core/step_time_ms", 0),
-                }
-                for task_label, task_results in results.get("all_core_results", {}).items():
-                    for task_metric, task_value in task_results.items():
-                        board_dict[f"core/{task_label}/{task_metric}"] = task_value
-                if (
-                    (self.ckpt_state.best_core_value is None) or 
-                    (results["core/core"] > self.ckpt_state.best_core_value)
-                ):
-                    self.ckpt_state.best_core_value = results["core/core"]
-                    self.ckpt_state.best_core_step = step
-                self.board.log(board_dict, step=step)
-                self.core_metrics.append(results, step=step)
-                self.model.train()
+                self.evaluate_core()
             
             # ================================================================
             # Sample some outputs every 'sample_every' steps
@@ -465,21 +387,7 @@ class Trainer:
                 (self.config.sample_every > 0 and 
                 (last_step or (step > 0 and step % self.config.sample_every == 0))))
             ):
-                self.model.eval()
-                prompts = [
-                    "The capital of France is",
-                    "The chemical symbol of gold is",
-                    "If yesterday was Friday, then tomorrow will be",
-                    "The opposite of hot is",
-                    "The planets of the solar system are:",
-                    "My favorite color is",
-                    "If 5*x + 3 = 13, then x is",
-                ]
-                engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
-                with self.val_context(self.model):
-                    samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
-                # print0(self.tokenizer.decode(samples[0]))
-                self.model.train()
+                self.evaluate_samples()
 
             # ================================================================
             # Training step with gradient accumulation
@@ -497,7 +405,7 @@ class Trainer:
 
                 self.state.train_loader_state = dataloader_state
                 with self.train_context():
-                    loss = self._compute_loss(x, y)
+                    loss = self.compute_loss(x, y)
                 loss = loss / n_acc_steps
 
                 if self.scaler is not None:
@@ -655,8 +563,128 @@ class Trainer:
         # Final checkpoint
         self.save_checkpoint()
 
-    def _compute_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Compute cross-entropy loss."""
+    def evaluate_bpb(self):
+        """Run BPB validation, log metrics, and update the best checkpoint.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        step = self.state.step
+        start_bpb_eval = time.time()
+        self._compiled_model.eval()
+        tokens_per_eval_step = (
+            self.config.device_batch_size
+            * self.model.config.max_context
+            * self.config.comp_info.world_size
+        )
+        eval_steps = max(
+            1,
+            math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
+        )
+        with self.val_context(self._compiled_model):
+            val_res = compute_bpb(
+                self._compiled_model,
+                self.val_loader(),
+                eval_steps,
+                comp_info=self.config.comp_info,
+                token_bytes=self.tokenizer.token_bytes
+            )
+        print0(f"Step {step:05d} | "\
+               f"Validation bpb: {val_res['bpb']:.6f} | "\
+            f"Validation loss: {val_res['loss']:.6f}")
+
+        dt_bpb_eval = time.time() - start_bpb_eval
+
+        if (
+            (self.ckpt_state.best_eval_value is None) or
+            (val_res['bpb'] < self.ckpt_state.best_eval_value)
+        ):
+            self.ckpt_state.best_eval_value = val_res['bpb']
+            self.ckpt_state.best_eval_step = step
+            if (
+                self.config.save_on_best and
+                not ((self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0)) # already saving this step
+                ):
+                self.save_checkpoint()
+
+        board_dict = {
+            "eval/loss": val_res['loss'],
+            "eval/bpb": val_res['bpb'],
+            "eval/best_bpb": self.ckpt_state.best_eval_value,
+            "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
+        }
+        self.board.log(board_dict, step=step)
+        self.eval_metrics.append(board_dict, step=step)
+        self._compiled_model.train()
+
+    def evaluate_core(self):
+        """Run CORE evaluation, log metrics, and track the best score.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        step = self.state.step
+        n_steps = self.config.n_steps
+        self.model.eval()
+        with self.val_context(self.model):
+            results = evaluate_core(
+                self.model,
+                self.tokenizer,
+                self.device,
+                max_per_task=self.config.n_core_tokens,
+            )
+        max_throughput = results.get("core/max_per_task", 0) * self.config.comp_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
+        print0(f"Step {step:05d}/{n_steps:05d} | "
+               f"CORE: {results['core/core']:.4f} | "
+               f"Accuracy: {results['core/accuracy']:.4f} | "
+               f"Max per task: {int(results['core/max_per_task'])} | "
+               f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
+               f"Max throughput: {max_throughput:,.0f} tok/s")
+        board_dict = {
+            "core/core": results["core/core"],
+            "core/accuracy": results["core/accuracy"],
+            "core/max_per_task": results["core/max_per_task"],
+            "core/step_time_ms": results.get("core/step_time_ms", 0),
+        }
+        for task_label, task_results in results.get("all_core_results", {}).items():
+            for task_metric, task_value in task_results.items():
+                board_dict[f"core/{task_label}/{task_metric}"] = task_value
+        if (
+            (self.ckpt_state.best_core_value is None) or
+            (results["core/core"] > self.ckpt_state.best_core_value)
+        ):
+            self.ckpt_state.best_core_value = results["core/core"]
+            self.ckpt_state.best_core_step = step
+        self.board.log(board_dict, step=step)
+        self.core_metrics.append(results, step=step)
+        self.model.train()
+
+    def evaluate_samples(self):
+        """Generate samples using the original model to avoid recompilation.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        self.model.eval()
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+            "My favorite color is",
+            "If 5*x + 3 = 13, then x is",
+        ]
+        engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
+        with self.val_context(self.model):
+            samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
+        # print0(self.tokenizer.decode(samples[0]))
+        self.model.train()
+
+    def compute_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Return a scalar loss connected to the computation graph.
+
+        Override this method to use a different training objective. The training
+        loop supplies autocast, gradient accumulation scaling, and backward.
+        By default, use the model's loss or compute cross-entropy from logits.
+        """
         output = self._compiled_model(x, y)
         if hasattr(output, "loss"):
             return output.loss

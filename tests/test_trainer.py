@@ -12,6 +12,7 @@ from gpt_lab.utils.schemas import (
 )
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from gpt_lab.utils.schemas import TrainerConfig
 
@@ -79,6 +80,128 @@ def test_gradient_monitor_reads_accumulated_parameter_gradients(tmp_path):
     assert values["grad_mean/weight"] == pytest.approx(-1.0)
     assert values["grad_abs_mean/weight"] == pytest.approx(2.0)
     assert not model.weight._backward_hooks
+
+@pytest.mark.fast
+@pytest.mark.parametrize("step,previous_best,save_on_best,should_save", [
+    (5, None, True, True),
+    (10, 2.0, True, False),  # The scheduled checkpoint will save this step.
+    (5, 1.0, True, False),
+    (5, 2.0, False, False),
+])
+def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
+    tmp_path, monkeypatch, step, previous_best, save_on_best, should_save,
+):
+    trainer, model, board = _make_trainer(tmp_path)
+    model.config = SimpleNamespace(max_context=2)
+    trainer._compiled_model = torch.nn.Linear(2, 2)
+    trainer.tokenizer = SimpleNamespace(token_bytes=torch.ones(2))
+    trainer.val_loader = Mock(return_value=iter(()))
+    trainer.config = trainer.config.model_copy(update={
+        "n_bpb_tokens": 9, "save_every": 10, "save_on_best": save_on_best,
+    })
+    trainer.state.step = step
+    trainer.ckpt_state.best_eval_value = previous_best
+    trainer.ckpt_state.best_eval_step = 1
+    trainer.save_checkpoint = Mock()
+
+    def evaluate(*args, **kwargs):
+        assert not trainer._compiled_model.training
+        assert torch.is_autocast_enabled("cpu")
+        return {"bpb": 1.5, "loss": 2.0}
+
+    evaluator = Mock(side_effect=evaluate)
+    monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", evaluator)
+
+    trainer.evaluate_bpb()
+
+    trainer.val_loader.assert_called_once_with()
+    evaluator.assert_called_once_with(
+        trainer._compiled_model, trainer.val_loader.return_value, 3,
+        comp_info=trainer.config.comp_info,
+        token_bytes=trainer.tokenizer.token_bytes,
+    )
+    improved = previous_best is None or previous_best > 1.5
+    best = 1.5 if improved else previous_best
+    assert trainer.ckpt_state.best_eval_value == best
+    assert trainer.ckpt_state.best_eval_step == (step if improved else 1)
+    assert trainer.save_checkpoint.call_count == int(should_save)
+    assert trainer._compiled_model.training
+    values, logged_step = board.records[-1]
+    assert logged_step == step
+    assert values["eval/best_bpb"] == best
+    assert trainer.eval_metrics.step == [step]
+    assert trainer.eval_metrics.bpb == [1.5]
+    assert trainer.eval_metrics.loss == [2.0]
+    assert trainer.eval_metrics.step_time_ms == [values["eval/step_time_ms"]]
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("previous_best", [None, 1.0])
+def test_evaluate_core_tracks_metrics_and_best_score(tmp_path, monkeypatch, previous_best):
+    trainer, model, board = _make_trainer(tmp_path)
+    trainer.state.step = 5
+    trainer.ckpt_state.best_core_value = previous_best
+    trainer.ckpt_state.best_core_step = 1
+    results = {
+        "core/core": 0.6,
+        "core/accuracy": 0.7,
+        "core/max_per_task": 2,
+        "core/step_time_ms": 10,
+        "all_core_results": {"task": {"accuracy": 0.8}},
+    }
+
+    def evaluate(*args, **kwargs):
+        assert not model.training
+        assert torch.is_autocast_enabled("cpu")
+        return results
+
+    evaluator = Mock(side_effect=evaluate)
+    monkeypatch.setattr("gpt_lab.train.trainer.evaluate_core", evaluator)
+
+    trainer.evaluate_core()
+
+    evaluator.assert_called_once_with(
+        model, trainer.tokenizer, trainer.device,
+        max_per_task=trainer.config.n_core_tokens,
+    )
+    assert model.training
+    assert trainer.ckpt_state.best_core_value == (0.6 if previous_best is None else 1.0)
+    assert trainer.ckpt_state.best_core_step == (5 if previous_best is None else 1)
+    values, step = board.records[-1]
+    assert step == 5
+    assert values["core/core"] == 0.6
+    assert values["core/task/accuracy"] == 0.8
+    assert trainer.core_metrics.step == [5]
+    assert trainer.core_metrics.core == [0.6]
+    assert trainer.core_metrics.accuracy == [0.7]
+    assert trainer.core_metrics.results == [results["all_core_results"]]
+
+
+@pytest.mark.fast
+def test_evaluate_samples_uses_original_model_and_generation_settings(tmp_path, monkeypatch):
+    trainer, model, _ = _make_trainer(tmp_path)
+    trainer._compiled_model = torch.nn.Linear(2, 2)
+
+    def generate(prompts, **kwargs):
+        assert not model.training
+        assert torch.is_autocast_enabled("cpu")
+        assert len(prompts) == 7
+        assert prompts[0] == "The capital of France is"
+
+    engine = Mock()
+    engine.generate_batch.side_effect = generate
+    engine_factory = Mock(return_value=engine)
+    monkeypatch.setattr("gpt_lab.train.trainer.Engine", engine_factory)
+
+    trainer.evaluate_samples()
+
+    engine_factory.assert_called_once_with(model, trainer.tokenizer)
+    engine.generate_batch.assert_called_once()
+    assert engine.generate_batch.call_args.kwargs == {
+        "num_samples": 1, "max_tokens": 16, "temperature": 0,
+    }
+    assert model.training
+
 
 class TestModelTrainer:
     model_name = "test-model"
