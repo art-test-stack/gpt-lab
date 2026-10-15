@@ -316,9 +316,9 @@ class Trainer:
         
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
-            self._compiled_model = torch.compile(self.model, dynamic=False)
+            self.compiled_model = torch.compile(self.model, dynamic=False)
         else:
-            self._compiled_model = self.model
+            self.compiled_model = self.model
 
         train_iter = iter(self.train_loader)
 
@@ -345,7 +345,7 @@ class Trainer:
             )
 
         # Prepare for training
-        self._compiled_model.train()
+        self.compiled_model.train()
         smooth_loss = self.state.smooth_train_loss
         ema_beta = 0.9
         
@@ -544,8 +544,8 @@ class Trainer:
             
             step += 1
 
-        del self._compiled_model  # Clean up compiled model if it exists
-        self._compiled_model = None
+        del self.compiled_model  # Clean up compiled model if it exists
+        self.compiled_model = None
         
         print0("=" * 70)
         print0(f"Training completed!")
@@ -577,7 +577,7 @@ class Trainer:
         else:
             self.optimizer.step()
 
-        self._compiled_model.zero_grad(set_to_none=True)
+        self.compiled_model.zero_grad(set_to_none=True)
 
     def evaluate_bpb(self):
         """Run BPB validation, log metrics, and update the best checkpoint.
@@ -586,7 +586,7 @@ class Trainer:
         """
         step = self.state.step
         start_bpb_eval = time.time()
-        self._compiled_model.eval()
+        self.compiled_model.eval()
         tokens_per_eval_step = (
             self.config.device_batch_size
             * self.model.config.max_context
@@ -596,9 +596,9 @@ class Trainer:
             1,
             math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
         )
-        with self.val_context(self._compiled_model):
+        with self.val_context(self.compiled_model):
             val_res = compute_bpb(
-                self._compiled_model,
+                self.compiled_model,
                 self.val_loader(),
                 eval_steps,
                 comp_info=self.config.comp_info,
@@ -630,7 +630,7 @@ class Trainer:
         }
         self.board.log(board_dict, step=step)
         self.eval_metrics.append(board_dict, step=step)
-        self._compiled_model.train()
+        self.compiled_model.train()
 
     def evaluate_core(self):
         """Run CORE evaluation, log metrics, and track the best score.
@@ -722,7 +722,7 @@ class Trainer:
         the model's loss or compute cross-entropy from logits.
         """
         x, y = payload
-        output = self._compiled_model(x, y)
+        output = self.compiled_model(x, y)
         if hasattr(output, "loss"):
             return output.loss
         else:

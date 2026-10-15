@@ -94,7 +94,7 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
 ):
     trainer, model, board = _make_trainer(tmp_path)
     model.config = SimpleNamespace(max_context=2)
-    trainer._compiled_model = torch.nn.Linear(2, 2)
+    trainer.compiled_model = torch.nn.Linear(2, 2)
     trainer.tokenizer = SimpleNamespace(token_bytes=torch.ones(2))
     trainer.val_loader = Mock(return_value=iter(()))
     trainer.config = trainer.config.model_copy(update={
@@ -106,7 +106,7 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     trainer.save_checkpoint = Mock()
 
     def evaluate(*args, **kwargs):
-        assert not trainer._compiled_model.training
+        assert not trainer.compiled_model.training
         assert torch.is_autocast_enabled("cpu")
         return {"bpb": 1.5, "loss": 2.0}
 
@@ -117,7 +117,7 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
 
     trainer.val_loader.assert_called_once_with()
     evaluator.assert_called_once_with(
-        trainer._compiled_model, trainer.val_loader.return_value, 3,
+        trainer.compiled_model, trainer.val_loader.return_value, 3,
         comp_info=trainer.config.comp_info,
         token_bytes=trainer.tokenizer.token_bytes,
     )
@@ -126,7 +126,7 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     assert trainer.ckpt_state.best_eval_value == best
     assert trainer.ckpt_state.best_eval_step == (step if improved else 1)
     assert trainer.save_checkpoint.call_count == int(should_save)
-    assert trainer._compiled_model.training
+    assert trainer.compiled_model.training
     values, logged_step = board.records[-1]
     assert logged_step == step
     assert values["eval/best_bpb"] == best
@@ -181,7 +181,7 @@ def test_evaluate_core_tracks_metrics_and_best_score(tmp_path, monkeypatch, prev
 @pytest.mark.fast
 def test_evaluate_samples_uses_original_model_and_generation_settings(tmp_path, monkeypatch):
     trainer, model, _ = _make_trainer(tmp_path)
-    trainer._compiled_model = torch.nn.Linear(2, 2)
+    trainer.compiled_model = torch.nn.Linear(2, 2)
 
     def generate(prompts, **kwargs):
         assert not model.training
@@ -237,11 +237,11 @@ def test_compute_loss_accepts_prepared_payload(tmp_path, model_returns_loss):
     logits = torch.tensor([[[2.0, 0.0], [1.0, 3.0]]], requires_grad=True)
     expected = torch.nn.functional.cross_entropy(logits.view(-1, 2), y.view(-1))
     output = SimpleNamespace(loss=expected) if model_returns_loss else logits
-    trainer._compiled_model = Mock(return_value=output)
+    trainer.compiled_model = Mock(return_value=output)
 
     loss = trainer.compute_loss((x, y))
 
-    trainer._compiled_model.assert_called_once_with(x, y)
+    trainer.compiled_model.assert_called_once_with(x, y)
     torch.testing.assert_close(loss, expected)
     loss.backward()
     assert logits.grad is not None
@@ -252,7 +252,7 @@ class _PayloadTrainer(Trainer):
         return raw_batch, raw_batch.get("state"), raw_batch["tokens"]
 
     def compute_loss(self, payload):
-        return (self._compiled_model(payload["features"]) - payload["targets"]).square().mean()
+        return (self.compiled_model(payload["features"]) - payload["targets"]).square().mean()
 
 
 @pytest.mark.fast
