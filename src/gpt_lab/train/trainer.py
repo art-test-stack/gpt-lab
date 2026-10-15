@@ -86,6 +86,34 @@ class Trainer:
     - Comprehensive metrics tracking
     - Memory optimization with gc management
 
+    Subclass extension points:
+        prepare_batch(raw_batch):
+            Return (payload, state, local_token_count) per microbatch. The default
+            accepts (x, y, state) or (x, y), producing payload=(x, y) and counting
+            x.numel() tokens. State is a DataLoaderState or None. Missing state
+            on the first batch triggers a warning; checkpoints record None for
+            batches without state and cannot restore their dataloader position.
+        compute_loss(payload):
+            Return a scalar loss connected to the computation graph. The loop
+            supplies autocast, divides by n_acc_steps, and performs backward.
+            Override together with prepare_batch for custom payload formats.
+        optimizer_step(should_log_step):
+            Apply accumulated gradients and clear them. The default unscales
+            gradients, synchronizes distributed overflow flags, optionally logs
+            gradients, updates the optimizer/scaler, and clears gradients.
+            Hyperparameter scheduling stays in train().
+        evaluate_bpb(), evaluate_core(), evaluate_samples():
+            Replace evaluations independently; their scheduling stays in train().
+            Each override owns model modes, evaluation contexts, and any logging,
+            metrics, or best-score updates. Defaults restore training mode.
+
+    train() creates the public compiled_model attribute before invoking hooks
+    and sets it to None on completion. Use it for training forwards; model is
+    the original model used for generation and checkpoints. Optimizers, schedules,
+    boards, and checkpoint managers can be injected through the constructor.
+    save_checkpoint() persists the standard model/optimizer/scaler/trainer state;
+    subclasses must explicitly persist any additional state they need to resume.
+
     Example:
     ```python
         trainer = Trainer(
