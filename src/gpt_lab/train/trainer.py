@@ -9,11 +9,9 @@ Key responsibilities:
 - Device management and memory optimization
 """
 
-from typing import Optional, Callable, Union, Dict
+from typing import Any, Optional, Callable, Union
 from pathlib import Path
 from contextlib import ExitStack, contextmanager, nullcontext
-
-import numpy as np
 
 import time
 import gc
@@ -27,10 +25,9 @@ import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 
 from gpt_lab.utils.board import Board
-from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
 from gpt_lab.utils.distributed import ComputeContext, _DTYPE_MAP, get_comp_info
 from gpt_lab.utils.common import print0
-from gpt_lab.utils.logging import log_error, log_critical, log0, log_dict
+from gpt_lab.utils.logging import log_error, log0, log_dict
 from gpt_lab.utils.schemas import (
     CheckpointState,
     COREMetrics,
@@ -88,6 +85,44 @@ class Trainer:
     - Validation and evaluation loops
     - Comprehensive metrics tracking
     - Memory optimization with gc management
+
+    Subclass extension points:
+        train_step(train_iter, batch, should_log_step):
+            Run one complete update, including accumulation, backward, prefetch,
+            hyperparameter scheduling, optimizer update, and timing. Return the
+            next prepared batch and a step_metrics dict; see the method contract.
+        prepare_batch(raw_batch):
+            Return (payload, state, local_token_count) per microbatch. The default
+            accepts (x, y, state) or (x, y), producing payload=(x, y) and counting
+            x.numel() tokens. State is a DataLoaderState or None. Missing state
+            on the first batch triggers a warning; checkpoints record None for
+            batches without state and cannot restore their dataloader position.
+        compute_loss(payload):
+            Return a scalar loss connected to the computation graph. train_step
+            supplies autocast, divides by n_acc_steps, and performs backward.
+            Override together with prepare_batch for custom payload formats.
+        optimizer_step(should_log_step):
+            Apply accumulated gradients and clear them. The default unscales
+            gradients, synchronizes distributed overflow flags, optionally logs
+            gradients, updates the optimizer/scaler, and clears gradients.
+            Hyperparameter scheduling stays in train_step().
+        update_metrics(step_metrics, total_dt):
+            Update counters, smoothed loss, and the duration history every step.
+            Return derived metrics; total_dt also controls ETA and time limits.
+        log_metrics(metrics):
+            Print, record, and send metrics to the board at train()'s logging
+            interval. Override reporting without changing per-step state.
+        evaluate_bpb(), evaluate_core(), evaluate_samples():
+            Replace evaluations independently; their scheduling stays in train().
+            Each override owns model modes, evaluation contexts, and any logging,
+            metrics, or best-score updates. Defaults restore training mode.
+
+    train() creates the public compiled_model attribute before invoking hooks
+    and sets it to None on completion. Use it for training forwards; model is
+    the original model used for generation and checkpoints. Optimizers, schedules,
+    boards, and checkpoint managers can be injected through the constructor.
+    save_checkpoint() persists the standard model/optimizer/scaler/trainer state;
+    subclasses must explicitly persist any additional state they need to resume.
 
     Example:
     ```python
@@ -311,17 +346,12 @@ class Trainer:
         # Extracte main constants from config
         step = self.state.step + int(self.state.step > 0) # start from the next step to avoid repeating the last step if resuming
         n_steps = self.config.n_steps
-        n_flops_per_token = self.config.n_flops_per_token
-        total_batch_size = self.config.total_batch_size
-        n_acc_steps = self.config.n_acc_steps
-
-        world_size = self.config.comp_info.world_size
         
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
-            self._compiled_model = torch.compile(self.model, dynamic=False)
+            self.compiled_model = torch.compile(self.model, dynamic=False)
         else:
-            self._compiled_model = self.model
+            self.compiled_model = self.model
 
         train_iter = iter(self.train_loader)
 
@@ -330,15 +360,26 @@ class Trainer:
         if self.config.comp_info.is_distributed:
             dist.barrier()
 
-        x, y, dataloader_state = next(train_iter) # prefetch
+        batch = self.prepare_batch(next(train_iter)) # prefetch
+        _, dataloader_state, _ = batch
 
         print(f"[rank={rank}] after prefetch", flush=True)
-        log_dict("First dataloader_state", dataloader_state.__dict__, logger=logger)
+        if dataloader_state is None:
+            self.state.train_loader_state = None
+            log0(
+                "No dataloader state provided. Dataloader state will not be saved "
+                "with checkpoints; the data position cannot be restored on resume.",
+                level="warning", logger=logger,
+            )
+        else:
+            log_dict(
+                "First dataloader_state",
+                dataloader_state.model_dump(),
+                logger=logger,
+            )
 
         # Prepare for training
-        self._compiled_model.train()
-        smooth_loss = self.state.smooth_train_loss
-        ema_beta = 0.9
+        self.compiled_model.train()
         
         total_dt = []  # For ETA calculation
         
@@ -352,7 +393,6 @@ class Trainer:
                     and step % self.config.log_every == 0
                 )
             )
-            flops_so_far = n_flops_per_token * total_batch_size * step
             self.synchronize()
             
             # ================================================================
@@ -364,96 +404,18 @@ class Trainer:
                 (self.config.eval_bpb_every > 0 and step > 0 and # eval every eval_bpb_every steps except the first step
                 (last_step or step % self.config.eval_bpb_every == 0)) 
             ):
-                start_bpb_eval = time.time()
-                self._compiled_model.eval()
-                tokens_per_eval_step = (
-                    self.config.device_batch_size
-                    * self.model.config.max_context
-                    * self.config.comp_info.world_size
-                )
-                eval_steps = max(
-                    1,
-                    math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
-                )
-                with self.val_context(self._compiled_model):
-                    val_res = compute_bpb(
-                        self._compiled_model, 
-                        self.val_loader(), 
-                        eval_steps,
-                        comp_info=self.config.comp_info,
-                        token_bytes=self.tokenizer.token_bytes
-                    )
-                print0(f"Step {step:05d} | "\
-                       f"Validation bpb: {val_res['bpb']:.6f} | "\
-                    f"Validation loss: {val_res['loss']:.6f}")
-                
-                dt_bpb_eval = time.time() - start_bpb_eval
-
-                if (
-                    (self.ckpt_state.best_eval_value is None) or 
-                    (val_res['bpb'] < self.ckpt_state.best_eval_value)
-                ):
-                    self.ckpt_state.best_eval_value = val_res['bpb']
-                    self.ckpt_state.best_eval_step = step
-                    if (
-                        self.config.save_on_best and 
-                        not ((self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0)) # already saving this step
-                        ):
-                        self.save_checkpoint()
-                
-                board_dict = {
-                    "eval/loss": val_res['loss'],
-                    "eval/bpb": val_res['bpb'],
-                    "eval/best_bpb": self.ckpt_state.best_eval_value,
-                    "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
-                }
-                self.board.log(board_dict, step=step)
-                self.eval_metrics.append(board_dict, step=step)
-                self._compiled_model.train()
+                self.evaluate_bpb()
 
             # ================================================================
             # Validation on CORE metric every 'core_eval_every' steps
             # ================================================================
             
-            results = {}
             if (
                 (self.config.eval_core_every == -1 and last_step) or
                 (self.config.eval_core_every > 0 and (
                 last_step or (step > 0 and step % self.config.eval_core_every == 0)))
             ):
-                self.model.eval()
-                with self.val_context(self.model):
-                    results = evaluate_core(
-                        self.model,
-                        self.tokenizer,
-                        self.device,
-                        max_per_task=self.config.n_core_tokens,
-                    )
-                max_throughput = results.get("core/max_per_task", 0) * self.config.comp_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
-                print0(f"Step {step:05d}/{n_steps:05d} | "
-                       f"CORE: {results['core/core']:.4f} | "
-                       f"Accuracy: {results['core/accuracy']:.4f} | "
-                       f"Max per task: {int(results['core/max_per_task'])} | "
-                       f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
-                       f"Max throughput: {max_throughput:,.0f} tok/s")
-                board_dict = {
-                    "core/core": results["core/core"],
-                    "core/accuracy": results["core/accuracy"],
-                    "core/max_per_task": results["core/max_per_task"],
-                    "core/step_time_ms": results.get("core/step_time_ms", 0),
-                }
-                for task_label, task_results in results.get("all_core_results", {}).items():
-                    for task_metric, task_value in task_results.items():
-                        board_dict[f"core/{task_label}/{task_metric}"] = task_value
-                if (
-                    (self.ckpt_state.best_core_value is None) or 
-                    (results["core/core"] > self.ckpt_state.best_core_value)
-                ):
-                    self.ckpt_state.best_core_value = results["core/core"]
-                    self.ckpt_state.best_core_step = step
-                self.board.log(board_dict, step=step)
-                self.core_metrics.append(results, step=step)
-                self.model.train()
+                self.evaluate_core()
             
             # ================================================================
             # Sample some outputs every 'sample_every' steps
@@ -465,162 +427,22 @@ class Trainer:
                 (self.config.sample_every > 0 and 
                 (last_step or (step > 0 and step % self.config.sample_every == 0))))
             ):
-                self.model.eval()
-                prompts = [
-                    "The capital of France is",
-                    "The chemical symbol of gold is",
-                    "If yesterday was Friday, then tomorrow will be",
-                    "The opposite of hot is",
-                    "The planets of the solar system are:",
-                    "My favorite color is",
-                    "If 5*x + 3 = 13, then x is",
-                ]
-                engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
-                with self.val_context(self.model):
-                    samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
-                # print0(self.tokenizer.decode(samples[0]))
-                self.model.train()
+                self.evaluate_samples()
 
             # ================================================================
             # Training step with gradient accumulation
             # ================================================================
 
-            loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
+            batch, step_metrics = self.train_step(train_iter, batch, should_log_step)
 
-            eff_global_tokens = 0
-
-            self.synchronize()
-            step_start_time = time.perf_counter()
-            
-            for _ in range(n_acc_steps):
-                eff_global_tokens += x.numel() * world_size
-
-                self.state.train_loader_state = dataloader_state
-                with self.train_context():
-                    loss = self._compute_loss(x, y)
-                loss = loss / n_acc_steps
-
-                if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-
-                loss_accum.add_(loss.detach().float())
-
-                if torch.isnan(loss_accum) or torch.isinf(loss_accum):
-                    from gpt_lab.utils.tensor_io import save_tensor_state
-                    save_tensor_state({"inputs": x}, self.dirname / "bad_batch.safetensors")
-                    log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
-                        f"Loss is NaN or Inf at {step=}.\n" \
-                        f"Dataloader state: {dataloader_state.__dict__}.\n" \
-                        f"Model inputs shape: {x.shape}, values: {x}\n" \
-                        f"Model targets shape: {y.shape}, values: {y}\n" \
-                        f"Accumulated loss: {loss_accum}",
-                        error_type=ValueError, logger=logger  
-                    )
-                x, y, dataloader_state = next(train_iter)
-            
-            if dataloader_state is not None:
-                if isinstance(dataloader_state, DataLoaderState):
-                    self.state.n_epochs = dataloader_state.epoch
-                else:
-                    self.state.n_epochs = dataloader_state.get("epoch", 0)
-            
-            lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
-
-            if self.scaler is not None:
-                self.scaler.unscale_(self.optimizer)
-                if self.config.comp_info.is_distributed:
-                    for g in self.scaler._found_inf_per_device(self.optimizer).values():
-                        dist.all_reduce(g, op=dist.ReduceOp.MAX)
-
-            if self.config.monitor_grad_norms and should_log_step:
-                self.log_gradients()
-
-            if self.scaler is not None:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-            
-            self._compiled_model.zero_grad(set_to_none=True)
-
-            self.synchronize()
-            step_end_time = time.perf_counter()
-            
             # ================================================================
             # Logging and metrics
             # ================================================================
             
-            step_dt_tensor = torch.tensor(step_end_time - step_start_time, device=self.device)
-
-            if self.config.comp_info.is_distributed:
-                dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
-
-            step_dt = step_dt_tensor.item()
-
-            loss_accum = loss_accum.item()
-            
-            smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
-            debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
-            
-            # Calculate throughput
-            if eff_global_tokens != total_batch_size:
-                log0(f"eff_global_tokens != total_batch_size, got {eff_global_tokens=} and {total_batch_size=}", logger=logger, level="warning")
-
-            tokens_per_sec = eff_global_tokens / step_dt
-
-            step_flops_per_sec = n_flops_per_token * tokens_per_sec
-            mfu = step_flops_per_sec / self.config.comp_info.gpu_peak_flops * 100 / world_size
-            
-            total_dt.append(step_dt)
-            self.state.n_tokens += eff_global_tokens
-            self.state.smooth_train_loss = smooth_loss
-            self.state.total_training_time += step_dt
-            
-            # Log every log_every steps
+            metrics = self.update_metrics(step_metrics, total_dt)
             if should_log_step:
-                pct_done = 100 * step / n_steps
-                
-                # ETA calculation
-                if len(total_dt) > 10:
-                    avg_step_time = sum(total_dt[-10:]) / 10
-                    eta_seconds = (n_steps - step) * avg_step_time
-                    eta_str = f" | ETA: {eta_seconds/60:.1f}m"
-                else:
-                    eta_str = ""
+                self.log_metrics(metrics)
 
-                if math.isnan(debiased_smooth_loss) or math.isinf(debiased_smooth_loss):
-                    log_error(f"Loss is NaN or Inf at {step=}, {debiased_smooth_loss=}. Check previous logs for details.", error_type=ValueError, logger=logger)
-                
-                print0(
-                    f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
-                    f"loss: {debiased_smooth_loss:.6f} | "
-                    f"lrm: {lrm:.2e} | "
-                    f"dt: {step_dt*1000:.2f}ms | "
-                    f"tok/s: {tokens_per_sec:,.0f}"
-                    f"{eta_str}"
-                )
-                board_dict = {
-                    "epochs": self.state.n_epochs,
-                    "train/loss": debiased_smooth_loss,
-                    "train/raw_loss": loss_accum,
-                    "train/tokens_per_sec": tokens_per_sec,
-                    "train/step_time_ms": step_dt * 1000,
-                    "train/total_tokens": self.state.n_tokens,
-                    "train/flops_per_sec": step_flops_per_sec,
-                    "train/mfu": mfu,
-                    "lrm": lrm,
-                    "muon_momentum": muon_momentum,
-                    "weight_decay": weight_decay,
-                    "train/total_training_flops": flops_so_far,
-                    "train/total_training_time": self.state.total_training_time,
-                    "train/eta_seconds": eta_seconds if len(total_dt) > 10 else float("inf"),
-                }
-
-                self.metrics.append(board_dict, step)
-                self.board.log(board_dict, step=step)
-            
             # ================================================================
             # Checkpointing
             # ================================================================
@@ -643,8 +465,8 @@ class Trainer:
             
             step += 1
 
-        del self._compiled_model  # Clean up compiled model if it exists
-        self._compiled_model = None
+        del self.compiled_model  # Clean up compiled model if it exists
+        self.compiled_model = None
         
         print0("=" * 70)
         print0(f"Training completed!")
@@ -655,9 +477,333 @@ class Trainer:
         # Final checkpoint
         self.save_checkpoint()
 
-    def _compute_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Compute cross-entropy loss."""
-        output = self._compiled_model(x, y)
+    def update_metrics(self, step_metrics, total_dt):
+        """Update per-step state and return the metric dict consumed by log_metrics.
+
+        Called every step, including when logging is disabled. Reduce step time
+        with MAX across ranks, update loss smoothing and token/time counters,
+        and append the reduced duration to total_dt for ETA and time limits.
+        """
+        step = self.state.step
+        n_steps = self.config.n_steps
+        n_flops_per_token = self.config.n_flops_per_token
+        total_batch_size = self.config.total_batch_size
+        world_size = self.config.comp_info.world_size
+        flops_so_far = n_flops_per_token * total_batch_size * step
+        ema_beta = 0.9
+        smooth_loss = self.state.smooth_train_loss
+        step_dt_tensor = torch.tensor(step_metrics["step_time"], device=self.device)
+
+        if self.config.comp_info.is_distributed:
+            dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
+
+        step_dt = step_dt_tensor.item()
+
+        loss_accum = step_metrics["loss"].item()
+        eff_global_tokens = step_metrics["tokens"]
+
+        smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
+        debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
+
+        # Calculate throughput
+        if eff_global_tokens != total_batch_size:
+            log0(f"eff_global_tokens != total_batch_size, got {eff_global_tokens=} and {total_batch_size=}", logger=logger, level="warning")
+
+        tokens_per_sec = eff_global_tokens / step_dt
+
+        step_flops_per_sec = n_flops_per_token * tokens_per_sec
+        mfu = step_flops_per_sec / self.config.comp_info.gpu_peak_flops * 100 / world_size
+
+        total_dt.append(step_dt)
+        self.state.n_tokens += eff_global_tokens
+        self.state.smooth_train_loss = smooth_loss
+        self.state.total_training_time += step_dt
+        if len(total_dt) > 10:
+            avg_step_time = sum(total_dt[-10:]) / 10
+            eta_seconds = (n_steps - step) * avg_step_time
+        else:
+            eta_seconds = float("inf")
+
+        return {
+            "epochs": self.state.n_epochs,
+            "train/loss": debiased_smooth_loss,
+            "train/raw_loss": loss_accum,
+            "train/tokens_per_sec": tokens_per_sec,
+            "train/step_time_ms": step_dt * 1000,
+            "train/total_tokens": self.state.n_tokens,
+            "train/flops_per_sec": step_flops_per_sec,
+            "train/mfu": mfu,
+            "lrm": step_metrics["lrm"],
+            "muon_momentum": step_metrics["muon_momentum"],
+            "weight_decay": step_metrics["weight_decay"],
+            "train/total_training_flops": flops_so_far,
+            "train/total_training_time": self.state.total_training_time,
+            "train/eta_seconds": eta_seconds,
+        }
+
+    def log_metrics(self, metrics):
+        """Print metrics, append metric history, and send them to the board.
+
+        train() controls logging cadence. Override to customize reporting without
+        changing per-step counters or loss smoothing in update_metrics().
+        """
+        step = self.state.step
+        n_steps = self.config.n_steps
+        pct_done = 100 * step / n_steps
+        loss = metrics["train/loss"]
+        eta_seconds = metrics["train/eta_seconds"]
+        eta_str = f" | ETA: {eta_seconds/60:.1f}m" if math.isfinite(eta_seconds) else ""
+        if math.isnan(loss) or math.isinf(loss):
+            log_error(f"Loss is NaN or Inf at {step=}, {loss=}. Check previous logs for details.", error_type=ValueError, logger=logger)
+        print0(
+            f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
+            f"loss: {loss:.6f} | "
+            f"lrm: {metrics['lrm']:.2e} | "
+            f"dt: {metrics['train/step_time_ms']:.2f}ms | "
+            f"tok/s: {metrics['train/tokens_per_sec']:,.0f}"
+            f"{eta_str}"
+        )
+        self.metrics.append(metrics, step)
+        self.board.log(metrics, step=step)
+
+    def train_step(self, train_iter, batch, should_log_step: bool):
+        """Run one optimizer update and return (next_batch, step_metrics).
+
+        batch and next_batch are prepared (payload, state, local_token_count)
+        tuples. Accumulate config.n_acc_steps microbatches, preserving the last
+        consumed state for checkpoints and prefetching the next batch.
+
+        step_metrics keys are loss (detached accumulated tensor), tokens (global
+        count), step_time (local seconds), lrm, muon_momentum, and weight_decay. Timing
+        covers accumulation, prefetch, scheduling, and the optimizer update;
+        reduction across ranks happens in update_metrics().
+        """
+        step = self.state.step
+        n_acc_steps = self.config.n_acc_steps
+        world_size = self.config.comp_info.world_size
+        payload, dataloader_state, token_count = batch
+        loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
+
+        eff_global_tokens = 0
+
+        self.synchronize()
+        step_start_time = time.perf_counter()
+
+        for _ in range(n_acc_steps):
+            eff_global_tokens += token_count * world_size
+
+            self.state.train_loader_state = dataloader_state
+            with self.train_context():
+                loss = self.compute_loss(payload)
+            loss = loss / n_acc_steps
+
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            loss_accum.add_(loss.detach().float())
+
+            if torch.isnan(loss_accum) or torch.isinf(loss_accum):
+                from gpt_lab.utils.tensor_io import save_tensor_state
+                try:
+                    save_tensor_state({"payload": payload}, self.dirname / "bad_batch.safetensors")
+                except TypeError:
+                    log0("Bad-batch payload cannot be serialized; see the loss error for details.", level="warning", logger=logger)
+                log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
+                    f"Loss is NaN or Inf at {step=}.\n" \
+                    f"Dataloader state: {dataloader_state}.\n" \
+                    f"Batch payload: {payload}\n" \
+                    f"Accumulated loss: {loss_accum}",
+                    error_type=ValueError, logger=logger
+                )
+            payload, dataloader_state, token_count = self.prepare_batch(next(train_iter))
+
+        if dataloader_state is not None:
+            self.state.n_epochs = dataloader_state.epoch
+
+        lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
+
+        self.optimizer_step(should_log_step)
+
+        self.synchronize()
+        step_end_time = time.perf_counter()
+        return (payload, dataloader_state, token_count), {
+            "loss": loss_accum,
+            "tokens": eff_global_tokens,
+            "step_time": step_end_time - step_start_time,
+            "lrm": lrm,
+            "muon_momentum": muon_momentum,
+            "weight_decay": weight_decay,
+        }
+
+    def optimizer_step(self, should_log_step: bool):
+        """Apply accumulated gradients, update the scaler, and clear gradients.
+
+        Override this method to customize the optimizer update. Hyperparameter
+        scheduling stays in train_step(); monitoring uses unscaled gradients.
+        """
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+            if self.config.comp_info.is_distributed:
+                for g in self.scaler._found_inf_per_device(self.optimizer).values():
+                    dist.all_reduce(g, op=dist.ReduceOp.MAX)
+
+        if self.config.monitor_grad_norms and should_log_step:
+            self.log_gradients()
+
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+
+        self.compiled_model.zero_grad(set_to_none=True)
+
+    def evaluate_bpb(self):
+        """Run BPB validation, log metrics, and update the best checkpoint.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        step = self.state.step
+        start_bpb_eval = time.time()
+        self.compiled_model.eval()
+        tokens_per_eval_step = (
+            self.config.device_batch_size
+            * self.model.config.max_context
+            * self.config.comp_info.world_size
+        )
+        eval_steps = max(
+            1,
+            math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
+        )
+        with self.val_context(self.compiled_model):
+            val_res = compute_bpb(
+                self.compiled_model,
+                self.val_loader(),
+                eval_steps,
+                comp_info=self.config.comp_info,
+                token_bytes=self.tokenizer.token_bytes
+            )
+        print0(f"Step {step:05d} | "\
+               f"Validation bpb: {val_res['bpb']:.6f} | "\
+            f"Validation loss: {val_res['loss']:.6f}")
+
+        dt_bpb_eval = time.time() - start_bpb_eval
+
+        if (
+            (self.ckpt_state.best_eval_value is None) or
+            (val_res['bpb'] < self.ckpt_state.best_eval_value)
+        ):
+            self.ckpt_state.best_eval_value = val_res['bpb']
+            self.ckpt_state.best_eval_step = step
+            if (
+                self.config.save_on_best and
+                not ((self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0)) # already saving this step
+                ):
+                self.save_checkpoint()
+
+        board_dict = {
+            "eval/loss": val_res['loss'],
+            "eval/bpb": val_res['bpb'],
+            "eval/best_bpb": self.ckpt_state.best_eval_value,
+            "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
+        }
+        self.board.log(board_dict, step=step)
+        self.eval_metrics.append(board_dict, step=step)
+        self.compiled_model.train()
+
+    def evaluate_core(self):
+        """Run CORE evaluation, log metrics, and track the best score.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        step = self.state.step
+        n_steps = self.config.n_steps
+        self.model.eval()
+        with self.val_context(self.model):
+            results = evaluate_core(
+                self.model,
+                self.tokenizer,
+                self.device,
+                max_per_task=self.config.n_core_tokens,
+            )
+        max_throughput = results.get("core/max_per_task", 0) * self.config.comp_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
+        print0(f"Step {step:05d}/{n_steps:05d} | "
+               f"CORE: {results['core/core']:.4f} | "
+               f"Accuracy: {results['core/accuracy']:.4f} | "
+               f"Max per task: {int(results['core/max_per_task'])} | "
+               f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
+               f"Max throughput: {max_throughput:,.0f} tok/s")
+        board_dict = {
+            "core/core": results["core/core"],
+            "core/accuracy": results["core/accuracy"],
+            "core/max_per_task": results["core/max_per_task"],
+            "core/step_time_ms": results.get("core/step_time_ms", 0),
+        }
+        for task_label, task_results in results.get("all_core_results", {}).items():
+            for task_metric, task_value in task_results.items():
+                board_dict[f"core/{task_label}/{task_metric}"] = task_value
+        if (
+            (self.ckpt_state.best_core_value is None) or
+            (results["core/core"] > self.ckpt_state.best_core_value)
+        ):
+            self.ckpt_state.best_core_value = results["core/core"]
+            self.ckpt_state.best_core_step = step
+        self.board.log(board_dict, step=step)
+        self.core_metrics.append(results, step=step)
+        self.model.train()
+
+    def evaluate_samples(self):
+        """Generate samples using the original model to avoid recompilation.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        self.model.eval()
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+            "My favorite color is",
+            "If 5*x + 3 = 13, then x is",
+        ]
+        engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
+        with self.val_context(self.model):
+            samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
+        # print0(self.tokenizer.decode(samples[0]))
+        self.model.train()
+
+    def prepare_batch(self, raw_batch) -> tuple[Any, Optional[DataLoaderState], int]:
+        """Return (payload, optional loader state, local token count).
+
+        The default accepts (x, y, state) or (x, y), returning (x, y) as the
+        payload and x.numel() as the token count. Override alongside compute_loss
+        for other dataloader formats. The payload passes to compute_loss unchanged.
+
+        State must be a DataLoaderState or None.
+        Without state, checkpoints cannot restore the dataloader position.
+        Token counts are per rank and microbatch, before gradient accumulation.
+        """
+        if not isinstance(raw_batch, (tuple, list)) or len(raw_batch) not in (2, 3):
+            raise ValueError("Expected (x, y) or (x, y, state); override prepare_batch for other formats.")
+        x, y = raw_batch[:2]
+        state = raw_batch[2] if len(raw_batch) == 3 else None
+        if state is not None and not isinstance(state, DataLoaderState):
+            raise TypeError("Loader state must be a DataLoaderState or None.")
+        return (x, y), state, x.numel()
+
+    def compute_loss(self, payload: Any) -> torch.Tensor:
+        """Return a scalar loss connected to the computation graph.
+
+        Override this method to use a different training objective. The training
+        step supplies autocast, gradient accumulation scaling, and backward.
+        The payload comes from prepare_batch. By default, unpack (x, y) and use
+        the model's loss or compute cross-entropy from logits.
+        """
+        x, y = payload
+        output = self.compiled_model(x, y)
         if hasattr(output, "loss"):
             return output.loss
         else:
