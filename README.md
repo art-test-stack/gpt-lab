@@ -585,7 +585,8 @@ for module-mode launches and checkpoint selection.
 
 Subclass [`Trainer`](src/gpt_lab/train/trainer.py) and override `train_step` for a
 complete update, or `prepare_batch`, `compute_loss`, and `optimizer_step` for
-smaller changes. Override `evaluate_bpb`, `evaluate_core`, and `evaluate_samples`
+smaller changes. `update_metrics` updates per-step state; `log_metrics` handles
+reporting. Override `evaluate_bpb`, `evaluate_core`, and `evaluate_samples`
 independently; the main loop schedules evaluations. Use `self.compiled_model`
 for training forwards.
 See the class docstring for contracts and

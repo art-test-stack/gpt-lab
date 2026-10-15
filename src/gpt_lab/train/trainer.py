@@ -106,6 +106,12 @@ class Trainer:
             gradients, synchronizes distributed overflow flags, optionally logs
             gradients, updates the optimizer/scaler, and clears gradients.
             Hyperparameter scheduling stays in train_step().
+        update_metrics(step_metrics, total_dt):
+            Update counters, smoothed loss, and the duration history every step.
+            Return derived metrics; total_dt also controls ETA and time limits.
+        log_metrics(metrics):
+            Print, record, and send metrics to the board at train()'s logging
+            interval. Override reporting without changing per-step state.
         evaluate_bpb(), evaluate_core(), evaluate_samples():
             Replace evaluations independently; their scheduling stays in train().
             Each override owns model modes, evaluation contexts, and any logging,
@@ -340,10 +346,6 @@ class Trainer:
         # Extracte main constants from config
         step = self.state.step + int(self.state.step > 0) # start from the next step to avoid repeating the last step if resuming
         n_steps = self.config.n_steps
-        n_flops_per_token = self.config.n_flops_per_token
-        total_batch_size = self.config.total_batch_size
-
-        world_size = self.config.comp_info.world_size
         
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
@@ -378,8 +380,6 @@ class Trainer:
 
         # Prepare for training
         self.compiled_model.train()
-        smooth_loss = self.state.smooth_train_loss
-        ema_beta = 0.9
         
         total_dt = []  # For ETA calculation
         
@@ -393,7 +393,6 @@ class Trainer:
                     and step % self.config.log_every == 0
                 )
             )
-            flops_so_far = n_flops_per_token * total_batch_size * step
             self.synchronize()
             
             # ================================================================
@@ -440,79 +439,10 @@ class Trainer:
             # Logging and metrics
             # ================================================================
             
-            step_dt_tensor = torch.tensor(step_metrics["step_time"], device=self.device)
-
-            if self.config.comp_info.is_distributed:
-                dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
-
-            step_dt = step_dt_tensor.item()
-
-            loss_accum = step_metrics["loss"].item()
-            eff_global_tokens = step_metrics["tokens"]
-            lrm = step_metrics["lrm"]
-            muon_momentum = step_metrics["muon_momentum"]
-            weight_decay = step_metrics["weight_decay"]
-            
-            smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
-            debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
-            
-            # Calculate throughput
-            if eff_global_tokens != total_batch_size:
-                log0(f"eff_global_tokens != total_batch_size, got {eff_global_tokens=} and {total_batch_size=}", logger=logger, level="warning")
-
-            tokens_per_sec = eff_global_tokens / step_dt
-
-            step_flops_per_sec = n_flops_per_token * tokens_per_sec
-            mfu = step_flops_per_sec / self.config.comp_info.gpu_peak_flops * 100 / world_size
-            
-            total_dt.append(step_dt)
-            self.state.n_tokens += eff_global_tokens
-            self.state.smooth_train_loss = smooth_loss
-            self.state.total_training_time += step_dt
-            
-            # Log every log_every steps
+            metrics = self.update_metrics(step_metrics, total_dt)
             if should_log_step:
-                pct_done = 100 * step / n_steps
-                
-                # ETA calculation
-                if len(total_dt) > 10:
-                    avg_step_time = sum(total_dt[-10:]) / 10
-                    eta_seconds = (n_steps - step) * avg_step_time
-                    eta_str = f" | ETA: {eta_seconds/60:.1f}m"
-                else:
-                    eta_str = ""
+                self.log_metrics(metrics)
 
-                if math.isnan(debiased_smooth_loss) or math.isinf(debiased_smooth_loss):
-                    log_error(f"Loss is NaN or Inf at {step=}, {debiased_smooth_loss=}. Check previous logs for details.", error_type=ValueError, logger=logger)
-                
-                print0(
-                    f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
-                    f"loss: {debiased_smooth_loss:.6f} | "
-                    f"lrm: {lrm:.2e} | "
-                    f"dt: {step_dt*1000:.2f}ms | "
-                    f"tok/s: {tokens_per_sec:,.0f}"
-                    f"{eta_str}"
-                )
-                board_dict = {
-                    "epochs": self.state.n_epochs,
-                    "train/loss": debiased_smooth_loss,
-                    "train/raw_loss": loss_accum,
-                    "train/tokens_per_sec": tokens_per_sec,
-                    "train/step_time_ms": step_dt * 1000,
-                    "train/total_tokens": self.state.n_tokens,
-                    "train/flops_per_sec": step_flops_per_sec,
-                    "train/mfu": mfu,
-                    "lrm": lrm,
-                    "muon_momentum": muon_momentum,
-                    "weight_decay": weight_decay,
-                    "train/total_training_flops": flops_so_far,
-                    "train/total_training_time": self.state.total_training_time,
-                    "train/eta_seconds": eta_seconds if len(total_dt) > 10 else float("inf"),
-                }
-
-                self.metrics.append(board_dict, step)
-                self.board.log(board_dict, step=step)
-            
             # ================================================================
             # Checkpointing
             # ================================================================
@@ -547,6 +477,95 @@ class Trainer:
         # Final checkpoint
         self.save_checkpoint()
 
+    def update_metrics(self, step_metrics, total_dt):
+        """Update per-step state and return the metric dict consumed by log_metrics.
+
+        Called every step, including when logging is disabled. Reduce step time
+        with MAX across ranks, update loss smoothing and token/time counters,
+        and append the reduced duration to total_dt for ETA and time limits.
+        """
+        step = self.state.step
+        n_steps = self.config.n_steps
+        n_flops_per_token = self.config.n_flops_per_token
+        total_batch_size = self.config.total_batch_size
+        world_size = self.config.comp_info.world_size
+        flops_so_far = n_flops_per_token * total_batch_size * step
+        ema_beta = 0.9
+        smooth_loss = self.state.smooth_train_loss
+        step_dt_tensor = torch.tensor(step_metrics["step_time"], device=self.device)
+
+        if self.config.comp_info.is_distributed:
+            dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
+
+        step_dt = step_dt_tensor.item()
+
+        loss_accum = step_metrics["loss"].item()
+        eff_global_tokens = step_metrics["tokens"]
+
+        smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
+        debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
+
+        # Calculate throughput
+        if eff_global_tokens != total_batch_size:
+            log0(f"eff_global_tokens != total_batch_size, got {eff_global_tokens=} and {total_batch_size=}", logger=logger, level="warning")
+
+        tokens_per_sec = eff_global_tokens / step_dt
+
+        step_flops_per_sec = n_flops_per_token * tokens_per_sec
+        mfu = step_flops_per_sec / self.config.comp_info.gpu_peak_flops * 100 / world_size
+
+        total_dt.append(step_dt)
+        self.state.n_tokens += eff_global_tokens
+        self.state.smooth_train_loss = smooth_loss
+        self.state.total_training_time += step_dt
+        if len(total_dt) > 10:
+            avg_step_time = sum(total_dt[-10:]) / 10
+            eta_seconds = (n_steps - step) * avg_step_time
+        else:
+            eta_seconds = float("inf")
+
+        return {
+            "epochs": self.state.n_epochs,
+            "train/loss": debiased_smooth_loss,
+            "train/raw_loss": loss_accum,
+            "train/tokens_per_sec": tokens_per_sec,
+            "train/step_time_ms": step_dt * 1000,
+            "train/total_tokens": self.state.n_tokens,
+            "train/flops_per_sec": step_flops_per_sec,
+            "train/mfu": mfu,
+            "lrm": step_metrics["lrm"],
+            "muon_momentum": step_metrics["muon_momentum"],
+            "weight_decay": step_metrics["weight_decay"],
+            "train/total_training_flops": flops_so_far,
+            "train/total_training_time": self.state.total_training_time,
+            "train/eta_seconds": eta_seconds,
+        }
+
+    def log_metrics(self, metrics):
+        """Print metrics, append metric history, and send them to the board.
+
+        train() controls logging cadence. Override to customize reporting without
+        changing per-step counters or loss smoothing in update_metrics().
+        """
+        step = self.state.step
+        n_steps = self.config.n_steps
+        pct_done = 100 * step / n_steps
+        loss = metrics["train/loss"]
+        eta_seconds = metrics["train/eta_seconds"]
+        eta_str = f" | ETA: {eta_seconds/60:.1f}m" if math.isfinite(eta_seconds) else ""
+        if math.isnan(loss) or math.isinf(loss):
+            log_error(f"Loss is NaN or Inf at {step=}, {loss=}. Check previous logs for details.", error_type=ValueError, logger=logger)
+        print0(
+            f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
+            f"loss: {loss:.6f} | "
+            f"lrm: {metrics['lrm']:.2e} | "
+            f"dt: {metrics['train/step_time_ms']:.2f}ms | "
+            f"tok/s: {metrics['train/tokens_per_sec']:,.0f}"
+            f"{eta_str}"
+        )
+        self.metrics.append(metrics, step)
+        self.board.log(metrics, step=step)
+
     def train_step(self, train_iter, batch, should_log_step: bool):
         """Run one optimizer update and return (next_batch, step_metrics).
 
@@ -557,7 +576,7 @@ class Trainer:
         step_metrics keys are loss (detached accumulated tensor), tokens (global
         count), step_time (local seconds), lrm, muon_momentum, and weight_decay. Timing
         covers accumulation, prefetch, scheduling, and the optimizer update;
-        reduction across ranks remains in the metrics block in train().
+        reduction across ranks happens in update_metrics().
         """
         step = self.state.step
         n_acc_steps = self.config.n_acc_steps

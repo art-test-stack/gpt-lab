@@ -308,16 +308,17 @@ def test_train_step_matches_accumulated_update_and_preserves_prefetch_state(tmp_
 
 @pytest.mark.fast
 @pytest.mark.parametrize("with_state", [False, True])
+@pytest.mark.parametrize("log_every", [0, 1])
 def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
-    tmp_path, monkeypatch, caplog, with_state,
+    tmp_path, monkeypatch, caplog, with_state, log_every,
 ):
-    trainer, model, _ = _make_trainer(
+    trainer, model, board = _make_trainer(
         tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer,
     )
     trainer.config = trainer.config.model_copy(update={
         "n_steps": 2, "n_acc_steps": 2, "total_batch_size": 6,
         "n_flops_per_token": 100, "eval_bpb_every": 0,
-        "eval_core_every": 0, "sample_every": 0,
+        "eval_core_every": 0, "sample_every": 0, "log_every": log_every,
     })
     batches = [dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3,
                     state=DataLoaderState(epoch=i + 1, offset_in_row_group=i) if with_state else None)
@@ -354,6 +355,54 @@ def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
     loaded = load_checkpoint(tmp_path, step=1, comp_info=trainer.config.comp_info, load_scaler=False)
     assert loaded.trainer_state.train_loader_state == batches[3]["state"]
     assert loaded.trainer_state.n_tokens == 12
+    assert len(board.records) == (2 if log_every else 0)
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("prior_duration_count", [0, 10])
+def test_update_metrics_tracks_state_and_log_metrics_only_reports(
+    tmp_path, capsys, prior_duration_count,
+):
+    trainer, _, board = _make_trainer(tmp_path)
+    trainer.config = trainer.config.model_copy(update={"n_steps": 20, "n_flops_per_token": 100})
+    trainer.state.step = 10
+    trainer.state.n_tokens = 40
+    trainer.state.n_epochs = 2
+    trainer.state.smooth_train_loss = 1.8
+    trainer.state.total_training_time = 5.0
+    total_dt = [0.25] * prior_duration_count
+    step_metrics = dict(loss=torch.tensor(2.0), tokens=4, step_time=0.5,
+                        lrm=0.75, muon_momentum=0.95, weight_decay=0.25)
+
+    metrics = trainer.update_metrics(step_metrics, total_dt)
+
+    expected = {
+        "epochs": 2, "train/loss": 1.82 / (1 - 0.9**11), "train/raw_loss": 2.0,
+        "train/tokens_per_sec": 8.0, "train/step_time_ms": 500,
+        "train/total_tokens": 44, "train/flops_per_sec": 800, "train/mfu": 0.0,
+        "lrm": 0.75, "muon_momentum": 0.95, "weight_decay": 0.25,
+        "train/total_training_flops": 4000, "train/total_training_time": 5.5,
+        "train/eta_seconds": 2.75 if prior_duration_count else float("inf"),
+    }
+    assert metrics == pytest.approx(expected)
+    assert trainer.state.n_tokens == 44
+    assert trainer.state.smooth_train_loss == pytest.approx(1.82)
+    assert trainer.state.total_training_time == 5.5
+    assert total_dt == [0.25] * prior_duration_count + [0.5]
+    assert board.records == []
+    assert trainer.metrics.step == []
+    state_before_logging = trainer.state.model_dump()
+
+    trainer.log_metrics(metrics)
+
+    assert trainer.state.model_dump() == state_before_logging
+    assert board.records == [(metrics, 10)]
+    assert trainer.metrics.step == [10]
+    assert trainer.metrics.raw_loss == [2.0]
+    output = capsys.readouterr().out
+    assert "Step 00010/00020" in output
+    assert "tok/s: 8" in output
+    assert ("ETA:" in output) == bool(prior_duration_count)
 
 
 @pytest.mark.fast
