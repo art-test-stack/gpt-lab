@@ -14,7 +14,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from gpt_lab.utils.schemas import TrainerConfig
+from gpt_lab.utils.schemas import DataLoaderState, TrainerConfig
+from gpt_lab.model.checkpoint import load_checkpoint, save_checkpoint
 
 
 class _CaptureBoard:
@@ -25,7 +26,7 @@ class _CaptureBoard:
         self.records.append((values, step))
 
 
-def _make_trainer(tmp_path, compute_dtype=torch.bfloat16, monitor=False):
+def _make_trainer(tmp_path, compute_dtype=torch.bfloat16, monitor=False, trainer_class=Trainer):
     model = torch.nn.Linear(2, 2, bias=False)
     board = _CaptureBoard()
     config = TrainerConfig(
@@ -37,7 +38,7 @@ def _make_trainer(tmp_path, compute_dtype=torch.bfloat16, monitor=False):
         monitor_grad_norms=monitor,
         comp_info=ComputeContext(device=torch.device("cpu"), compute_dtype=compute_dtype),
     )
-    trainer = Trainer(
+    trainer = trainer_class(
         model=model,
         tokenizer=None,
         train_loader=SimpleNamespace(B=2),
@@ -201,6 +202,127 @@ def test_evaluate_samples_uses_original_model_and_generation_settings(tmp_path, 
         "num_samples": 1, "max_tokens": 16, "temperature": 0,
     }
     assert model.training
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("state", [None, DataLoaderState(epoch=3)])
+def test_prepare_batch_preserves_payload_and_optional_state(tmp_path, state):
+    trainer, _, _ = _make_trainer(tmp_path)
+    x, y = torch.ones(2, 3), torch.zeros(2, 3)
+    raw_batch = (x, y) if state is None else (x, y, state)
+
+    payload, loader_state, tokens = trainer.prepare_batch(raw_batch)
+
+    assert payload[0] is x
+    assert payload[1] is y
+    assert loader_state is state
+    assert tokens == 6
+
+
+@pytest.mark.fast
+def test_prepare_batch_rejects_custom_formats_without_override(tmp_path):
+    trainer, _, _ = _make_trainer(tmp_path)
+    with pytest.raises(ValueError, match="override prepare_batch"):
+        trainer.prepare_batch({"input_ids": torch.ones(2, 3)})
+    with pytest.raises(TypeError, match="DataLoaderState or None"):
+        trainer.prepare_batch((torch.ones(2, 3), torch.zeros(2, 3), {"offset": 1}))
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("model_returns_loss", [False, True])
+def test_compute_loss_accepts_prepared_payload(tmp_path, model_returns_loss):
+    trainer, _, _ = _make_trainer(tmp_path)
+    x = torch.ones(1, 2, dtype=torch.long)
+    y = torch.tensor([[0, 1]])
+    logits = torch.tensor([[[2.0, 0.0], [1.0, 3.0]]], requires_grad=True)
+    expected = torch.nn.functional.cross_entropy(logits.view(-1, 2), y.view(-1))
+    output = SimpleNamespace(loss=expected) if model_returns_loss else logits
+    trainer._compiled_model = Mock(return_value=output)
+
+    loss = trainer.compute_loss((x, y))
+
+    trainer._compiled_model.assert_called_once_with(x, y)
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert logits.grad is not None
+
+
+class _PayloadTrainer(Trainer):
+    def prepare_batch(self, raw_batch):
+        return raw_batch, raw_batch.get("state"), raw_batch["tokens"]
+
+    def compute_loss(self, payload):
+        return (self._compiled_model(payload["features"]) - payload["targets"]).square().mean()
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("with_state", [False, True])
+def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
+    tmp_path, monkeypatch, caplog, with_state,
+):
+    trainer, model, _ = _make_trainer(
+        tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer,
+    )
+    trainer.config = trainer.config.model_copy(update={
+        "n_steps": 2, "n_acc_steps": 2, "total_batch_size": 6,
+        "n_flops_per_token": 100, "eval_bpb_every": 0,
+        "eval_core_every": 0, "sample_every": 0,
+    })
+    batches = [dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3,
+                    state=DataLoaderState(epoch=i + 1, offset_in_row_group=i) if with_state else None)
+               for i in range(5)]
+    trainer.train_loader = batches
+    trainer.optimizer.update_hyperparams = Mock()
+    trainer.ckpt_manager.save = lambda **kwargs: save_checkpoint(
+        checkpoint_dir=tmp_path, comp_info=trainer.config.comp_info, **kwargs,
+    )
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+    # Keep the trainer's process-wide GC policy from affecting other tests.
+    for name in ("collect", "freeze", "disable"):
+        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
+    initial_weight = model.weight.detach().clone()
+    seen_payloads = []
+    compute_loss = trainer.compute_loss
+
+    def capture_loss(payload):
+        seen_payloads.append(payload)
+        return compute_loss(payload)
+
+    trainer.compute_loss = capture_loss
+    caplog.set_level("WARNING", logger="gpt_lab.train.trainer")
+
+    trainer.train()
+
+    assert all(seen is raw for seen, raw in zip(seen_payloads, batches))
+    assert len(seen_payloads) == 4
+    assert trainer.state.n_tokens == 12
+    assert not torch.equal(model.weight, initial_weight)
+    assert model.weight.grad is None
+    warnings = [record for record in caplog.records if "No dataloader state provided" in record.message]
+    assert len(warnings) == (0 if with_state else 1)
+    loaded = load_checkpoint(tmp_path, step=1, comp_info=trainer.config.comp_info, load_scaler=False)
+    assert loaded.trainer_state.train_loader_state == batches[3]["state"]
+    assert loaded.trainer_state.n_tokens == 12
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("serializable", [False, True])
+def test_nonfinite_custom_payload_reports_loss_without_loader_state(tmp_path, monkeypatch, serializable):
+    trainer, _, _ = _make_trainer(tmp_path, trainer_class=_PayloadTrainer)
+    trainer.config = trainer.config.model_copy(update={
+        "n_flops_per_token": 100, "eval_bpb_every": 0,
+        "eval_core_every": 0, "sample_every": 0,
+    })
+    payload = dict(features=torch.ones(2, 2), targets=torch.full((2, 2), float("nan")), tokens=4)
+    if not serializable:
+        payload["custom_metadata"] = object()
+    trainer.train_loader = [payload]
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+
+    with pytest.raises(ValueError, match="Loss is NaN or Inf"):
+        trainer.train()
+
+    assert (tmp_path / "bad_batch.safetensors").exists() == serializable
 
 
 class TestModelTrainer:

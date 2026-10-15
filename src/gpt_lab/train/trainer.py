@@ -9,7 +9,7 @@ Key responsibilities:
 - Device management and memory optimization
 """
 
-from typing import Optional, Callable, Union, Dict
+from typing import Any, Optional, Callable, Union
 from pathlib import Path
 from contextlib import ExitStack, contextmanager, nullcontext
 
@@ -330,10 +330,22 @@ class Trainer:
         if self.config.comp_info.is_distributed:
             dist.barrier()
 
-        x, y, dataloader_state = next(train_iter) # prefetch
+        payload, dataloader_state, token_count = self.prepare_batch(next(train_iter)) # prefetch
 
         print(f"[rank={rank}] after prefetch", flush=True)
-        log_dict("First dataloader_state", dataloader_state.__dict__, logger=logger)
+        if dataloader_state is None:
+            self.state.train_loader_state = None
+            log0(
+                "No dataloader state provided. Dataloader state will not be saved "
+                "with checkpoints; the data position cannot be restored on resume.",
+                level="warning", logger=logger,
+            )
+        else:
+            log_dict(
+                "First dataloader_state",
+                dataloader_state.model_dump(),
+                logger=logger,
+            )
 
         # Prepare for training
         self._compiled_model.train()
@@ -401,11 +413,11 @@ class Trainer:
             step_start_time = time.perf_counter()
             
             for _ in range(n_acc_steps):
-                eff_global_tokens += x.numel() * world_size
+                eff_global_tokens += token_count * world_size
 
                 self.state.train_loader_state = dataloader_state
                 with self.train_context():
-                    loss = self.compute_loss(x, y)
+                    loss = self.compute_loss(payload)
                 loss = loss / n_acc_steps
 
                 if self.scaler is not None:
@@ -417,22 +429,21 @@ class Trainer:
 
                 if torch.isnan(loss_accum) or torch.isinf(loss_accum):
                     from gpt_lab.utils.tensor_io import save_tensor_state
-                    save_tensor_state({"inputs": x}, self.dirname / "bad_batch.safetensors")
+                    try:
+                        save_tensor_state({"payload": payload}, self.dirname / "bad_batch.safetensors")
+                    except TypeError:
+                        log0("Bad-batch payload cannot be serialized; see the loss error for details.", level="warning", logger=logger)
                     log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
                         f"Loss is NaN or Inf at {step=}.\n" \
-                        f"Dataloader state: {dataloader_state.__dict__}.\n" \
-                        f"Model inputs shape: {x.shape}, values: {x}\n" \
-                        f"Model targets shape: {y.shape}, values: {y}\n" \
+                        f"Dataloader state: {dataloader_state}.\n" \
+                        f"Batch payload: {payload}\n" \
                         f"Accumulated loss: {loss_accum}",
                         error_type=ValueError, logger=logger  
                     )
-                x, y, dataloader_state = next(train_iter)
+                payload, dataloader_state, token_count = self.prepare_batch(next(train_iter))
             
             if dataloader_state is not None:
-                if isinstance(dataloader_state, DataLoaderState):
-                    self.state.n_epochs = dataloader_state.epoch
-                else:
-                    self.state.n_epochs = dataloader_state.get("epoch", 0)
+                self.state.n_epochs = dataloader_state.epoch
             
             lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
 
@@ -686,13 +697,34 @@ class Trainer:
         # print0(self.tokenizer.decode(samples[0]))
         self.model.train()
 
-    def compute_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def prepare_batch(self, raw_batch) -> tuple[Any, Optional[DataLoaderState], int]:
+        """Return (payload, optional loader state, local token count).
+
+        The default accepts (x, y, state) or (x, y), returning (x, y) as the
+        payload and x.numel() as the token count. Override alongside compute_loss
+        for other dataloader formats. The payload passes to compute_loss unchanged.
+
+        State must be a DataLoaderState or None.
+        Without state, checkpoints cannot restore the dataloader position.
+        Token counts are per rank and microbatch, before gradient accumulation.
+        """
+        if not isinstance(raw_batch, (tuple, list)) or len(raw_batch) not in (2, 3):
+            raise ValueError("Expected (x, y) or (x, y, state); override prepare_batch for other formats.")
+        x, y = raw_batch[:2]
+        state = raw_batch[2] if len(raw_batch) == 3 else None
+        if state is not None and not isinstance(state, DataLoaderState):
+            raise TypeError("Loader state must be a DataLoaderState or None.")
+        return (x, y), state, x.numel()
+
+    def compute_loss(self, payload: Any) -> torch.Tensor:
         """Return a scalar loss connected to the computation graph.
 
         Override this method to use a different training objective. The training
         loop supplies autocast, gradient accumulation scaling, and backward.
-        By default, use the model's loss or compute cross-entropy from logits.
+        The payload comes from prepare_batch. By default, unpack (x, y) and use
+        the model's loss or compute cross-entropy from logits.
         """
+        x, y = payload
         output = self._compiled_model(x, y)
         if hasattr(output, "loss"):
             return output.loss
