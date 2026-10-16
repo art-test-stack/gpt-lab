@@ -40,6 +40,11 @@ backed up to a numbered sibling. `--corpus-dir` overrides
 enables comparison; `--board` is unused. Training/evaluation sources may overlap;
 check before claiming held-out performance.
 
+## Value-embedding experiment
+
+See [value_vocab/README.md](value_vocab/README.md) for the single-run experiment
+and independent job-command generator.
+
 ## Checks
 
 ```bash
@@ -47,4 +52,6 @@ uv run --locked --extra cpu --group dev pytest -q tests/experiments
 ```
 
 Tests exercise the offline benchmark, argument parsing, result preservation,
-and mocked scaling resume. They do not run a full tokenizer sweep.
+mocked scaling resume, single-run smoke training, pretrained vocabulary
+truncation, and grid command generation. Pretrained tokenizer assets must be
+cached for offline tests. No expensive training runs are included.

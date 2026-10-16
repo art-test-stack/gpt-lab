@@ -1,18 +1,21 @@
 import json
 import math
+import itertools
+import shlex
 
 import pytest
 import torch
 
-from experiments.value_vocab import (
+from experiments.value_vocab.run import (
     SHARING, CyclingBatches, evaluation_batches, parser, plan, run,
 )
+from experiments.value_vocab.submit import commands, parser as submit_parser
 from gpt_lab.model.checkpoint import build_meta_model
 from gpt_lab.tokenizer.tokenizer import Tokenizer
 from gpt_lab.utils.schemas import TransformerConfig
 
 
-def test_sharing_accounting_and_fixed_compute():
+def test_sharing_accounting_and_dense_flop_estimate():
     rows = []
     for vocab in [300, 600]:
         for mode in SHARING.values():
@@ -53,22 +56,25 @@ def test_batches_cover_tail_and_cycle():
     assert y.tolist() == [[5, 99], [1, 2]]
 
 
-def test_real_smoke_sweep_and_dry_run(tmp_path, monkeypatch):
+@pytest.mark.parametrize("vocab,sharing,seed", [
+    (300, "fully-shared", 0), (300, "independent", 1),
+    (320, "shared-values", 0), (320, "independent-values-tied-head", 1),
+])
+def test_single_run_and_dry_run(tmp_path, monkeypatch, vocab, sharing, seed):
     def no_training(*args, **kwargs):
         pytest.fail("the experiment must not train tokenizers")
 
     monkeypatch.setattr(Tokenizer, "train_from_iterator", no_training)
     output = tmp_path / "results.jsonl"
-    argv = ["--smoke", "--vocab-sizes", "300", "320", "--seeds", "0", "1", "--output", str(output)]
+    argv = ["--smoke", "--vocab-size", str(vocab), "--sharing", sharing,
+            "--seed", str(seed), "--output", str(output)]
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
         run(parser().parse_args(argv))
         rows = [json.loads(line) for line in output.read_text().splitlines()]
-        assert len(rows) == 2 * len(SHARING) * 2
-        assert len({(r["requested_vocab_size"], r["sharing"], r["seed"]) for r in rows}) == len(rows)
-        assert len({r["eval_sha256"] for r in rows}) == 1
-        assert len({r["eval_bytes"] for r in rows}) == 1
+        assert len(rows) == 1
+        assert (rows[0]["requested_vocab_size"], rows[0]["sharing"], rows[0]["seed"]) == (vocab, sharing, seed)
         for row in rows:
             assert row["actual_vocab_size"] == row["requested_vocab_size"]
             assert row["base_tokenizer"] == "cl100k_base"
@@ -83,9 +89,9 @@ def test_real_smoke_sweep_and_dry_run(tmp_path, monkeypatch):
             run(parser().parse_args(argv))
         assert output.read_bytes() == original
         dry = tmp_path / "dry.jsonl"
-        run(parser().parse_args(["--smoke", "--dry-run", "--sharing", "fully-shared", "--seeds", "0", "--output", str(dry)]))
+        run(parser().parse_args([*argv[:-2], "--dry-run", "--output", str(dry)]))
         planned = [json.loads(line) for line in dry.read_text().splitlines()]
-        assert [row["actual_vocab_size"] for row in planned] == [512, 1024, 2048]
+        assert [row["actual_vocab_size"] for row in planned] == [vocab]
         for row in planned:
             assert row["status"] == "planned"
             assert row["training_tokens"] == row["training_steps"] == 0
@@ -109,5 +115,39 @@ def test_pretrained_truncation_and_base_size_limit(name, tmp_path):
     output = tmp_path / "too-large.jsonl"
     with pytest.raises(ValueError, match="exceeds"):
         run(parser().parse_args(["--smoke", "--dry-run", "--base-tokenizer", name,
-                                "--vocab-sizes", str(base.vocab_size + 1), "--output", str(output)]))
+                                "--vocab-size", str(base.vocab_size + 1), "--output", str(output)]))
     assert not output.exists()
+
+
+def test_job_commands_cover_grid_and_keep_paths_separate(tmp_path):
+    args = submit_parser().parse_args([
+        "--vocab-sizes", "300", "320", "--sharing", "fully-shared", "independent",
+        "--seeds", "0", "1", "--result-dir", str(tmp_path / "results with spaces"),
+        "--", "--train-text", "train text.txt", "--eval-text", "eval text.txt", "--dry-run",
+    ])
+    jobs = list(commands(args))
+    parsed = []
+    for command in jobs:
+        assert shlex.split(shlex.join(command)) == command
+        assert command[0] == "env" and command[2:5] == ["python", "-m", "experiments.value_vocab.run"]
+        options = parser().parse_args(command[5:])
+        assert str(options.train_text) == "train text.txt"
+        assert str(options.eval_text) == "eval text.txt"
+        assert options.dry_run
+        parsed.append(options)
+    assert {(job.vocab_size, job.sharing, job.seed) for job in parsed} == set(
+        itertools.product([300, 320], ["fully-shared", "independent"], [0, 1])
+    )
+    assert len(jobs) == len({job.output for job in parsed}) == len({job[1] for job in jobs}) == 8
+    assert not (tmp_path / "results with spaces").exists()
+
+
+@pytest.mark.parametrize("extra", [["--seed=3"], ["--output", "out.jsonl"]])
+def test_job_commands_reject_runner_overrides(extra):
+    with pytest.raises(ValueError, match="submitter"):
+        list(commands(submit_parser().parse_args(["--", *extra])))
+
+
+def test_job_commands_reject_duplicate_axes():
+    with pytest.raises(ValueError, match="duplicates"):
+        list(commands(submit_parser().parse_args(["--vocab-sizes", "300", "300"])))
