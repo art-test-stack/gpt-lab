@@ -3,6 +3,7 @@
 .vscode
 .DS_Store
 runs
+experiments/results/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
