@@ -14,7 +14,17 @@ if TYPE_CHECKING:
 
 
 class MuonStrategy(OptimizerStrategy):
-    """Muon optimizer strategy for single and distributed training."""
+    """Existing Polar Express/NorMuon-style variant with cautious weight decay."""
+
+    step_kernel = staticmethod(muon_step)
+
+    @staticmethod
+    def _normalization_dim(shape) -> int:
+        return -1 if shape[-2] >= shape[-1] else -2
+
+    @staticmethod
+    def _learning_rate(group: dict, shape) -> float:
+        return group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5
     
     def local_step(self, group: dict) -> None:
         params: list[torch.Tensor] = group["params"]
@@ -24,26 +34,26 @@ class MuonStrategy(OptimizerStrategy):
         p = params[0]
         state = self.opt.state[p]
         shape, device, dtype = p.shape, p.device, p.dtype
+        red_dim = self._normalization_dim(shape)
         
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(len(params), *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
             state_shape = (
-                (len(params), shape[-2], 1) if shape[-2] >= shape[-1]
+                (len(params), shape[-2], 1) if red_dim == -1
                 else (len(params), 1, shape[-1])
             )
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
         
         self.opt.scalars.muon_momentum_t.fill_(group["momentum"])
         self.opt.scalars.muon_beta2_t.fill_(group.get("beta") or 0.0)
-        self.opt.scalars.muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
+        self.opt.scalars.muon_lr_t.fill_(self._learning_rate(group, shape))
         self.opt.scalars.muon_wd_t.fill_(group["weight_decay"])
         
-        muon_step(
+        self.step_kernel(
             stacked_grads, stacked_params, state["momentum_buffer"],
             state["second_momentum_buffer"], self.opt.scalars.muon_momentum_t,
             self.opt.scalars.muon_lr_t, self.opt.scalars.muon_wd_t,
@@ -123,6 +133,7 @@ class MuonStrategy(OptimizerStrategy):
         chunk_size = info["chunk_size"]
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
+        red_dim = self._normalization_dim(shape)
         
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
@@ -132,12 +143,11 @@ class MuonStrategy(OptimizerStrategy):
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
             state_shape = (
-                (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1]
+                (chunk_size, shape[-2], 1) if red_dim == -1
                 else (chunk_size, 1, shape[-1])
             )
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
         updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         
         if num_owned > 0:
@@ -147,11 +157,11 @@ class MuonStrategy(OptimizerStrategy):
             self.opt.scalars.muon_momentum_t.fill_(group["momentum"])
             self.opt.scalars.muon_beta2_t.fill_(group["beta"])
             self.opt.scalars.muon_lr_t.fill_(
-                group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5
+                self._learning_rate(group, shape)
             )
             self.opt.scalars.muon_wd_t.fill_(group["weight_decay"])
             
-            muon_step(
+            self.step_kernel(
                 info["grad_chunk"][:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned],
                 state["second_momentum_buffer"][:num_owned],

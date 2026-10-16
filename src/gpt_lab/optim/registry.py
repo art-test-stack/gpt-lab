@@ -5,6 +5,7 @@ Enables adding new optimizers with a single registry entry.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -54,3 +55,14 @@ def _validate_group(group: dict[str, Any], idx: int) -> None:
             f"Param group [{idx}] (opt={opt_name!r}) is missing required keys: {missing}. "
             f"Check that your YAML config or code defaults supply all required fields."
         )
+
+    if opt_name == "normuon":
+        for key in ("lr", "weight_decay", "momentum", "beta"):
+            value = group[key]
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"NorMuon {key} must be finite and non-negative")
+            if key in ("momentum", "beta") and value >= 1:
+                raise ValueError(f"NorMuon {key} must be less than 1")
+        steps = group["ns_steps"]
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError("NorMuon ns_steps must be a positive integer")
