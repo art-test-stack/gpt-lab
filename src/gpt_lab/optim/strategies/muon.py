@@ -114,6 +114,7 @@ class MuonStrategy(OptimizerStrategy):
             "grad_chunk": grad_chunk,
             "stacked_grads": stacked_grads,
             "chunk_size": chunk_size,
+            "param_indices": list(param_indices),
             "owner_positions": [
                 index % owner_chunk_size
                 for index in indices_by_owner[dist.get_rank()]
@@ -123,20 +124,39 @@ class MuonStrategy(OptimizerStrategy):
     def dist_compute(
         self, group: dict, info: dict, gather_list: list, rank: int, world_size: int,
     ) -> None:
-        if info["work"] is None:
-            return
-        
-        info["work"].wait()
-        if info["average"]:
-            info["grad_chunk"].div_(world_size)
+        """Consume one full-group reduction or {"buckets": complete_partition}.
+
+        Assemble gradients into the original owner-local slots before one group
+        update and gather. Bucket boundaries do not change checkpoint state layout.
+        """
         params = group["params"]
-        chunk_size = info["chunk_size"]
+        if not params:
+            return
+
+        buckets = info.get("buckets", [info])
+        indices = [index for bucket in buckets for index in bucket["param_indices"]]
+        if sorted(indices) != list(range(len(params))):
+            raise ValueError("Muon buckets must cover every group parameter exactly once")
+
+        chunk_size = (len(params) + world_size - 1) // world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
         red_dim = self._normalization_dim(shape)
         
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
+
+        if len(buckets) == 1 and buckets[0]["owner_positions"] == list(range(num_owned)):
+            owned_grads = buckets[0]["grad_chunk"]
+        else:
+            owned_grads = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        for bucket in buckets:
+            bucket["work"].wait()
+            if bucket["average"]:
+                bucket["grad_chunk"].div_(world_size)
+            if owned_grads is not bucket["grad_chunk"]:
+                for slot, position in enumerate(bucket["owner_positions"]):
+                    owned_grads[position].copy_(bucket["grad_chunk"][slot])
         
         state = self.opt.state[p]
         if "momentum_buffer" not in state:
@@ -162,7 +182,7 @@ class MuonStrategy(OptimizerStrategy):
             self.opt.scalars.muon_wd_t.fill_(group["weight_decay"])
             
             self.step_kernel(
-                info["grad_chunk"][:num_owned], stacked_owned,
+                owned_grads[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned],
                 state["second_momentum_buffer"][:num_owned],
                 self.opt.scalars.muon_momentum_t, self.opt.scalars.muon_lr_t,
@@ -174,7 +194,10 @@ class MuonStrategy(OptimizerStrategy):
         if num_owned < chunk_size:
             updated_params[num_owned:].zero_()
         
-        gathered_buffer = info["stacked_grads"]
+        gathered_buffer = (
+            buckets[0]["stacked_grads"] if len(buckets) == 1
+            else torch.empty(chunk_size * world_size, *shape, dtype=dtype, device=device)
+        )
         work = dist.all_gather_into_tensor(
             gathered_buffer, updated_params, async_op=True
         )

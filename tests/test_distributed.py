@@ -194,42 +194,62 @@ def test_two_process_gloo_optimizer_matches_averaged_local_updates():
 
 
 def _muon_bucket_worker(rank, port):
-    from gpt_lab.optim.strategies.muon import MuonStrategy
+    from gpt_lab.optim.factory import OptimizerFactory
 
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2",
                       MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
                       GLOO_SOCKET_IFNAME="lo0" if sys.platform == "darwin" else "lo")
     dist.init_process_group("gloo", timeout=timedelta(seconds=30))
     try:
-        params = [torch.nn.Parameter(torch.zeros(2, 3)) for _ in range(5)]
-        for index, parameter in enumerate(params):
-            parameter.grad = torch.full_like(parameter, index + 2 * rank)
-        strategy = MuonStrategy(None)
-        # Original owners are [0, 0, 0, 1, 1], even for reordered buckets.
-        owned_count = 3 if rank == 0 else 2
-        assembled = torch.empty(owned_count, 2, 3)
-        seen_positions = []
-        for indices in ([4, 1, 3], [2, 0]):
-            info = strategy._reduce_bucket({"params": params}, indices, 2)
-            info["work"].wait()
-            assert info["average"]
-            averaged = info["grad_chunk"] / 2
-            expected_indices = [index for index in indices if index // 3 == rank]
-            assert info["owner_positions"] == [index % 3 for index in expected_indices]
-            for slot, (index, position) in enumerate(zip(expected_indices, info["owner_positions"])):
-                torch.testing.assert_close(averaged[slot], torch.full((2, 3), index + 1.0))
-                assembled[position].copy_(averaged[slot])
-            torch.testing.assert_close(
-                averaged[len(expected_indices):],
-                torch.zeros_like(averaged[len(expected_indices):]),
-            )
-            seen_positions.extend(info["owner_positions"])
-        assert sorted(seen_positions) == list(range(owned_count))
-        expected = torch.stack([
-            torch.full((2, 3), rank * 3 + position + 1.0)
-            for position in range(owned_count)
-        ])
-        torch.testing.assert_close(assembled, expected)
+        context = init_dist_groups("cpu")
+        for opt_name in ("muon", "normuon"):
+            params = [
+                torch.nn.Parameter(torch.linspace(-0.3, 0.7, 6).reshape(2, 3) + index / 10)
+                for index in range(5)
+            ]
+            reference = [torch.nn.Parameter(parameter.detach().clone()) for parameter in params]
+
+            def group(parameters):
+                return dict(params=parameters, opt=opt_name, lr=0.01, momentum=0.95,
+                            beta=0.95, ns_steps=5, weight_decay=0.1)
+
+            optimizer = OptimizerFactory([group(params)], comp_info=context)
+            local = OptimizerFactory([group(reference)], comp_info=ComputeContext(device=torch.device("cpu")))
+            strategy = optimizer.backend.strategies[opt_name]
+            param_group = optimizer.param_groups[0]
+            # Original owners stay [0, 0, 0, 1, 1], regardless of bucket order.
+            owned_count = 3 if rank == 0 else 2
+            with torch.no_grad(), torch.compiler.set_stance("force_eager"):
+                for step in range(2):
+                    for index, (parameter, expected) in enumerate(zip(params, reference)):
+                        base = torch.arange(parameter.numel(), dtype=torch.float32).reshape(parameter.shape)
+                        gradients = [torch.sin(base + index + step + worker) * (worker + 1) for worker in range(2)]
+                        parameter.grad = gradients[rank].clone()
+                        expected.grad = (gradients[0] + gradients[1]) / 2
+                    buckets = [strategy._reduce_bucket(param_group, indices, 2)
+                               for indices in ([4, 1, 3], [2, 0])]
+                    gathers = []
+                    if step == 0:
+                        for invalid in ([buckets[0]], [*buckets, buckets[0]]):
+                            with pytest.raises(ValueError, match="exactly once"):
+                                strategy.dist_compute(param_group, {"buckets": invalid}, gathers, rank, 2)
+                        assert not optimizer.state and not gathers
+                        for parameter, expected in zip(params, reference):
+                            torch.testing.assert_close(parameter, expected)
+                    if step == 1:
+                        buckets.reverse()
+                    strategy.dist_compute(param_group, {"buckets": buckets}, gathers, rank, 2)
+                    assert len(gathers) == 1
+                    optimizer.backend._finish_gathers(gathers)
+                    local.step()
+                    for parameter, expected in zip(params, reference):
+                        torch.testing.assert_close(parameter, expected, rtol=1e-5, atol=1e-6)
+                    for key in ("momentum_buffer", "second_momentum_buffer"):
+                        actual = optimizer.state[params[0]][key]
+                        expected = local.state[reference[0]][key][rank * 3:rank * 3 + owned_count]
+                        assert actual.shape[0] == 3
+                        torch.testing.assert_close(actual[:owned_count], expected)
+                        torch.testing.assert_close(actual[owned_count:], torch.zeros_like(actual[owned_count:]))
     finally:
         cleanup_dist_groups()
 
