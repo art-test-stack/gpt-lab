@@ -163,6 +163,10 @@ compatibility wrappers.
 Standalone dataloader benchmarks and tokenizer scaling live in
 [experiments/](experiments/README.md).
 
+For a lightweight recap of runs, curves, evaluation results, and configurations,
+see the [results dashboard guide](docs/results_dashboard.md). The viewer in
+[`spaces/results/`](spaces/results/) can be deployed as a static Hugging Face Space.
+
 ### Data
 
 **TLDR;** The dataloader is easily built with the following code snippet. It employs the following strategies:
