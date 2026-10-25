@@ -49,6 +49,9 @@ try {
   transfer.items.add(new win.File([JSON.stringify({schema_version:1, synthetic:true, runs})], 'chart-check.json', {type:'application/json'}));
   $('import').files = transfer.files; $('import').dispatchEvent(new win.Event('change'));
   await until(() => getChart('loss-chart')?.data.datasets[0].data.length === 601);
+  assert($('smoothing').value === '0.9' && $('loss-description').textContent === 'EMA · 0.9 · NATS', 'Loss smoothing must default to EMA 0.9 with a matching panel description');
+  change('smoothing', '0');
+  assert($('loss-description').textContent === 'RAW LOSS · NATS', 'Loss panel must identify unsmoothed loss');
   const mfu = getChart('mfu-chart');
   assert(mfu.data.datasets.length === 2 && mfu.data.datasets[0].data.length === 2, 'MFU must omit runs and points without logged values');
   assert(mfu.data.datasets[0].data[1].y === 28.5 && mfu.data.datasets[0].data[0].y === 0, 'MFU must retain logged percentages and zero without rescaling');
@@ -63,10 +66,16 @@ try {
   chart.canvas.dispatchEvent(new win.MouseEvent('mouseout', {bubbles:true}));
   await until(() => chart.getActiveElements().length === 0 && chart.tooltip.opacity === 0);
   change('smoothing', '0.6');
+  assert($('loss-description').textContent === 'EMA · 0.6 · NATS', 'Loss panel must identify the selected smoothing factor');
   assert(!Object.values(win.Chart.instances).includes(chart), 'Rerender must dispose of old charts');
   chart = getChart('loss-chart'); tooltip = await hover(chart);
   assert(tooltip.body[0].after[0] === 'Raw loss: 3.999 · EMA: 0.6', 'EMA tooltip must retain the raw value');
   assert(Math.abs(tooltip.dataPoints[0].parsed.y - 3.9996) < 1e-10, 'Tooltip must show the actual EMA value');
+  change('smoothing', '0.9');
+  assert($('loss-description').textContent === 'EMA · 0.9 · NATS', 'Loss panel must update when the smoothing factor changes');
+  change('smoothing', '0');
+  assert($('loss-description').textContent === 'RAW LOSS · NATS', 'Disabling smoothing must restore the raw-loss description');
+  change('smoothing', '0.6');
   change('axis', 'train/total_tokens');
   assert(!$('bpb-chart').querySelector('canvas'), 'Sparse evaluation must not invent token counters');
   tooltip = await hover(getChart('loss-chart'));
@@ -127,7 +136,7 @@ try {
   assert($('config-downloads').children.length === 1, 'Configuration downloads must follow the experiment scope');
   $('differences').checked = false;
   doc.querySelector('[data-tab="overview"]').click();
-  $('smoothing').value = '0'; $('demo').click();
+  $('smoothing').value = '0.9'; $('demo').click();
   assert(getChart('loss-chart').data.datasets.length === 2, 'Leave the synthetic preview visible for manual inspection');
   frame.style.width = '390px';
   await until(() => doc.documentElement.clientWidth < 400);

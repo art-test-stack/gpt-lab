@@ -130,11 +130,12 @@ function configs() {
 }
 function render() {
   for (const chart of charts.values()) chart.destroy(); charts.clear();
+  $('loss-description').textContent = Number($('smoothing').value) ? `EMA · ${$('smoothing').value} · NATS` : 'RAW LOSS · NATS';
   runList(); $('empty').hidden = snapshot.runs.length > 0; $('workspace').hidden = !snapshot.runs.length;
   $('demo-banner').hidden = !synthetic; $('download').disabled = !chosen().length;
   $('snapshot-info').textContent = synthetic ? 'Synthetic interface preview' : `${snapshot.runs.length} runs · ${snapshot.exported_at ? `Snapshot ${snapshot.exported_at}` : 'Imported snapshot'}`;
   summary(); configs(); tasks();
-  if (tab === 'overview') { chart('loss-chart','train/raw_loss',{smooth:true}); chart('bpb-chart','eval/bpb'); chart('throughput-chart','train/tokens_per_sec'); chart('lr-chart','lrm'); chart('mfu-chart','train/mfu',{unit:'%'}); }
+  if (tab === 'overview') { chart('loss-chart','train/raw_loss',{smooth:true}); chart('bpb-chart','eval/bpb'); chart('throughput-chart','train/tokens_per_sec'); chart('mfu-chart','train/mfu',{unit:'%'}); }
   if (tab === 'evaluation') { chart('core-chart','core/core'); chart('eval-chart','core/step_time_ms',{factor:0.001}); }
 }
 for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => {
