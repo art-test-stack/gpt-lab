@@ -1,0 +1,139 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Dashboard self-check</title>
+<h1>Dashboard self-check</h1>
+<pre id="result" role="status">Running…</pre>
+<iframe id="viewer" src="../../spaces/results/index.html" title="Dashboard under test" style="width:1200px;height:1000px;border:1px solid #ccc"></iframe>
+<script type="module">
+const frame = document.getElementById('viewer'), result = document.getElementById('result');
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const until = async predicate => {
+  const deadline = performance.now() + 10000;
+  while (!predicate()) {
+    if (performance.now() > deadline) throw new Error('Timed out waiting for chart state');
+    await new Promise(requestAnimationFrame);
+  }
+};
+try {
+  await new Promise(resolve => frame.addEventListener('load', resolve, {once:true}));
+  const win = frame.contentWindow, doc = win.document, $ = id => doc.getElementById(id);
+  // Wait for app.js's initial fetch before importing the test snapshot.
+  await new Promise(resolve => {
+    doc.addEventListener('chart-test-ready', resolve, {once:true});
+    const script = doc.createElement('script'); script.type = 'module';
+    script.textContent = "import './app.js'; document.dispatchEvent(new Event('chart-test-ready'));";
+    doc.head.append(script);
+  });
+  const getChart = id => win.Chart.getChart($(id).querySelector('canvas'));
+  const change = (id, value) => { $(id).value = value; $(id).dispatchEvent(new win.Event('change')); };
+  const hover = async (chart, index = 1) => {
+    const point = chart.getDatasetMeta(0).data[index], rect = chart.canvas.getBoundingClientRect();
+    chart.canvas.dispatchEvent(new win.MouseEvent('mousemove', {clientX:rect.left + point.x, clientY:rect.top + point.y, bubbles:true}));
+    await until(() => chart.tooltip.opacity > 0 && chart.tooltip.dataPoints[0].dataIndex === index);
+    return chart.tooltip;
+  };
+  const transfer = new win.DataTransfer();
+  // Space the inspected points apart so integer mouse coordinates cannot pick a neighbor.
+  const history = Array.from({length:601}, (_, index) => {
+    const step = index < 3 ? index * 10 : index + 97;
+    return {step, 'train/raw_loss':4-index/1000, 'train/total_tokens':step*100};
+  });
+  history.push({step:698, 'eval/bpb':1.25});
+  const runs = ['A','B'].map(id => ({id, label:`Run ${id}`, group:`Experiment ${id}`, history,
+    config: {model_name:'test-model', optim_config:{learning_rate:id === 'A' ? 0.01 : 0.02},
+      training_config:id === 'A' ? {seed:0, dist_info:{world_size:1, note:'<img src=x>'}}
+        : {dist_info:{note:'<img src=x>', world_size:1}, seed:0}},
+  }));
+  runs.push({id:'C', label:'Ungrouped run', history:[]});
+  transfer.items.add(new win.File([JSON.stringify({schema_version:1, synthetic:true, runs})], 'chart-check.json', {type:'application/json'}));
+  $('import').files = transfer.files; $('import').dispatchEvent(new win.Event('change'));
+  await until(() => getChart('loss-chart')?.data.datasets[0].data.length === 601);
+  let chart = getChart('loss-chart'), tooltip = await hover(chart);
+  assert(tooltip.title[0] === 'Training step: 10', 'Tooltip must snap to an actual recorded step');
+  assert(tooltip.dataPoints.length === 2, 'Runs at the same step must share the tooltip');
+  assert(tooltip.body[0].lines[0].includes('Run A · train/raw_loss: 3.999'), 'Tooltip must show the recorded run and value');
+  chart.canvas.dispatchEvent(new win.MouseEvent('mouseout', {bubbles:true}));
+  await until(() => chart.getActiveElements().length === 0 && chart.tooltip.opacity === 0);
+  change('smoothing', '0.6');
+  assert(!Object.values(win.Chart.instances).includes(chart), 'Rerender must dispose of old charts');
+  chart = getChart('loss-chart'); tooltip = await hover(chart);
+  assert(tooltip.body[0].after[0] === 'Raw loss: 3.999 · EMA: 0.6', 'EMA tooltip must retain the raw value');
+  assert(Math.abs(tooltip.dataPoints[0].parsed.y - 3.9996) < 1e-10, 'Tooltip must show the actual EMA value');
+  change('axis', 'train/total_tokens');
+  assert(!$('bpb-chart').querySelector('canvas'), 'Sparse evaluation must not invent token counters');
+  tooltip = await hover(getChart('loss-chart'));
+  assert(tooltip.title[0] === 'Training tokens: 1,000', 'Tooltip must use recorded token counters');
+  change('axis', 'step');
+  assert(getChart('bpb-chart').data.datasets[0].data[0].y === 1.25, 'A single evaluation point must remain visible');
+  await hover(getChart('bpb-chart'), 0);
+  while ($('run-list').querySelector('input:checked')) {
+    const input = $('run-list').querySelector('input:checked');
+    input.checked = false; input.dispatchEvent(new win.Event('change'));
+  }
+  assert(Object.keys(win.Chart.instances).length === 0, 'Empty selection must dispose of every chart');
+  $('select-all').click();
+  change('experiment', JSON.stringify('Experiment A'));
+  assert($('stat-runs').textContent === '1' && getChart('loss-chart').data.datasets[0].label === 'Run A', 'Experiment must scope charts and summaries');
+  assert($('recap-table').querySelectorAll('tbody tr').length === 1 && $('config-table').querySelectorAll('th').length === 2, 'Experiment must scope tables');
+  change('experiment', JSON.stringify('Experiment B')); $('clear-selection').click();
+  assert($('download').disabled && !$('loss-chart').querySelector('canvas'), 'An empty experiment selection must disable export and clear charts');
+  change('experiment', '');
+  assert($('stat-runs').textContent === '2' && !$('run-list').querySelector('input[value="B"]').checked, 'Switching experiments must preserve checkbox selections');
+  change('experiment', JSON.stringify(''));
+  assert($('stat-runs').textContent === '1' && $('run-list').textContent.includes('Ungrouped run'), 'Missing groups must be selectable as Ungrouped');
+  change('experiment', '');
+  $('search').value = 'Run B'; $('search').dispatchEvent(new win.Event('input')); $('select-all').click();
+  assert($('stat-runs').textContent === '3', 'Select shown must add only the matching run');
+  $('clear-selection').click();
+  assert($('stat-runs').textContent === '2', 'Clear shown must preserve hidden run selections');
+  $('search').value = 'no match'; $('search').dispatchEvent(new win.Event('input'));
+  assert(!$('no-runs').hidden, 'An unmatched search must explain the empty run list');
+  $('search').value = ''; $('search').dispatchEvent(new win.Event('input')); $('select-all').click();
+  const ungrouped = $('run-list').querySelector('input[value="C"]');
+  ungrouped.checked = false; ungrouped.dispatchEvent(new win.Event('change'));
+  doc.querySelector('[data-tab="configuration"]').click();
+  const configKeys = () => [...$('config-table').querySelectorAll('.config-key')].map(node => node.textContent);
+  assert(configKeys().join(',') === 'model_name,optim_config,training_config', 'Nested settings must occupy one top-level row');
+  const row = [...$('config-table').querySelectorAll('tbody tr')].find(row => row.querySelector('.config-key')?.textContent === 'training_config');
+  const details = row.querySelector('details'); details.querySelector('summary').click();
+  const displayed = JSON.parse(details.querySelector('pre').textContent);
+  assert(details.open && displayed.seed === 0 && displayed.dist_info.note === '<img src=x>', 'Expandable JSON must preserve nested values and escaping');
+  assert(!$('config-table').querySelector('img'), 'Config values must render as text');
+  $('differences').checked = true; $('differences').dispatchEvent(new win.Event('change'));
+  assert(configKeys().join(',') === 'optim_config', 'Differences must compare nested values regardless of object key order');
+  // Inspect real Blob downloads without saving files to the user's Downloads folder.
+  const originalClick = win.HTMLAnchorElement.prototype.click, downloads = [];
+  try {
+    win.HTMLAnchorElement.prototype.click = function () { downloads.push({filename:this.download, response:win.fetch(this.href)}); };
+    $('config-downloads').querySelector('button').click();
+    const response = await downloads[0].response, config = await response.json();
+    assert(downloads[0].filename === 'synthetic-A-config.json' && response.headers.get('content-type') === 'application/json', 'Configuration download must be JSON with a synthetic filename');
+    assert(JSON.stringify(config) === JSON.stringify(runs[0].config), 'Configuration download must preserve the full original config without history');
+    $('download').click();
+    const snapshot = await (await downloads[1].response).json();
+    assert(snapshot.synthetic === true && snapshot.runs.length === 2, 'Selection export must preserve the synthetic label and chosen runs');
+  } finally { win.HTMLAnchorElement.prototype.click = originalClick; }
+  change('experiment', JSON.stringify('Experiment A'));
+  assert($('config-downloads').children.length === 1, 'Configuration downloads must follow the experiment scope');
+  $('differences').checked = false;
+  doc.querySelector('[data-tab="overview"]').click();
+  $('smoothing').value = '0'; $('demo').click();
+  assert(getChart('loss-chart').data.datasets.length === 2, 'Leave the synthetic preview visible for manual inspection');
+  frame.style.width = '390px';
+  await until(() => doc.documentElement.clientWidth < 400);
+  assert(doc.documentElement.scrollWidth <= doc.documentElement.clientWidth + 1, 'Mobile layout must not overflow the viewport');
+  doc.querySelector('[data-tab="configuration"]').click();
+  $('config-table').querySelector('summary').click();
+  assert(doc.documentElement.scrollWidth <= doc.documentElement.clientWidth + 1, 'Expanded JSON must stay inside the mobile table scroll area');
+  doc.querySelector('[data-tab="overview"]').click();
+  frame.style.width = '1200px';
+  assert(doc.querySelector('.brand img').naturalWidth === 144, 'The logo must load');
+  assert(doc.querySelector('.rail-footer img').naturalWidth === 24, 'The GitHub mark must load');
+  const nav = doc.querySelector('[data-tab="configuration"]');
+  nav.focus();
+  assert(win.getComputedStyle(nav, '::after').visibility === 'visible', 'Page names must appear on keyboard focus');
+  assert(win.getComputedStyle(nav, '::after').content.includes('Configuration'), 'Page tooltip must name the destination');
+  nav.blur();
+  result.textContent = 'PASS — chart tracking, sparse axes, experiment selections, expandable JSON, differences, JSON downloads, mobile layout, and navigation labels.';
+} catch (error) { result.textContent = `FAIL — ${error.message}\n${error.stack}`; console.error(error); }
+</script>

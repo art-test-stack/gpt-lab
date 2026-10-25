@@ -10,6 +10,7 @@ export function validateSnapshot(data) {
   for (const run of data.runs) {
     if (!run || typeof run.id !== 'string' || !run.id || ids.has(run.id)) throw new Error('Every run needs a unique, non-empty string id.');
     ids.add(run.id);
+    if (run.group != null && typeof run.group !== 'string') throw new Error('Run group must be a string.');
     if (!Array.isArray(run.history) || run.history.length > 100000) throw new Error('Each run needs a history array with at most 100,000 rows.');
     if (!run.history.every(row => row && typeof row === 'object' && !Array.isArray(row) && finite(row.step))) throw new Error('Every history row needs a numeric step.');
     if (run.config != null && (typeof run.config !== 'object' || Array.isArray(run.config))) throw new Error('Run config must be an object.');
@@ -46,17 +47,15 @@ export function evaluationSeconds(run) {
   return durations.size ? [...durations.values()].reduce((a, b) => a + b, 0) : null;
 }
 
-export function flatten(value, prefix = '', result = Object.create(null), depth = 0) {
-  if (depth > 12) { result[prefix] = '[nested value]'; return result; }
-  if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length) {
-    for (const [key, child] of Object.entries(value)) flatten(child, prefix ? `${prefix}.${key}` : key, result, depth + 1);
-  } else result[prefix] = value;
-  return result;
+export function configJSON(value, space = 0) {
+  // Object key order is not a configuration difference; array order is.
+  return JSON.stringify(value, (_, child) => child && typeof child === 'object' && !Array.isArray(child)
+    ? Object.fromEntries(Object.entries(child).sort(([a], [b]) => a.localeCompare(b))) : child, space);
 }
 
 export function demoSnapshot() {
   const runs = ['A', 'B'].map((letter, index) => ({
-    id: `synthetic-${letter}`, label: `Example run ${letter}`, status: 'synthetic', group: 'Interface preview',
+    id: `synthetic-${letter}`, label: `Example run ${letter}`, status: 'synthetic', group: `Example experiment ${letter}`,
     config: {model: {layers: 8, width: 512, context: 1024}, optimizer: {name: 'illustrative', learning_rate: index ? 0.0015 : 0.001}, training: {seed: 42, global_batch_tokens: 65536}, evaluation: {examples_per_task: 100, protocol: 'synthetic-preview'}},
     history: Array.from({length: 51}, (_, i) => {
       const row = {step: i * 20, 'train/total_tokens': i * 20 * 65536, 'train/total_training_time': i * 55, _runtime: i * 70, 'train/raw_loss': 3.2 + 3.9 * Math.exp(-i / 12) + Math.sin(i * 1.7 + index) * 0.05, 'train/tokens_per_sec': 23500 + Math.sin(i + index) * 1500, lrm: Math.min(1, (i + 1) / 3) * Math.max(0.05, (51 - i) / 35)};

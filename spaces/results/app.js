@@ -1,4 +1,4 @@
-import {COLORS, finite, validateSnapshot, points, last, extrema, evaluationSeconds, flatten, demoSnapshot} from './data.mjs';
+import {COLORS, finite, validateSnapshot, points, last, extrema, evaluationSeconds, configJSON, demoSnapshot} from './data.mjs';
 
 const $ = id => document.getElementById(id);
 const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
@@ -7,51 +7,84 @@ const compact = n => new Intl.NumberFormat('en-US', {notation:'compact', maximum
 const duration = n => !finite(n) ? '—' : n >= 3600 ? `${fmt(n / 3600, 1)} h` : n >= 60 ? `${fmt(n / 60, 1)} min` : `${fmt(n, 1)} s`;
 const title = run => String(run.label || run.id);
 let snapshot = {schema_version: 1, runs: []}, realSnapshot = snapshot, selected = new Set(), synthetic = false, tab = 'overview';
-const chosen = () => snapshot.runs.filter(run => selected.has(run.id));
+const inExperiment = run => !$('experiment').value || JSON.stringify(run.group || '') === $('experiment').value;
+const chosen = () => snapshot.runs.filter(run => inExperiment(run) && selected.has(run.id));
+const visibleRuns = () => snapshot.runs.filter(run => inExperiment(run) && `${title(run)} ${run.group || ''} ${run.status || ''}`.toLowerCase().includes($('search').value.toLowerCase()));
 const color = run => COLORS[snapshot.runs.indexOf(run) % COLORS.length];
+const charts = new Map();
+const cursor = {
+  id: 'recorded-point-cursor',
+  afterDatasetsDraw(chart) {
+    const point = chart.getActiveElements()[0];
+    if (!point) return;
+    const {ctx, chartArea: {top, bottom}} = chart, x = point.element.x;
+    ctx.save(); ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom);
+    ctx.strokeStyle = '#8ba1ae'; ctx.lineWidth = 1; ctx.stroke(); ctx.restore();
+  },
+};
 
 function message(text, error = false) { $('message').textContent = text; $('message').classList.toggle('error', error); $('message').hidden = !text; }
+function downloadJSON(data, filename) {
+  const blob = new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = filename; a.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+}
 function setSnapshot(data, isDemo = false) {
   validateSnapshot(data); isDemo = isDemo || data.synthetic === true; snapshot = data; synthetic = isDemo;
   if (!isDemo) realSnapshot = data;
+  $('experiment').replaceChildren(new Option('All experiments', ''), ...[...new Set(data.runs.map(run => run.group || ''))].sort().map(group => new Option(group || 'Ungrouped', JSON.stringify(group))));
+  $('search').value = '';
   selected = new Set(data.runs.map(run => run.id)); render();
 }
 function runList() {
-  const query = $('search').value.toLowerCase(); $('run-list').replaceChildren();
-  for (const run of snapshot.runs.filter(run => `${title(run)} ${run.group || ''} ${run.status || ''}`.toLowerCase().includes(query))) {
+  const runs = visibleRuns(); $('run-list').replaceChildren();
+  for (const run of runs) {
     const label = document.createElement('label'); label.className = 'run-item';
-    const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = selected.has(run.id);
+    const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.value = run.id; checkbox.checked = selected.has(run.id);
     checkbox.addEventListener('change', () => { checkbox.checked ? selected.add(run.id) : selected.delete(run.id); render(); });
     const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = color(run);
     const text = document.createElement('span'); text.append(document.createTextNode(title(run)));
     const small = document.createElement('small'); small.textContent = [run.group, run.status].filter(Boolean).join(' · ') || 'Status not supplied'; text.append(small);
     label.append(checkbox, dot, text); $('run-list').append(label);
   }
-  $('run-count').textContent = snapshot.runs.length;
+  $('run-count').textContent = `${chosen().length} selected · ${runs.length} shown`;
+  $('no-runs').hidden = runs.length > 0;
 }
 function chart(id, metric, {factor = 1, smooth = false} = {}) {
   const host = $(id), axis = $('axis').value, smoothing = smooth ? Number($('smoothing').value) : 0;
   const series = chosen().map(run => ({run, data: points(run, metric, axis, smoothing).map(([x,y,raw]) => [x,y * factor, raw * factor])})).filter(s => s.data.length);
   if (!series.length) { host.innerHTML = '<div class="no-data">No recorded values for this metric and axis.<br>Try training step, or select another run.</div>'; return; }
-  const W = 620, H = 275, L = 56, R = 18, T = 15, B = 38;
-  let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
-  for (const s of series) for (const [x,y] of s.data) { xmin = Math.min(xmin,x); xmax = Math.max(xmax,x); ymin = Math.min(ymin,y); ymax = Math.max(ymax,y); }
-  if (xmin === xmax) { xmin -= 0.5; xmax += 0.5; }
-  const pad = ymax === ymin ? Math.max(0.05, Math.abs(ymin) * 0.05) : (ymax - ymin) * 0.1; ymin -= pad; ymax += pad;
-  const X = x => L + (x-xmin)/(xmax-xmin)*(W-L-R), Y = y => T + (ymax-y)/(ymax-ymin)*(H-T-B);
-  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(metric)} by ${esc(axis)}"><title>${esc(metric)}; ${esc(axis)}. Recorded data points have hover labels.</title>`;
-  for (let i=0; i<=4; i++) {
-    const y = ymin+(ymax-ymin)*i/4, x = xmin+(xmax-xmin)*i/4;
-    svg += `<line x1="${L}" y1="${Y(y)}" x2="${W-R}" y2="${Y(y)}" stroke="#edf0f3"/><text x="${L-12}" y="${Y(y)+4}" fill="#91a0ab" font-size="10" text-anchor="end">${esc(Math.abs(y) >= 1000 ? compact(y) : fmt(y, 3))}</text><text x="${X(x)}" y="${H-15}" fill="#91a0ab" font-size="10" text-anchor="middle">${esc(Math.abs(x) >= 1000 ? compact(x) : fmt(x, 2))}</text>`;
-  }
-  for (const {run, data} of series) {
-    const path = data.map(([x,y],i) => `${i ? 'L' : 'M'}${X(x).toFixed(2)},${Y(y).toFixed(2)}`).join(' ');
-    svg += `<path d="${path}" fill="none" stroke="${color(run)}" stroke-width="2.3" stroke-linejoin="round"/>`;
-    // Limit hover targets only; all recorded points remain in the line and export.
-    const stride = Math.max(1, Math.ceil(data.length/300));
-    data.forEach(([x,y,raw],i) => { if (i % stride === 0 || i === data.length-1) svg += `<circle cx="${X(x)}" cy="${Y(y)}" r="${data.length === 1 ? 4 : 3}" fill="${color(run)}" fill-opacity="${data.length === 1 ? 1 : 0.05}"><title>${esc(title(run))} · ${esc(axis)}: ${fmt(x)} · ${esc(metric)}: ${fmt(y,5)}${smoothing ? ` · raw: ${fmt(raw,5)}` : ''}</title></circle>`; });
-  }
-  host.innerHTML = svg + '</svg><div class="chart-legend">' + series.map(s => `<span><i style="background:${color(s.run)}"></i>${esc(title(s.run))}</span>`).join('') + '</div>';
+  const axisLabel = $('axis').selectedOptions[0].textContent;
+  host.innerHTML = `<div class="chart-canvas"><canvas role="img" aria-label="${esc(metric)} by ${esc(axisLabel)}. Hover or tap to inspect recorded points."></canvas></div><div class="chart-legend">` + series.map(s => `<span><i style="background:${color(s.run)}"></i>${esc(title(s.run))}</span>`).join('') + '</div>';
+  charts.set(id, new Chart(host.querySelector('canvas'), {
+    type: 'line',
+    data: {datasets: series.map(({run, data}) => ({
+      label: title(run), data: data.map(([x,y,raw]) => ({x,y,raw})),
+      borderColor: color(run), backgroundColor: color(run), borderWidth: 2,
+      pointRadius: data.length === 1 ? 4 : 0, pointHoverRadius: 4, tension: 0,
+    }))},
+    plugins: [cursor],
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
+      interaction: {mode: 'nearest', axis: 'x', intersect: false},
+      scales: {
+        x: {type: 'linear', title: {display: true, text: axisLabel}, grid: {display: false}, ticks: {maxTicksLimit: 6, callback: value => Math.abs(value) >= 1000 ? compact(value) : fmt(value, 2)}},
+        y: {grace: '10%', grid: {color: '#edf0f3'}, ticks: {maxTicksLimit: 5, callback: value => Math.abs(value) >= 1000 ? compact(value) : fmt(value, 3)}},
+      },
+      plugins: {
+        legend: {display: false},
+        tooltip: {
+          backgroundColor: '#fff', titleColor: '#182631', bodyColor: '#52616d',
+          borderColor: '#e5e9ed', borderWidth: 1, padding: 12, position: 'nearest',
+          callbacks: {
+            title: items => `${axisLabel}: ${fmt(items[0].parsed.x, 8)}`,
+            label: item => `${item.dataset.label} · ${metric}: ${fmt(item.parsed.y, 8)}`,
+            afterLabel: item => smoothing ? `Raw loss: ${fmt(item.raw.raw, 8)} · EMA: ${smoothing}` : '',
+          },
+        },
+      },
+    },
+  }));
 }
 function table(host, headers, rows) {
   $(host).innerHTML = `<table><thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.map(r => `<tr${r.different ? ' class="config-diff"' : ''}>${r.cells.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${headers.length}">No recorded values for this selection.</td></tr>`}</tbody></table>`;
@@ -76,14 +109,29 @@ function tasks() {
   table('tasks-table', ['Task', ...runs.map(title)], keys.map(key => ({cells:[esc(key.slice(5,-9)), ...runs.map(run => esc(fmt(last(run,key),4)))]})));
 }
 function configs() {
-  const runs = chosen(), configs = runs.map(run => flatten(run.config || {})), keys = [...new Set(configs.flatMap(c => Object.keys(c)))].sort();
-  const stringify = v => v === undefined ? '—' : JSON.stringify(v);
-  const rows = keys.map(key => { const values = configs.map(c => stringify(c[key])); return {different: new Set(values).size > 1, cells:[`<span class="config-key">${esc(key)}</span>`, ...values.map(esc)]}; }).filter(row => !$('differences').checked || row.different);
+  const runs = chosen(), configs = runs.map(run => run.config || {}), keys = [...new Set(configs.flatMap(c => Object.keys(c)))].sort();
+  const rows = keys.map(key => {
+    const values = configs.map(config => Object.hasOwn(config,key) ? config[key] : undefined);
+    const jsons = values.map(value => value === undefined ? '—' : configJSON(value,2));
+    return {different: new Set(jsons).size > 1, cells:[`<span class="config-key">${esc(key)}</span>`, ...values.map((value,index) =>
+      value && typeof value === 'object'
+        ? `<details class="config-json"><summary>JSON ${Array.isArray(value) ? `array · ${value.length} items` : `object · ${Object.keys(value).length} keys`}</summary><pre tabindex="0" aria-label="${esc(key)} JSON for ${esc(title(runs[index]))}">${esc(jsons[index])}</pre></details>`
+        : esc(jsons[index]))]};
+  }).filter(row => !$('differences').checked || row.different);
   table('config-table', ['Setting', ...runs.map(title)], rows);
+  $('config-downloads').replaceChildren();
+  for (const run of runs) {
+    const button = document.createElement('button'); button.className = 'button secondary';
+    button.textContent = `${title(run)} · config.json ↓`;
+    button.setAttribute('aria-label', `Download ${title(run)} configuration JSON`);
+    button.addEventListener('click', () => downloadJSON(run.config || {}, `${synthetic ? 'synthetic-' : ''}${run.id.replace(/[^\w.-]+/g,'-')}-config.json`));
+    $('config-downloads').append(button);
+  }
 }
 function render() {
+  for (const chart of charts.values()) chart.destroy(); charts.clear();
   runList(); $('empty').hidden = snapshot.runs.length > 0; $('workspace').hidden = !snapshot.runs.length;
-  $('demo-banner').hidden = !synthetic; $('download').disabled = !selected.size;
+  $('demo-banner').hidden = !synthetic; $('download').disabled = !chosen().length;
   $('snapshot-info').textContent = synthetic ? 'Synthetic interface preview' : `${snapshot.runs.length} runs · ${snapshot.exported_at ? `Snapshot ${snapshot.exported_at}` : 'Imported snapshot'}`;
   summary(); configs(); tasks();
   if (tab === 'overview') { chart('loss-chart','train/raw_loss',{smooth:true}); chart('bpb-chart','eval/bpb'); chart('throughput-chart','train/tokens_per_sec'); chart('lr-chart','lrm'); }
@@ -91,17 +139,18 @@ function render() {
 }
 for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => {
   tab = button.dataset.tab;
-  for (const node of document.querySelectorAll('[data-tab]')) node.classList.toggle('active',node === button);
+  for (const node of document.querySelectorAll('[data-tab]')) { node.classList.toggle('active',node === button); node.setAttribute('aria-pressed', node === button); }
   for (const node of document.querySelectorAll('.tab-panel')) node.hidden = node.id !== tab;
   const names = {overview:'Experiment overview', evaluation:'Evaluation results', configuration:'Training configuration'};
   $('page-title').replaceChildren(document.createTextNode(names[tab]),Object.assign(document.createElement('span'),{textContent:'.'}));
   $('selection-label').textContent = tab === 'overview' ? 'Learning curves' : tab === 'evaluation' ? 'Evaluation checkpoints' : 'Compare every setting';
   $('smoothing-label').hidden = tab !== 'overview'; $('axis').parentElement.hidden = tab === 'configuration'; render();
 });
-for (const id of ['axis','smoothing','differences']) $(id).addEventListener('change', render);
+for (const id of ['axis','smoothing','differences','experiment']) $(id).addEventListener('change', render);
 $('import-button').addEventListener('click', () => $('import').click());
 $('search').addEventListener('input', runList);
-$('select-all').addEventListener('click', () => { const query=$('search').value.toLowerCase(); for (const run of snapshot.runs) if (`${title(run)} ${run.group||''} ${run.status||''}`.toLowerCase().includes(query)) selected.add(run.id); render(); });
+$('select-all').addEventListener('click', () => { for (const run of visibleRuns()) selected.add(run.id); render(); });
+$('clear-selection').addEventListener('click', () => { for (const run of visibleRuns()) selected.delete(run.id); render(); });
 for (const id of ['demo','empty-demo']) $(id).addEventListener('click', () => { message(''); setSnapshot(demoSnapshot(),true); });
 $('clear-demo').addEventListener('click', () => setSnapshot(realSnapshot));
 $('import').addEventListener('change', async event => {
@@ -111,8 +160,7 @@ $('import').addEventListener('change', async event => {
   event.target.value = '';
 });
 $('download').addEventListener('click', () => {
-  const blob = new Blob([JSON.stringify({...snapshot, runs:chosen(), ...(synthetic ? {synthetic:true} : {})},null,2)],{type:'application/json'});
-  const url = URL.createObjectURL(blob), a=document.createElement('a'); a.href=url; a.download=synthetic ? 'synthetic-preview.json' : 'gpt-lab-results.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000);
+  downloadJSON({...snapshot, runs:chosen(), ...(synthetic ? {synthetic:true} : {})}, synthetic ? 'synthetic-preview.json' : 'gpt-lab-results.json');
 });
 render();
 try { const response = await fetch('./results.json', {cache:'no-cache'}); if (!response.ok) throw new Error(`HTTP ${response.status}`); setSnapshot(await response.json()); }
