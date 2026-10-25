@@ -2,7 +2,7 @@
 title: GPT Lab · Experiments
 emoji: 🧪
 colorFrom: gray
-colorTo: orange
+colorTo: yellow
 sdk: static
 app_file: index.html
 pinned: false
