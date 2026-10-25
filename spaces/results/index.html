@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>GPT Lab — Experiments</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#"><span class="brand-mark">g.</span><span>GPT LAB<small>EXPERIMENT NOTEBOOK</small></span></a>
+    <div class="sidebar-label">WORKSPACE</div>
+    <nav aria-label="Dashboard sections">
+      <button class="nav active" data-tab="overview"><span>↗</span> Overview</button>
+      <button class="nav" data-tab="evaluation"><span>◉</span> Evaluation</button>
+      <button class="nav" data-tab="configuration"><span>☷</span> Configuration</button>
+    </nav>
+    <div class="sidebar-label run-label">RUNS <span id="run-count">0</span></div>
+    <label class="search-label"><span class="sr-only">Search runs</span><input id="search" type="search" placeholder="Filter runs…"></label>
+    <div id="run-list" class="run-list"></div>
+    <button id="select-all" class="subtle">Select visible runs</button>
+    <div class="sidebar-footer"><span class="live-dot"></span> Read-only results<br><a href="https://github.com/art-test-stack/gpt-lab" target="_blank" rel="noopener noreferrer">View gpt-lab ↗</a></div>
+  </aside>
+
+  <main>
+    <header>
+      <div><div class="eyebrow">RESEARCH / GPT-LAB</div><h1 id="page-title">Experiment overview<span>.</span></h1><p>Follow the learning. Compare the details.</p></div>
+      <div class="actions"><button id="demo" class="button secondary">Preview example</button><button id="import-button" class="button secondary">Import JSON</button><input id="import" type="file" accept=".json,application/json" hidden><button id="download" class="button primary">Export selection ↓</button></div>
+    </header>
+    <div id="message" class="message" role="status" aria-live="polite" hidden></div>
+    <div id="demo-banner" class="demo-banner" hidden>SYNTHETIC PREVIEW · Illustrative data only. These curves are not measured results. <button id="clear-demo">Return to real results</button></div>
+    <section id="empty" class="empty panel"><div class="empty-icon">↗</div><h2>Your experiments, in one place.</h2><p>Import a results snapshot or export your existing W&amp;B runs.<br>Learning curves, evaluations, and configurations will appear here.</p><button id="empty-demo" class="button primary">Explore the example →</button><p class="small">Imported files stay in this browser session. Nothing is uploaded.</p></section>
+
+    <div id="workspace" hidden>
+      <section class="summary-grid" aria-label="Selection summary">
+        <article class="stat"><div class="eyebrow">SELECTED RUNS</div><strong id="stat-runs">—</strong><small>Compared side by side</small></article>
+        <article class="stat"><div class="eyebrow">LOWEST RECORDED BPB</div><strong id="stat-bpb">—</strong><small id="stat-bpb-run">Validation · lower is better</small></article>
+        <article class="stat"><div class="eyebrow">HIGHEST RECORDED CORE</div><strong id="stat-core">—</strong><small id="stat-core-run">Centered score · higher is better</small></article>
+        <article class="stat"><div class="eyebrow">RECORDED EVALUATION</div><strong id="stat-eval">—</strong><small>Sum of logged BPB + CORE durations</small></article>
+      </section>
+      <div class="toolbar"><div id="selection-label">Learning curves</div><div class="plot-controls"><label>Horizontal axis <select id="axis"><option value="step">Training step</option><option value="train/total_tokens">Training tokens</option><option value="train/total_training_time">Training time (h)</option><option value="_runtime">Logged elapsed time (h)</option></select></label><label id="smoothing-label">Loss smoothing <select id="smoothing"><option value="0">Off</option><option value="0.6">EMA · 0.6</option><option value="0.9">EMA · 0.9</option></select></label></div></div>
+
+      <section id="overview" class="tab-panel">
+        <div class="charts"><article class="panel chart-panel"><div class="panel-title"><h2>Training loss</h2><span>RAW LOSS · NATS</span></div><div id="loss-chart" class="chart"></div></article><article class="panel chart-panel"><div class="panel-title"><h2>Validation BPB</h2><span>LOWER IS BETTER</span></div><div id="bpb-chart" class="chart"></div></article></div>
+        <div class="charts"><article class="panel chart-panel"><div class="panel-title"><h2>Training throughput</h2><span>TOKENS / SECOND</span></div><div id="throughput-chart" class="chart"></div></article><article class="panel chart-panel"><div class="panel-title"><h2>Learning-rate multiplier</h2><span>SCHEDULE</span></div><div id="lr-chart" class="chart"></div></article></div>
+      </section>
+      <section id="evaluation" class="tab-panel" hidden>
+        <div class="charts"><article class="panel chart-panel"><div class="panel-title"><h2>CORE over training</h2><span>CENTERED SCORE</span></div><div id="core-chart" class="chart"></div></article><article class="panel chart-panel"><div class="panel-title"><h2>Evaluation duration</h2><span>SECONDS PER CORE PASS</span></div><div id="eval-chart" class="chart"></div></article></div>
+        <article class="panel"><div class="panel-title"><h2>CORE by task</h2><span>LATEST RECORDED ACCURACY PER TASK</span></div><p class="table-note">Check example counts and few-shot settings before comparing scores. Missing results stay blank.</p><div id="tasks-table" class="table-wrap"></div></article>
+      </section>
+      <section id="configuration" class="tab-panel" hidden><article class="panel"><div class="panel-title"><h2>Configuration comparison</h2><label class="small"><input id="differences" type="checkbox"> Only differences</label></div><div id="config-table" class="table-wrap"></div></article></section>
+
+      <article class="panel runs-panel"><div class="panel-title"><h2>Run recap</h2><span>LAST RECORDED VALUES</span></div><div id="recap-table" class="table-wrap"></div></article>
+      <p class="footnote">Training time excludes evaluation in gpt-lab. Logged elapsed time includes intervals between metric logs; neither is a Modal billing measurement. Missing axis values are omitted, not interpolated. Scores are not automatically ranked as comparable experiments.</p>
+    </div>
+    <footer><span>GPT LAB <b>/</b> A small record of what changed.</span><span id="snapshot-info">No results loaded</span></footer>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
