@@ -50,7 +50,7 @@ function runList() {
   $('run-count').textContent = `${chosen().length} selected · ${runs.length} shown`;
   $('no-runs').hidden = runs.length > 0;
 }
-function chart(id, metric, {factor = 1, smooth = false} = {}) {
+function chart(id, metric, {factor = 1, smooth = false, unit = ''} = {}) {
   const host = $(id), axis = $('axis').value, smoothing = smooth ? Number($('smoothing').value) : 0;
   const series = chosen().map(run => ({run, data: points(run, metric, axis, smoothing).map(([x,y,raw]) => [x,y * factor, raw * factor])})).filter(s => s.data.length);
   if (!series.length) { host.innerHTML = '<div class="no-data">No recorded values for this metric and axis.<br>Try training step, or select another run.</div>'; return; }
@@ -69,7 +69,7 @@ function chart(id, metric, {factor = 1, smooth = false} = {}) {
       interaction: {mode: 'nearest', axis: 'x', intersect: false},
       scales: {
         x: {type: 'linear', title: {display: true, text: axisLabel}, grid: {display: false}, ticks: {maxTicksLimit: 6, callback: value => Math.abs(value) >= 1000 ? compact(value) : fmt(value, 2)}},
-        y: {grace: '10%', grid: {color: '#edf0f3'}, ticks: {maxTicksLimit: 5, callback: value => Math.abs(value) >= 1000 ? compact(value) : fmt(value, 3)}},
+        y: {grace: '10%', grid: {color: '#edf0f3'}, ticks: {maxTicksLimit: 5, callback: value => `${Math.abs(value) >= 1000 ? compact(value) : fmt(value, 3)}${unit}`}},
       },
       plugins: {
         legend: {display: false},
@@ -78,7 +78,7 @@ function chart(id, metric, {factor = 1, smooth = false} = {}) {
           borderColor: '#e5e9ed', borderWidth: 1, padding: 12, position: 'nearest',
           callbacks: {
             title: items => `${axisLabel}: ${fmt(items[0].parsed.x, 8)}`,
-            label: item => `${item.dataset.label} · ${metric}: ${fmt(item.parsed.y, 8)}`,
+            label: item => `${item.dataset.label} · ${metric}: ${fmt(item.parsed.y, 8)}${unit}`,
             afterLabel: item => smoothing ? `Raw loss: ${fmt(item.raw.raw, 8)} · EMA: ${smoothing}` : '',
           },
         },
@@ -100,9 +100,9 @@ function summary() {
   const rows = runs.map(run => {
     let source = '';
     try { const url = new URL(run.source_url); if (url.protocol === 'https:') source = ` <a href="${esc(url.href)}" target="_blank" rel="noopener noreferrer" aria-label="Open source for ${esc(title(run))}">↗</a>`; } catch { /* source is optional */ }
-    return {cells:[`<span style="color:${color(run)}">●</span> ${esc(title(run))}${source}`, `<span class="pill">${esc(run.status || 'unknown')}</span>`, esc(fmt(last(run,'train/total_tokens'),0)), esc(fmt(last(run,'eval/bpb'),4)), esc(fmt(last(run,'core/core'),4)), esc(fmt(last(run,'core/max_per_task'),0)), esc(duration(last(run,'train/total_training_time'))), esc(duration(last(run,'_runtime'))), esc(duration(evaluationSeconds(run)))]};
+    return {cells:[`<span style="color:${color(run)}">●</span> ${esc(title(run))}${source}`, `<span class="pill">${esc(run.status || 'unknown')}</span>`, esc(fmt(last(run,'train/total_tokens'),0)), esc(fmt(last(run,'eval/bpb'),4)), esc(fmt(last(run,'core/core'),4)), esc(fmt(last(run,'train/mfu'),2)), esc(fmt(last(run,'core/max_per_task'),0)), esc(duration(last(run,'train/total_training_time'))), esc(duration(last(run,'_runtime'))), esc(duration(evaluationSeconds(run)))]};
   });
-  table('recap-table', ['Run','Status','Training tokens','Latest BPB','Latest CORE','CORE cap/task','Training time','Logged elapsed','Recorded eval'], rows);
+  table('recap-table', ['Run','Status','Training tokens','Latest BPB','Latest CORE','Latest MFU (%)','CORE cap/task','Training time','Logged elapsed','Recorded eval'], rows);
 }
 function tasks() {
   const runs = chosen(), keys = [...new Set(runs.flatMap(run => run.history.flatMap(row => Object.keys(row).filter(k => /^core\/.+\/accuracy$/.test(k)))))].sort();
@@ -134,7 +134,7 @@ function render() {
   $('demo-banner').hidden = !synthetic; $('download').disabled = !chosen().length;
   $('snapshot-info').textContent = synthetic ? 'Synthetic interface preview' : `${snapshot.runs.length} runs · ${snapshot.exported_at ? `Snapshot ${snapshot.exported_at}` : 'Imported snapshot'}`;
   summary(); configs(); tasks();
-  if (tab === 'overview') { chart('loss-chart','train/raw_loss',{smooth:true}); chart('bpb-chart','eval/bpb'); chart('throughput-chart','train/tokens_per_sec'); chart('lr-chart','lrm'); }
+  if (tab === 'overview') { chart('loss-chart','train/raw_loss',{smooth:true}); chart('bpb-chart','eval/bpb'); chart('throughput-chart','train/tokens_per_sec'); chart('lr-chart','lrm'); chart('mfu-chart','train/mfu',{unit:'%'}); }
   if (tab === 'evaluation') { chart('core-chart','core/core'); chart('eval-chart','core/step_time_ms',{factor:0.001}); }
 }
 for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => {

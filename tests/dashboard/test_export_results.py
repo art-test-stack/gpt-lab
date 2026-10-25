@@ -16,11 +16,13 @@ class ExportTests(unittest.TestCase):
     def test_sparse_eval_and_zero_values_are_preserved_without_filling(self):
         rows = export.normalize_history([
             {"_step": 10, "core/core": 0, "_runtime": 80},
-            {"_step": 9, "train/raw_loss": 4.2, "train/total_tokens": 1000},
+            {"_step": 9, "train/raw_loss": 4.2, "train/total_tokens": 1000, "train/mfu": 28.5},
             {"_step": 10, "eval/bpb": "1.4", "eval/loss": float("nan")},
         ])
         self.assertEqual([r["step"] for r in rows], [9, 10, 10])
         self.assertEqual(rows[1]["core/core"], 0)
+        self.assertEqual(rows[0]["train/mfu"], 28.5)
+        self.assertNotIn("train/mfu", rows[1])
         self.assertNotIn("train/total_tokens", rows[1])
         self.assertNotIn("eval/loss", rows[2])
         json.dumps(rows, allow_nan=False)

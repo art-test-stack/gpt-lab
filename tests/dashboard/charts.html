@@ -39,7 +39,8 @@ try {
     return {step, 'train/raw_loss':4-index/1000, 'train/total_tokens':step*100};
   });
   history.push({step:698, 'eval/bpb':1.25});
-  const runs = ['A','B'].map(id => ({id, label:`Run ${id}`, group:`Experiment ${id}`, history,
+  const runs = ['A','B'].map(id => ({id, label:`Run ${id}`, group:`Experiment ${id}`,
+    history:history.map((row, index) => index < 2 ? {...row, 'train/mfu':id === 'A' && index === 1 ? 28.5 : 0} : row),
     config: {model_name:'test-model', optim_config:{learning_rate:id === 'A' ? 0.01 : 0.02},
       training_config:id === 'A' ? {seed:0, dist_info:{world_size:1, note:'<img src=x>'}}
         : {dist_info:{note:'<img src=x>', world_size:1}, seed:0}},
@@ -48,6 +49,13 @@ try {
   transfer.items.add(new win.File([JSON.stringify({schema_version:1, synthetic:true, runs})], 'chart-check.json', {type:'application/json'}));
   $('import').files = transfer.files; $('import').dispatchEvent(new win.Event('change'));
   await until(() => getChart('loss-chart')?.data.datasets[0].data.length === 601);
+  const mfu = getChart('mfu-chart');
+  assert(mfu.data.datasets.length === 2 && mfu.data.datasets[0].data.length === 2, 'MFU must omit runs and points without logged values');
+  assert(mfu.data.datasets[0].data[1].y === 28.5 && mfu.data.datasets[0].data[0].y === 0, 'MFU must retain logged percentages and zero without rescaling');
+  const mfuTooltip = await hover(mfu);
+  assert(mfuTooltip.body[0].lines[0] === 'Run A · train/mfu: 28.5%', 'MFU tooltip must display the recorded percentage');
+  const mfuColumn = [...$('recap-table').querySelectorAll('th')].findIndex(cell => cell.textContent === 'Latest MFU (%)');
+  assert(mfuColumn >= 0 && [...$('recap-table').querySelectorAll('tbody tr')].map(row => row.cells[mfuColumn].textContent).join(',') === '28.5,0,—', 'MFU recap must show latest values, zero, and missing values distinctly');
   let chart = getChart('loss-chart'), tooltip = await hover(chart);
   assert(tooltip.title[0] === 'Training step: 10', 'Tooltip must snap to an actual recorded step');
   assert(tooltip.dataPoints.length === 2, 'Runs at the same step must share the tooltip');
@@ -74,6 +82,7 @@ try {
   $('select-all').click();
   change('experiment', JSON.stringify('Experiment A'));
   assert($('stat-runs').textContent === '1' && getChart('loss-chart').data.datasets[0].label === 'Run A', 'Experiment must scope charts and summaries');
+  assert(getChart('mfu-chart').data.datasets.length === 1 && getChart('mfu-chart').data.datasets[0].label === 'Run A', 'Experiment must scope MFU curves');
   assert($('recap-table').querySelectorAll('tbody tr').length === 1 && $('config-table').querySelectorAll('th').length === 2, 'Experiment must scope tables');
   change('experiment', JSON.stringify('Experiment B')); $('clear-selection').click();
   assert($('download').disabled && !$('loss-chart').querySelector('canvas'), 'An empty experiment selection must disable export and clear charts');
@@ -81,6 +90,7 @@ try {
   assert($('stat-runs').textContent === '2' && !$('run-list').querySelector('input[value="B"]').checked, 'Switching experiments must preserve checkbox selections');
   change('experiment', JSON.stringify(''));
   assert($('stat-runs').textContent === '1' && $('run-list').textContent.includes('Ungrouped run'), 'Missing groups must be selectable as Ungrouped');
+  assert(!$('mfu-chart').querySelector('canvas'), 'A run without MFU must show no recorded data');
   change('experiment', '');
   $('search').value = 'Run B'; $('search').dispatchEvent(new win.Event('input')); $('select-all').click();
   assert($('stat-runs').textContent === '3', 'Select shown must add only the matching run');
@@ -134,6 +144,6 @@ try {
   assert(win.getComputedStyle(nav, '::after').visibility === 'visible', 'Page names must appear on keyboard focus');
   assert(win.getComputedStyle(nav, '::after').content.includes('Configuration'), 'Page tooltip must name the destination');
   nav.blur();
-  result.textContent = 'PASS — chart tracking, sparse axes, experiment selections, expandable JSON, differences, JSON downloads, mobile layout, and navigation labels.';
+  result.textContent = 'PASS — chart tracking, MFU percentages and recap, sparse axes, experiment selections, expandable JSON, differences, JSON downloads, mobile layout, and navigation labels.';
 } catch (error) { result.textContent = `FAIL — ${error.message}\n${error.stack}`; console.error(error); }
 </script>

@@ -49,6 +49,7 @@
       <section id="overview" class="tab-panel">
         <div class="charts"><article class="panel chart-panel"><div class="panel-title"><h2>Training loss</h2><span>RAW LOSS · NATS</span></div><div id="loss-chart" class="chart"></div></article><article class="panel chart-panel"><div class="panel-title"><h2>Validation BPB</h2><span>LOWER IS BETTER</span></div><div id="bpb-chart" class="chart"></div></article></div>
         <div class="charts"><article class="panel chart-panel"><div class="panel-title"><h2>Training throughput</h2><span>TOKENS / SECOND</span></div><div id="throughput-chart" class="chart"></div></article><article class="panel chart-panel"><div class="panel-title"><h2>Learning-rate multiplier</h2><span>SCHEDULE</span></div><div id="lr-chart" class="chart"></div></article></div>
+        <article class="panel chart-panel"><div class="panel-title"><h2>Model FLOPs utilization (MFU)</h2><span>ESTIMATED · %</span></div><div id="mfu-chart" class="chart"></div></article>
       </section>
       <section id="evaluation" class="tab-panel" hidden>
         <div class="charts"><article class="panel chart-panel"><div class="panel-title"><h2>CORE over training</h2><span>CENTERED SCORE</span></div><div id="core-chart" class="chart"></div></article><article class="panel chart-panel"><div class="panel-title"><h2>Evaluation duration</h2><span>SECONDS PER CORE PASS</span></div><div id="eval-chart" class="chart"></div></article></div>
@@ -57,7 +58,7 @@
       <section id="configuration" class="tab-panel" hidden><article class="panel"><div class="panel-title"><h2>Configuration comparison</h2><label class="small"><input id="differences" type="checkbox"> Only differences</label></div><p class="table-note">Nested settings stay together. Expand JSON to inspect, or download a run’s complete configuration.</p><div id="config-downloads" class="config-downloads" aria-label="Configuration JSON downloads"></div><div id="config-table" class="table-wrap"></div></article></section>
 
       <article class="panel runs-panel"><div class="panel-title"><h2>Run recap</h2><span>LAST RECORDED VALUES</span></div><div id="recap-table" class="table-wrap"></div></article>
-      <p class="footnote">Training time excludes evaluation in gpt-lab. Logged elapsed time includes intervals between metric logs; neither is a Modal billing measurement. Missing axis values are omitted, not interpolated. Scores are not automatically ranked as comparable experiments.</p>
+      <p class="footnote">Training time excludes evaluation in gpt-lab. Logged elapsed time includes intervals between metric logs; neither is a Modal billing measurement. MFU is an estimate based on model FLOPs and configured peak compute. Missing axis values are omitted, not interpolated. Scores are not automatically ranked as comparable experiments.</p>
     </div>
     <footer><span>gpt-lab <b>/</b> A small record of what changed.</span><span id="snapshot-info">No results loaded</span></footer>
   </main>

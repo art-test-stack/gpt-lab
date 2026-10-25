@@ -59,6 +59,7 @@ export function demoSnapshot() {
     config: {model: {layers: 8, width: 512, context: 1024}, optimizer: {name: 'illustrative', learning_rate: index ? 0.0015 : 0.001}, training: {seed: 42, global_batch_tokens: 65536}, evaluation: {examples_per_task: 100, protocol: 'synthetic-preview'}},
     history: Array.from({length: 51}, (_, i) => {
       const row = {step: i * 20, 'train/total_tokens': i * 20 * 65536, 'train/total_training_time': i * 55, _runtime: i * 70, 'train/raw_loss': 3.2 + 3.9 * Math.exp(-i / 12) + Math.sin(i * 1.7 + index) * 0.05, 'train/tokens_per_sec': 23500 + Math.sin(i + index) * 1500, lrm: Math.min(1, (i + 1) / 3) * Math.max(0.05, (51 - i) / 35)};
+      row['train/mfu'] = 28 + Math.sin(i + index) * 2;
       if (i && i % 10 === 0) Object.assign(row, {'eval/bpb': 1.3 + Math.exp(-i / 15) * 0.8, 'eval/step_time_ms': 12000, 'core/core': 0.08 + i / 500, 'core/step_time_ms': 110000 + i * 100, 'core/max_per_task': 100, 'core/example-task-1/accuracy': 0.3 + i / 400, 'core/example-task-2/accuracy': 0.4 + i / 450});
       return row;
     }),
