@@ -184,8 +184,9 @@ def main(argv=None):
         write_snapshot(args.output, runs, append=args.append)
         if args.space_dir:
             args.space_dir.mkdir(parents=True, exist_ok=True)
-            for name in ("README.md", "index.html", "style.css", "app.js", "data.mjs"):
+            for name in ("README.md", "index.html", "style.css", "app.js", "data.mjs", "logo.png"):
                 shutil.copy2(ASSETS / name, args.space_dir / name)
+            shutil.copytree(ASSETS / "vendor", args.space_dir / "vendor", dirs_exist_ok=True)
             destination = args.space_dir / "results.json"
             if destination.resolve() != args.output.resolve():
                 shutil.copy2(args.output, destination)

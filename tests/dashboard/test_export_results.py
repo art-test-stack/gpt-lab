@@ -16,11 +16,13 @@ class ExportTests(unittest.TestCase):
     def test_sparse_eval_and_zero_values_are_preserved_without_filling(self):
         rows = export.normalize_history([
             {"_step": 10, "core/core": 0, "_runtime": 80},
-            {"_step": 9, "train/raw_loss": 4.2, "train/total_tokens": 1000},
+            {"_step": 9, "train/raw_loss": 4.2, "train/total_tokens": 1000, "train/mfu": 28.5},
             {"_step": 10, "eval/bpb": "1.4", "eval/loss": float("nan")},
         ])
         self.assertEqual([r["step"] for r in rows], [9, 10, 10])
         self.assertEqual(rows[1]["core/core"], 0)
+        self.assertEqual(rows[0]["train/mfu"], 28.5)
+        self.assertNotIn("train/mfu", rows[1])
         self.assertNotIn("train/total_tokens", rows[1])
         self.assertNotIn("eval/loss", rows[2])
         json.dumps(rows, allow_nan=False)
@@ -69,6 +71,11 @@ class ExportTests(unittest.TestCase):
             history.write_text('{"_step":0,"train/raw_loss":4}\n{"_step":1,"core/core":0.2}\n')
             export.main(["--history", str(history), "--id", "test", "--output", str(base / "results.json"), "--space-dir", str(base / "space")])
             self.assertTrue((base / "space" / "index.html").exists())
+            self.assertEqual((base / "space" / "logo.png").read_bytes(),
+                             (export.ASSETS / "logo.png").read_bytes())
+            self.assertEqual((base / "space" / "vendor" / "chart.umd.min.js").read_bytes(),
+                             (export.ASSETS / "vendor" / "chart.umd.min.js").read_bytes())
+            self.assertTrue((base / "space" / "vendor" / "Chart.js-LICENSE.md").exists())
             data = json.loads((base / "space" / "results.json").read_text())
             self.assertEqual(data["runs"][0]["history"][1]["core/core"], 0.2)
 

@@ -1,5 +1,5 @@
 ---
-title: GPT Lab · Experiments
+title: gpt-lab · Experiments
 emoji: 🧪
 colorFrom: gray
 colorTo: yellow
@@ -9,9 +9,9 @@ pinned: false
 license: mit
 ---
 
-# GPT Lab · Experiments
+# gpt-lab · Experiments
 
-A small, dependency-free experiment recap. Compare learning curves, CORE results,
+A small, static experiment recap. Compare learning curves, CORE results,
 training configurations, and recorded runtime. No Python server, training packages,
 API credentials, or GPU are needed to view it.
 
