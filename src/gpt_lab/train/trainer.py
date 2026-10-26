@@ -572,6 +572,10 @@ class Trainer:
         batch and next_batch are prepared (payload, state, local_token_count)
         tuples. Accumulate config.n_acc_steps microbatches, preserving the last
         consumed state for checkpoints and prefetching the next batch.
+        Prepare each next batch without inspecting loss tensors on the host.
+        Validate the accumulated loss once after the complete loop; non-finite
+        loss aborts before the optimizer update. Failure diagnostics describe
+        the last consumed batch, not the first non-finite microbatch.
 
         step_metrics keys are loss (detached accumulated tensor), tokens (global
         count), step_time (local seconds), lrm, muon_momentum, and weight_decay. Timing
@@ -604,20 +608,19 @@ class Trainer:
 
             loss_accum.add_(loss.detach().float())
 
-            if torch.isnan(loss_accum) or torch.isinf(loss_accum):
-                from gpt_lab.utils.tensor_io import save_tensor_state
-                try:
-                    save_tensor_state({"payload": payload}, self.dirname / "bad_batch.safetensors")
-                except TypeError:
-                    log0("Bad-batch payload cannot be serialized; see the loss error for details.", level="warning", logger=logger)
-                log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
-                    f"Loss is NaN or Inf at {step=}.\n" \
-                    f"Dataloader state: {dataloader_state}.\n" \
-                    f"Batch payload: {payload}\n" \
-                    f"Accumulated loss: {loss_accum}",
-                    error_type=ValueError, logger=logger
-                )
+            last_consumed_dataloader_metadata = (
+                dataloader_state.model_dump() if dataloader_state is not None else None
+            )
             payload, dataloader_state, token_count = self.prepare_batch(next(train_iter))
+
+        if not torch.isfinite(loss_accum):
+            log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
+                f"Accumulated loss is non-finite at optimizer {step=}.\n" \
+                f"Last consumed dataloader state: {last_consumed_dataloader_metadata}.\n" \
+                "Exact consumed-batch tensors were not captured; loader buffers may have been reused.\n" \
+                f"Accumulated loss: {loss_accum}",
+                error_type=ValueError, logger=logger
+            )
 
         if dataloader_state is not None:
             self.state.n_epochs = dataloader_state.epoch

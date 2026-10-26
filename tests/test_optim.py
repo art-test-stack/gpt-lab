@@ -3,6 +3,43 @@ import pytest
 import torch
 
 from gpt_lab.optim.factory import OptimizerFactory
+from gpt_lab.optim.kernels.muon import muon_step_fused
+from torch.utils._python_dispatch import TorchDispatchMode
+
+
+@pytest.mark.parametrize("compute_dtype", [torch.bfloat16, torch.float32])
+def test_muon_restores_parameter_dtype_after_orthogonalization(compute_dtype):
+    generator = torch.Generator().manual_seed(123)
+    params = torch.randn(2, 3, 4, generator=generator)
+    grads = torch.randn(params.shape, generator=generator)
+    momentum = torch.zeros_like(params)
+    variance = torch.zeros(2, 3, 1)
+    initial_params = params.clone()
+    matmul_dtypes, scaling_dtypes = [], []
+
+    class ObserveDtypes(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten.bmm.default:
+                matmul_dtypes.append((args[0].dtype, args[1].dtype))
+            if (func == torch.ops.aten.mul.Tensor
+                    and isinstance(args[1], torch.Tensor)
+                    and args[0].shape == params.shape and args[1].shape == variance.shape):
+                scaling_dtypes.append((args[0].dtype, args[1].dtype))
+            return func(*args, **(kwargs or {}))
+
+    with ObserveDtypes():
+        muon_step_fused.__wrapped__(
+            grads, params, momentum, variance,
+            *(torch.tensor(value) for value in (0.95, 0.02, 0.28, 0.9)),
+            5, -1, compute_dtype,
+        )
+
+    assert matmul_dtypes == [(compute_dtype, compute_dtype)] * 15
+    assert scaling_dtypes == [(torch.float32, torch.float32)]
+    for tensor in (params, grads, momentum, variance):
+        assert tensor.dtype == torch.float32
+        assert torch.isfinite(tensor).all()
+    assert not torch.equal(params, initial_params)
 
 
 def test_hyperparameter_schedules_preserve_group_specific_values():

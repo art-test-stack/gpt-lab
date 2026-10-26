@@ -129,6 +129,30 @@ class TestSDPA:
 
 
 @pytest.mark.fast
+@pytest.mark.parametrize("window_size", [None, (-1, -1), (-1, 0)])
+def test_flash_fallback_full_causal_uses_sdpa_causal_dispatch(monkeypatch, window_size):
+    q, k, v = torch.randn(3, 1, 4, 2, 8).unbind(0)
+    sdpa = F.scaled_dot_product_attention
+    expected = sdpa(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+        is_causal=True,
+    ).transpose(1, 2)
+    calls = []
+
+    def capture_sdpa(*args, **kwargs):
+        calls.append(kwargs)
+        return sdpa(*args, **kwargs)
+
+    monkeypatch.setattr(F, "scaled_dot_product_attention", capture_sdpa)
+    output = _sdpa_fallback(q, k, v, causal=True, window_size=window_size)
+
+    assert torch.allclose(output, expected)
+    assert len(calls) == 1
+    assert calls[0]["attn_mask"] is None
+    assert calls[0]["is_causal"] is True
+
+
+@pytest.mark.fast
 def test_flash_fallback_local_attention_is_causal_and_uses_keep_mask():
     q = torch.zeros(1, 4, 1, 2)
     k = torch.zeros_like(q)

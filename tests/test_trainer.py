@@ -256,7 +256,7 @@ class _PayloadTrainer(Trainer):
 
 
 @pytest.mark.fast
-def test_train_step_matches_accumulated_update_and_preserves_prefetch_state(tmp_path):
+def test_train_step_matches_accumulated_update_and_preserves_prefetch_state(tmp_path, monkeypatch):
     trainer, model, _ = _make_trainer(
         tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer,
     )
@@ -284,7 +284,30 @@ def test_train_step_matches_accumulated_update_and_preserves_prefetch_state(tmp_
     train_iter = iter(batches)
     batch = trainer.prepare_batch(next(train_iter))
 
-    next_batch, metrics = trainer.train_step(train_iter, batch, should_log_step=True)
+    events = []
+    prepare_batch = trainer.prepare_batch
+    tensor_bool = torch.Tensor.__bool__
+    isfinite = torch.isfinite
+
+    def prepare(raw_batch):
+        events.append("prepare")
+        return prepare_batch(raw_batch)
+
+    def inspect_loss(tensor):
+        events.append("host_read")
+        return tensor_bool(tensor)
+
+    def check_finite(tensor):
+        events.append("isfinite")
+        return isfinite(tensor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(trainer, "prepare_batch", prepare)
+        patch.setattr(torch.Tensor, "__bool__", inspect_loss)
+        patch.setattr(torch, "isfinite", check_finite)
+        next_batch, metrics = trainer.train_step(train_iter, batch, should_log_step=True)
+
+    assert events == ["prepare", "prepare", "isfinite", "host_read"]
 
     torch.testing.assert_close(model.weight, reference.weight)
     assert model.weight.grad is None
@@ -406,23 +429,49 @@ def test_update_metrics_tracks_state_and_log_metrics_only_reports(
 
 
 @pytest.mark.fast
-@pytest.mark.parametrize("serializable", [False, True])
-def test_nonfinite_custom_payload_reports_loss_without_loader_state(tmp_path, monkeypatch, serializable):
-    trainer, _, _ = _make_trainer(tmp_path, trainer_class=_PayloadTrainer)
-    trainer.config = trainer.config.model_copy(update={
-        "n_flops_per_token": 100, "eval_bpb_every": 0,
-        "eval_core_every": 0, "sample_every": 0,
-    })
-    payload = dict(features=torch.ones(2, 2), targets=torch.full((2, 2), float("nan")), tokens=4)
-    if not serializable:
-        payload["custom_metadata"] = object()
-    trainer.train_loader = [payload]
-    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+@pytest.mark.parametrize("bad_loss,microstep,with_state", [
+    (float("nan"), 0, True), (float("inf"), 1, True), (float("nan"), 1, False),
+])
+def test_nonfinite_loss_completes_accumulation_reports_last_metadata_and_aborts(
+    tmp_path, bad_loss, microstep, with_state,
+):
+    trainer, model, _ = _make_trainer(
+        tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer,
+    )
+    trainer.compiled_model = model
+    trainer.config = trainer.config.model_copy(update={"n_acc_steps": 2})
+    trainer.state.step = 7
+    trainer.optimizer_step = Mock()
+    initial_weight = model.weight.detach().clone()
+    features, targets = torch.ones(2, 2), torch.zeros(2, 2)
+    states = [DataLoaderState(epoch=i + 1, offset_in_row_group=10 + i) if with_state else None
+              for i in range(3)]
+    fetched = []
 
-    with pytest.raises(ValueError, match="Loss is NaN or Inf"):
-        trainer.train()
+    def batches():
+        for i, state in enumerate(states):
+            targets.fill_(bad_loss if i == microstep else 0.0)
+            fetched.append(i)
+            yield dict(features=features, targets=targets, tokens=4, state=state)
 
-    assert (tmp_path / "bad_batch.safetensors").exists() == serializable
+    train_iter = batches()
+    batch = trainer.prepare_batch(next(train_iter))
+
+    with pytest.raises(ValueError, match="Accumulated loss is non-finite") as error:
+        trainer.train_step(train_iter, batch, should_log_step=False)
+
+    message = str(error.value)
+    metadata = states[1].model_dump() if with_state else None
+    assert "optimizer step=7" in message
+    assert "microstep=" not in message
+    assert f"Last consumed dataloader state: {metadata}." in message
+    assert "Exact consumed-batch tensors were not captured" in message
+    assert "Batch payload:" not in message
+    assert fetched == [0, 1, 2]
+    assert trainer.state.train_loader_state is states[1]
+    trainer.optimizer_step.assert_not_called()
+    torch.testing.assert_close(model.weight, initial_weight)
+    assert not (tmp_path / "bad_batch.safetensors").exists()
 
 
 class TestModelTrainer:

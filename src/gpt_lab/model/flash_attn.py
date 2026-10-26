@@ -106,7 +106,7 @@ def _sdpa_fallback(q, k, v,
     k = k.transpose(1, 2)  # B, H, Tk, D
     v = v.transpose(1, 2)  # B, H, Tk, D
 
-    has_local_window = window_left >= 0 or window_right >= 0
+    has_local_window = window_left >= 0 or (not causal and window_right >= 0)
     if causal and Tq == Tk and not has_local_window:
         output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=dropout_p,

@@ -47,7 +47,8 @@ class MuonStrategy(OptimizerStrategy):
             stacked_grads, stacked_params, state["momentum_buffer"],
             state["second_momentum_buffer"], self.opt.scalars.muon_momentum_t,
             self.opt.scalars.muon_lr_t, self.opt.scalars.muon_wd_t,
-            self.opt.scalars.muon_beta2_t, group["ns_steps"], red_dim, dtype,
+            self.opt.scalars.muon_beta2_t, group["ns_steps"], red_dim,
+            self.opt.comp_info.compute_dtype,
         )
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
     
@@ -130,7 +131,7 @@ class MuonStrategy(OptimizerStrategy):
                 state["second_momentum_buffer"][:num_owned],
                 self.opt.scalars.muon_momentum_t, self.opt.scalars.muon_lr_t,
                 self.opt.scalars.muon_wd_t, self.opt.scalars.muon_beta2_t,
-                group["ns_steps"], red_dim, dtype,
+                group["ns_steps"], red_dim, self.opt.comp_info.compute_dtype,
             )
             updated_params[:num_owned].copy_(stacked_owned)
         
