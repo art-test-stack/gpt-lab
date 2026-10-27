@@ -89,6 +89,9 @@ def training_dependencies(monkeypatch):
         def group_configs(self):
             return self.groups
 
+        def model_copy(self, *, update):
+            return Config(**(vars(self) | update))
+
     profile = Config(groups={})
     Config.from_file = Mock(return_value=profile)
 
@@ -100,7 +103,7 @@ def training_dependencies(monkeypatch):
     tokenizer = Mock()
     meta = Config(name='demo', run_name='run-1', model_cfg=model.config, tokenizer_cfg=object(),
                   base_train={'device_batch_size': 3, 'n_steps': 10})
-    saved_config = Config(comp_info={})
+    saved_config = Config(comp_info={}, n_steps=10, stop_after_updates=None)
     state = SimpleNamespace(train_loader_state=object())
     checkpoint = SimpleNamespace(trainer_state=state, checkpoint_state=object(), optimizer_state=object(), scaler_state=object())
     manager = Mock()
@@ -155,6 +158,23 @@ def test_resume_restores_all_states_through_existing_pipeline(training_dependenc
     deps.board.close.assert_called_once()
     deps.cleanup.assert_called_once()
     assert '_handler' not in deps.board_factory.call_args.kwargs['config']
+
+
+@pytest.mark.parametrize('cap', [None, 7])
+def test_resume_retains_or_overrides_absolute_execution_cap(training_dependencies, cap):
+    from gpt_lab.cli.commands.base import run
+    deps = training_dependencies
+    deps.saved_config.stop_after_updates = 5
+    args = parse('train resume --device cpu --board dummy')
+    args.stop_after_updates = cap
+    run(args)
+    config = deps.trainer_factory.call_args.kwargs['config']
+    assert config.n_steps == 10
+    assert config.stop_after_updates == (5 if cap is None else cap)
+    if cap is not None:
+        deps.manager.save_training_config.assert_called_once_with(config)
+    else:
+        deps.manager.save_training_config.assert_not_called()
 
 
 @pytest.mark.parametrize('mode', ['auto', 'resume'])
@@ -322,11 +342,13 @@ def test_training_is_callable_without_argparse(training_dependencies, monkeypatc
     from gpt_lab.workflows.train_base import train_base
     deps = training_dependencies
     monkeypatch.setattr('gpt_lab.cli.parser.build_parser', Mock(side_effect=AssertionError('Python training must not parse CLI arguments')))
-    train_base(optim_config=deps.profile, depth=4, total_batch_size=128, num_steps=7,
+    train_base(optim_config=deps.profile, depth=4, total_batch_size=128, num_steps=7, stop_after_updates=5,
                device='cpu', board='dummy', random_seed=123)
     assert deps.auto.call_args.kwargs['depth'] == 4
     assert deps.auto.call_args.kwargs['total_batch_size'] == 128
     assert deps.auto.call_args.kwargs['n_steps'] == 7
+    assert 'stop_after_updates' not in deps.auto.call_args.kwargs
+    assert deps.trainer_factory.call_args.kwargs['config'].stop_after_updates == 5
     deps.init_dist.assert_called_once_with(device_type='cpu', random_seed=123)
     assert deps.model.build_optimizer.call_args.kwargs['optim_config'] is deps.profile
     deps.trainer.train.assert_called_once()

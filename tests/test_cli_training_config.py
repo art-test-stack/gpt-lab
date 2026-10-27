@@ -3,9 +3,63 @@ from gpt_lab.utils.distributed import ComputeContext
 import math
 
 import pytest
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 from gpt_lab.model.checkpoint import build_meta_model
 from gpt_lab.utils.schemas import OptimizerConfig, TrainerConfig, TransformerConfig
+
+
+def test_pr35_horizon_changes_only_schedules_and_cap_does_not_change_them():
+    from gpt_lab.cli.parser import build_parser
+    from gpt_lab.model.auto import AutoGPTConfig
+    from scripts.adapters.pr35_comparison import verify_comparison
+
+    reference_path = Path(__file__).resolve().parents[1] / 'configs/pr35-comparison.json'
+    reference = json.loads(reference_path.read_text())
+
+    class FourRanks(ComputeContext):
+        @property
+        def world_size(self):
+            return 4
+
+    context = FourRanks(device=torch.device('cpu'), compute_dtype=torch.bfloat16)
+    resolved = []
+    groups = []
+    for horizon in (945, 2317):
+        args = build_parser().parse_args(['train', '--depth', '12', '--device-batch-size', '16',
+            '--target-param-data-ratio', '8', '--attn-impl', 'fused', '--num-steps', str(horizon),
+            '--stop-after-updates', '945'])
+        auto = AutoGPTConfig(depth=args.depth, d_head=args.d_head, aspect_ratio=args.aspect_ratio,
+            n_steps=args.num_steps, device_batch_size=args.device_batch_size,
+            target_param_data_ratio=args.target_param_data_ratio, attn_impl=args.attn_impl, comp_info=context)
+        model = auto.build_meta_model_from_depth(args.depth, reference['tokenizer']['vocab_size'])
+        assert model.config.model_dump() == reference['model']
+        assert model.embeds.weight.shape == (50304, 768)
+        training = auto.build_training_config(model, model)
+        assert training['total_batch_size'] == 524288 and training['n_acc_steps'] == 4
+        resolved.append({k: v for k, v in training.items() if k not in ('n_steps', 'n_total_tokens')})
+        config = TrainerConfig(comp_info=context, **training, stop_after_updates=args.stop_after_updates,
+            lr_warmup_steps=300, lr_warmdown_ratio=0.65, final_lr_ratio=0.05,
+            optim_config=OptimizerConfig.from_file())
+        optimizer = model.build_optimizer(config)
+        groups.append([{k: v for k, v in group.items() if k != 'params'} for group in optimizer.param_groups])
+        if horizon == 2317:
+            report = verify_comparison(SimpleNamespace(model=model, config=config, optimizer=optimizer,
+                state=SimpleNamespace(completed_updates=0),
+                tokenizer=SimpleNamespace(config=SimpleNamespace(**reference['tokenizer']))), reference_path)
+            assert report['execution_cap'] == 945
+            uncapped = config.model_copy(update={'stop_after_updates': None})
+            for step in reference['shared_update_indices']:
+                expected_lr = (step + 1) / 300 if step < 300 else (1.0 if step <= 811 else 0.05 + 0.95 * (2317 - step) / 1506)
+                assert config.lr_multiplier_schedule(step) == pytest.approx(expected_lr)
+                assert config.muon_momentum_schedule(step) == pytest.approx(expected_lr)
+                assert config.weight_decay_schedule(step) == pytest.approx(0.5 * (1 + math.cos(math.pi * step / 2317)))
+                for name in ('lr_multiplier_schedule', 'muon_momentum_schedule', 'weight_decay_schedule'):
+                    assert getattr(config, name)(step) == getattr(uncapped, name)(step)
+    assert resolved[0] == resolved[1]
+    assert groups[0] == groups[1]
 
 
 @pytest.mark.parametrize('custom', [False, True])
