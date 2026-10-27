@@ -219,6 +219,8 @@ class Trainer:
         
         # State and metrics
         self.state = resume_state or TrainerState()
+        if self.state.completed_updates is None:
+            self.state.completed_updates = self.state.step + int(self.state.step > 0 or self.state.n_tokens > 0)
         self.ckpt_state = best_state or CheckpointState()
         self.metrics = TrainerMetrics()     # TODO
         self.eval_metrics = EvalMetrics()   # TODO
@@ -344,8 +346,16 @@ class Trainer:
         print0("=" * 70)
         
         # Extracte main constants from config
-        step = self.state.step + int(self.state.step > 0) # start from the next step to avoid repeating the last step if resuming
+        step = self.state.completed_updates
         n_steps = self.config.n_steps
+        execution_limit = min(n_steps, self.config.stop_after_updates) if self.config.stop_after_updates is not None else n_steps
+        if step >= execution_limit:
+            self.compiled_model = None
+            self.save_checkpoint()
+            if self.config.stop_after_updates is not None:
+                self.board.log({"train/scheduling_horizon": n_steps, "train/execution_cap": self.config.stop_after_updates,
+                                "train/completed_updates": step}, step=self.state.step)
+            return
         
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
@@ -383,9 +393,9 @@ class Trainer:
         
         total_dt = []  # For ETA calculation
         
-        while step < n_steps:
+        while step < execution_limit:
             self.state.step = step
-            last_step = (step == n_steps - 1)
+            last_step = (step == execution_limit - 1)
             should_log_step = (
                 (self.config.log_every == -1 and last_step)
                 or (
@@ -440,6 +450,8 @@ class Trainer:
             # ================================================================
             
             metrics = self.update_metrics(step_metrics, total_dt)
+            self.state.completed_updates = step + 1
+            metrics["train/completed_updates"] = self.state.completed_updates
             if should_log_step:
                 self.log_metrics(metrics)
 
@@ -476,6 +488,9 @@ class Trainer:
         
         # Final checkpoint
         self.save_checkpoint()
+        if self.config.stop_after_updates is not None:
+            self.board.log({"train/scheduling_horizon": n_steps, "train/execution_cap": self.config.stop_after_updates,
+                            "train/completed_updates": self.state.completed_updates}, step=self.state.step)
 
     def update_metrics(self, step_metrics, total_dt):
         """Update per-step state and return the metric dict consumed by log_metrics.

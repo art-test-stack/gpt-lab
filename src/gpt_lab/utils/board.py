@@ -24,6 +24,8 @@ class DummyBoard:
         pass
     def finish(self, *args, **kwargs):
         pass
+    def close(self):
+        pass
 
 class Board:
     def __init__(
@@ -88,4 +90,3 @@ class Board:
             self.main.close()
         elif self.board_type == "wandb":
             wandb.finish()
-        
