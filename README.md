@@ -259,6 +259,14 @@ meta_config = cfg.generate_gpt_config(device="cuda")
 > Setting `training_time`, `n_steps`, `target_flops`, or `target_param_data_ratio` controls training horizon priority. \
 > The system automatically builds a reference model (12-layer baseline) to normalize scaling-law computations.
 
+`--num-steps` sets the complete scheduling horizon. To stop execution earlier
+without shortening LR, momentum, or weight-decay schedules, use
+`--num-steps 2317 --stop-after-updates 945`. The cap counts completed optimizer
+updates since training began, including updates before a resume. It defaults
+to unset; resume retains a saved cap unless explicitly overridden. A capped
+run uses normal final checkpointing. See [the PR35 comparison](docs/pr35-execution-cap.md)
+for the pinned Modal adapter and verification results.
+
 Next sections detail the different generated components.
 
 ### Tokenization
