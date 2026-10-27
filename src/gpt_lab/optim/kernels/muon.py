@@ -119,7 +119,7 @@ def muon_step_fused(
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
-    g = X
+    g = X.to(stacked_params.dtype)
 
     # Variance reduction
     beta2 = beta2_t.to(g.dtype)

@@ -505,6 +505,7 @@ class TrainerConfig(BaseModel):
 
     # Training hparams
     n_steps: int = 1 # TODO: decide whether step = #forward pass or #tokens seen by model
+    stop_after_updates: Optional[int] = Field(default=None, ge=0)
     n_acc_steps: int = 100
     target_time: float = -1.0 # in seconds, overrides n_steps if > 0
     total_batch_size: int = -1 # Overrides device_batch_size if > 0
@@ -771,6 +772,7 @@ class DataLoaderState(BaseModel):
 
 class TrainerState(BaseModel):
     step: int = 0
+    completed_updates: Optional[int] = Field(default=None, ge=0) # None permits inference from legacy checkpoints.
     n_tokens: int = 0
     n_epochs: float = 0.0
     total_training_time: float = 0.0

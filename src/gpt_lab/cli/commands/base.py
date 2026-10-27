@@ -25,6 +25,7 @@ def add_common_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--monitor-grad-norms', action='store_true', help='Whether to monitor gradient norms during training. If set, will log the norm of the gradients of each parameter to the board at each training step.')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Batch size for each device during training. Batch size define further effective batch size as device_batch_size * max_seq_len * n_acc_steps.')
     parser.add_argument('--use-nanochat-dataloader', action='store_true', help='Whether to use the nanochat dataloader instead of the default dataloader.')
+    parser.add_argument('--stop-after-updates', type=int, default=None, help='Absolute cap on completed optimizer updates, including before resume; >=0. Leaves the scheduling horizon unchanged. Unset retains the saved cap on resume.')
 
 
 def add_auto_arguments(parser: ArgumentParser) -> None:
@@ -44,7 +45,7 @@ def add_auto_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--softcap', type=float, default=18.0, help='Soft cap for model logits to prevent overflow.')
     parser.add_argument('--attn-softcap', type=float, default=None, help='Soft cap for attention scores to prevent overflow.')
     parser.add_argument('--attn-impl', type=str, default='sdpa', help="Attention implementation to use for auto-configured models. Options are 'sdpa' and 'fused'. Both shoulf exhibit same results but 'fused' should be slightly faster (if runned under cuda device).")
-    parser.add_argument('--num-steps', type=int, default=-1, help='Number of training steps (overrides num-epochs if > 0).')
+    parser.add_argument('--num-steps', type=int, default=-1, help='Complete scheduling horizon; -1 infers it. Use --stop-after-updates to limit execution without shortening schedules.')
     parser.add_argument('--target-flops', type=float, default=-1.0, help='Target FLOPS for auto-configured models.')
     parser.add_argument('--target-param-data-ratio', type=float, default=11.0, help='Target parameter-to-data ratio for auto-configured models.')
     parser.add_argument('--target-time', type=float, default=-1.0, help='Target training time in seconds for auto-configured models. This parameter overrides num-steps. ')
