@@ -3,12 +3,14 @@ from gpt_lab.utils.import_utils import is_torch_cuda_available, is_flash_attn3_a
 import torch
 import torch.nn.functional as F
 import os
+import warnings
 from typing import Optional, Union
 from types import SimpleNamespace
 
 import math
 
 _flash_attn = None
+_flash_attn2 = None
 if is_torch_cuda_available():
     try:
         major, _ = torch.cuda.get_device_capability()
@@ -16,6 +18,16 @@ if is_torch_cuda_available():
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
             import kernels
             _flash_attn = kernels.get_kernel('varunneal/flash-attention-3').flash_attn_interface
+        elif major == 8:
+            try:
+                import kernels
+                _flash_attn2 = kernels.get_kernel(
+                    'kernels-community/flash-attn2',
+                    revision='c3f3c93a4a39e3d2cf49c13eac49229bc726ea13',
+                )
+            except Exception as error:
+                warnings.warn(f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}',
+                              RuntimeWarning, stacklevel=2)
     except Exception:
         pass
 
@@ -167,7 +179,25 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
             which is slightly slower and uses more memory. The forward pass is always deterministic.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
+
+    Ampere uses FlashAttention 2 for BF16 causal (512, 0) windows with zero
+    dropout when the pinned Hub kernel is available; other cases retain the
+    existing backend dispatch.
     """
+    attention_dtype = (torch.get_autocast_dtype('cuda')
+                       if torch.is_autocast_enabled('cuda') else qkv.dtype)
+    if (_flash_attn2 is not None and qkv.is_cuda and causal
+            and window_size is not None and tuple(window_size) == (512, 0)
+            and dropout_p == 0.0 and alibi_slopes is None
+            and qkv.size(-1) <= 256
+            and qkv.dtype in (torch.float32, torch.bfloat16)
+            and attention_dtype == torch.bfloat16):
+        # Value embeddings can promote packed Q/K/V; FA2 needs an explicit AMP cast.
+        return _flash_attn2.flash_attn_qkvpacked_func(
+            qkv.to(dtype=torch.bfloat16), dropout_p=dropout_p,
+            softmax_scale=softmax_scale, causal=causal, window_size=window_size,
+            deterministic=deterministic,
+        )
     if flash_attention_is_installed:
         return _flash_attn.flash_attn_qkvpacked_func(
             qkv,
