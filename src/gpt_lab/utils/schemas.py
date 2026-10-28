@@ -2,7 +2,7 @@ import math
 import json
 import torch
 
-from pydantic import BaseModel, Field, ConfigDict, PrivateAttr, field_validator
+from pydantic import AliasChoices, BaseModel, Field, ConfigDict, PrivateAttr, field_validator
 from typing import Any, Dict, List, Literal, Optional, Union
 from pathlib import Path
 import os, time
@@ -326,7 +326,7 @@ class TransformerConfig(BaseModel):
             raise ValueError("BF16 input/value embeddings cannot share parameters with the FP32 vocabulary head")
         if any("value_embs" in group and len(group) > 1 for group in groups) and self.n_kv_heads * self.d_head != self.d_model:
             raise ValueError(
-                "Tying value_embs to embs or head requires n_kv_heads * d_head == d_model; "
+                "Tying value_embs to embs requires n_kv_heads * d_head == d_model; "
                 "value and input embedding widths must match"
             )
         if self.n_kv_heads != self.n_heads:
@@ -507,7 +507,10 @@ class TrainerConfig(BaseModel):
 
     # Training hparams
     n_steps: int = 1 # TODO: decide whether step = #forward pass or #tokens seen by model
-    stop_after_updates: Optional[int] = Field(default=None, ge=0)
+    stop_after_step: Optional[int] = Field(
+        default=None, ge=0,
+        validation_alias=AliasChoices("stop_after_step", "stop_after_updates"),
+    )
     n_acc_steps: int = 100
     target_time: float = -1.0 # in seconds, overrides n_steps if > 0
     total_batch_size: int = -1 # Overrides device_batch_size if > 0
@@ -774,7 +777,10 @@ class DataLoaderState(BaseModel):
 
 class TrainerState(BaseModel):
     step: int = 0
-    completed_updates: Optional[int] = Field(default=None, ge=0) # None permits inference from legacy checkpoints.
+    completed_steps: Optional[int] = Field(
+        default=None, ge=0,
+        validation_alias=AliasChoices("completed_steps", "completed_updates"),
+    )
     n_tokens: int = 0
     n_epochs: float = 0.0
     total_training_time: float = 0.0

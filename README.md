@@ -261,8 +261,8 @@ meta_config = cfg.generate_gpt_config(device="cuda")
 
 `--num-steps` sets the complete scheduling horizon. To stop execution earlier
 without shortening LR, momentum, or weight-decay schedules, use
-`--num-steps 2317 --stop-after-updates 945`. The cap counts completed optimizer
-updates since training began, including updates before a resume. It defaults
+`--num-steps 2317 --stop-after-step 945`. The cap counts completed optimizer
+steps since training began, including steps before a resume. It defaults
 to unset; resume retains a saved cap unless explicitly overridden. A capped
 run uses normal final checkpointing. See [the PR35 comparison](docs/pr35-execution-cap.md)
 for the pinned Modal adapter and verification results.
@@ -502,7 +502,7 @@ To add a new optimizer (e.g., Aurora), you only need to edit **one place**:
    
    class AuroraStrategy(OptimizerStrategy):
        def local_step(self, group: dict) -> None:
-           # Single-GPU update logic
+           # Single-GPU step logic
            pass
        
        def dist_reduce(self, group: dict, world_size: int) -> dict:
@@ -596,7 +596,7 @@ for module-mode launches and checkpoint selection.
 #### Customizing the trainer
 
 Subclass [`Trainer`](src/gpt_lab/train/trainer.py) and override `train_step` for a
-complete update, or `prepare_batch`, `compute_loss`, and `optimizer_step` for
+complete optimizer step, or `prepare_batch`, `compute_loss`, and `optimizer_step` for
 smaller changes. `update_metrics` updates per-step state; `log_metrics` handles
 reporting. Override `evaluate_bpb`, `evaluate_core`, and `evaluate_samples`
 independently; the main loop schedules evaluations. Use `self.compiled_model`

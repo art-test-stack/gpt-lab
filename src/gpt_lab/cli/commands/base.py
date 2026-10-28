@@ -25,7 +25,7 @@ def add_common_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--monitor-grad-norms', action='store_true', help='Whether to monitor gradient norms during training. If set, will log the norm of the gradients of each parameter to the board at each training step.')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Batch size for each device during training. Batch size define further effective batch size as device_batch_size * max_seq_len * n_acc_steps.')
     parser.add_argument('--use-nanochat-dataloader', action='store_true', help='Whether to use the nanochat dataloader instead of the default dataloader.')
-    parser.add_argument('--stop-after-updates', type=int, default=None, help='Absolute cap on completed optimizer updates, including before resume; >=0. Leaves the scheduling horizon unchanged. Unset retains the saved cap on resume.')
+    parser.add_argument('--stop-after-step', type=int, default=None, help='Absolute cap on completed optimizer steps, including before resume; >=0. Leaves the scheduling horizon unchanged. Unset retains the saved cap on resume.')
 
 
 def add_auto_arguments(parser: ArgumentParser) -> None:
@@ -39,13 +39,13 @@ def add_auto_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--aspect-ratio', type=float, default=64, help='Aspect ratio for auto-configured models.')
     parser.add_argument('--d-head', type=int, default=128, help='Dimension of each attention head for auto-configured models. If not set, will be determined by aspect ratio and model depth.')
     parser.add_argument('--n-kv-heads', '--d-kv-head', dest='n_kv_heads', type=int, default=None, help='Number of key/value heads for GQA; None uses the query head count. --d-kv-head is a deprecated alias.')
-    parser.add_argument('--tie-embeddings', type=str, default='embs;value_embs;head', help='Embedding groups: comma ties, semicolon separates. Names: embs, head, value_embs. Standalone value_embs: ties all value tables; bare value_embs leaves them separate. Quote the string in the shell.')
+    parser.add_argument('--tie-embeddings', type=str, default='embs;value_embs;head', help='Use commas to share parameters and semicolons to separate groups. Valid examples: embs;value_embs;head (separate), embs,value_embs;head (share input/value tables; widths must match), embs;value_embs:;head (share value tables only). Head sharing is unsupported. Quote this value in the shell.')
     parser.add_argument('--window-pattern', type=str, default=None, help="Window pattern for sliding attention window. String of 'S' and 'L'. If 'None', will be later set as 'SSSL'.")
     parser.add_argument('--window-size', type=str, default=None, help='Window size for pattern smalls (S).')
     parser.add_argument('--softcap', type=float, default=18.0, help='Soft cap for model logits to prevent overflow.')
     parser.add_argument('--attn-softcap', type=float, default=None, help='Soft cap for attention scores to prevent overflow.')
     parser.add_argument('--attn-impl', type=str, default='sdpa', help="Attention implementation to use for auto-configured models. Options are 'sdpa' and 'fused'. Both shoulf exhibit same results but 'fused' should be slightly faster (if runned under cuda device).")
-    parser.add_argument('--num-steps', type=int, default=-1, help='Complete scheduling horizon; -1 infers it. Use --stop-after-updates to limit execution without shortening schedules.')
+    parser.add_argument('--num-steps', type=int, default=-1, help='Complete scheduling horizon; -1 infers it. Use --stop-after-step to limit execution without shortening schedules.')
     parser.add_argument('--target-flops', type=float, default=-1.0, help='Target FLOPS for auto-configured models.')
     parser.add_argument('--target-param-data-ratio', type=float, default=11.0, help='Target parameter-to-data ratio for auto-configured models.')
     parser.add_argument('--target-time', type=float, default=-1.0, help='Target training time in seconds for auto-configured models. This parameter overrides num-steps. ')

@@ -23,14 +23,7 @@ def detect_compute_dtype():
     env = os.environ.get("GPTLAB_DTYPE", None)
     if env is not None and env != "bfloat16":
         raise ValueError("Only BF16 compute is supported; GPTLAB_DTYPE must be bfloat16")
-    if torch.cuda.is_available():
-        # bf16 requires SM 80+ (Ampere: A100, A10, etc.)
-        # Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
-        capability = torch.cuda.get_device_capability()
-        if capability >= (8, 0):
-            return torch.bfloat16, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (bf16 supported)"
-        raise ValueError("BF16 compute requires a BF16-capable CUDA device (SM 80 or newer)")
-    return torch.bfloat16, "BF16 compute policy (CPU/MPS require BF16 operator support)"
+    return torch.bfloat16, "BF16 compute policy"
 
 # -----------------------------------------------------------
 # distributed utils
@@ -65,6 +58,15 @@ class ComputeContext:
     mesh: DeviceMesh | None = None
     compute_dtype: torch.dtype = field(default_factory=lambda: detect_compute_dtype()[0])
     compute_dtype_reason: str = field(default_factory=lambda: detect_compute_dtype()[1])
+
+    def __post_init__(self) -> None:
+        if self.device.type == "cuda":
+            capability = torch.cuda.get_device_capability(self.device)
+            if capability < (8, 0):
+                raise ValueError(
+                    "BF16 compute requires a BF16-capable CUDA device (SM 80 or newer); "
+                    f"{self.device} has capability {capability[0]}.{capability[1]}"
+                )
 
     @property
     def rank(self) -> int:

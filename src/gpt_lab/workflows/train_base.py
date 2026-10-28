@@ -74,7 +74,7 @@ def train_base(
     attn_softcap=None,
     attn_impl='sdpa',
     num_steps=-1,
-    stop_after_updates=None,
+    stop_after_step=None,
     target_flops=-1.0,
     target_param_data_ratio=11.0,
     target_time=-1.0,
@@ -94,8 +94,8 @@ def train_base(
     """
     if model_init not in ("auto", "resume"):
         raise ValueError("model_init must be auto or resume")
-    if stop_after_updates is not None and (not isinstance(stop_after_updates, int) or stop_after_updates < 0):
-        raise ValueError("stop_after_updates must be a nonnegative integer or None")
+    if stop_after_step is not None and (not isinstance(stop_after_step, int) or stop_after_step < 0):
+        raise ValueError("stop_after_step must be a nonnegative integer or None")
     if model_init == "auto" and optim_config is None:
         raise ValueError("Fresh training requires a loaded OptimizerConfig")
     if optim_config is not None:
@@ -238,8 +238,8 @@ def train_base(
 
         if is_resumed:
             assert type(trainer_config) == TrainerConfig, "Trainer config loaded from checkpoint is not of type TrainerConfig. Please check the checkpoint data and trainer config."
-            if stop_after_updates is not None:
-                trainer_config = trainer_config.model_copy(update={"stop_after_updates": stop_after_updates})
+            if stop_after_step is not None:
+                trainer_config = trainer_config.model_copy(update={"stop_after_step": stop_after_step})
                 ckpt_manager.save_training_config(trainer_config)
             # TODO: add option to override some trainer config parameters from CLI args even when resuming (eg: evaluation frequency, save frequency, etc.)
         else:
@@ -270,7 +270,7 @@ def train_base(
                 project=f"trainbase_{meta_config.name}",
                 run=meta_config.run_name,
                 config=board_args | {"meta_config": meta_config.model_dump(), "training_config": trainer_config.model_dump(), "model_card": model.config.model_dump(),
-                                     "scheduling_horizon": trainer_config.n_steps, "execution_cap": trainer_config.stop_after_updates},
+                                     "scheduling_horizon": trainer_config.n_steps, "step_limit": trainer_config.stop_after_step},
                 board_dir=board_dir,
                 resume=is_resumed,
             )
@@ -371,7 +371,7 @@ def build_trainer_config(parameters: dict, comp_info: ComputeContext, base_train
     from gpt_lab.utils.schemas import TrainerConfig
 
     return TrainerConfig(
-        stop_after_updates=parameters.get("stop_after_updates"),
+        stop_after_step=parameters.get("stop_after_step"),
         optim_config=parameters["optim_config"],
         lr_warmup_steps=parameters["warmup_steps"],
         lr_warmdown_ratio=parameters["warmdown_ratio"],
