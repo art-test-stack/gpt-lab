@@ -295,14 +295,16 @@ def test_checkpoint_migrates_legacy_completed_updates(tmp_path):
     model = torch.nn.Linear(2, 2)
     checkpoint_dir = tmp_path / "demo" / "run" / "base"
     save_checkpoint(model, checkpoint_dir, step=4,
-                    trainer_state=TrainerState(step=4, completed_steps=4), comp_info=comp_info)
+                    trainer_state=TrainerState(step=4, completed_steps=4),
+                    checkpoint_state=CheckpointState(), comp_info=comp_info)
 
     state_path = checkpoint_dir / "checkpoint_step_000004" / "trainer_state.json"
     raw = json.loads(state_path.read_text())
     raw["completed_updates"] = raw.pop("completed_steps")
     state_path.write_text(json.dumps(raw))
 
-    loaded = load_checkpoint(checkpoint_dir, step=4, comp_info=comp_info, load_scaler=False)
+    loaded = load_checkpoint(checkpoint_dir, step=4, comp_info=comp_info,
+                             load_optim=False, load_scaler=False)
     assert loaded.trainer_state.completed_steps == 4
 
 
