@@ -151,7 +151,7 @@ class Trainer:
         lr_schedule: Optional[Callable] = None,
         muon_momentum_schedule: Optional[Callable] = None,
         weight_decay_schedule: Optional[Callable] = None,
-        scaler: Optional[GradScaler] = None, # only used if config.compute_dtype is float16 and for resume training
+        scaler: Optional[GradScaler] = None, # legacy checkpoint argument; not automatically created for BF16
         resume_state: Optional[TrainerState] = None,
         best_state: Optional[CheckpointState] = None,
     ):
@@ -170,7 +170,7 @@ class Trainer:
             lr_schedule: Learning rate schedule function (step -> lr multiplier). Default: TrainerConfig.lr_schedule
             muon_momentum_schedule: Momentum schedule for Muon optimizer (step -> momentum multiplier). Default: TrainerConfig.muon_momentum_schedule
             weight_decay_schedule: Weight decay schedule for Muon optimizer (step -> weight decay multiplier). Default: TrainerConfig.weight_decay_schedule
-            scaler: Gradient scaler for mixed precision training. Default: None (will be created if config.compute_dtype is float16)
+            scaler: Optional legacy gradient scaler; BF16 training does not require one.
         """
         self.training_type = "base" # for now we only have base training, TODO: extend to sft, grpo, etc.
         self.model = model
@@ -235,9 +235,9 @@ class Trainer:
         self.device = torch.device(config.comp_info.device)
         raw_dtype = self.config.comp_info.compute_dtype
         self.dtype = _DTYPE_MAP.get(raw_dtype, raw_dtype)
-        if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise ValueError(f"Unsupported compute dtype: {raw_dtype!r}")
-        self.use_amp = self.dtype in (torch.float16, torch.bfloat16)
+        if self.dtype != torch.bfloat16:
+            raise ValueError(f"Only BF16 compute is supported, got {raw_dtype!r}")
+        self.use_amp = True
 
         def amp_context():
             if self.use_amp:

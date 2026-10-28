@@ -21,18 +21,16 @@ _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": t
 @lru_cache()
 def detect_compute_dtype():
     env = os.environ.get("GPTLAB_DTYPE", None)
-    if env is not None:
-        return _DTYPE_MAP[env], f"set via GPTLAB_DTYPE={env}"
+    if env is not None and env != "bfloat16":
+        raise ValueError("Only BF16 compute is supported; GPTLAB_DTYPE must be bfloat16")
     if torch.cuda.is_available():
         # bf16 requires SM 80+ (Ampere: A100, A10, etc.)
         # Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
         capability = torch.cuda.get_device_capability()
         if capability >= (8, 0):
             return torch.bfloat16, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (bf16 supported)"
-        # fp16 training requires GradScaler (not yet implemented), so fall back to fp32.
-        # Users can still force fp16 via GPTLAB_DTYPE=float16 if they know what they're doing.
-        return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
-    return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
+        raise ValueError("BF16 compute requires a BF16-capable CUDA device (SM 80 or newer)")
+    return torch.bfloat16, "BF16 compute policy (CPU/MPS require BF16 operator support)"
 
 # -----------------------------------------------------------
 # distributed utils
@@ -117,7 +115,8 @@ class ComputeContext:
 
     @cached_property
     def gpu_peak_flops(self) -> float:
-        if self.device_type == "cpu":
+        if self.device_type in {"cpu", "mps"}:
+            # The MPS table entry is FP32; a BF16 peak has not been calibrated.
             return float("inf")
         return get_peak_flops(self.device_name) if self.device_name is not None else float("inf")
 

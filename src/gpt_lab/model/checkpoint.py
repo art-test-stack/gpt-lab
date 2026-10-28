@@ -686,12 +686,6 @@ def build_model(
         load_rng=True,
         optimizer_state_layout=optimizer_state_layout,
     )
-    if device.type in {"cpu", "mps"}:
-        # Convert bfloat16 tensors to float for CPU inference
-        checkpoint_data.model_state = {
-            k: v.float() if v.dtype == torch.bfloat16 else v
-            for k, v in checkpoint_data.model_state.items()
-        }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in checkpoint_data.model_state.items()}
     model_config_kwargs = meta_config.model_cfg.model_dump()

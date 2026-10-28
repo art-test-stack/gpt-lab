@@ -118,6 +118,16 @@ class DenseTransformer(BaseTransformer):
 
         # default loss_fn, can be overridden by trainer or by passing a different loss_fn to the model if needed
         self.loss_fn = build_loss() 
+        self._enforce_precision()
+
+    def _enforce_precision(self):
+        embedding_weights = {id(self.embeds.weight), *(id(ve.weight) for ve in self.value_embeds.values())}
+        for parameter in self.parameters():
+            dtype = torch.bfloat16 if id(parameter) in embedding_weights else torch.float32
+            parameter.data = parameter.data.to(dtype)
+            if parameter.grad is not None:
+                parameter.grad.data = parameter.grad.data.to(dtype)
+        self.pe_cache = self.pe_cache.to(torch.bfloat16)
 
     def _tie_embedding_weights(self):
         for group in parse_embedding_groups(self.config.tie_embeddings):
@@ -137,16 +147,21 @@ class DenseTransformer(BaseTransformer):
         result = super()._apply(fn, recurse=recurse)
         # Device/dtype moves can replace the shared Parameter objects.
         self._tie_embedding_weights()
+        self._enforce_precision()
         return result
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         result = super().load_state_dict(state_dict, strict=strict, assign=assign)
         self._tie_embedding_weights()
+        self._enforce_precision()
         return result
 
     @torch.no_grad()
     def init_weights(self):
-        torch.nn.init.normal_(self.embeds.weight, mean=0.0, std=0.8)
+        embedding = torch.empty_like(self.embeds.weight, dtype=torch.float32)
+        torch.nn.init.normal_(embedding, mean=0.0, std=0.8)
+        self.embeds.weight.copy_(embedding)
+        del embedding
         if self.lm_head.weight is not self.embeds.weight:
             torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
@@ -173,7 +188,10 @@ class DenseTransformer(BaseTransformer):
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.children():
             if ve.weight is not self.embeds.weight and ve.weight is not self.lm_head.weight:
-                torch.nn.init.uniform_(ve.weight, -s, s)
+                embedding = torch.empty_like(ve.weight, dtype=torch.float32)
+                torch.nn.init.uniform_(embedding, -s, s)
+                ve.weight.copy_(embedding)
+                del embedding
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.blocks:
@@ -221,7 +239,7 @@ class DenseTransformer(BaseTransformer):
         else:
             raise ValueError(f"Unknown positional encoding: {self.config.positional_encoding}")
 
-        return pe_cache
+        return pe_cache.to(torch.bfloat16)
     
     @property
     def n_params(self) -> int:
@@ -380,6 +398,9 @@ class DenseTransformer(BaseTransformer):
                 T0 = past_key_values.shape[3] # assuming shape is (L, 2, B, T, H, D)
             else:
                 pass
+        device_type = input_ids.device.type
+        if torch.is_autocast_enabled(device_type) and torch.get_autocast_dtype(device_type) != torch.bfloat16:
+            raise ValueError("DenseTransformer requires BF16 compute; FP16/FP32 autocast is unsupported")
         x = self.embeds(input_ids)
 
         if self.config.positional_encoding == "positional_encoding":
@@ -399,6 +420,7 @@ class DenseTransformer(BaseTransformer):
             # TODO: not return attn yet
             return_attn = return_attentions and (i == len(self.blocks) - 1) and False
             x = self.res_h[i] * x + self.res_x0[i] * x0
+            x = x.to(torch.bfloat16)
             ve = None
             if str(i) in self.value_embeds:
                 ve = self.value_embeds[str(i)](input_ids).to(x.dtype)
@@ -440,7 +462,7 @@ class DenseTransformer(BaseTransformer):
         loss = None
         if labels is not None:
             assert labels.is_contiguous(), "Labels should be contiguous for efficient loss computation"
-            loss = self.loss_fn(logits, labels, reduction=reduction)
+            loss = self.loss_fn(logits.float(), labels, reduction=reduction)
 
         if loss_only:
             return loss

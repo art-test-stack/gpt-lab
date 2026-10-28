@@ -322,6 +322,8 @@ class TransformerConfig(BaseModel):
         
         object.__setattr__(self, "n_kv_heads", self.n_kv_heads or self.n_heads)
         groups = parse_embedding_groups(self.tie_embeddings)
+        if any("head" in group and ("embs" in group or "value_embs" in group) for group in groups):
+            raise ValueError("BF16 input/value embeddings cannot share parameters with the FP32 vocabulary head")
         if any("value_embs" in group and len(group) > 1 for group in groups) and self.n_kv_heads * self.d_head != self.d_model:
             raise ValueError(
                 "Tying value_embs to embs or head requires n_kv_heads * d_head == d_model; "
