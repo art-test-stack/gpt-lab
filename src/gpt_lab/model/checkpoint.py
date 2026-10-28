@@ -404,6 +404,12 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
 
+def _migrate_trainer_config(raw):
+    if "stop_after_updates" in raw:
+        raw.setdefault("stop_after_step", raw["stop_after_updates"])
+        raw.pop("stop_after_updates")
+    return raw
+
 def find_potential_run_name(model_dir: Union[str, Path], git_info: Optional[Dict] = None) -> str:
     model_dir = _solve_path(model_dir)
 
@@ -600,9 +606,11 @@ def load_checkpoint(
         trainer_filename = _TRAINER_DEFAULT_FILENAME[optimizer_state_layout](rank)
         if not (step_dir / trainer_filename).exists():
             trainer_filename = "trainer_state.json"
-        trainer_state = TrainerState.model_validate(
-            _load_json(step_dir, trainer_filename)
-        )
+        raw_trainer_state = _load_json(step_dir, trainer_filename)
+        if "completed_updates" in raw_trainer_state:
+            raw_trainer_state.setdefault("completed_steps", raw_trainer_state["completed_updates"])
+            raw_trainer_state.pop("completed_updates")
+        trainer_state = TrainerState.model_validate(raw_trainer_state)
     checkpoint_state = None
     checkpoint_state_path = _resolve_state_path(step_dir / "checkpoint_state.safetensors")
     if checkpoint_state_path.exists():
@@ -670,7 +678,7 @@ def build_model(
     ckpt_dir = model_cachedir / model_name / run_name / source
     if phase == "train":
         raw = _load_state_dict(ckpt_dir, "training_config.safetensors", map_location="cpu", weight_only=False)
-        trainer_config = TrainerConfig.model_validate(raw | {"comp_info": comp_info})
+        trainer_config = TrainerConfig.model_validate(_migrate_trainer_config(raw) | {"comp_info": comp_info})
     load_scaler = (
         comp_info.compute_dtype == torch.float16
         and device.type == "cuda"
@@ -686,12 +694,6 @@ def build_model(
         load_rng=True,
         optimizer_state_layout=optimizer_state_layout,
     )
-    if device.type in {"cpu", "mps"}:
-        # Convert bfloat16 tensors to float for CPU inference
-        checkpoint_data.model_state = {
-            k: v.float() if v.dtype == torch.bfloat16 else v
-            for k, v in checkpoint_data.model_state.items()
-        }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in checkpoint_data.model_state.items()}
     model_config_kwargs = meta_config.model_cfg.model_dump()
@@ -705,6 +707,7 @@ def build_model(
     # Load the model state
     model.to_empty(device=device)
     model.precompute_pos_enc()
+    model._enforce_precision(comp_info.compute_dtype)
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
@@ -826,7 +829,7 @@ class CheckpointManager:
             log0(f"No training config found at {path}.", logger=logger, level="warning")
             return None
         raw = _load_state_dict(path, map_location="cpu", weight_only=False)
-        return TrainerConfig.model_validate(raw | {"comp_info": self.comp_info})
+        return TrainerConfig.model_validate(_migrate_trainer_config(raw) | {"comp_info": self.comp_info})
     
     def save(
         self,

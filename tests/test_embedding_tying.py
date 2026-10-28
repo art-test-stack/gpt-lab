@@ -55,7 +55,8 @@ def _assert_sharing(model):
 
 
 @pytest.mark.parametrize("mode", [mode[0] for mode in MODES])
-def test_embedding_tying_lifecycle(mode, tmp_path):
+@pytest.mark.parametrize("compute_dtype", [torch.float32, torch.bfloat16])
+def test_embedding_tying_lifecycle(mode, compute_dtype, tmp_path):
     config = _config(tie_embeddings=mode)
     model = build_meta_model(config)
     _assert_sharing(model)
@@ -64,7 +65,13 @@ def test_embedding_tying_lifecycle(mode, tmp_path):
     model.init_weights()
     assert model.embeds.weight.std().item() == pytest.approx(0.8, rel=0.15)
     model.double().float()
+    assert all(p.dtype == torch.float32 for p in model.parameters())
+    model._enforce_precision(compute_dtype)
     _assert_sharing(model)
+    assert model.lm_head.weight.dtype == torch.float32
+    for table in [model.embeds, *model.value_embeds.values()]:
+        expected_dtype = torch.float32 if table.weight is model.lm_head.weight else compute_dtype
+        assert table.weight.dtype == expected_dtype
 
     counts = model.n_params_per_layer()
     table_size = model.embeds.weight.numel()
@@ -78,12 +85,16 @@ def test_embedding_tying_lifecycle(mode, tmp_path):
     untied = build_meta_model(_config())
     assert model.estimate_flops() == untied.estimate_flops()
 
-    optimizer = model.build_optimizer(TrainerConfig(comp_info=ComputeContext(device=torch.device("cpu"))))
+    optimizer = model.build_optimizer(TrainerConfig(comp_info=ComputeContext(device=torch.device("cpu"), compute_dtype=compute_dtype)))
     optimized = [p for group in optimizer.param_groups for p in group["params"]]
     assert len(optimized) == len({id(p) for p in optimized}) == len(list(model.parameters()))
     assert {id(p) for p in optimized} == {id(p) for p in model.parameters()}
     embedding_group = next(group for group in optimizer.param_groups if group["name"] == "embeddings")
     assert any(p is model.embeds.weight for p in embedding_group["params"])
+    for ve in model.value_embeds.values():
+        owner = "embeddings" if values_input else "head" if values_head else "value_embeds"
+        group = next(group for group in optimizer.param_groups if group["name"] == owner)
+        assert any(p is ve.weight for p in group["params"])
 
     # Nonzero output projections let value tables receive gradients on the first pass.
     with torch.no_grad():
@@ -91,11 +102,19 @@ def test_embedding_tying_lifecycle(mode, tmp_path):
             block.attention.o_proj.weight.fill_(0.01)
     ids = torch.randint(0, config.vocab_size, (2, config.max_context))
     labels = torch.randint(0, config.vocab_size, ids.shape)
+    observed_dtypes = []
+    hook = model.blocks[1].register_forward_pre_hook(
+        lambda module, args, kwargs: observed_dtypes.append((args[0].dtype, kwargs["value_embeds"].dtype)),
+        with_kwargs=True,
+    )
     output = model(ids, labels)
+    hook.remove()
+    assert observed_dtypes == [(compute_dtype, compute_dtype)]
     assert torch.isfinite(output.loss)
     output.loss.backward()
     for ve in model.value_embeds.values():
         assert ve.weight.grad is not None
+        assert ve.weight.grad.dtype == ve.weight.dtype
         assert torch.isfinite(ve.weight.grad).all()
         assert ve.weight.grad.abs().sum() > 0
 
@@ -108,6 +127,7 @@ def test_embedding_tying_lifecycle(mode, tmp_path):
     state = load_checkpoint(tmp_path, step=7, load_optim=False, load_trainer=False,
                             load_scaler=False, load_rng=False, comp_info=comp_info).model_state
     restored = build_meta_model(config).to_empty(device="cpu")
+    restored._enforce_precision(compute_dtype)
     restored.precompute_pos_enc()
     restored.load_state_dict(state, strict=True, assign=True)
     _assert_sharing(restored)

@@ -40,6 +40,7 @@ from gpt_lab.utils.schemas import (
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
 from gpt_lab.model.wrapper import Engine
+from gpt_lab.model.gpt import DenseTransformer
 from gpt_lab.model.checkpoint import CheckpointManager, make_default_run_name
 
 logger = logging.getLogger(__name__)
@@ -88,8 +89,8 @@ class Trainer:
 
     Subclass extension points:
         train_step(train_iter, batch, should_log_step):
-            Run one complete update, including accumulation, backward, prefetch,
-            hyperparameter scheduling, optimizer update, and timing. Return the
+            Run one complete optimizer step, including accumulation, backward, prefetch,
+            hyperparameter scheduling, optimizer step, and timing. Return the
             next prepared batch and a step_metrics dict; see the method contract.
         prepare_batch(raw_batch):
             Return (payload, state, local_token_count) per microbatch. The default
@@ -104,7 +105,7 @@ class Trainer:
         optimizer_step(should_log_step):
             Apply accumulated gradients and clear them. The default unscales
             gradients, synchronizes distributed overflow flags, optionally logs
-            gradients, updates the optimizer/scaler, and clears gradients.
+            gradients, advances optimizer/scaler state, and clears gradients.
             Hyperparameter scheduling stays in train_step().
         update_metrics(step_metrics, total_dt):
             Update counters, smoothed loss, and the duration history every step.
@@ -115,7 +116,7 @@ class Trainer:
         evaluate_bpb(), evaluate_core(), evaluate_samples():
             Replace evaluations independently; their scheduling stays in train().
             Each override owns model modes, evaluation contexts, and any logging,
-            metrics, or best-score updates. Defaults restore training mode.
+            metrics, or best-score changes. Defaults restore training mode.
 
     train() creates the public compiled_model attribute before invoking hooks
     and sets it to None on completion. Use it for training forwards; model is
@@ -151,7 +152,7 @@ class Trainer:
         lr_schedule: Optional[Callable] = None,
         muon_momentum_schedule: Optional[Callable] = None,
         weight_decay_schedule: Optional[Callable] = None,
-        scaler: Optional[GradScaler] = None, # only used if config.compute_dtype is float16 and for resume training
+        scaler: Optional[GradScaler] = None, # legacy checkpoint argument; not automatically created for BF16
         resume_state: Optional[TrainerState] = None,
         best_state: Optional[CheckpointState] = None,
     ):
@@ -170,7 +171,7 @@ class Trainer:
             lr_schedule: Learning rate schedule function (step -> lr multiplier). Default: TrainerConfig.lr_schedule
             muon_momentum_schedule: Momentum schedule for Muon optimizer (step -> momentum multiplier). Default: TrainerConfig.muon_momentum_schedule
             weight_decay_schedule: Weight decay schedule for Muon optimizer (step -> weight decay multiplier). Default: TrainerConfig.weight_decay_schedule
-            scaler: Gradient scaler for mixed precision training. Default: None (will be created if config.compute_dtype is float16)
+            scaler: Optional legacy gradient scaler; BF16 training does not require one.
         """
         self.training_type = "base" # for now we only have base training, TODO: extend to sft, grpo, etc.
         self.model = model
@@ -209,6 +210,17 @@ class Trainer:
             board = Board(board_type="dummy")
         self.board = board
         
+        # Select storage before creating optimizer groups; accept legacy dtype strings.
+        self.device_type = config.comp_info.device_type
+        self.device = torch.device(config.comp_info.device)
+        raw_dtype = self.config.comp_info.compute_dtype
+        self.dtype = _DTYPE_MAP.get(raw_dtype, raw_dtype)
+        if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported compute dtype: {raw_dtype!r}")
+        self.use_amp = self.dtype in (torch.float16, torch.bfloat16)
+        if isinstance(model, DenseTransformer):
+            model._enforce_precision(self.dtype)
+
         # Optimizer
         if optimizer is None:
             if hasattr(model, "build_optimizer"):
@@ -222,23 +234,13 @@ class Trainer:
         
         # State and metrics
         self.state = resume_state or TrainerState()
-        if self.state.completed_updates is None:
-            self.state.completed_updates = self.state.step + int(self.state.step > 0 or self.state.n_tokens > 0)
+        if self.state.completed_steps is None:
+            self.state.completed_steps = self.state.step + int(self.state.step > 0 or self.state.n_tokens > 0)
         self.ckpt_state = best_state or CheckpointState()
         self.metrics = TrainerMetrics()     # TODO
         self.eval_metrics = EvalMetrics()   # TODO
         self.core_metrics = COREMetrics()   # TODO
         
-        # Device and mixed precision. get_comp_info() stores a torch.dtype, but
-        # accept legacy string values when resuming older checkpoints.
-        self.device_type = config.comp_info.device_type
-        self.device = torch.device(config.comp_info.device)
-        raw_dtype = self.config.comp_info.compute_dtype
-        self.dtype = _DTYPE_MAP.get(raw_dtype, raw_dtype)
-        if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise ValueError(f"Unsupported compute dtype: {raw_dtype!r}")
-        self.use_amp = self.dtype in (torch.float16, torch.bfloat16)
-
         def amp_context():
             if self.use_amp:
                 return autocast(
@@ -349,15 +351,14 @@ class Trainer:
         print0("=" * 70)
         
         # Extracte main constants from config
-        step = self.state.completed_updates
+        step = self.state.completed_steps
         n_steps = self.config.n_steps
-        execution_limit = min(n_steps, self.config.stop_after_updates) if self.config.stop_after_updates is not None else n_steps
-        if step >= execution_limit:
+        step_limit = min(n_steps, self.config.stop_after_step) if self.config.stop_after_step is not None else n_steps
+        if step >= step_limit:
             self.compiled_model = None
             self.save_checkpoint()
-            if self.config.stop_after_updates is not None:
-                self.board.log({"train/scheduling_horizon": n_steps, "train/execution_cap": self.config.stop_after_updates,
-                                "train/completed_updates": step}, step=self.state.step)
+            if self.config.stop_after_step is not None:
+                self.board.log({"train/completed_steps": step}, step=self.state.step)
             return
         
         use_scalar_loss = (
@@ -404,9 +405,9 @@ class Trainer:
         
         total_dt = []  # For ETA calculation
         
-        while step < execution_limit:
+        while step < step_limit:
             self.state.step = step
-            last_step = (step == execution_limit - 1)
+            last_step = (step == step_limit - 1)
             should_log_step = (
                 (self.config.log_every == -1 and last_step)
                 or (
@@ -461,8 +462,8 @@ class Trainer:
             # ================================================================
             
             metrics = self.update_metrics(step_metrics, total_dt)
-            self.state.completed_updates = step + 1
-            metrics["train/completed_updates"] = self.state.completed_updates
+            self.state.completed_steps = step + 1
+            metrics["train/completed_steps"] = self.state.completed_steps
             if should_log_step:
                 self.log_metrics(metrics)
 
@@ -500,9 +501,8 @@ class Trainer:
         
         # Final checkpoint
         self.save_checkpoint()
-        if self.config.stop_after_updates is not None:
-            self.board.log({"train/scheduling_horizon": n_steps, "train/execution_cap": self.config.stop_after_updates,
-                            "train/completed_updates": self.state.completed_updates}, step=self.state.step)
+        if self.config.stop_after_step is not None:
+            self.board.log({"train/completed_steps": self.state.completed_steps}, step=self.state.step)
 
     def update_metrics(self, step_metrics, total_dt):
         """Update per-step state and return the metric dict consumed by log_metrics.
@@ -594,19 +594,20 @@ class Trainer:
         self.board.log(metrics, step=step)
 
     def train_step(self, train_iter, batch, should_log_step: bool):
-        """Run one optimizer update and return (next_batch, step_metrics).
+        """Run one optimizer step and return (next_batch, step_metrics).
 
         batch and next_batch are prepared (payload, state, local_token_count)
-        tuples. Accumulate config.n_acc_steps microbatches, preserving the last
-        consumed state for checkpoints and prefetching the next batch.
+        tuples. Each acc_step consumes one microbatch. Run config.n_acc_steps
+        iterations, preserving the last consumed state for checkpoints and
+        prefetching the next batch.
         Prepare each next batch without inspecting loss tensors on the host.
         Validate the accumulated loss once after the complete loop; non-finite
-        loss aborts before the optimizer update. Failure diagnostics describe
+        loss aborts before the optimizer step. Failure diagnostics describe
         the last consumed batch, not the first non-finite microbatch.
 
         step_metrics keys are loss (detached accumulated tensor), tokens (global
         count), step_time (local seconds), lrm, muon_momentum, and weight_decay. Timing
-        covers accumulation, prefetch, scheduling, and the optimizer update;
+        covers accumulation, prefetch, scheduling, and the optimizer step;
         reduction across ranks happens in update_metrics().
         """
         step = self.state.step
@@ -620,7 +621,7 @@ class Trainer:
         self.synchronize()
         step_start_time = time.perf_counter()
 
-        for _ in range(n_acc_steps):
+        for acc_step in range(n_acc_steps):
             eff_global_tokens += token_count * world_size
 
             self.state.train_loader_state = dataloader_state
@@ -670,7 +671,7 @@ class Trainer:
     def optimizer_step(self, should_log_step: bool):
         """Apply accumulated gradients, update the scaler, and clear gradients.
 
-        Override this method to customize the optimizer update. Hyperparameter
+        Override this method to customize the optimizer step. Hyperparameter
         scheduling stays in train_step(); monitoring uses unscaled gradients.
         """
         if self.scaler is not None:

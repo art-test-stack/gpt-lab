@@ -33,11 +33,12 @@ def apply_layer_norm(x: torch.Tensor, eps: float = 1e-5, torch_impl: bool = True
 def build_norm(normalization: NormalizationTypes, eps: float = 1e-5, torch_impl: bool = True) -> Callable[[torch.Tensor], torch.Tensor]:
     def norm(x: torch.Tensor) -> torch.Tensor:
         if normalization == 'rms':
-            return apply_rms_norm(x, eps=eps, torch_impl=torch_impl)
+            output = apply_rms_norm(x, eps=eps, torch_impl=torch_impl)
         elif normalization == 'layer':
-            return apply_layer_norm(x, eps=eps, torch_impl=torch_impl)
+            output = apply_layer_norm(x, eps=eps, torch_impl=torch_impl)
         else:
             raise ValueError(f'Unknown normalization: {normalization}. Supported normalizations are in {get_args(NormalizationTypes)}.')
+        return output.to(x.dtype)
     return norm
 
 
@@ -86,6 +87,10 @@ class Linear(nn.Linear, Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = False, device: torch.device = DEVICE, dtype=None) -> None:
         super().__init__(in_features=in_features, out_features=out_features, bias=bias, device=device, dtype=dtype)
         # TODO: Reparametrize weights and bias here
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Temporary forward casts preserve parameter storage (nanochat; LICENSES/nanochat-MIT.txt).
+        return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
 
     def init_weights(self, std: float = 0.01, method: str ='uniform') -> None:
         assert method in ['uniform', 'normal', 'zero'], 'Method must be "uniform", "normal" or "zero"'
