@@ -404,6 +404,12 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
 
+def _migrate_trainer_config(raw):
+    if "stop_after_updates" in raw:
+        raw.setdefault("stop_after_step", raw["stop_after_updates"])
+        raw.pop("stop_after_updates")
+    return raw
+
 def find_potential_run_name(model_dir: Union[str, Path], git_info: Optional[Dict] = None) -> str:
     model_dir = _solve_path(model_dir)
 
@@ -670,7 +676,7 @@ def build_model(
     ckpt_dir = model_cachedir / model_name / run_name / source
     if phase == "train":
         raw = _load_state_dict(ckpt_dir, "training_config.safetensors", map_location="cpu", weight_only=False)
-        trainer_config = TrainerConfig.model_validate(raw | {"comp_info": comp_info})
+        trainer_config = TrainerConfig.model_validate(_migrate_trainer_config(raw) | {"comp_info": comp_info})
     load_scaler = (
         comp_info.compute_dtype == torch.float16
         and device.type == "cuda"
@@ -821,7 +827,7 @@ class CheckpointManager:
             log0(f"No training config found at {path}.", logger=logger, level="warning")
             return None
         raw = _load_state_dict(path, map_location="cpu", weight_only=False)
-        return TrainerConfig.model_validate(raw | {"comp_info": self.comp_info})
+        return TrainerConfig.model_validate(_migrate_trainer_config(raw) | {"comp_info": self.comp_info})
     
     def save(
         self,

@@ -15,6 +15,7 @@ from gpt_lab.model.checkpoint import (
     set_rng_state,
 )
 from gpt_lab.utils.schemas import CheckpointState, MetaConfig, TrainerConfig, TrainerState, TransformerConfig
+from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
 
 def numpy_rng_equal(s1, s2):
     if s1[0] != s2[0]:  # algorithm name
@@ -316,3 +317,18 @@ def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, 
     assert CheckpointManager("demo", model_run="best", model_cachedir=tmp_path, comp_info=comp_info).run_name == "run"
     model_state = manager.load_states("best", load_optim=False)
     assert model_state.trainer_state.step == 8
+
+
+def test_checkpoint_manager_migrates_legacy_stop_after_updates(tmp_path):
+    comp_info = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
+    run_dir = tmp_path / "demo" / "run"
+    MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=TransformerConfig(), base_train={})
+    manager = CheckpointManager("demo", model_run="run", model_cachedir=tmp_path, comp_info=comp_info)
+    manager.save_training_config(TrainerConfig(comp_info=comp_info, stop_after_step=7))
+
+    path = manager.source_dir / "training_config.safetensors"
+    raw = load_tensor_state(path)
+    raw["stop_after_updates"] = raw.pop("stop_after_step")
+    save_tensor_state(raw, path)
+
+    assert manager.load_training_config().stop_after_step == 7
