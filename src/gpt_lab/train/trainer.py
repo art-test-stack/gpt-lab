@@ -119,7 +119,9 @@ class Trainer:
 
     train() creates the public compiled_model attribute before invoking hooks
     and sets it to None on completion. Use it for training forwards; model is
-    the original model used for generation and checkpoints. Optimizers, schedules,
+    the original model used for generation and checkpoints. The base compute_loss
+    uses compiled_training_loss by default when the model provides training_loss.
+    Optimizers, schedules,
     boards, and checkpoint managers can be injected through the constructor.
     save_checkpoint() persists the standard model/optimizer/scaler/trainer state;
     subclasses must explicitly persist any additional state they need to resume.
@@ -184,6 +186,7 @@ class Trainer:
                 "Please provide a TrainerConfig instance.", level="warning", logger=logger
             )
         self.config = config
+        self.compiled_training_loss = None
         
         if checkpoint_manager is None:
             model_name = self.model.__class__.__name__
@@ -357,11 +360,19 @@ class Trainer:
                                 "train/completed_updates": step}, step=self.state.step)
             return
         
+        use_scalar_loss = (
+            type(self).compute_loss is Trainer.compute_loss
+            and callable(getattr(self.model, "training_loss", None))
+        )
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
             self.compiled_model = torch.compile(self.model, dynamic=False)
+            if use_scalar_loss:
+                self.compiled_training_loss = torch.compile(self.model.training_loss, dynamic=False)
         else:
             self.compiled_model = self.model
+            if use_scalar_loss:
+                self.compiled_training_loss = self.model.training_loss
 
         train_iter = iter(self.train_loader)
 
@@ -479,6 +490,7 @@ class Trainer:
 
         del self.compiled_model  # Clean up compiled model if it exists
         self.compiled_model = None
+        self.compiled_training_loss = None
         
         print0("=" * 70)
         print0(f"Training completed!")
@@ -818,9 +830,12 @@ class Trainer:
         Override this method to use a different training objective. The training
         step supplies autocast, gradient accumulation scaling, and backward.
         The payload comes from prepare_batch. By default, unpack (x, y) and use
-        the model's loss or compute cross-entropy from logits.
+        the compiled scalar-loss entry point when available.
+        Otherwise use the model's loss or compute cross-entropy from logits.
         """
         x, y = payload
+        if self.compiled_training_loss is not None:
+            return self.compiled_training_loss(x, y)
         output = self.compiled_model(x, y)
         if hasattr(output, "loss"):
             return output.loss

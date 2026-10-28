@@ -334,6 +334,28 @@ class DenseTransformer(BaseTransformer):
             return_hidden_states: bool = False,
             reduction: str = "mean",
         ) -> ModelOutput:
+        return self._forward(
+            input_ids, labels, attn_mask, past_key_values,
+            return_attentions, return_hidden_states, reduction,
+        )
+
+    def training_loss(self, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Mean-loss training entry point; bypasses top-level forward hooks."""
+        assert self.training, "training_loss requires training mode"
+        assert labels is not None, "training_loss requires labels"
+        return self._forward(input_ids, labels, loss_only=True)
+
+    def _forward(
+            self,
+            input_ids: torch.Tensor,
+            labels: Optional[torch.Tensor] = None,
+            attn_mask: torch.Tensor | None = None,
+            past_key_values: Any = None,
+            return_attentions: bool = False,
+            return_hidden_states: bool = False,
+            reduction: str = "mean",
+            loss_only: bool = False,
+        ) -> ModelOutput | torch.Tensor:
         assert (past_key_values is None) or (not self.training), "KV cache can not be used during training."
         # assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
@@ -419,6 +441,9 @@ class DenseTransformer(BaseTransformer):
         if labels is not None:
             assert labels.is_contiguous(), "Labels should be contiguous for efficient loss computation"
             loss = self.loss_fn(logits, labels, reduction=reduction)
+
+        if loss_only:
+            return loss
 
         output = ModelOutput(
             logits=logits,
