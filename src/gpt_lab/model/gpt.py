@@ -429,8 +429,6 @@ class DenseTransformer(BaseTransformer):
             # TODO: not return attn yet
             return_attn = return_attentions and (i == len(self.blocks) - 1) and False
             x = self.res_h[i] * x + self.res_x0[i] * x0
-            if compute_dtype == torch.bfloat16:
-                x = x.to(torch.bfloat16)
             ve = None
             if str(i) in self.value_embeds:
                 ve = self.value_embeds[str(i)](input_ids).to(x.dtype)
