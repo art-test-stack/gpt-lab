@@ -61,8 +61,7 @@ def test_execution_cap_preserves_horizon_and_checkpoint_resume(tmp_path, monkeyp
     assert trainer.state.n_tokens == completed * 3
     assert sum('train/raw_loss' in values for values, _ in board.records) == int(completed > 0)
     if cap is not None:
-        assert board.records[-1][0] == {'train/scheduling_horizon': horizon, 'train/step_limit': cap,
-                                      'train/completed_steps': completed}
+        assert board.records[-1][0] == {'train/completed_steps': completed}
     loaded = load_checkpoint(tmp_path, step=max(0, completed - 1), comp_info=trainer.config.comp_info, load_scaler=False)
     assert loaded.trainer_state.completed_steps == completed
     torch.testing.assert_close(loaded.model_state['weight'], model.weight)

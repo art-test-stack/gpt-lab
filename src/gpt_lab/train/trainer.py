@@ -358,8 +358,7 @@ class Trainer:
             self.compiled_model = None
             self.save_checkpoint()
             if self.config.stop_after_step is not None:
-                self.board.log({"train/scheduling_horizon": n_steps, "train/step_limit": self.config.stop_after_step,
-                                "train/completed_steps": step}, step=self.state.step)
+                self.board.log({"train/completed_steps": step}, step=self.state.step)
             return
         
         use_scalar_loss = (
@@ -503,8 +502,7 @@ class Trainer:
         # Final checkpoint
         self.save_checkpoint()
         if self.config.stop_after_step is not None:
-            self.board.log({"train/scheduling_horizon": n_steps, "train/step_limit": self.config.stop_after_step,
-                            "train/completed_steps": self.state.completed_steps}, step=self.state.step)
+            self.board.log({"train/completed_steps": self.state.completed_steps}, step=self.state.step)
 
     def update_metrics(self, step_metrics, total_dt):
         """Update per-step state and return the metric dict consumed by log_metrics.
