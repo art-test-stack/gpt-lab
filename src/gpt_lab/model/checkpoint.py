@@ -606,9 +606,11 @@ def load_checkpoint(
         trainer_filename = _TRAINER_DEFAULT_FILENAME[optimizer_state_layout](rank)
         if not (step_dir / trainer_filename).exists():
             trainer_filename = "trainer_state.json"
-        trainer_state = TrainerState.model_validate(
-            _load_json(step_dir, trainer_filename)
-        )
+        raw_trainer_state = _load_json(step_dir, trainer_filename)
+        if "completed_updates" in raw_trainer_state:
+            raw_trainer_state.setdefault("completed_steps", raw_trainer_state["completed_updates"])
+            raw_trainer_state.pop("completed_updates")
+        trainer_state = TrainerState.model_validate(raw_trainer_state)
     checkpoint_state = None
     checkpoint_state_path = _resolve_state_path(step_dir / "checkpoint_state.safetensors")
     if checkpoint_state_path.exists():

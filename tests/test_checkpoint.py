@@ -290,6 +290,22 @@ def test_checkpoint_restores_optimizer_scaler_and_rng_continuation(tmp_path, leg
         torch.testing.assert_close(restored.state_dict()[name], weight, rtol=0, atol=0)
 
 
+def test_checkpoint_migrates_legacy_completed_updates(tmp_path):
+    comp_info = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
+    model = torch.nn.Linear(2, 2)
+    checkpoint_dir = tmp_path / "demo" / "run" / "base"
+    save_checkpoint(model, checkpoint_dir, step=4,
+                    trainer_state=TrainerState(step=4, completed_steps=4), comp_info=comp_info)
+
+    state_path = checkpoint_dir / "checkpoint_step_000004" / "trainer_state.json"
+    raw = json.loads(state_path.read_text())
+    raw["completed_updates"] = raw.pop("completed_steps")
+    state_path.write_text(json.dumps(raw))
+
+    loaded = load_checkpoint(checkpoint_dir, step=4, comp_info=comp_info, load_scaler=False)
+    assert loaded.trainer_state.completed_steps == 4
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_checkpoint_manager_round_trips_training_config_and_best_step(tmp_path, legacy):
     comp_info = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
