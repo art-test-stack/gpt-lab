@@ -21,9 +21,17 @@ _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": t
 @lru_cache()
 def detect_compute_dtype():
     env = os.environ.get("GPTLAB_DTYPE", None)
-    if env is not None and env != "bfloat16":
-        raise ValueError("Only BF16 compute is supported; GPTLAB_DTYPE must be bfloat16")
-    return torch.bfloat16, "BF16 compute policy"
+    if env is not None:
+        return _DTYPE_MAP[env], f"set via GPTLAB_DTYPE={env}"
+    if torch.cuda.is_available():
+        # bf16 requires SM 80+ (Ampere: A100, A10, etc.)
+        # Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
+        capability = torch.cuda.get_device_capability()
+        if capability >= (8, 0):
+            return torch.bfloat16, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (bf16 supported)"
+        # Keep FP32 as the default on older GPUs; FP16 remains an explicit choice.
+        return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
+    return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
 
 # -----------------------------------------------------------
 # distributed utils
@@ -58,15 +66,6 @@ class ComputeContext:
     mesh: DeviceMesh | None = None
     compute_dtype: torch.dtype = field(default_factory=lambda: detect_compute_dtype()[0])
     compute_dtype_reason: str = field(default_factory=lambda: detect_compute_dtype()[1])
-
-    def __post_init__(self) -> None:
-        if self.device.type == "cuda":
-            capability = torch.cuda.get_device_capability(self.device)
-            if capability < (8, 0):
-                raise ValueError(
-                    "BF16 compute requires a BF16-capable CUDA device (SM 80 or newer); "
-                    f"{self.device} has capability {capability[0]}.{capability[1]}"
-                )
 
     @property
     def rank(self) -> int:
@@ -117,8 +116,8 @@ class ComputeContext:
 
     @cached_property
     def gpu_peak_flops(self) -> float:
-        if self.device_type in {"cpu", "mps"}:
-            # The MPS table entry is FP32; a BF16 peak has not been calibrated.
+        if self.device_type == "cpu" or (self.device_type == "mps" and self.compute_dtype != torch.float32):
+            # Only the FP32 MPS peak is calibrated.
             return float("inf")
         return get_peak_flops(self.device_name) if self.device_name is not None else float("inf")
 

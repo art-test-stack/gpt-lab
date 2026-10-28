@@ -40,6 +40,7 @@ from gpt_lab.utils.schemas import (
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
 from gpt_lab.model.wrapper import Engine
+from gpt_lab.model.gpt import DenseTransformer
 from gpt_lab.model.checkpoint import CheckpointManager, make_default_run_name
 
 logger = logging.getLogger(__name__)
@@ -209,6 +210,17 @@ class Trainer:
             board = Board(board_type="dummy")
         self.board = board
         
+        # Select storage before creating optimizer groups; accept legacy dtype strings.
+        self.device_type = config.comp_info.device_type
+        self.device = torch.device(config.comp_info.device)
+        raw_dtype = self.config.comp_info.compute_dtype
+        self.dtype = _DTYPE_MAP.get(raw_dtype, raw_dtype)
+        if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported compute dtype: {raw_dtype!r}")
+        self.use_amp = self.dtype in (torch.float16, torch.bfloat16)
+        if isinstance(model, DenseTransformer):
+            model._enforce_precision(self.dtype)
+
         # Optimizer
         if optimizer is None:
             if hasattr(model, "build_optimizer"):
@@ -229,16 +241,6 @@ class Trainer:
         self.eval_metrics = EvalMetrics()   # TODO
         self.core_metrics = COREMetrics()   # TODO
         
-        # Device and mixed precision. get_comp_info() stores a torch.dtype, but
-        # accept legacy string values when resuming older checkpoints.
-        self.device_type = config.comp_info.device_type
-        self.device = torch.device(config.comp_info.device)
-        raw_dtype = self.config.comp_info.compute_dtype
-        self.dtype = _DTYPE_MAP.get(raw_dtype, raw_dtype)
-        if self.dtype != torch.bfloat16:
-            raise ValueError(f"Only BF16 compute is supported, got {raw_dtype!r}")
-        self.use_amp = True
-
         def amp_context():
             if self.use_amp:
                 return autocast(
@@ -597,8 +599,9 @@ class Trainer:
         """Run one optimizer step and return (next_batch, step_metrics).
 
         batch and next_batch are prepared (payload, state, local_token_count)
-        tuples. Accumulate config.n_acc_steps microbatches, preserving the last
-        consumed state for checkpoints and prefetching the next batch.
+        tuples. Each acc_step consumes one microbatch. Run config.n_acc_steps
+        iterations, preserving the last consumed state for checkpoints and
+        prefetching the next batch.
         Prepare each next batch without inspecting loss tensors on the host.
         Validate the accumulated loss once after the complete loop; non-finite
         loss aborts before the optimizer step. Failure diagnostics describe
@@ -620,7 +623,7 @@ class Trainer:
         self.synchronize()
         step_start_time = time.perf_counter()
 
-        for _ in range(n_acc_steps):
+        for acc_step in range(n_acc_steps):
             eff_global_tokens += token_count * world_size
 
             self.state.train_loader_state = dataloader_state

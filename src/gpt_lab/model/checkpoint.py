@@ -699,6 +699,7 @@ def build_model(
     # Load the model state
     model.to_empty(device=device)
     model.precompute_pos_enc()
+    model._enforce_precision(comp_info.compute_dtype)
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":

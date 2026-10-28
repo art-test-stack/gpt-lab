@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import itertools
 
-from gpt_lab.utils.schemas import DataLoaderState, TrainerConfig
+from gpt_lab.utils.schemas import DataLoaderState, TrainerConfig, TrainerState
 from gpt_lab.model.checkpoint import load_checkpoint, save_checkpoint
 
 
@@ -27,11 +27,24 @@ class _CaptureBoard:
         self.records.append((values, step))
 
 
+def test_step_fields_are_canonical():
+    config = TrainerConfig(stop_after_step=5)
+    state = TrainerState(completed_steps=3)
+    assert config.stop_after_step == 5
+    assert state.completed_steps == 3
+    assert config.model_dump()['stop_after_step'] == 5
+    assert state.model_dump()['completed_steps'] == 3
+    assert 'stop_after_updates' not in config.model_dump()
+    assert 'completed_updates' not in state.model_dump()
+    assert TrainerConfig(stop_after_updates=5).stop_after_step is None
+    assert TrainerState(completed_updates=3).completed_steps is None
+
+
 @pytest.mark.parametrize('horizon,cap,completed', [(2317, 945, 945), (3, None, 3), (3, 1, 1), (3, 0, 0), (2, 3, 2)])
 def test_execution_cap_preserves_horizon_and_checkpoint_resume(tmp_path, monkeypatch, horizon, cap, completed):
     trainer, model, board = _make_trainer(tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer)
     trainer.config = trainer.config.model_copy(update=dict(
-        n_steps=horizon, stop_after_updates=cap, n_acc_steps=1, total_batch_size=3,
+        n_steps=horizon, stop_after_step=cap, n_acc_steps=1, total_batch_size=3,
         n_flops_per_token=100, eval_bpb_every=0, eval_core_every=0, sample_every=0, log_every=-1))
     trainer.train_loader = itertools.repeat(dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3, state=None))
     trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
@@ -43,21 +56,21 @@ def test_execution_cap_preserves_horizon_and_checkpoint_resume(tmp_path, monkeyp
         monkeypatch.setattr(f'gpt_lab.train.trainer.gc.{name}', lambda: None)
     trainer.train()
     assert trainer.config.n_steps == horizon
-    assert trainer.state.completed_updates == completed
+    assert trainer.state.completed_steps == completed
     assert trainer.state.step == max(0, completed - 1)
     assert trainer.state.n_tokens == completed * 3
     assert sum('train/raw_loss' in values for values, _ in board.records) == int(completed > 0)
     if cap is not None:
-        assert board.records[-1][0] == {'train/scheduling_horizon': horizon, 'train/execution_cap': cap,
-                                      'train/completed_updates': completed}
+        assert board.records[-1][0] == {'train/scheduling_horizon': horizon, 'train/step_limit': cap,
+                                      'train/completed_steps': completed}
     loaded = load_checkpoint(tmp_path, step=max(0, completed - 1), comp_info=trainer.config.comp_info, load_scaler=False)
-    assert loaded.trainer_state.completed_updates == completed
+    assert loaded.trainer_state.completed_steps == completed
     torch.testing.assert_close(loaded.model_state['weight'], model.weight)
     assert bool(loaded.optimizer_state['state']) == bool(completed)
 
     # Legacy checkpoints omitted the counter; include the step-zero boundary.
     if completed:
-        loaded.trainer_state.completed_updates = None
+        loaded.trainer_state.completed_steps = None
     restored_optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     restored_optimizer.load_state_dict(loaded.optimizer_state)
     restored_optimizer.update_hyperparams = lambda **kwargs: None
@@ -65,16 +78,16 @@ def test_execution_cap_preserves_horizon_and_checkpoint_resume(tmp_path, monkeyp
                               optimizer=restored_optimizer, board=board,
                               checkpoint_manager=trainer.ckpt_manager, resume_state=loaded.trainer_state)
     before = model.weight.detach().clone()
-    logged_updates = sum('train/raw_loss' in values for values, _ in board.records)
+    logged_steps = sum('train/raw_loss' in values for values, _ in board.records)
     resumed.train() # None loader must never be accessed once the absolute limit is met.
-    assert resumed.state.completed_updates == completed
-    assert sum('train/raw_loss' in values for values, _ in board.records) == logged_updates
+    assert resumed.state.completed_steps == completed
+    assert sum('train/raw_loss' in values for values, _ in board.records) == logged_steps
     torch.testing.assert_close(model.weight, before)
     if cap == 1:
-        resumed.config = resumed.config.model_copy(update={'stop_after_updates': 2})
+        resumed.config = resumed.config.model_copy(update={'stop_after_step': 2})
         resumed.train_loader = trainer.train_loader
         resumed.train()
-        assert resumed.state.completed_updates == 2 and resumed.state.step == 1
+        assert resumed.state.completed_steps == 2 and resumed.state.step == 1
         assert resumed.state.n_tokens == 6 and resumed.config.n_steps == horizon
 
 
@@ -104,7 +117,7 @@ def _make_trainer(tmp_path, compute_dtype=torch.bfloat16, monitor=False, trainer
 
 
 @pytest.mark.fast
-@pytest.mark.parametrize("compute_dtype", [torch.bfloat16, "bfloat16"])
+@pytest.mark.parametrize("compute_dtype", [torch.bfloat16, "bfloat16", torch.float32, "float32"])
 def test_trainer_enables_amp_for_torch_and_legacy_dtypes(tmp_path, compute_dtype):
     trainer, model, _ = _make_trainer(tmp_path, compute_dtype=compute_dtype)
     inputs = torch.ones(2, 2)
@@ -114,10 +127,11 @@ def test_trainer_enables_amp_for_torch_and_legacy_dtypes(tmp_path, compute_dtype
     with trainer.val_context(model):
         val_output = model(inputs)
 
-    assert trainer.use_amp
-    assert trainer.dtype == torch.bfloat16
-    assert train_output.dtype == torch.bfloat16
-    assert val_output.dtype == torch.bfloat16
+    expected_dtype = torch.bfloat16 if compute_dtype in (torch.bfloat16, "bfloat16") else torch.float32
+    assert trainer.use_amp == (expected_dtype == torch.bfloat16)
+    assert trainer.dtype == expected_dtype
+    assert train_output.dtype == expected_dtype
+    assert val_output.dtype == expected_dtype
 
 
 @pytest.mark.fast

@@ -120,14 +120,21 @@ class DenseTransformer(BaseTransformer):
         self.loss_fn = build_loss() 
         self._enforce_precision()
 
-    def _enforce_precision(self):
+    def _enforce_precision(self, compute_dtype=None):
+        dtype = self.pe_cache.dtype if compute_dtype is None else (
+            torch.bfloat16 if compute_dtype in (torch.bfloat16, "bfloat16") else torch.float32
+        )
         embedding_weights = {id(self.embeds.weight), *(id(ve.weight) for ve in self.value_embeds.values())}
         for parameter in self.parameters():
-            dtype = torch.bfloat16 if id(parameter) in embedding_weights else torch.float32
-            parameter.data = parameter.data.to(dtype)
+            parameter_dtype = dtype
+            # A tied head keeps one FP32 parameter; lookup outputs are cast instead.
+            if dtype == torch.bfloat16:
+                parameter_dtype = (torch.bfloat16 if id(parameter) in embedding_weights and parameter is not self.lm_head.weight
+                                   else torch.float32)
+            parameter.data = parameter.data.to(parameter_dtype)
             if parameter.grad is not None:
-                parameter.grad.data = parameter.grad.data.to(dtype)
-        self.pe_cache = self.pe_cache.to(torch.bfloat16)
+                parameter.grad.data = parameter.grad.data.to(parameter_dtype)
+        self.pe_cache = self.pe_cache.to(dtype)
 
     def _tie_embedding_weights(self):
         for group in parse_embedding_groups(self.config.tie_embeddings):
@@ -239,7 +246,7 @@ class DenseTransformer(BaseTransformer):
         else:
             raise ValueError(f"Unknown positional encoding: {self.config.positional_encoding}")
 
-        return pe_cache.to(torch.bfloat16)
+        return pe_cache.to(self.pe_cache.dtype) if hasattr(self, "pe_cache") else pe_cache
     
     @property
     def n_params(self) -> int:
@@ -399,9 +406,11 @@ class DenseTransformer(BaseTransformer):
             else:
                 pass
         device_type = input_ids.device.type
-        if torch.is_autocast_enabled(device_type) and torch.get_autocast_dtype(device_type) != torch.bfloat16:
-            raise ValueError("DenseTransformer requires BF16 compute; FP16/FP32 autocast is unsupported")
+        compute_dtype = (torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type)
+                         else self.pe_cache.dtype)
         x = self.embeds(input_ids)
+        if compute_dtype == torch.bfloat16:
+            x = x.to(torch.bfloat16)
 
         if self.config.positional_encoding == "positional_encoding":
             x = x + self.pe_cache[:x.size(2)]
@@ -420,7 +429,8 @@ class DenseTransformer(BaseTransformer):
             # TODO: not return attn yet
             return_attn = return_attentions and (i == len(self.blocks) - 1) and False
             x = self.res_h[i] * x + self.res_x0[i] * x0
-            x = x.to(torch.bfloat16)
+            if compute_dtype == torch.bfloat16:
+                x = x.to(torch.bfloat16)
             ve = None
             if str(i) in self.value_embeds:
                 ve = self.value_embeds[str(i)](input_ids).to(x.dtype)

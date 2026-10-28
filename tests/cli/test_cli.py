@@ -103,6 +103,17 @@ def test_auto_parsing_and_deprecated_alias():
     assert args.train_tokenizer and args.window_size == '128'
 
 
+def test_step_limit_flag():
+    args = build_parser().parse_args(['train', '--stop-after-step', '5'])
+    assert args.stop_after_step == 5
+    assert not hasattr(args, 'stop_after_updates')
+
+
+def test_step_limit_rejects_old_flag():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(['train', '--stop-after-updates', '5'])
+
+
 @pytest.mark.parametrize('value,expected', [('120', 120), ('0', 0), ('-1', -1), ('-2', -2), ('latest', 'latest'), ('best', 'best')])
 def test_resume_step_parsing(value, expected):
     args = build_parser().parse_args(['train', 'resume', '--checkpoint-step', value, '--checkpoint-dir', '/missing/run/base'])
