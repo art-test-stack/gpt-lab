@@ -338,6 +338,8 @@ def _migrate_model_config(model_cfg: Dict, version: Optional[str]) -> None:
     Functional embedding tying starts at 0.1.1. For ambiguous 0.1.0 or
     unversioned metadata, missing tying fields identify the old no-op flag.
     """
+    if model_cfg.get("act_func") is None:
+        model_cfg["act_func"] = "swiglu"
     if "tie_embeddings" in model_cfg:
         return
     saved_version = Version(version) if version is not None else None

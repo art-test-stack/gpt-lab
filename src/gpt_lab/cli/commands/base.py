@@ -36,6 +36,7 @@ def add_auto_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--train-tokenizer', action='store_true', help='Whether to train a new tokenizer from scratch.')
     parser.add_argument('--truncate-tokenizer', action='store_true', help='Legacy flag, retained but unused by the training pipeline.')
     parser.add_argument('--depth', type=int, default=12, help='Number of model layers.')
+    parser.add_argument('--act-func', choices=('swiglu', 'relu_squared', 'relu_squarred'), default='relu_squared', help='FFN architecture; squared ReLU by default. Both retain the inner residual. Saved checkpoints with missing activation load as SwiGLU.')
     parser.add_argument('--aspect-ratio', type=float, default=64, help='Aspect ratio for auto-configured models.')
     parser.add_argument('--d-head', type=int, default=128, help='Dimension of each attention head for auto-configured models. If not set, will be determined by aspect ratio and model depth.')
     parser.add_argument('--n-kv-heads', '--d-kv-head', dest='n_kv_heads', type=int, default=None, help='Number of key/value heads for GQA; None uses the query head count. --d-kv-head is a deprecated alias.')

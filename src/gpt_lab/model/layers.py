@@ -319,6 +319,21 @@ class SwigLUFeedForward(Module):
         return output
     
     
+class SquaredReLUFeedForward(Module):
+    '''Squared-ReLU FFN with the inner residual preserved (architecture C).'''
+    def __init__(self, d_in: int, d_latent: int, dropout: float, device=DEVICE) -> None:
+        super().__init__()
+        self.w_1 = Linear(d_in, d_latent, device=device)
+        self.w_2 = Linear(d_latent, d_in, device=device)
+        self.dropout_rate = dropout
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.w_2(F.relu(self.w_1(x)).square())
+        if self.training and self.dropout_rate > 0.0:
+            h = F.dropout(h, p=self.dropout_rate, training=True)
+        return h + x
+
+
 class DecoderLayer(Module):
     '''Decoder layer'''
     def __init__(self, config: TransformerConfig, layer_idx: int = 0) -> None:
@@ -329,9 +344,8 @@ class DecoderLayer(Module):
         self.norm = build_norm(config.normalization, eps=config.norm_eps, torch_impl=True)
         self.attention = CausalSelfAttention(config=config, layer_idx=layer_idx) 
         
-        # self.ffn = FeedForward(d_in=dim_model, d_latent=dim_ffn, dropout=dropout)
-        # TODO: try SwigLU + make it configurable
-        self.ffn = SwigLUFeedForward(d_in=config.d_model, d_latent=config.d_ffn, dropout=config.dropout) 
+        ffn_class = SquaredReLUFeedForward if config.act_func == "relu_squared" else SwigLUFeedForward
+        self.ffn = ffn_class(d_in=config.d_model, d_latent=config.d_ffn, dropout=config.dropout)
         self.dropout_rate = config.dropout
 
         self.norm = build_norm(config.normalization, eps=1e-8, torch_impl=True)
