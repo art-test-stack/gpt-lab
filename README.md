@@ -450,6 +450,23 @@ The system is organized around three key components:
 
 #### Configuration Example
 
+`opt: muon` retains the existing variant: Polar Express orthogonalization,
+shape-dependent factored normalization, and cautious weight decay.
+`opt: normuon` follows the [official NorMuon reference update](https://github.com/zichongli5/NorMuon/blob/main/normuon.py):
+BF16 fixed-coefficient Newton–Schulz iterations, row-wise second-moment
+normalization, and standard decoupled weight decay. Both use the existing
+whole-matrix optimizer sharding and require same-shaped 2D parameters per group.
+The configuration key `beta` is NorMuon's `beta2`; `momentum` is its first-moment
+coefficient. The existing Muon momentum schedule also applies to NorMuon.
+NorMuon uses a compiled update kernel; fusion may change intermediate BF16
+rounding relative to the eager reference implementation.
+
+Use `--optim-config-path configs/normuon.yaml` for a NorMuon override profile.
+Its hyperparameters are starting values, not calibrated replacements for the
+current Muon profile. Existing defaults and Muon checkpoints retain their behavior.
+Choose NorMuon for a fresh run; changing a saved group's optimizer name is not a
+checkpoint conversion because normalization state layouts can differ.
+
 ```yaml
 default:
   opt: "adamw"

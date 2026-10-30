@@ -47,6 +47,14 @@ def test_optimizer_profile_is_scaled_once_without_mutation(tmp_path, custom):
     assert restored.optim_config.model_dump() == snapshot
 
 
+def test_normuon_override_profile():
+    profile = OptimizerConfig.from_file("configs/normuon.yaml")
+    groups = profile.group_configs()
+    assert groups["transformer"]["opt"] == "normuon"
+    assert groups["transformer"]["beta"] == 0.95
+    assert groups["embeddings"]["opt"] == groups["head"]["opt"] == "adamw"
+
+
 @pytest.mark.parametrize('contents', [
     'batch_size: 64',
     'transformer:\n  n_steps: 8',

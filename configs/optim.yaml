@@ -9,6 +9,7 @@ embeddings:
   eps: 1e-10
   weight_decay: 1e-3
 transformer:
+  # Existing variant: Polar Express, shape-dependent normalization, cautious decay.
   opt: "muon"
   lr: 2e-2
   momentum: .95
