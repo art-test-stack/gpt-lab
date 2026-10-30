@@ -163,6 +163,10 @@ compatibility wrappers.
 Standalone dataloader benchmarks and tokenizer scaling live in
 [experiments/](experiments/README.md).
 
+For a lightweight recap of runs, curves, evaluation results, and configurations,
+see the [results dashboard guide](docs/results_dashboard.md). The viewer in
+[`spaces/results/`](spaces/results/) can be deployed as a static Hugging Face Space.
+
 ### Data
 
 **TLDR;** The dataloader is easily built with the following code snippet. It employs the following strategies:
@@ -254,6 +258,14 @@ meta_config = cfg.generate_gpt_config(device="cuda")
 > Setting `vocab_size = -1` enables automatic scaling-law vocabulary selection. \
 > Setting `training_time`, `n_steps`, `target_flops`, or `target_param_data_ratio` controls training horizon priority. \
 > The system automatically builds a reference model (12-layer baseline) to normalize scaling-law computations.
+
+`--num-steps` sets the complete scheduling horizon. To stop execution earlier
+without shortening LR, momentum, or weight-decay schedules, use
+`--num-steps 2317 --stop-after-step 945`. The cap counts completed optimizer
+steps since training began, including steps before a resume. It defaults
+to unset; resume retains a saved cap unless explicitly overridden. A capped
+run uses normal final checkpointing. See [the PR35 comparison](docs/pr35-execution-cap.md)
+for the pinned Modal adapter and verification results.
 
 Next sections detail the different generated components.
 
@@ -507,7 +519,7 @@ To add a new optimizer (e.g., Aurora), you only need to edit **one place**:
    
    class AuroraStrategy(OptimizerStrategy):
        def local_step(self, group: dict) -> None:
-           # Single-GPU update logic
+           # Single-GPU step logic
            pass
        
        def dist_reduce(self, group: dict, world_size: int) -> dict:
@@ -597,6 +609,17 @@ the rank-0 files, while subsequent local checkpoints use `"full"`.
 `--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
 With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)
 for module-mode launches and checkpoint selection.
+
+#### Customizing the trainer
+
+Subclass [`Trainer`](src/gpt_lab/train/trainer.py) and override `train_step` for a
+complete optimizer step, or `prepare_batch`, `compute_loss`, and `optimizer_step` for
+smaller changes. `update_metrics` updates per-step state; `log_metrics` handles
+reporting. Override `evaluate_bpb`, `evaluate_core`, and `evaluate_samples`
+independently; the main loop schedules evaluations. Use `self.compiled_model`
+for training forwards.
+See the class docstring for contracts and
+[`DistillationTrainer`](src/gpt_lab/train/distillation.py) for an example.
 
 <!-- Main arguments: 
 Argument | Description

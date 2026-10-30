@@ -16,12 +16,36 @@ from gpt_lab.utils.distributed import (
     ComputeContext,
     broadcast_model,
     cleanup_dist_groups,
+    detect_compute_dtype,
     get_comp_info,
     get_peak_flops,
     init_dist_groups,
 )
 from gpt_lab.utils.schemas import TrainerConfig
 from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
+
+
+@pytest.mark.parametrize("override,cuda,capability,expected", [
+    (None, False, (0, 0), torch.float32),
+    (None, True, (7, 5), torch.float32),
+    (None, True, (8, 0), torch.bfloat16),
+    ("float16", True, (7, 5), torch.float16),
+    ("float32", True, (8, 0), torch.float32),
+    ("bfloat16", False, (0, 0), torch.bfloat16),
+])
+def test_compute_dtype_fallbacks(monkeypatch, override, cuda, capability, expected):
+    monkeypatch.delenv("GPTLAB_DTYPE", raising=False)
+    if override is not None:
+        monkeypatch.setenv("GPTLAB_DTYPE", override)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: capability)
+    detect_compute_dtype.cache_clear()
+    try:
+        assert detect_compute_dtype()[0] == expected
+        context = ComputeContext(device=torch.device("cuda" if cuda else "cpu"))
+        assert context.compute_dtype == expected
+    finally:
+        detect_compute_dtype.cache_clear()
 
 
 def test_cpu_device_name():

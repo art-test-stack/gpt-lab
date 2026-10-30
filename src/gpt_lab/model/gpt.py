@@ -118,6 +118,23 @@ class DenseTransformer(BaseTransformer):
 
         # default loss_fn, can be overridden by trainer or by passing a different loss_fn to the model if needed
         self.loss_fn = build_loss() 
+        self._enforce_precision()
+
+    def _enforce_precision(self, compute_dtype=None):
+        dtype = self.pe_cache.dtype if compute_dtype is None else (
+            torch.bfloat16 if compute_dtype in (torch.bfloat16, "bfloat16") else torch.float32
+        )
+        embedding_weights = {id(self.embeds.weight), *(id(ve.weight) for ve in self.value_embeds.values())}
+        for parameter in self.parameters():
+            parameter_dtype = dtype
+            # A tied head keeps one FP32 parameter; lookup outputs are cast instead.
+            if dtype == torch.bfloat16:
+                parameter_dtype = (torch.bfloat16 if id(parameter) in embedding_weights and parameter is not self.lm_head.weight
+                                   else torch.float32)
+            parameter.data = parameter.data.to(parameter_dtype)
+            if parameter.grad is not None:
+                parameter.grad.data = parameter.grad.data.to(parameter_dtype)
+        self.pe_cache = self.pe_cache.to(dtype)
 
     def _tie_embedding_weights(self):
         for group in parse_embedding_groups(self.config.tie_embeddings):
@@ -137,16 +154,21 @@ class DenseTransformer(BaseTransformer):
         result = super()._apply(fn, recurse=recurse)
         # Device/dtype moves can replace the shared Parameter objects.
         self._tie_embedding_weights()
+        self._enforce_precision()
         return result
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         result = super().load_state_dict(state_dict, strict=strict, assign=assign)
         self._tie_embedding_weights()
+        self._enforce_precision()
         return result
 
     @torch.no_grad()
     def init_weights(self):
-        torch.nn.init.normal_(self.embeds.weight, mean=0.0, std=0.8)
+        embedding = torch.empty_like(self.embeds.weight, dtype=torch.float32)
+        torch.nn.init.normal_(embedding, mean=0.0, std=0.8)
+        self.embeds.weight.copy_(embedding)
+        del embedding
         if self.lm_head.weight is not self.embeds.weight:
             torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
@@ -173,7 +195,10 @@ class DenseTransformer(BaseTransformer):
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.children():
             if ve.weight is not self.embeds.weight and ve.weight is not self.lm_head.weight:
-                torch.nn.init.uniform_(ve.weight, -s, s)
+                embedding = torch.empty_like(ve.weight, dtype=torch.float32)
+                torch.nn.init.uniform_(embedding, -s, s)
+                ve.weight.copy_(embedding)
+                del embedding
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.blocks:
@@ -221,7 +246,7 @@ class DenseTransformer(BaseTransformer):
         else:
             raise ValueError(f"Unknown positional encoding: {self.config.positional_encoding}")
 
-        return pe_cache
+        return pe_cache.to(self.pe_cache.dtype) if hasattr(self, "pe_cache") else pe_cache
     
     @property
     def n_params(self) -> int:
@@ -334,6 +359,28 @@ class DenseTransformer(BaseTransformer):
             return_hidden_states: bool = False,
             reduction: str = "mean",
         ) -> ModelOutput:
+        return self._forward(
+            input_ids, labels, attn_mask, past_key_values,
+            return_attentions, return_hidden_states, reduction,
+        )
+
+    def training_loss(self, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Mean-loss training entry point; bypasses top-level forward hooks."""
+        assert self.training, "training_loss requires training mode"
+        assert labels is not None, "training_loss requires labels"
+        return self._forward(input_ids, labels, loss_only=True)
+
+    def _forward(
+            self,
+            input_ids: torch.Tensor,
+            labels: Optional[torch.Tensor] = None,
+            attn_mask: torch.Tensor | None = None,
+            past_key_values: Any = None,
+            return_attentions: bool = False,
+            return_hidden_states: bool = False,
+            reduction: str = "mean",
+            loss_only: bool = False,
+        ) -> ModelOutput | torch.Tensor:
         assert (past_key_values is None) or (not self.training), "KV cache can not be used during training."
         # assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
@@ -358,7 +405,12 @@ class DenseTransformer(BaseTransformer):
                 T0 = past_key_values.shape[3] # assuming shape is (L, 2, B, T, H, D)
             else:
                 pass
+        device_type = input_ids.device.type
+        compute_dtype = (torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type)
+                         else self.pe_cache.dtype)
         x = self.embeds(input_ids)
+        if compute_dtype == torch.bfloat16:
+            x = x.to(torch.bfloat16)
 
         if self.config.positional_encoding == "positional_encoding":
             x = x + self.pe_cache[:x.size(2)]
@@ -418,7 +470,10 @@ class DenseTransformer(BaseTransformer):
         loss = None
         if labels is not None:
             assert labels.is_contiguous(), "Labels should be contiguous for efficient loss computation"
-            loss = self.loss_fn(logits, labels, reduction=reduction)
+            loss = self.loss_fn(logits.float(), labels, reduction=reduction)
+
+        if loss_only:
+            return loss
 
         output = ModelOutput(
             logits=logits,

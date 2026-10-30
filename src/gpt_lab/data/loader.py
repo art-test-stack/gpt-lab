@@ -205,8 +205,8 @@ class DistDataLoader:
                 # Document fully consumed — O(1) removal.
                 self.buffer.popleft()
 
-        # Async host-to-device transfer.
-        self.gpu.copy_(self.cpu, non_blocking=(self.device.type == "cuda"))
+        # Blocking host-to-device transfer.
+        self.gpu.copy_(self.cpu, non_blocking=False)
 
         data = self.gpu.view(B, T + 1)
         self.inputs.copy_(data[:, :-1])

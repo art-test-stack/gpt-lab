@@ -29,8 +29,7 @@ def detect_compute_dtype():
         capability = torch.cuda.get_device_capability()
         if capability >= (8, 0):
             return torch.bfloat16, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (bf16 supported)"
-        # fp16 training requires GradScaler (not yet implemented), so fall back to fp32.
-        # Users can still force fp16 via GPTLAB_DTYPE=float16 if they know what they're doing.
+        # Keep FP32 as the default on older GPUs; FP16 remains an explicit choice.
         return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
     return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
 
@@ -117,7 +116,8 @@ class ComputeContext:
 
     @cached_property
     def gpu_peak_flops(self) -> float:
-        if self.device_type == "cpu":
+        if self.device_type == "cpu" or (self.device_type == "mps" and self.compute_dtype != torch.float32):
+            # Only the FP32 MPS peak is calibrated.
             return float("inf")
         return get_peak_flops(self.device_name) if self.device_name is not None else float("inf")
 
