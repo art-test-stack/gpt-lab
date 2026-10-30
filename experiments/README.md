@@ -4,6 +4,10 @@ Run these modules from the repository root with the installed project environmen
 They are separate from the `gpt-lab` CLI; the old `scripts/benchmark/` entry points
 have moved here. Use `--help` for all options and defaults.
 
+Create each new experiment in a dedicated subfolder containing its scripts,
+checks, configuration and notes. The FFN experiment lives in
+[`ffn_ablation/`](ffn_ablation/README.md).
+
 ## Dataloader benchmark
 
 ```bash
