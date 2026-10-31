@@ -22,7 +22,7 @@ def production_factory(cache, batch_size=16, seq_len=2048):
                                     cachedir=Path(cache)/"data", comp_info=ComputeContext(torch.device("cpu")))
 
 
-def preflight(run_name, warmup, measured):
+def preflight(run_name, warmup, measured, batch_sizes=BATCH_SIZES):
     import hashlib
     import platform
     import torch
@@ -41,7 +41,7 @@ def preflight(run_name, warmup, measured):
     if (Path("/runs")/run_name).exists():
         raise FileExistsError("Choose a fresh run name")
     results = {}
-    for batch_size in BATCH_SIZES:
+    for batch_size in batch_sizes:
         resolved = resolve_cpu_batch(batch_size)
         print("Resolved CPU preflight batch: " + json.dumps(resolved),flush=True)
         setup_start = time.perf_counter()

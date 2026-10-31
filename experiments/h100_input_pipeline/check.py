@@ -143,20 +143,46 @@ def test_restore_and_complete_production_updates_across_paths(tmp_path,device_ba
 @pytest.mark.parametrize("device_batch_size", BATCH_SIZES)
 def test_idle_gaps_use_union_and_report_temporal_overlap(tmp_path,device_batch_size):
     def span(name,start,duration,cat="user_annotation"):
-        return dict(name=name,ts=start,dur=duration,cat=cat,ph="X")
+        return dict(name=name,ts=start,dur=duration,cat=cat,ph="X",pid=4,tid=4 if cat == "user_annotation" else 7)
     resolved = resolve_cpu_batch(device_batch_size)
     events = [span("diagnostic/update/25",0,100),span("kernel",0,20,"kernel"),
               span("kernel",10,20,"kernel"),span("copy",50,10,"gpu_memcpy"),span("kernel",70,30,"kernel")]
+    events[2]["tid"] = 8  # Overlapping CUDA activity on another stream.
     events += [span("compute/optimizer",99,1)]
     for _ in range(resolved["n_acc_steps"]):
         events += [span("input/fetch",10,50),span("input/transfer",40,20),
                    span("compute/forward",1,1),span("compute/backward",2,1)]
+    # Include real Kineto metadata, including its numeric CPU/GPU pid collision.
+    events += [dict(name="process_labels",ph="M",pid=4,tid=0,args=dict(labels="CPU")),
+               dict(name="process_labels",ph="M",pid=4,tid=0,args=dict(labels="GPU 4")),
+               dict(name="thread_name",ph="M",pid=4,tid=4,args=dict(name="thread 4 (python)")),
+               dict(name="thread_name",ph="M",pid=4,tid=7,args=dict(name="stream 7")),
+               dict(name="thread_name",ph="M",pid=4,tid=8,args=dict(name="stream 8"))]
+    originals = [e for e in events if e.get("cat") == "user_annotation"]
+    # Correctly tagged GPU duplicates, plus a same-named user annotation on a GPU lane.
+    events += [e | dict(cat="gpu_user_annotation",tid=7) for e in originals]
+    events += [e | dict(tid=7) for e in originals]
     path = tmp_path/"trace.json"
     path.write_text(json.dumps(dict(traceEvents=events)))
     result = summarize(path,expected_updates=1,expected_microsteps=resolved["n_acc_steps"])["updates"][0]
+    assert result["range_counts"]["input/fetch"] == resolved["n_acc_steps"]
+    assert result["gpu_busy_union_ms"] == pytest.approx(.07)
     assert result["gpu_idle_ms"] == pytest.approx(.03)
+    assert sum(result["exclusive_idle_association_ms"].values()) == pytest.approx(result["gpu_idle_ms"])
     assert result["idle_overlapping_fetch_ms"] == pytest.approx(.02)
     assert result["idle_overlapping_transfer_ms"] == pytest.approx(.01)
+    assert json.loads(path.read_text())["traceEvents"] == events
+    with pytest.raises(RuntimeError,match="Expected update steps"):
+        summarize(path,expected_updates=1,expected_microsteps=resolved["n_acc_steps"],expected_steps=[26])
+    # A GPU duplicate cannot stand in for a missing CPU backward range.
+    events.remove(next(e for e in events if e.get("name") == "compute/backward" and e.get("tid") == 4))
+    path.write_text(json.dumps(dict(traceEvents=events)))
+    with pytest.raises(RuntimeError,match="Incomplete update ranges"):
+        summarize(path,expected_updates=1,expected_microsteps=resolved["n_acc_steps"])
+    events[:] = [e for e in events if e.get("ph") != "M"]
+    path.write_text(json.dumps(dict(traceEvents=events)))
+    with pytest.raises(RuntimeError,match="metadata"):
+        summarize(path,expected_updates=1,expected_microsteps=resolved["n_acc_steps"])
 
 
 def test_summary_separates_batch_and_input_effects():
@@ -175,3 +201,13 @@ def test_summary_separates_batch_and_input_effects():
     reports["32"]["initial_model_sha256"] = "different"
     with pytest.raises(AssertionError,match="initial_model"):
         combine_reports(reports)
+
+
+def test_batch32_only_plan_keeps_automatic_accumulation():
+    result = subprocess.run([sys.executable,str(HERE/"launch.py"),"--run-name","batch32-only",
+                             "--device-batch-size","32","--dry-run"],capture_output=True,text=True,check=True)
+    plan = json.loads(result.stdout)
+    assert plan["device_batch_sizes"] == [32] and set(plan["training"]) == {"32"}
+    assert resolve_cpu_batch(32)["n_acc_steps"] == 8
+    args = plan["training"]["32"]
+    assert args[args.index("--n-acc-steps")+1] == "-1"

@@ -132,10 +132,15 @@ are reported separately, including first-leg compilation.
 For each shape, a separate production run warms up for at least 25 updates,
 then captures two CPU/CUDA updates with `input/fetch`, `input/transfer`, `compute/forward`,
 `compute/backward`, `compute/optimizer` and complete-update ranges. Python method
-instrumentation is active only in that run. The analyzer verifies complete
-range counts and computes GPU idle gaps from the union of CUDA kernels, memcpy
+instrumentation is active only in that run. GPU annotations remain in the raw trace and are
+excluded from host-range counts; numeric CPU and GPU process IDs can collide.
+The analyzer selects host `user_annotation` events using CPU process and thread
+metadata, verifies complete range counts and expected update indices, and
+computes GPU idle gaps from the union of CUDA kernels, memcpy
 and memset across streams. It reports the largest gaps and their temporal
-intersection with input ranges. Fetch contains transfer; overlap columns and
+intersection with input ranges, plus exclusive idle-association buckets for
+fetch only, transfer only, both and neither. Those buckets partition idle time
+without double-counting. Fetch contains transfer; overlap columns and
 variant timing differences are **not additive**. Read the raw trace before
 attributing a gap to input rather than launch/optimizer/other host work.
 
@@ -201,7 +206,7 @@ optimizer executes eagerly: these tests verify state transitions and arithmetic,
 not TorchInductor or CUDA compilation. One initial attempt to compile the CPU
 optimizer hit stale shared TorchInductor precompiled headers; the focused test
 now explicitly forces eager execution without changing GPU worker behavior.
-The updated local check run passed **10 tests**, including the existing trainer
+The updated local check run passed **11 tests**, including the existing trainer
 accumulation/prefetch and CLI AutoConfig override regressions. Launcher dry-run also passed with the installed
 Modal 1.6.2 interpreter; no remote APIs were invoked. The checks explicitly
 verify production AutoConfig resolves B=16 to 16 microsteps and B=32 to 8,
@@ -218,8 +223,90 @@ under `.tmp/codex/`, outside Git.
 A stable production-versus-CPU-cache gain would implicate read/tokenize/packing;
 a further CPU-cache-versus-GPU-cache gain would implicate staging, transfer or
 its stream synchronization. Require agreement with the trace and gains larger
-than control drift/within-leg variability. No bottleneck conclusion is justified
-until the user runs the real-cache preflight and H100 comparison. The two requested microbatch sizes are the only shapes compared. A speedup
+than control drift/within-leg variability. Interpret each shape using its own real-cache preflight, repeated controls and
+H100 trace; the corrected batch-16 findings are recorded below, and batch 32
+remains unmeasured. The two requested microbatch sizes are the only shapes compared. A speedup
 from B=32 alone can reflect larger GEMMs or fewer accumulation/launch iterations
 and does not demonstrate a loader bottleneck. No loader changes, optimizations,
 quality claim or A100-to-H100 extrapolation is included.
+
+
+## Corrected saved batch-16 analysis and batch-32 continuation
+
+The original `h100-input-pipeline-b16-b32-01` run completed all four unprofiled
+batch-16 timing legs, then stopped during trace analysis. PyTorch emitted
+identically named CPU `user_annotation` and `gpu_user_annotation` ranges. The
+old analyzer selected names alone, counting four update events instead of two.
+The corrected selection combines category with CPU process/thread metadata;
+it also handles Kineto's numeric CPU/GPU process-ID collisions. Regression
+fixtures contain same-named CPU/GPU annotations, an incorrectly tagged GPU-lane
+annotation, overlapping kernels on different streams, missing host ranges and
+missing metadata. GPU annotations remain intact in the original raw trace.
+
+The saved trace was reanalyzed **offline**. It has exactly updates **25 and 26**;
+each has **16 fetch, 16 transfer, 16 forward, 16 backward and one optimizer**
+host ranges. GPU busy time is a union across CUDA kernels, copies and memset,
+so overlapping activity is counted once:
+
+| Update | Profile wall ms | GPU busy union ms | GPU idle ms | Idle during fetch only ms | Idle during fetch + transfer ms | Other idle ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| 25 | 1413.378 | 1373.931 | 39.447 | 14.280 | 11.778 | 13.389 |
+| 26 | 1410.987 | 1383.859 | 27.127 | 2.462 | 12.624 | 12.041 |
+
+Transfer-only idle is zero in these windows; transfer is nested in fetch.
+These are temporal associations in a separately instrumented trace, not causal
+stage costs or additional throughput measurements. CPU fetch spans total about
+1161/1162 ms per update, mostly overlapping CUDA work or waiting in the blocking
+copy; those durations are not exposed GPU idle. One 10.877 ms GPU idle gap in
+update 25 coincides with fetching, with only 0.049 ms inside the transfer range.
+The trace does not separately identify whether that preparation gap was a
+read, tokenization, packing, scheduling or profiler overhead.
+
+The saved unprofiled measurements are independent of the analyzer bug. The
+uploaded runner's hash matches its saved manifest. In that runner all timing
+legs ended at line 151, before the separate profiler at line 174 and the failing
+analysis at line 179. `reanalyze.py` verifies that ordering against the actual
+recorded Git revision, recomputes throughput from saved global-token counts and
+wall times, and recomputes median/p95 from the original 50 samples per leg:
+
+| Input path | Global tokens/s | Median update ms | p95 update ms |
+| --- | --- | --- | --- |
+| Production before | 372736.396 | 1406.481 | 1412.220 |
+| CPU cache | 373020.554 | 1405.840 | 1410.697 |
+| GPU cache | 374433.359 | 1400.108 | 1405.247 |
+| Production after | 372722.162 | 1406.525 | 1413.317 |
+
+On this single NVIDIA H100 80GB HBM3, BF16, B=16/T=2048, 524288 tokens/update,
+the gains versus the faster production control remain **+0.08% CPU cache** and
+**+0.46% GPU cache**. Their median savings (0.641/6.373 ms) are both below the
+conservative variability threshold (12.399 ms). This run does not establish a
+material input bottleneck at batch 16; it does not establish the batch-32 result.
+
+The original downloaded `report.json`, `trace.json` and manifest remain under
+`.tmp/codex/h100-input-pipeline-trace-failure/artifacts/batch-16/`, unchanged.
+The separate corrected report is
+`.tmp/codex/h100-input-pipeline-trace-failure/batch-16-corrected.json`. It retains
+the original measured legs and records source hashes, corrected counts/idle
+metrics, verified throughput gains and analysis-source hashes. The offline
+`reanalyze.py --trace ... --report ... --output <new-path>` command never trains
+or overwrites existing artifacts. It requires the saved sibling manifest and
+recorded runner revision to verify measurement independence.
+
+To continue with **batch 32 only**, use a fresh run name:
+
+```sh
+uv run --no-project --python 3.12 --with modal==1.6.2 python experiments/h100_input_pipeline/launch.py \
+  --device-batch-size 32 --run-name h100-input-pipeline-b32-01
+```
+
+This restricts both the real-cache CPU preflight and GPU comparison to batch 32.
+Production AutoConfig still receives `--n-acc-steps -1`, resolves **eight**
+microsteps on one H100, and validates the global-token invariant. All three
+input paths, the repeated production control, shape-specific compilation,
+25-update warmup, 50 measured complete updates and the separate corrected
+profiler remain enabled. The original batch-16 run is not repeated or modified.
+The single-shape top-level report is complete for its requested batch only;
+it makes no cross-shape claim. The existing offline `recipe.combine_reports`
+helper can compare corrected batch-16 and future batch-32 reports after their
+initialization/schedule checks pass. No remote computation was launched while
+making this correction.

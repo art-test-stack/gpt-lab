@@ -8,7 +8,7 @@ import subprocess
 from recipe import SHA, REPOSITORY, train_args, BATCH_SIZES, ORDER
 
 
-def gpu_worker(run_name, warmup, measured, runs, harness_sha):
+def gpu_worker(run_name, warmup, measured, runs, harness_sha, batch_sizes):
     import os
     import sys
     import json
@@ -27,7 +27,7 @@ def gpu_worker(run_name, warmup, measured, runs, harness_sha):
     try:
         with (root/"worker.log").open("x",buffering=1) as log:
             reports = {}
-            for batch_size in BATCH_SIZES:
+            for batch_size in batch_sizes:
                 output = root/f"batch-{batch_size}"
                 output.mkdir(exist_ok=False)
                 environment["TORCHINDUCTOR_CACHE_DIR"] = f"/opt/gpt-lab/.tmp/codex/h100-input-pipeline/compiler_cache/batch-{batch_size}"
@@ -44,7 +44,7 @@ def gpu_worker(run_name, warmup, measured, runs, harness_sha):
                     raise RuntimeError(f"Batch {batch_size} failed ({code}); inspect {run_name}/worker.log and partial reports")
                 reports[str(batch_size)] = json.loads((output/"report.json").read_text())
                 summary = combine_reports(reports) if len(reports) == len(BATCH_SIZES) else {}
-                (root/"report.json").write_text(json.dumps(dict(batches=reports,complete=len(reports)==len(BATCH_SIZES),**summary),indent=2)+"\n")
+                (root/"report.json").write_text(json.dumps(dict(batches=reports,complete=len(reports)==len(batch_sizes),device_batch_sizes=batch_sizes,**summary),indent=2)+"\n")
     finally:
         runs.commit()
     return str(root/"report.json")
@@ -52,6 +52,7 @@ def gpu_worker(run_name, warmup, measured, runs, harness_sha):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device-batch-size",type=int,choices=BATCH_SIZES,help="Run only this shape (default: both)")
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--measured", type=int, default=50)
@@ -62,14 +63,15 @@ def main(argv=None):
         parser.error("run-name must contain 1–100 letters/digits/_/-")
     if args.warmup<25 or args.measured<50 or args.warmup+args.measured>2317:
         parser.error("Need >=25 warmup, >=50 measured updates within horizon 2317")
+    batch_sizes = [args.device_batch_size] if args.device_batch_size is not None else list(BATCH_SIZES)
     here = Path(__file__).resolve().parent
     root = here.parents[1]
     harness_sha = subprocess.check_output(["git","-C",str(root),"rev-parse","HEAD"],text=True).strip()
     print(json.dumps(dict(production_sha=SHA,harness_sha=harness_sha,repository=REPOSITORY,
                          gpu="H100:1",workers=1,cpu_preflight_first=True,cpu_only=args.cpu_only,
                          warmup=args.warmup,measured=args.measured,order=ORDER,
-                         training={str(size):train_args(size) for size in BATCH_SIZES},
-                         device_batch_sizes=BATCH_SIZES,environment="main"),indent=2),flush=True)
+                         training={str(size):train_args(size) for size in batch_sizes},
+                         device_batch_sizes=batch_sizes,environment="main"),indent=2),flush=True)
     if args.dry_run:
         return
     dirty = subprocess.check_output(["git","-C",str(root),"status","--porcelain","--",
@@ -96,13 +98,14 @@ def main(argv=None):
         .add_local_dir(str(here),"/opt/diagnostic/h100_input_pipeline",ignore=["**/__pycache__/**","**/*.pyc"])
         .add_local_dir(str(here.parent/"h100_fp8_diagnostic"),"/opt/diagnostic/h100_fp8_diagnostic",ignore=["**/__pycache__/**","**/*.pyc"]))
     # Use the uv environment for both functions, including CPU-side production imports.
-    def cpu_entry(run_name, warmup, measured, runs):
+    def cpu_entry(run_name, warmup, measured, runs, batch_sizes):
         import subprocess
         import json
         from pathlib import Path
         script = "/opt/diagnostic/h100_input_pipeline/preflight_entry.py"
         subprocess.run(["/opt/gpt-lab/.venv/bin/python",script,"--run-name",run_name,
-                        "--warmup",str(warmup),"--measured",str(measured)],check=True,cwd="/opt/gpt-lab")
+                        "--warmup",str(warmup),"--measured",str(measured),
+                        "--device-batch-sizes",*map(str,batch_sizes)],check=True,cwd="/opt/gpt-lab")
         runs.commit()
         return json.loads((Path("/runs")/run_name/"cpu-preflight.json").read_text())
     check = app.function(image=image,cpu=16,memory=65536,timeout=1800,
@@ -113,10 +116,10 @@ def main(argv=None):
                        volumes={"/cache/gpt_lab":cache.with_mount_options(read_only=True),"/runs":runs},
                        serialized=True)(gpu_worker)
     with modal.enable_output(), app.run(environment_name="main"):
-        result = check.remote(args.run_name,args.warmup,args.measured,runs)
+        result = check.remote(args.run_name,args.warmup,args.measured,runs,batch_sizes)
         print(json.dumps(result,indent=2),flush=True)
         if not args.cpu_only:
-            print(run.remote(args.run_name,args.warmup,args.measured,runs,harness_sha))
+            print(run.remote(args.run_name,args.warmup,args.measured,runs,harness_sha,batch_sizes))
 
 
 if __name__ == "__main__":

@@ -176,7 +176,8 @@ def diagnostic(trainer, factory, output, warmup, measured, preflight):
             run_updates(trainer,traced,batch,warmup,2,profile=True)
         torch.cuda.synchronize()
     trace.export_chrome_trace(str(output/"trace.json"))
-    report["profile"] = summarize(output/"trace.json",expected_microsteps=resolved["n_acc_steps"])
+    report["profile"] = summarize(output/"trace.json",expected_microsteps=resolved["n_acc_steps"],
+                                  expected_steps=range(warmup,warmup+2))
     report["complete"] = True
     report["interpretation"] = "Production versus CPU cache removes reads/tokenization/packing; CPU versus GPU cache removes staging/transfer. Differences are interventions, not additive stage costs. Require repeat-control stability and trace evidence before attribution. All caches remain allocated in every timed leg; report their overhead separately."
     write(output/"report.json",report)
