@@ -103,6 +103,29 @@ def test_eight_gpu_preflight_preserves_matched_settings(monkeypatch, tmp_path):
         launcher.check_inputs([*arguments, "--num-steps", "150"], "new-run", 8, check_data=False)
 
 
+def test_preflight_worker_needs_no_project_packages(tmp_path):
+    # Modal's worker lacks gpt_lab; only the selected project interpreter has it.
+    repository = Path(__file__).parents[1]
+    code = """
+import importlib.util, json, pathlib, runpy, sys
+assert importlib.util.find_spec("gpt_lab") is None
+namespace = runpy.run_path(sys.argv[1])
+check = namespace["check_inputs"]
+check.__globals__.update(PYTHON=sys.argv[2], REPO=pathlib.Path(sys.argv[3]),
+                        RUNS=pathlib.Path(sys.argv[4]))
+settings = check(namespace["cli_defaults"](namespace["DEFAULT_TRAIN"]), "new-run", 8, False)
+print(json.dumps(settings))
+"""
+    result = subprocess.check_output(
+        [sys.executable, "-I", "-S", "-c", code,
+         str(repository / "scripts/modal_cuda_graphs.py"), sys.executable,
+         str(repository), str(tmp_path)], cwd=tmp_path, text=True,
+    )
+    settings = json.loads(result)
+    assert settings["optim_config_path"] == "configs/normuon.yaml"
+    assert settings["num_steps"] == 2317 and settings["stop_after_step"] == 150
+
+
 def initial_rank(rank=0):
     return dict(rank=rank, world_size=1, initial_model_sha256="model",
                 initial_optimizer_sha256="optimizer", initial_rng_sha256="rng",

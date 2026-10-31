@@ -309,7 +309,10 @@ def cli_defaults(settings):
 def check_inputs(arguments, run_name, world_size, check_data=True):
     """Validate native CLI arguments and existing cache on CPU before GPU work."""
     code = ("import json, sys; from gpt_lab.cli.parser import build_parser; "
-            "print(json.dumps(vars(build_parser().parse_args(sys.argv[1:]))))")
+            "from gpt_lab.utils.schemas import OptimizerConfig; "
+            "settings = vars(build_parser().parse_args(sys.argv[1:])); "
+            "OptimizerConfig.from_file(settings['optim_config_path']); "
+            "print(json.dumps(settings))")
     settings = json.loads(subprocess.check_output(
         [PYTHON, "-c", code, "train", "auto", *arguments], cwd=REPO, text=True,
     ))
@@ -332,8 +335,6 @@ def check_inputs(arguments, run_name, world_size, check_data=True):
         settings["n_acc_steps"] < 1 or (batch != -1 and batch != microbatch_tokens * settings["n_acc_steps"])
     ):
         raise ValueError("Explicit n_acc_steps must be positive and match total_batch_size.")
-    from gpt_lab.utils.schemas import OptimizerConfig
-    OptimizerConfig.from_file(settings["optim_config_path"])
     if world_size == 8 and (
         settings["device_batch_size"], settings["max_seq_len"], batch,
         settings["num_steps"], settings["warmup_steps"], cap, settings["n_acc_steps"]
