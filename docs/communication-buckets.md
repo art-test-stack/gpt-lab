@@ -1,5 +1,11 @@
 # Communication bucketing and overlap experiment
 
+This note preserves the original implementation handoff. For measured Muon
+64/128 MiB results and the new optimizer-selectable NorMuon sweep, use
+[Optimizer-specific communication sweeps](communication-optimizer-sweeps.md).
+The original launcher/source remains pinned in the original checkout for
+same-SHA profiling; the new launcher lives on `exp/comm-optimizer-sweeps`.
+
 Pinned starting code: `192bbe2921e4774d24324b2d07852311b7bc4dcf`.
 The standalone performance handoff explicitly selects **Muon**, using
 `configs/optim.yaml`; NorMuon is checked separately for compatibility. Being on
@@ -299,8 +305,10 @@ changed bucket target. The Modal smoke checks use in-memory state restore and
 write only JSON, XML, logs, and traces; they never write model/optimizer
 checkpoints. Tiny correctness uses eager optimizer execution to avoid compiling
 many small fixture shapes; performance runs use the existing compiled kernels.
-No optimizer-time, peak-memory, throughput, NCCL, or overlap result has been
-measured on GPU hardware. CPU/MPS checks cannot establish those results.
+At the original handoff no GPU result was available. Subsequent user-launched
+Muon 64/128 MiB sweeps have measured NCCL correctness, peak memory and throughput;
+see the linked results report. Optimizer-time/packing/wait profiles and actual
+overlap remain unmeasured. CPU/MPS checks cannot establish those results.
 
 The first user-launched Modal correctness run stopped during pytest setup:
 the fresh image lacked the parent of the explicit `--basetemp` directory.
@@ -309,6 +317,11 @@ checks this from an empty temporary repository. No NCCL comparison ran in that
 failed attempt. Retry with a fresh run name, such as `comm-nccl-20261031-r2`.
 
 ## User-launched Modal handoff
+
+The commands and 35-update screens in this section describe the **original
+`exp/comm-buckets` checkout at `8956f6e2cb8aae856c467c40ff2e3f37824dff75`**.
+Use the linked optimizer-specific report for the new branch's explicit optimizer
+selection, 55-update screens, 1% decision rule, and NorMuon commands.
 
 All source and runners are tracked relative to the experiment worktree's Git
 root. `scripts/benchmark/modal_communication.py` verifies a clean checkout, the

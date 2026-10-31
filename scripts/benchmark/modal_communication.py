@@ -4,6 +4,8 @@ Use --dry-run to verify the published source without importing Modal.
 Stages: correctness (2 A100s), sweep (4 A100s), compatibility (2 A100s),
 profile (4 A100s, separate from timed runs). Existing Modal volumes:
 gpt-lab-cache and gpt-lab-runs; existing secret: gpt-lab (HF_TOKEN).
+Select --optimizer explicitly. Screens run 55 updates (25 warmup + 30 measured),
+then 150-update confirmation. Retain baseline unless both gains reach 1%.
 """
 import argparse
 from datetime import datetime, timezone
@@ -25,6 +27,9 @@ CACHE = Path("/cache/gpt_lab")
 RUNS = Path("/runs")
 PYTHON = str(REPO / ".venv/bin/python")
 MODES = ("baseline", "buckets", "pipeline", "backward")
+WARMUP_UPDATES = 25
+SCREEN_UPDATES = 55
+MIN_THROUGHPUT_GAIN = 0.01
 REQUIRED = (
     "scripts/benchmark/modal_communication.py", "scripts/benchmark/communication.py",
     "src/gpt_lab/optim/communication.py", "src/gpt_lab/optim/factory.py",
@@ -44,16 +49,17 @@ def verify_source(sha):
     if Path(git("rev-parse", "--show-toplevel")).resolve() != ROOT:
         raise ValueError("Launcher must belong to this worktree's Git root")
     if git("rev-parse", "HEAD") != sha or git("status", "--porcelain"):
-        raise ValueError("Use the clean, committed exp/comm-buckets checkout at --sha")
+        raise ValueError("Use a clean, committed checkout at --sha")
     git("ls-files", "--error-unmatch", *REQUIRED)
-    remote = git("ls-remote", "--exit-code", "origin", "refs/heads/exp/comm-buckets")
+    branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
+    remote = git("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}")
     if remote.split()[0] != sha:
-        raise ValueError("--sha must equal the published origin/exp/comm-buckets tip")
+        raise ValueError(f"--sha must equal the published origin/{branch} tip")
     repository = git("remote", "get-url", "origin")
     return re.sub(r"^(?:git@github.com:|ssh://git@github.com/)", "https://github.com/", repository)
 
 
-def preflight(stage, run_name, results_run, sha):
+def preflight(stage, run_name, results_run, sha, optimizer):
     if (RUNS / run_name).exists():
         raise FileExistsError(f"Run {run_name!r} already exists; use a fresh name")
     if stage in ("sweep", "profile"):
@@ -66,15 +72,19 @@ def preflight(stage, run_name, results_run, sha):
             raise ValueError("Cached gpt2 tokenizer is missing")
     if stage in ("compatibility", "profile"):
         previous = json.loads((RUNS / results_run / "manifest.json").read_text())
-        if previous["status"] != "completed" or previous["sha"] != sha or previous.get("winner") not in MODES[1:]:
-            raise ValueError("--results-run must be a completed sweep at the same SHA")
+        if (previous["status"] != "completed" or previous["stage"] != "sweep"
+                or previous["sha"] != sha or previous["selected_optimizer"] != optimizer
+                or previous.get("candidate_mode") not in MODES[1:]):
+            raise ValueError("--results-run must be a completed sweep with the same SHA and optimizer")
     return True
 
 
 def validate_matched(reference, candidate):
     """Fresh processes reset state/data; fail if their recorded reset differs."""
-    if candidate["status"] != "completed" or candidate["selected_optimizer"] != "muon":
-        raise ValueError("Candidate did not finish with the explicit Muon profile")
+    optimizer = reference["selected_optimizer"]
+    if (optimizer not in ("muon", "normuon") or candidate["status"] != "completed"
+            or candidate["selected_optimizer"] != optimizer):
+        raise ValueError("Matched fingerprints require the same selected optimizer")
     for first, second in zip(reference["initial_fingerprints_per_rank"], candidate["initial_fingerprints_per_rank"], strict=True):
         for key in ("rank", "model_sha256", "optimizer_state_sha256", "optimizer_groups",
                     "first_batch_sha256", "first_batch_position"):
@@ -151,7 +161,7 @@ def result_summary(result):
     }
 
 
-def run_suite(stage, run_name, results_run, sha, bucket_mib, volume, candidate_timeout):
+def run_suite(stage, run_name, results_run, sha, bucket_mib, optimizer, volume, candidate_timeout):
     if subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip() != sha:
         raise RuntimeError("Modal image does not match the pinned source")
     world = 2 if stage in ("correctness", "compatibility") else 4
@@ -168,7 +178,9 @@ def run_suite(stage, run_name, results_run, sha, bucket_mib, volume, candidate_t
         "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1", "TORCH_NCCL_BLOCKING_WAIT": "0",
     }
     manifest = dict(sha=sha, stage=stage, status="running", bucket_mib=bucket_mib,
-                    world_size=world, selected_optimizer="muon", candidates={},
+                    world_size=world, selected_optimizer=optimizer, candidates={},
+                    screen_updates=SCREEN_UPDATES, warmup_updates=WARMUP_UPDATES,
+                    min_throughput_gain=MIN_THROUGHPUT_GAIN,
                     started_at=datetime.now(timezone.utc).isoformat())
 
     def persist():
@@ -182,19 +194,21 @@ def run_suite(stage, run_name, results_run, sha, bucket_mib, volume, candidate_t
         output = directory / label
         command = [str(REPO / ".venv/bin/torchrun"), "--standalone", f"--nproc_per_node={world}",
                    "--max_restarts=0", "scripts/benchmark/communication.py",
-                   "--optimizer", "muon", "--communication", mode,
+                   "--optimizer", optimizer, "--communication", mode,
                    "--bucket-mib", str(bucket_mib), "--updates", str(updates),
-                   "--warmup-updates", "25", "--output-dir", str(output)]
+                   "--warmup-updates", str(WARMUP_UPDATES), "--output-dir", str(output)]
         if profile:
             command.append("--profile")
         manifest["current_candidate"] = label
         persist()
         run_process(command, output, env, volume, candidate_timeout)
         result = json.loads((output / "communication-results.json").read_text())
-        if (result["status"] != "completed" or result["selected_optimizer"] != "muon"
+        if (result["status"] != "completed" or result["selected_optimizer"] != optimizer
                 or result["world_size"] != world or result["git_sha"] != sha
                 or result["completed_steps_by_rank"] != [updates] * world
-                or result["scheduler_horizon_by_rank"] != [2317] * world):
+                or result["scheduler_horizon_by_rank"] != [2317] * world
+                or result["steady_updates"] != updates - WARMUP_UPDATES
+                or result["bucket_mib"] != bucket_mib):
             raise ValueError("Candidate source, optimizer, or update/horizon invariants failed")
         if reference is not None:
             validate_matched(reference, result)
@@ -211,36 +225,41 @@ def run_suite(stage, run_name, results_run, sha, bucket_mib, volume, candidate_t
                  "; assert all('A100' in torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count()))")
         run_process([PYTHON, "-c", probe], directory / "hardware", env, volume, 120)
         if stage == "correctness":
-            manifest["correctness"] = correctness(directory / "muon-correctness", "muon", MODES[1:], world, env, volume, 600)
+            manifest["correctness"] = correctness(directory / f"{optimizer}-correctness", optimizer, MODES[1:], world, env, volume, 600)
         elif stage == "compatibility":
             previous = json.loads((RUNS / results_run / "manifest.json").read_text())
-            manifest["winner"] = previous["winner"]
-            manifest["selected_optimizer"] = "normuon"
-            manifest["correctness"] = correctness(directory / "normuon-compatibility", "normuon", [previous["winner"]], world, env, volume, 600)
+            manifest["candidate_mode"] = previous["candidate_mode"]
+            manifest["correctness"] = correctness(directory / f"{optimizer}-compatibility", optimizer, [previous["candidate_mode"]], world, env, volume, 600)
         elif stage == "sweep":
             # Gate expensive training on actual NCCL parameter/gradient/state agreement.
-            manifest["correctness"] = correctness(directory / "muon-correctness", "muon", MODES[1:], world, env, volume, 600)
+            manifest["correctness"] = correctness(directory / f"{optimizer}-correctness", optimizer, MODES[1:], world, env, volume, 600)
             persist()
-            baseline = candidate("screen-baseline", "baseline", 35)
-            screened = {mode: candidate(f"screen-{mode}", mode, 35, baseline) for mode in MODES[1:]}
+            baseline = candidate("screen-baseline", "baseline", SCREEN_UPDATES)
+            screened = {mode: candidate(f"screen-{mode}", mode, SCREEN_UPDATES, baseline) for mode in MODES[1:]}
             winner = max(MODES[1:], key=lambda mode: screened[mode]["steady_train_loop_tokens_per_second"])
-            manifest["winner"] = winner
-            persist()
-            manifest["normuon_compatibility"] = correctness(directory / "normuon-compatibility", "normuon", [winner], world, env, volume, 600)
+            manifest["candidate_mode"] = winner
+            manifest["screen_throughput_ratio_to_baseline"] = (
+                screened[winner]["steady_train_loop_tokens_per_second"] / baseline["steady_train_loop_tokens_per_second"])
             persist()
             full_baseline = candidate("full-baseline", "baseline", 150, baseline)
             full_winner = candidate(f"full-{winner}", winner, 150, full_baseline)
             manifest["full_throughput_ratio_to_baseline"] = (
                 full_winner["steady_train_loop_tokens_per_second"] / full_baseline["steady_train_loop_tokens_per_second"])
+            manifest["recommended_mode"] = (
+                winner if min(manifest["screen_throughput_ratio_to_baseline"],
+                              manifest["full_throughput_ratio_to_baseline"]) >= 1 + MIN_THROUGHPUT_GAIN
+                else "baseline")
+            manifest["selection_note"] = "Require at least 1% higher throughput in both stages; this is a conservative threshold, not a confidence interval."
         else:
             previous = json.loads((RUNS / results_run / "manifest.json").read_text())
             bucket_mib = previous["bucket_mib"]
             manifest["bucket_mib"] = bucket_mib
-            winner = previous["winner"]
-            manifest["winner"] = winner
+            winner = previous["candidate_mode"]
+            manifest["candidate_mode"] = winner
+            manifest["recommended_mode"] = previous.get("recommended_mode", "baseline")
             prior_baseline = json.loads((RUNS / results_run / "full-baseline/communication-results.json").read_text())
-            baseline = candidate("profile-baseline", "baseline", 35, prior_baseline, profile=True)
-            candidate(f"profile-{winner}", winner, 35, baseline, profile=True)
+            baseline = candidate("profile-baseline", "baseline", SCREEN_UPDATES, prior_baseline, profile=True)
+            candidate(f"profile-{winner}", winner, SCREEN_UPDATES, baseline, profile=True)
         manifest["status"] = "completed"
     except BaseException as error:
         manifest.update(status="failed", error_type=type(error).__name__, error=str(error))
@@ -258,6 +277,7 @@ def main(argv=None):
     parser.add_argument("--sha", required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--results-run")
+    parser.add_argument("--optimizer", choices=("muon", "normuon"), default="muon")
     parser.add_argument("--bucket-mib", type=float, default=64)
     parser.add_argument("--candidate-timeout", type=int, default=1800)
     parser.add_argument("--detach", action="store_true")
@@ -274,7 +294,9 @@ def main(argv=None):
     world = 2 if args.stage in ("correctness", "compatibility") else 4
     if args.dry_run:
         print(json.dumps(vars(args) | {"gpu": f"A100-80GB:{world}", "repository": repository,
-                                     "optimizer": "normuon" if args.stage == "compatibility" else "muon"}, indent=2))
+                                     "optimizer": args.optimizer, "screen_updates": SCREEN_UPDATES,
+                                     "warmup_updates": WARMUP_UPDATES, "confirmation_updates": 150,
+                                     "min_throughput_gain": MIN_THROUGHPUT_GAIN}, indent=2))
         return
     import modal
     app = modal.App("gpt-lab-communication")
@@ -300,8 +322,8 @@ def main(argv=None):
                           volumes={str(CACHE): cache_volume, str(RUNS): run_volume},
                           secrets=[modal.Secret.from_name("gpt-lab", required_keys=["HF_TOKEN"])])(run_suite)
     with modal.enable_output(), app.run(detach=args.detach):
-        check.remote(args.stage, args.run_name, args.results_run, args.sha)
-        values = (args.stage, args.run_name, args.results_run, args.sha, args.bucket_mib, run_volume, args.candidate_timeout)
+        check.remote(args.stage, args.run_name, args.results_run, args.sha, args.optimizer)
+        values = (args.stage, args.run_name, args.results_run, args.sha, args.bucket_mib, args.optimizer, run_volume, args.candidate_timeout)
         if args.detach:
             call = worker.spawn(*values)
             print(f"Submitted {args.run_name}: {call.object_id}; results in gpt-lab-runs/{args.run_name}")

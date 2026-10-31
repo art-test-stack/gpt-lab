@@ -313,23 +313,24 @@ def test_nccl_buckets_accumulation_padding_ties_and_resume(tmp_path):
     _run("nccl", tmp_path)
 
 
-def test_diagnostic_cli_preserves_native_overrides_and_scheduler_horizon(tmp_path):
+@pytest.mark.parametrize("optimizer", ["muon", "normuon"])
+def test_diagnostic_cli_preserves_native_overrides_and_scheduler_horizon(tmp_path, optimizer):
     runner = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/benchmark/communication.py"))
     from gpt_lab.cli.parser import build_parser
     args, forwarded = runner["parse_args"]([
-        "--communication", "backward", "--bucket-mib", "32",
+        "--optimizer", optimizer, "--communication", "backward", "--bucket-mib", "32",
         "--device-batch-size", "4", "--random-seed", "7", "--num-steps", "150",
         "--eval-bpb-every", "10", "--save-every", "5",
     ])
     resolved = build_parser().parse_args([
         "train", "auto", *runner["default_cli_args"](tmp_path),
-        *forwarded, *runner["invariant_cli_args"](),
+        *forwarded, *runner["invariant_cli_args"](args.optimizer),
     ])
     assert args.communication == "backward" and args.bucket_mib == 32
     assert resolved.device_batch_size == 16 and resolved.random_seed == 42
     assert resolved.num_steps == 2317 and resolved.stop_after_step == 150
     assert resolved.eval_bpb_every == resolved.eval_core_every == resolved.sample_every == resolved.save_every == 0
-    assert resolved.optim_config_path.endswith("configs/optim.yaml")
+    assert resolved.optim_config_path.endswith("configs/optim.yaml" if optimizer == "muon" else "configs/normuon.yaml")
 
 
 def test_diagnostic_failure_preserves_error_without_new_collectives(tmp_path, monkeypatch):
