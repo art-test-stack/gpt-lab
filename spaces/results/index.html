@@ -14,6 +14,7 @@
       <button class="nav active" data-tab="overview" aria-label="Overview" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16h16M7 14l4-5 4 3 5-7"/></svg></button>
       <button class="nav" data-tab="evaluation" aria-label="Evaluation" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16M7 16v-5m5 5V5m5 11V8"/></svg></button>
       <button class="nav" data-tab="configuration" aria-label="Configuration" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h6m4 0h6M4 17h10m4 0h2M10 4v6m4 4v6"/></svg></button>
+      <button class="nav" data-tab="evidence" aria-label="Experiment archive" title="Experiment archive" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v14H3zM2 3h20v4H2zM9 11h6"/></svg></button>
     </nav>
     <a class="rail-footer" href="https://github.com/art-test-stack/gpt-lab" target="_blank" rel="noopener noreferrer" aria-label="View gpt-lab on GitHub"><img src="vendor/github.svg" width="24" height="24" alt=""></a>
   </aside>
@@ -21,7 +22,7 @@
   <main>
     <header>
       <div><div class="product-name">gpt-lab</div><h1 id="page-title">Experiment overview<span>.</span></h1><p>Follow the learning. Compare the details.</p></div>
-      <div class="actions"><button id="demo" class="button secondary">Preview example</button><button id="import-button" class="button secondary">Import JSON</button><input id="import" type="file" accept=".json,application/json" hidden><button id="download" class="button primary">Export selection ↓</button></div>
+      <div class="actions"><button class="button secondary" data-tab="evidence" aria-pressed="false">Experiment archive</button><button id="demo" class="button secondary">Preview example</button><button id="import-button" class="button secondary">Import JSON</button><input id="import" type="file" accept=".json,application/json" hidden><button id="download" class="button primary">Export selection ↓</button></div>
     </header>
     <div id="message" class="message" role="status" aria-live="polite" hidden></div>
     <div id="demo-banner" class="demo-banner" hidden>SYNTHETIC PREVIEW · Illustrative data only. These curves are not measured results. <button id="clear-demo">Return to real results</button></div>
@@ -59,9 +60,22 @@
       <article class="panel runs-panel"><div class="panel-title"><h2>Run recap</h2><span>LAST RECORDED VALUES</span></div><div id="recap-table" class="table-wrap"></div></article>
       <p class="footnote">Training time excludes evaluation in gpt-lab. Logged elapsed time includes intervals between metric logs; neither is a Modal billing measurement. MFU is an estimate based on model FLOPs and configured peak compute. Missing axis values are omitted, not interpolated. Scores are not automatically ranked as comparable experiments.</p>
     </div>
+    <section id="evidence" class="tab-panel archive-panel" hidden>
+      <p id="archive-status-message" class="table-note" role="status">Loading experiment archive…</p>
+      <section class="panel run-controls"><div class="run-controls-head">
+        <label>Experiment <select id="archive-experiment"><option value="">All experiments</option></select></label>
+        <label>Status <select id="archive-status"><option value="">All statuses</option></select></label>
+        <label>Sort <select id="archive-order"><option value="newest">Experiment / newest</option><option value="name">Experiment / name</option></select></label>
+        <label class="search-label"><span class="sr-only">Search archive</span><input id="archive-search" type="search" placeholder="Run name, status or commit…"></label>
+        <button id="archive-download" class="button secondary">Download index ↓</button>
+      </div><p id="archive-count" class="small">0 runs</p></section>
+      <p class="table-note">Reports retain the recorded protocol and units. Download profiler traces and open them in <a href="https://ui.perfetto.dev/" target="_blank" rel="noopener noreferrer">Perfetto</a>. Missing measurements stay missing.</p>
+      <div id="archive-runs"></div>
+    </section>
     <footer><span>gpt-lab <b>/</b> A small record of what changed.</span><span id="snapshot-info">No results loaded</span></footer>
   </main>
   <script src="vendor/chart.umd.min.js"></script>
   <script type="module" src="app.js"></script>
+  <script type="module" src="evidence.js"></script>
 </body>
 </html>
