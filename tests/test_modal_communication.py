@@ -63,7 +63,11 @@ def test_distributed_deadline_kills_process_and_persists(tmp_path, monkeypatch):
 
 def test_skipped_nccl_is_rejected(tmp_path, monkeypatch):
     check = launcher()["correctness"]
+    monkeypatch.setitem(check.__globals__, "REPO", tmp_path)
     def skipped(command, directory, *args):
+        basetemp = Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--basetemp=")))
+        assert basetemp.parent == tmp_path / ".tmp/codex/modal-correctness"
+        assert basetemp.parent.is_dir()
         directory.mkdir(parents=True)
         (directory / "junit.xml").write_text('<testsuites><testsuite tests="1" skipped="1" /></testsuites>')
     monkeypatch.setitem(check.__globals__, "run_process", skipped)

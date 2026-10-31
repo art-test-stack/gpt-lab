@@ -114,6 +114,8 @@ def run_process(command, directory, env, volume, timeout):
 
 
 def correctness(directory, optimizer, modes, world, env, volume, timeout):
+    basetemp = REPO / ".tmp/codex/modal-correctness/pytest"
+    basetemp.parent.mkdir(parents=True, exist_ok=True)
     report = directory / "correctness.json"
     run_env = env | {"GPTLAB_COMM_TEST_WORLD_SIZE": str(world),
                      "GPTLAB_COMM_TEST_OPTIMIZER": optimizer,
@@ -123,7 +125,7 @@ def correctness(directory, optimizer, modes, world, env, volume, timeout):
     junit = directory / "junit.xml"
     command = [PYTHON, "-m", "pytest", "tests/test_communication.py",
                "-k", "test_nccl_buckets_accumulation_padding_ties_and_resume", "-s", "-q",
-               f"--junitxml={junit}", "--basetemp=.tmp/codex/modal-correctness/pytest"]
+               f"--junitxml={junit}", f"--basetemp={basetemp}"]
     run_process(command, directory, run_env, volume, timeout)
     suites = list(ET.parse(junit).getroot().iter("testsuite"))
     if sum(int(s.get("tests", "0")) for s in suites) != 1 or any(

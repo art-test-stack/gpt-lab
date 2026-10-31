@@ -302,6 +302,12 @@ many small fixture shapes; performance runs use the existing compiled kernels.
 No optimizer-time, peak-memory, throughput, NCCL, or overlap result has been
 measured on GPU hardware. CPU/MPS checks cannot establish those results.
 
+The first user-launched Modal correctness run stopped during pytest setup:
+the fresh image lacked the parent of the explicit `--basetemp` directory.
+The launcher now creates that parent before invoking pytest; a local regression
+checks this from an empty temporary repository. No NCCL comparison ran in that
+failed attempt. Retry with a fresh run name, such as `comm-nccl-20261031-r2`.
+
 ## User-launched Modal handoff
 
 All source and runners are tracked relative to the experiment worktree's Git
