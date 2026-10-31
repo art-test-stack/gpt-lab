@@ -583,16 +583,8 @@ class TrainerConfig(BaseModel):
             return progress * 1.0 + (1 - progress) * self.final_lr_ratio
     
     def muon_momentum_schedule(self, step: int) -> float:
-        n_steps = self.n_steps
-        warmup_iters = self.lr_warmup_steps
-        warmdown_iters = round(self.lr_warmdown_ratio * n_steps)
-        if step < warmup_iters:
-            return (step + 1) / warmup_iters
-        elif step <= n_steps - warmdown_iters:
-            return 1.0
-        else:
-            progress = (n_steps - step) / warmdown_iters
-            return progress * 1.0 + (1 - progress) * self.final_lr_ratio
+        """Keep configured momentum fixed; custom schedules return multipliers."""
+        return 1.0
     
     def weight_decay_schedule(self, step: int) -> float:
         # New profiles apply decay scaling when building the optimizer.

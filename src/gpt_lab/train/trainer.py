@@ -511,7 +511,8 @@ class Trainer:
         """Update per-step state and return the metric dict consumed by log_metrics.
 
         Called every step, including when logging is disabled. Reduce step time
-        with MAX across ranks, update loss smoothing and token/time counters,
+        with MAX across ranks, average loss across ranks before smoothing,
+        update token/time counters,
         and append the reduced duration to total_dt for ETA and time limits.
         """
         step = self.state.step
@@ -529,7 +530,13 @@ class Trainer:
 
         step_dt = step_dt_tensor.item()
 
-        loss_accum = step_metrics["loss"].item()
+        # Equal token counts per rank make the rank mean the global batch loss.
+        # Reduce a detached copy so reporting cannot change the training loss.
+        loss_tensor = step_metrics["loss"].detach().float().clone()
+        if self.config.comp_info.is_distributed:
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            loss_tensor.div_(world_size)
+        loss_accum = loss_tensor.item()
         eff_global_tokens = step_metrics["tokens"]
 
         smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum

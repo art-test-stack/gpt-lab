@@ -17,6 +17,10 @@ import itertools
 
 from gpt_lab.utils.schemas import DataLoaderState, TrainerConfig, TrainerState
 from gpt_lab.model.checkpoint import load_checkpoint, save_checkpoint
+from datetime import timedelta
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
 
 
 class _CaptureBoard:
@@ -25,6 +29,59 @@ class _CaptureBoard:
 
     def log(self, values, step=None):
         self.records.append((values, step))
+
+
+def _distributed_loss_metrics_worker(rank, rendezvous):
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        context = ComputeContext(
+            device=torch.device("cpu"),
+            mesh=init_device_mesh("cpu", (2,), mesh_dim_names=("dp",)),
+        )
+        trainer = Trainer.__new__(Trainer)
+        trainer.device = context.device
+        trainer.config = TrainerConfig(
+            comp_info=context, n_steps=3, total_batch_size=8, n_flops_per_token=100,
+        )
+        trainer.state = TrainerState()
+        parameter = torch.tensor(float(rank + 1), requires_grad=True)
+        expected_ema = 0.0
+        durations = []
+        for step in range(2):
+            trainer.state.step = step
+            local_loss = parameter * (2 * (step + 1))
+            local_loss.backward()
+            original_loss = local_loss.detach().clone()
+            original_grad = parameter.grad.clone()
+            metrics = trainer.update_metrics(dict(
+                loss=local_loss, tokens=8, step_time=(rank + 1) * 0.5,
+                lrm=1.0, muon_momentum=1.0, weight_decay=1.0,
+            ), durations)
+
+            global_loss = 3.0 * (step + 1)
+            expected_ema = 0.9 * expected_ema + 0.1 * global_loss
+            assert metrics["train/raw_loss"] == pytest.approx(global_loss)
+            assert metrics["train/loss"] == pytest.approx(expected_ema / (1 - 0.9 ** (step + 1)))
+            assert trainer.state.smooth_train_loss == pytest.approx(expected_ema)
+            assert metrics["train/step_time_ms"] == 1000.0
+            assert metrics["train/tokens_per_sec"] == 8.0
+            torch.testing.assert_close(local_loss, original_loss)
+            torch.testing.assert_close(parameter.grad, original_grad)
+        assert trainer.state.n_tokens == 16
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo unavailable")
+def test_distributed_metrics_average_loss_before_smoothing(tmp_path):
+    # File rendezvous avoids a free-port selection race; workers own the group.
+    mp.spawn(
+        _distributed_loss_metrics_worker,
+        args=((tmp_path / "loss-metrics-rendezvous").as_uri(),), nprocs=2, join=True,
+    )
 
 
 def test_step_fields_are_canonical():
@@ -491,6 +548,40 @@ def test_update_metrics_tracks_state_and_log_metrics_only_reports(
     assert "Step 00010/00020" in output
     assert "tok/s: 8" in output
     assert ("ETA:" in output) == bool(prior_duration_count)
+
+
+@pytest.mark.fast
+def test_loss_reporting_reduces_a_detached_copy(tmp_path, monkeypatch):
+    trainer, model, _ = _make_trainer(tmp_path, compute_dtype=torch.float32)
+    context = SimpleNamespace(is_distributed=True, world_size=2, gpu_peak_flops=float("inf"))
+    trainer.config = trainer.config.model_copy(update={
+        "comp_info": context, "n_steps": 2, "n_flops_per_token": 100,
+    })
+    local_loss = model(torch.ones(2, 2)).square().mean()
+    original_loss = local_loss.detach().clone()
+    local_loss.backward()
+    original_grad = model.weight.grad.clone()
+
+    def reduce(tensor, op):
+        assert not tensor.requires_grad
+        if op == dist.ReduceOp.MAX:
+            tensor.fill_(1.0)
+        else:
+            assert op == dist.ReduceOp.SUM
+            assert tensor.data_ptr() != local_loss.data_ptr()
+            tensor.add_(4.0)  # The other rank's mean loss.
+
+    monkeypatch.setattr("gpt_lab.train.trainer.dist.all_reduce", reduce)
+    metrics = trainer.update_metrics(dict(
+        loss=local_loss, tokens=4, step_time=0.5,
+        lrm=1.0, muon_momentum=1.0, weight_decay=1.0,
+    ), [])
+    expected = (original_loss.item() + 4.0) / 2
+    assert metrics["train/raw_loss"] == pytest.approx(expected)
+    assert metrics["train/loss"] == pytest.approx(expected)
+    assert trainer.state.smooth_train_loss == pytest.approx(0.1 * expected)
+    torch.testing.assert_close(local_loss, original_loss)
+    torch.testing.assert_close(model.weight.grad, original_grad)
 
 
 @pytest.mark.fast
