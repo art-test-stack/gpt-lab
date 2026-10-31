@@ -46,6 +46,9 @@ cpu = [
 gpu = [
     "torch==2.9.1",
 ]
+fp8 = [
+    "torchao==0.15.0",
+]
 
 [dependency-groups]
 dev = [
