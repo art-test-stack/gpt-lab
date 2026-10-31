@@ -634,53 +634,97 @@ hardware. Optimizer-update and communication capture are pending. No throughput
 or CUDA correctness claim is made from CPU checks.
 
 The standalone [`scripts/modal_cuda_graphs.py`](scripts/modal_cuda_graphs.py)
-launcher follows the existing local `runs/modal_trainbase.py` launcher. Install
-`modal==1.6.2` in your launcher environment and run `modal setup`. Run the four
-commands below from this worktree, waiting for each to finish. First commit and
-push the capture changes and launcher: the script requires a clean attached
-branch with local HEAD equal to its live origin tip, and clones that exact SHA.
+launcher follows the existing local `runs/modal_trainbase.py`. It requires a
+clean branch whose HEAD matches its live origin tip, Modal 1.6.2 authentication,
+the `gpt-lab` secret (`HF_TOKEN`, `WANDB_API_KEY`), and existing `gpt-lab-cache`
+and `gpt-lab-runs` volumes. It clones the exact selected SHA; it never uploads
+local source or starts a GPU for `--dry-run`.
+
+Every GPU job first runs the small real-CUDA equivalence check in
+[`scripts/benchmark/cuda_graph_equivalence.py`](scripts/benchmark/cuda_graph_equivalence.py).
+It uses a two-layer production transformer, the explicitly selected optimizer
+profile, and six updates with changing production LR/momentum/decay schedules.
+Both paths use compiled kernels with compiler-managed graphs disabled. It
+compares accumulated loss, pre-update accumulated gradients, parameters, and
+all optimizer state after each update. It also checks in-place gradient clearing,
+fixed gradient addresses, warmup restoration of model/buffers/optimizer/RNG,
+and replicated parameters across ranks. Distributed checks use the actual NCCL
+reduce/scatter/gather backend outside capture. Checks collect every rank's
+result before allowing timing. A skipped or failed check cannot authorize a run.
+
+The small check uses batch 2 and sequence 16, with the requested run's accumulation
+count (16/4/2 for 1/4/8 GPUs). Floating-point comparisons use rtol/atol
+`1e-3/1e-6` for BF16 and `1e-5/1e-6` for FP32; Python counters and state keys
+must match exactly. It saves observed maximum absolute errors and all failures.
+These tolerances are explicit initial acceptance criteria; real-CUDA checks
+remain unverified until run on user-provided hardware. No optimizer or
+communication capture is added.
+
+Run these commands from the `exp/cuda-graphs` worktree after pushing. They
+allocate paid GPUs only when the user executes them. First run the small check:
 
 ```bash
-python scripts/modal_cuda_graphs.py --gpus 1 --mode disabled --run-name cg-1-compiled
-python scripts/modal_cuda_graphs.py --gpus 1 --mode forward_backward --run-name cg-1-captured
-python scripts/modal_cuda_graphs.py --gpus 4 --mode disabled --run-name cg-4-compiled
-python scripts/modal_cuda_graphs.py --gpus 4 --mode forward_backward --run-name cg-4-captured
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 1 --mode verify --require-sxm --run-name cg-check-1-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy
 ```
 
-Add `--dry-run` to validate the Git source and print a command without importing
-Modal. `--detach` submits an individual run in the background; wait for it to
-finish before launching the next run. Repeated runs need new run names.
-Add `--require-sxm` for a comparison against an SXM4 baseline: the hardware
-probe rejects any allocated GPU whose name is not `NVIDIA A100-SXM4-80GB`
-before training begins. This flag verifies the allocation; Modal's
-`A100-80GB` request does not let this launcher choose SXM4 versus PCIe.
-For the single-GPU captured rerun, use `--gpus 1 --mode forward_backward
---require-sxm --run-name cg-1-captured-sxm`.
+The optional matched eight-GPU comparison verifies distributed equivalence again
+on its own allocation before either timed run. The eight-GPU preflight enforces
+microbatch 16, sequence 2048, global batch 524288, two accumulation microsteps,
+horizon 2317, warmup 300 and cap 150. Both modes retain BF16, seed 42, depth 12,
+width 768, fused attention, and the same explicit optimizer profile. Evaluation,
+generation and all model/optimizer checkpoint saves are disabled.
 
-All four default to A100-80GB, BF16, seed 42, depth 12, width 768, sequence
-length 2048, device batch 16, global batch 524288 tokens, fused attention and
-`configs/normuon.yaml`. Accumulation is 16 microbatches on one GPU and four on
-four GPUs. The scheduler horizon stays at 2317 with 300 warmup steps; each run
-stops at 150 updates. Evaluation, generation and all checkpoint saves (including
-the final save) are disabled. Compiler-managed graphs are disabled in both
-modes. Each rank gets a fresh compiler cache for that run. Apply any training
-overrides identically to all four commands.
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 8 --mode paired --require-sxm --run-name cg-8-matched-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy --n-acc-steps 2
+```
 
-The launcher reuses `gpt-lab-cache` and `gpt-lab-runs` Modal volumes and the
-`gpt-lab` secret with `HF_TOKEN` and `WANDB_API_KEY`. Data and tokenizer must
-already be cached; a CPU preflight checks them before requesting GPUs. W&B
-defaults match the reference launcher; pass `--board dummy` consistently to
-disable W&B logging.
+Paired runs execute sequentially within one GPU worker, keeping the allocation
+and topology fixed. Each mode reconstructs initial state in a fresh process from
+the same seed and restarts the deterministic dataloader at its initial position.
+Before capture starts, the second process must match the first process's model,
+optimizer, RNG, first-input hashes and initial data position. Final data positions
+and execution settings must also match before a paired comparison is accepted.
+This is a verified fresh-process reset, not a continuation from the first run.
+Each timed process has a fresh compiler cache. Compiler build threads are fixed
+to one per rank to bound concurrent compilation on eight ranks.
 
-Results appear in the runs volume under `/runs/<run-name>/`: `launch.json`,
-`train.log`, per-rank `rank_N.json` and `summary.json`. Compare
-`steady_global_tokens_per_second` for updates 11–150 within each GPU count.
-This uses the slowest rank's full loop duration, including logging and metrics;
-`steady_mean_train_step_ms` separately reports the trainer's narrower step
-timer. Startup reports setup before the first update, time through the first
-update, and capture setup (compilation, warmup and recording together). Modal
-image build and provisioning time are outside these training timers and remain
-in Modal's logs. These short runs measure throughput, not convergence quality.
+Collect the separate short profile with the same model/data settings:
+
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 8 --mode paired --profile --require-sxm --run-name cg-8-profile-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy --n-acc-steps 2
+```
+
+Profile jobs preserve the 2317/300 scheduler and use a separate 14-update
+execution cap. PyTorch CPU/CUDA profiling waits ten updates, warms up one, then
+records three. Open `trace_rank_N.json` in Perfetto or a Chrome trace viewer to
+inspect host gaps, CUDA launches and kernel activities. `kernels_rank_N.txt`
+contains the top 40 entries by self device time. Regions label batch preparation,
+accumulated updates and optimizer/communication. Profiling overhead is excluded
+from all throughput comparisons by using separate jobs and profile-only summaries.
+
+The runs volume stores `/runs/<run-name>/comparison.json`, `equivalence.log`,
+per-rank equivalence JSON, `gpus.csv` (all GPU names/UUIDs/bus IDs/memory/driver),
+and `topology.txt` (`nvidia-smi topo -m`). Execution-mode directories `disabled/`
+and `forward_backward/` contain launch settings, logs, per-rank metrics and
+`summary.json`. Timed summaries report global tokens/s over updates 11–150,
+per-rank startup/steady peak allocated and reserved memory, trainer elapsed time
+including capture setup, and complete subprocess elapsed time including model
+initialization, compilation, data setup and shutdown. The root comparison also
+reports equivalence time and total worker elapsed time. Modal image build and
+provisioning remain outside worker timers and appear in Modal logs.
+
+Use new run names for retries. `--require-sxm` rejects allocations other than
+`NVIDIA A100-SXM4-80GB` before checking/training; it cannot force Modal placement.
+`--mode disabled` and `--mode forward_backward` remain available for individual
+runs, and `--gpus` accepts 1, 4 or 8. `--mode verify` needs no cached dataset.
+`--detach` submits one worker in the background. These diagnostics do not measure
+convergence quality; timing and profile claims await real user-launched results.
 
 #### Customizing the trainer
 

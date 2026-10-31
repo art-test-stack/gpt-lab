@@ -1,4 +1,6 @@
 import copy
+import importlib.util
+from pathlib import Path
 
 import pytest
 import torch
@@ -7,6 +9,36 @@ from gpt_lab.train.cuda_graph import CapturedForwardBackward
 from gpt_lab.train.trainer import Trainer
 from gpt_lab.utils.distributed import ComputeContext
 from gpt_lab.utils.schemas import TrainerConfig
+
+
+spec = importlib.util.spec_from_file_location(
+    "cuda_graph_equivalence", Path(__file__).parents[1] / "scripts/benchmark/cuda_graph_equivalence.py"
+)
+equivalence = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(equivalence)
+
+
+def test_nested_equivalence_reports_tensor_and_counter_mismatches():
+    errors, maxima = [], {}
+    equivalence.compare_values(
+        {"momentum": torch.tensor([1., 2.]), "step": 2},
+        {"momentum": torch.tensor([1., 3.]), "step": 3},
+        "optimizer", errors, maxima, rtol=1e-5, atol=1e-6,
+    )
+    assert len(errors) == 2
+    assert maxima["optimizer"] == 1
+    with pytest.raises(RuntimeError, match="Real CUDA is required"):
+        equivalence.run_check("configs/normuon.yaml", ComputeContext(device=torch.device("cpu")), ".")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA capture")
+def test_production_normuon_compiled_capture_equivalence(tmp_path):
+    from gpt_lab.utils.distributed import get_comp_info
+    torch.manual_seed(17)
+    result = equivalence.run_check("configs/normuon.yaml", get_comp_info("cuda"), tmp_path,
+                                   n_acc_steps=2, updates=6, attn_impl="fused")
+    assert result["passed"]
+    assert {"loss", "gradients", "parameters", "optimizer"} <= result["max_absolute_errors"].keys()
 
 
 def test_capture_is_opt_in_and_requires_cuda():
@@ -36,6 +68,7 @@ def test_compiled_capture_matches_multiple_updates_and_resume(n_acc_steps):
         )
 
     compiled_loss = loss_fn(replayed)
+    reference_loss = loss_fn(eager)
     batch = (torch.randn(2, 4, device=device), torch.randn(2, 3, device=device))
     before = [p.detach().clone() for p in replayed.parameters()]
     rng_before = torch.cuda.get_rng_state(device)
@@ -53,7 +86,7 @@ def test_compiled_capture_matches_multiple_updates_and_resume(n_acc_steps):
             # Reused loader storage must be copied before the next replay.
             batch[0].normal_()
             batch[1].normal_()
-            expected = (eager(batch[0]) - batch[1]).square().mean() / n_acc_steps
+            expected = reference_loss(batch) / n_acc_steps
             expected.backward()
             actual = graph.replay(batch)
             torch.testing.assert_close(actual, expected.detach(), rtol=1e-5, atol=1e-6)

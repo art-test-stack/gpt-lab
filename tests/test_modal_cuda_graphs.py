@@ -2,6 +2,9 @@ import importlib.util
 from pathlib import Path
 import shlex
 import sys
+import copy
+import json
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -16,8 +19,8 @@ launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
 
 
-@pytest.mark.parametrize("gpus", [1, 4])
-@pytest.mark.parametrize("mode", ["disabled", "forward_backward"])
+@pytest.mark.parametrize("gpus", [1, 4, 8])
+@pytest.mark.parametrize("mode", ["disabled", "forward_backward", "paired", "verify"])
 def test_dry_run_builds_matched_native_commands(monkeypatch, capsys, gpus, mode):
     monkeypatch.setattr(launcher, "resolve_source", lambda _: ("https://example.com/repo", "exp/cuda-graphs", "a" * 40))
     monkeypatch.setitem(sys.modules, "modal", None)  # Dry run must not load Modal.
@@ -27,7 +30,7 @@ def test_dry_run_builds_matched_native_commands(monkeypatch, capsys, gpus, mode)
     assert "Required device: NVIDIA A100-SXM4-80GB" in output
     command = output.splitlines()[1]
     settings = build_parser().parse_args(shlex.split(command)[1:])
-    assert settings.cuda_graph_mode == mode
+    assert settings.cuda_graph_mode == (mode if mode in ("disabled", "forward_backward") else "disabled")
     assert settings.optim_config_path == "configs/normuon.yaml"
     assert settings.stop_after_step == 150
     assert settings.num_steps == 2317 and settings.warmup_steps == 300
@@ -56,8 +59,16 @@ def test_gpu_probe_enforces_opt_in_sxm_guard(monkeypatch, names, require_sxm, ac
             exec(probe, {})
 
 
+def test_profile_is_a_separate_short_job(monkeypatch, capsys):
+    monkeypatch.setattr(launcher, "resolve_source", lambda _: ("repo", "branch", "a" * 40))
+    monkeypatch.setitem(sys.modules, "modal", None)
+    launcher.main(["--dry-run", "--gpus", "8", "--mode", "paired", "--profile"])
+    assert "14 updates per mode; record three updates" in capsys.readouterr().out
+
+
 def test_summary_excludes_startup_and_uses_global_tokens_once():
     ranks = [dict(
+        rank=rank,
         n_steps=2317, completed_steps=150, mode="forward_backward", dtype="torch.bfloat16",
         device_name="A100", n_acc_steps=4, device_batch_size=16,
         total_batch_size=524288, parameter_count=100,
@@ -79,3 +90,78 @@ def test_summary_excludes_startup_and_uses_global_tokens_once():
     ranks[1]["completed_steps"] = 149
     with pytest.raises(RuntimeError, match="Ranks disagree"):
         launcher.summarize(ranks)
+
+
+def test_eight_gpu_preflight_preserves_matched_settings(monkeypatch, tmp_path):
+    monkeypatch.setattr(launcher, "REPO", Path(__file__).parents[1])
+    monkeypatch.setattr(launcher, "PYTHON", sys.executable)
+    monkeypatch.setattr(launcher, "RUNS", tmp_path)
+    arguments = launcher.cli_defaults(launcher.DEFAULT_TRAIN)
+    settings = launcher.check_inputs(arguments, "new-run", 8, check_data=False)
+    assert settings["total_batch_size"] // (8 * settings["device_batch_size"] * settings["max_seq_len"]) == 2
+    with pytest.raises(ValueError, match="8-GPU comparison"):
+        launcher.check_inputs([*arguments, "--num-steps", "150"], "new-run", 8, check_data=False)
+
+
+def initial_rank(rank=0):
+    return dict(rank=rank, world_size=1, initial_model_sha256="model",
+                initial_optimizer_sha256="optimizer", initial_rng_sha256="rng",
+                first_batch_sha256="inputs", initial_data_position={"offset": 0},
+                final_data_position={"offset": 150}, n_steps=2317, completed_steps=150,
+                n_acc_steps=16, device_name="NVIDIA A100-SXM4-80GB", dtype="torch.bfloat16",
+                total_batch_size=524288, device_batch_size=16, parameter_count=422314440,
+                torch_version="2.9.1", cuda_version="12.8")
+
+
+@pytest.mark.parametrize("field", ["initial_model_sha256", "initial_optimizer_sha256",
+                                  "first_batch_sha256", "final_data_position", "device_name"])
+def test_pair_requires_identical_reset_and_data(field):
+    left = [initial_rank()]
+    right = copy.deepcopy(left)
+    launcher.verify_pair(left, right)
+    right[0][field] = "different"
+    with pytest.raises(RuntimeError, match=field):
+        launcher.verify_pair(left, right)
+
+
+@pytest.mark.parametrize("gate_passes", [False, True])
+def test_same_allocation_pair_is_blocked_by_failed_equivalence(monkeypatch, tmp_path, gate_passes):
+    monkeypatch.setattr(launcher, "REPO", tmp_path)
+    monkeypatch.setattr(launcher, "RUNS", tmp_path / "runs")
+    monkeypatch.setattr(launcher, "git", lambda directory, *args: "sha" if args[0] == "rev-parse" else "")
+    monkeypatch.setattr(launcher.subprocess, "check_output", lambda *args, **kwargs: "test topology")
+    events = []
+    def run(command, **kwargs):
+        if "scripts/benchmark/cuda_graph_equivalence.py" not in " ".join(command):
+            events.append("probe")
+            return
+        events.append("equivalence")
+        if not gate_passes:
+            raise subprocess.CalledProcessError(1, command)
+        directory = Path(command[command.index("--output-dir") + 1])
+        directory.mkdir(parents=True)
+        (directory / "rank_0.json").write_text(json.dumps(dict(passed=True, world_size=1)))
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    def train_one(arguments, name, sha, branch, env, settings, world, volume, directory):
+        mode = settings["cuda_graph_mode"]
+        events.append(mode)
+        if mode == "forward_backward":
+            assert env["GPTLAB_EXPECTED_INITIAL"] == str(directory.parent / "disabled")
+        directory.mkdir()
+        (directory / "rank_0.json").write_text(json.dumps(initial_rank()))
+        (directory / "summary.json").write_text(json.dumps(dict(mode=mode)))
+    monkeypatch.setattr(launcher, "train_one", train_one)
+    env = dict(GPTLAB_DTYPE="bfloat16", GPTLAB_REQUIRE_SXM="1", GPTLAB_PROFILE="0",
+               GPTLAB_DIAGNOSTIC_MODE="paired")
+    settings = launcher.DEFAULT_TRAIN | {"n_acc_steps": -1}
+    volume = SimpleNamespace(commit=lambda: None)
+    if gate_passes:
+        result = launcher.train([], "pair", "sha", "branch", env, settings, 1, volume)
+        assert result["identical_initial_state_and_data_position"]
+        assert events == ["probe", "equivalence", "disabled", "forward_backward"]
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            launcher.train([], "pair", "sha", "branch", env, settings, 1, volume)
+        assert events == ["probe", "equivalence"]
+        result = json.loads((tmp_path / "runs/pair/comparison.json").read_text())
+        assert result["status"] == "failed" and "results" not in result
