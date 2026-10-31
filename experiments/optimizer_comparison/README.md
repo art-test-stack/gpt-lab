@@ -61,6 +61,8 @@ and spectral NorMuon sequentially. It stops on any validation or training failur
 No more than eight GPUs are requested concurrently. The jobs use the existing
 `gpt-lab` secret (`HF_TOKEN`, `WANDB_API_KEY`) and `gpt-lab-cache`/`gpt-lab-runs`
 volumes in Modal's `main` environment; training data is not downloaded.
+Tracking uses the existing Forge W&B host/entity and `trainbase_ic1` project.
+Each W&B run name includes the launch prefix to keep repeated launches distinct.
 
 The hardware gate checks all eight ranks: compiled spectral zero/near-rank-one,
 tall/wide cases; NCCL owner states versus averaged local updates; same-variant

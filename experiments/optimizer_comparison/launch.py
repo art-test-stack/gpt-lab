@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from experiments.optimizer_comparison.recipe import COMMON, SELECTION, arguments
+from experiments.optimizer_comparison.recipe import COMMON, SELECTION, TRACKING, arguments
 from runs.modal_trainbase import resolve_source
 
 
@@ -22,7 +22,7 @@ def job_commands(root, mode):
             directory = root/variant["model_name"]
             commands.append(torchrun + ["experiments/optimizer_comparison/train_selected.py",
                 "--output", str(directory), "--expected-initial", str(root/SELECTION["variants"][0]["model_name"]),
-                "--", *arguments(variant, directory.name, directory)])
+                "--", *arguments(variant, f"{root.name}-{directory.name}", directory)])
     return commands
 
 
@@ -48,12 +48,13 @@ def worker(run_name, mode, sha, volume):
     import json
     sys.path.insert(0, "/opt/gpt-lab")
     from experiments.optimizer_comparison.launch import job_commands, run_commands
+    from experiments.optimizer_comparison.recipe import TRACKING
     root = Path("/runs")/run_name
     root.mkdir(exist_ok=False)
     env = os.environ | dict(GPTLAB_DTYPE="bfloat16", GPTLAB_CACHE_DIR="/cache/gpt_lab",
         PYTHONUNBUFFERED="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
         TORCHINDUCTOR_COMPILE_THREADS="1", PYTORCH_ALLOC_CONF="expandable_segments:True",
-        GPTLAB_SELECTED_SHA=sha)
+        GPTLAB_SELECTED_SHA=sha) | TRACKING
     record = dict(sha=sha, mode=mode, status="starting", commands=job_commands(root, mode))
     started = time.perf_counter()
     try:
@@ -98,7 +99,7 @@ def main(argv=None):
         parser.error("run-name must contain 1–70 letters/digits/_/-")
     commands = job_commands(Path("/runs")/args.run_name, args.mode)
     print(json.dumps(dict(sha=args.sha, branch="exp/anvil-normuon", gpu="H100:8",
-                         mode=args.mode, settings=COMMON, resolved_plan=SELECTION["resolved_plan"], commands=commands), indent=2), flush=True)
+                         mode=args.mode, settings=COMMON, tracking=TRACKING, resolved_plan=SELECTION["resolved_plan"], commands=commands), indent=2), flush=True)
     if args.dry_run:
         return
     repository, branch, sha = resolve_source(ROOT)

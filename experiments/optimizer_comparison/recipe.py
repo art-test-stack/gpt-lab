@@ -4,6 +4,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SELECTION = json.loads((Path(__file__).with_name("selected-runs.json")).read_text())
+TRACKING = dict(WANDB_ENTITY="art-test-stack-ntnu", WANDB_PROJECT="trainbase_ic1",
+                WANDB_BASE_URL="https://api.forge.coreweave.com",
+                WANDB_APP_URL="https://forge.coreweave.com/wandb", WANDB_MODE="online")
+
 # Freeze unspecified settings from the consolidated CLI, not historical diagnostics.
 COMMON = dict(ds_name="climbmix-base", tokenizer_model="gpt2", random_seed=42,
               device="cuda", depth=20, aspect_ratio=64, d_head=128,

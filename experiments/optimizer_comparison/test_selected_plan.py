@@ -22,6 +22,7 @@ def test_selected_commands_match_native_parser_and_selection():
         for key, value in recipe.COMMON.items():
             assert settings[key] == value
         assert settings["model_name"] == variant["model_name"]
+        assert settings["run_name"] == f"check-{variant['model_name']}"
         assert settings["optim_config_path"] == variant["optimizer_config"]
         assert settings["stop_after_step"] is None
         assert settings["num_steps"] == settings["target_flops"] == settings["target_time"] == -1
@@ -45,6 +46,7 @@ def test_dry_run_is_offline(monkeypatch, capsys):
     launch.main(["--sha", "e"*40, "--run-name", "offline", "--mode", "train", "--dry-run"])
     report = json.loads(capsys.readouterr().out)
     assert report["gpu"] == "H100:8" and len(report["commands"]) == 4
+    assert report["tracking"]["WANDB_BASE_URL"] == "https://api.forge.coreweave.com"
 
 
 def test_resolved_parameter_horizon_and_fingerprint():
