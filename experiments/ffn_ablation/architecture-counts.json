@@ -1,0 +1,32 @@
+{
+  "A": {
+    "parameters": 422314440,
+    "ffn_parameters_per_layer": 7077888,
+    "ffn_forward_matrix_flops_per_token": 169869312,
+    "ffn_training_matrix_flops_per_token": 509607936,
+    "useful_model_flops_per_token": 976837536.0,
+    "dense_projection_training_flops_per_token": 911280672,
+    "useful_causal_attention_training_flops_per_token": 65556864.0,
+    "flops_convention": "forward + backward, 2 FLOPs/FMA; dense projections including value gates and padded head; inclusive causal attention pairs; excludes elementwise, normalization, optimizer, conversion, padding of GEMMs and recomputation"
+  },
+  "B": {
+    "parameters": 422314440,
+    "ffn_parameters_per_layer": 7077888,
+    "ffn_forward_matrix_flops_per_token": 169869312,
+    "ffn_training_matrix_flops_per_token": 509607936,
+    "useful_model_flops_per_token": 976837536.0,
+    "dense_projection_training_flops_per_token": 911280672,
+    "useful_causal_attention_training_flops_per_token": 65556864.0,
+    "flops_convention": "forward + backward, 2 FLOPs/FMA; dense projections including value gates and padded head; inclusive causal attention pairs; excludes elementwise, normalization, optimizer, conversion, padding of GEMMs and recomputation"
+  },
+  "C": {
+    "parameters": 394002888,
+    "ffn_parameters_per_layer": 4718592,
+    "ffn_forward_matrix_flops_per_token": 113246208,
+    "ffn_training_matrix_flops_per_token": 339738624,
+    "useful_model_flops_per_token": 806968224.0,
+    "dense_projection_training_flops_per_token": 741411360,
+    "useful_causal_attention_training_flops_per_token": 65556864.0,
+    "flops_convention": "forward + backward, 2 FLOPs/FMA; dense projections including value gates and padded head; inclusive causal attention pairs; excludes elementwise, normalization, optimizer, conversion, padding of GEMMs and recomputation"
+  }
+}
