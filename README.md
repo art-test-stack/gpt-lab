@@ -467,6 +467,10 @@ current Muon profile. Existing defaults and Muon checkpoints retain their behavi
 Choose NorMuon for a fresh run; changing a saved group's optimizer name is not a
 checkpoint conversion because normalization state layouts can differ.
 
+The isolated [communication experiment](docs/communication-buckets.md) compares
+the original transport, fixed buckets, a packing pipeline, and backward hooks.
+It includes user-launched NCCL checks and size sweeps; GPU speedups are unverified.
+
 ```yaml
 default:
   opt: "adamw"

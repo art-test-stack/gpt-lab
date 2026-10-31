@@ -173,7 +173,9 @@ class MuonStrategy(OptimizerStrategy):
             )
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         
-        updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        updated_params = info.get("updated_params")
+        if updated_params is None:
+            updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         
         if num_owned > 0:
             owned_params = [params[start_idx + i] for i in range(num_owned)]

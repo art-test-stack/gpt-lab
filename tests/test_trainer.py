@@ -333,6 +333,8 @@ def test_train_step_matches_accumulated_update_and_preserves_prefetch_state(tmp_
     trainer.weight_decay_schedule = lambda step: 0.25
     trainer.optimizer.update_hyperparams = Mock()
     trainer.optimizer_step = Mock(wraps=trainer.optimizer_step)
+    backward_microsteps = []
+    trainer.optimizer.begin_backward_communication = backward_microsteps.append
     batches = [dict(features=torch.full((2, 2), float(i + 1)),
                     targets=torch.zeros(2, 2), tokens=3 + i,
                     state=DataLoaderState(epoch=i + 1, offset_in_row_group=i))
@@ -373,6 +375,7 @@ def test_train_step_matches_accumulated_update_and_preserves_prefetch_state(tmp_
         next_batch, metrics = trainer.train_step(train_iter, batch, should_log_step=True)
 
     assert events == ["prepare", "prepare", "isfinite", "host_read"]
+    assert backward_microsteps == [False, True]
 
     torch.testing.assert_close(model.weight, reference.weight)
     assert model.weight.grad is None
@@ -392,6 +395,18 @@ def test_train_step_matches_accumulated_update_and_preserves_prefetch_state(tmp_
     assert next(train_iter) is batches[3]
     # Preserve the existing epoch update from the prefetched batch.
     assert trainer.state.n_epochs == batches[2]["state"].epoch
+
+
+@pytest.mark.parametrize("unsafe", ["scaler", "capture"])
+def test_backward_communication_rejects_incompatible_training_modes(tmp_path, unsafe):
+    trainer, _, _ = _make_trainer(tmp_path, compute_dtype=torch.float32)
+    trainer.optimizer.communication = SimpleNamespace(mode="backward")
+    if unsafe == "scaler":
+        trainer.scaler = object()
+    else:
+        trainer.config = trainer.config.model_copy(update={"cuda_graph_mode": "forward_backward"})
+    with pytest.raises(ValueError, match="unscaled gradients and disabled CUDA capture"):
+        trainer.train_step(iter(()), None, should_log_step=False)
 
 
 @pytest.mark.fast
