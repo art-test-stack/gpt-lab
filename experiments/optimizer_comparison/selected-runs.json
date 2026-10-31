@@ -84,7 +84,7 @@
   "pending_before_training": [
     "Run prepared eight-H100 CUDA/NCCL gate: compiled FA3, FP8 forward/BF16 backward dispatch, finite updates and batch-32 memory",
     "Pass compiled spectral zero/near-rank-one/tall/wide checks, owner-state comparisons and same-variant disk resume",
-    "Launch commands must use the final published integration SHA; train mode repeats the gate before any long run"
+    "Launch commands must use the final published integration SHA; each direct selected run executes the gate before training"
   ],
   "paid_compute_launched": false,
   "frozen_defaults": {
@@ -116,11 +116,12 @@
     "Native ReLU-squared and SwiGLU FP8 conversion preserves Parameter identities and checkpoint keys",
     "Post-update evaluation and periodic checkpoint counters, including final evaluation",
     "Independent best BPB/CORE checkpoint saving, with zero-based directory compatibility",
-    "Offline selected-run plan, pinned sequential Modal launcher and fail-closed hardware gate"
+    "Offline selected-run plan, pinned independent direct Modal commands and fail-closed hardware gate"
   ],
   "entrypoints": {
-    "launcher": "experiments/optimizer_comparison/launch.py",
+    "launcher": "runs/modal_trainbase.py",
     "hardware_gate": "experiments/optimizer_comparison/check_h100.py",
-    "production_runner": "experiments/optimizer_comparison/train_selected.py"
+    "native_training": "gpt-lab train auto",
+    "reporting_checks": "experiments/optimizer_comparison/training_checks.py"
   }
 }

@@ -64,3 +64,17 @@ embedding tying, spectral/profile checks and offline launcher plans). The known
 socket-dependent distributed-metrics test was deselected. Entrypoint compilation
 and `git diff --check` passed. The eight-H100 gate is prepared but has not run;
 CUDA/NCCL, native dispatch, memory fit and learning quality remain unverified.
+
+Direct-launch correction: the former aggregate launcher depended on an ignored,
+untracked personal `runs/modal_trainbase.py`, so the remote preflight could not
+import it. The requested native entry point is now tracked. All three launches
+use that file directly with explicit training flags; the aggregate executable
+was removed. No `--full-run` or optimizer-selection flag was added. The implicit
+15-update cap was removed in favor of the native unset default. Each selected
+run performs the hardware gate inside its allocation before native CLI training.
+
+Direct-launch validation: eight focused checks passed, including all three
+literal README commands, cap handling, failed-gate ordering, existing diagnostic
+plans, and isolated preflight from tracked files with no personal launcher files.
+The native CLI parser was exercised through the project interpreter. Hardware
+validation has not been rerun and no paid compute was launched.

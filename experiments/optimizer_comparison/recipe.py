@@ -82,3 +82,23 @@ def storage_summary(model):
         key = str(parameter.dtype)
         counts[key] = counts.get(key, 0)+parameter.numel()
     return counts
+
+
+def selected_run(settings, run_name, world_size):
+    variant = next((v for v in SELECTION["variants"] if v["model_name"] == settings["model_name"]), None)
+    if variant is None:
+        return None
+    for key, value in COMMON.items():
+        if settings[key] != value:
+            raise ValueError(f"Selected recipe mismatch for {key}: expected {value!r}, got {settings[key]!r}")
+    if world_size != 8 or settings["stop_after_step"] is not None:
+        raise ValueError("Selected runs require eight GPUs and no execution cap")
+    if settings["optim_config_path"] != variant["optimizer_config"]:
+        raise ValueError("Selected model name and optimizer profile differ")
+    if not run_name.startswith(variant["model_name"] + "-"):
+        raise ValueError("Selected run names must start with the model name followed by a shared comparison suffix")
+    suffix = run_name[len(variant["model_name"]):]
+    index = SELECTION["variants"].index(variant)
+    previous = SELECTION["variants"][max(0, index - 1)]["model_name"]
+    return dict(reference_run=SELECTION["variants"][0]["model_name"] + suffix,
+                predecessor_run=previous + suffix)

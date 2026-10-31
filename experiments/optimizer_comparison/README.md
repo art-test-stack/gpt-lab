@@ -41,28 +41,78 @@ Improved BPB and CORE checkpoints are saved independently; the final checkpoint
 is resumable. Checkpoint directories retain zero-based indices; reports include
 completed-update counts. No checkpoint retention/deletion policy is introduced.
 
-Run from a clean, published `exp/anvil-normuon` checkout. Replace `PUBLISHED_SHA`
-with its full commit SHA; the launcher verifies it against the live branch.
-Offline planning needs no Modal import or network:
+Run from a clean, published `exp/anvil-normuon` checkout, through the tracked
+`runs/modal_trainbase.py` entry point. Replace `PUBLISHED_SHA` with the full commit
+SHA. Run these **one at a time, in this order**, waiting for completion before
+starting the next. Each command allocates eight H100s and runs the mandatory
+hardware gate before training. No aggregate wrapper or `--full-run` flag is used.
+
+The launcher no longer injects a 15-update cap. The native default is no cap;
+use `--stop-after-step N` explicitly for ordinary short diagnostics. These selected
+production commands leave the cap unset. Their model/run names identify the
+reviewed recipe; the shared `-v2` suffix lets later jobs locate the Muon reference
+and compare initial model, seeded Torch CPU/CUDA RNG, first inputs and data position.
+Change that suffix consistently for a fresh comparison.
 
 ```bash
-python experiments/optimizer_comparison/launch.py --sha PUBLISHED_SHA --run-name selected-h100-check-v1 --mode validate --dry-run
+uv run --no-project --python 3.12 --with modal==1.6.2 python runs/modal_trainbase.py \
+  --sha PUBLISHED_SHA --gpu H100 --gpus 8 --dtype bfloat16 \
+  --cpu 32 --memory 262144 --timeout 86400 --checkpoints \
+  --run-name ic1-d16-d20-muon-v2 -- \
+  --model-name ic1-d16-d20-muon --optim-config-path experiments/optimizer_comparison/configs/muon.yaml \
+  --ds-name climbmix-base --tokenizer-model gpt2 --random-seed 42 --device cuda \
+  --depth 20 --aspect-ratio 64 --d-head 128 --act-func relu_squared \
+  --attn-impl fa3 --max-seq-len 2048 --tie-embeddings 'embs;value_embs;head' \
+  --window-pattern SSSL --window-size 512 --softcap 18.0 \
+  --device-batch-size 32 --total-batch-size 524288 --n-acc-steps 1 \
+  --num-steps -1 --target-param-data-ratio 10 --target-flops -1 --target-time -1 \
+  --warmup-steps 40 --warmdown-ratio 0.65 --final-lr-frac 0.05 \
+  --fp8-ffn-forward --cuda-graph-mode disabled \
+  --eval-bpb-every 400 --n-bpb-tokens 41943040 --eval-core-every 400 --n-core-tokens 500 \
+  --save-on-best --save-every 0 --sample-every 0 --log-every 10 --board wandb
 ```
-
-Only the following user-launched commands allocate paid GPUs:
 
 ```bash
-uv run --no-project --python 3.12 --with modal==1.6.2 python experiments/optimizer_comparison/launch.py --sha PUBLISHED_SHA --run-name selected-h100-check-v1 --mode validate
-uv run --no-project --python 3.12 --with modal==1.6.2 python experiments/optimizer_comparison/launch.py --sha PUBLISHED_SHA --run-name selected-h100-training-v1 --mode train --detach
+uv run --no-project --python 3.12 --with modal==1.6.2 python runs/modal_trainbase.py \
+  --sha PUBLISHED_SHA --gpu H100 --gpus 8 --dtype bfloat16 \
+  --cpu 32 --memory 262144 --timeout 86400 --checkpoints \
+  --run-name ic1-d16-d20-normuon-v2 -- \
+  --model-name ic1-d16-d20-normuon --optim-config-path experiments/optimizer_comparison/configs/a_normuon.yaml \
+  --ds-name climbmix-base --tokenizer-model gpt2 --random-seed 42 --device cuda \
+  --depth 20 --aspect-ratio 64 --d-head 128 --act-func relu_squared \
+  --attn-impl fa3 --max-seq-len 2048 --tie-embeddings 'embs;value_embs;head' \
+  --window-pattern SSSL --window-size 512 --softcap 18.0 \
+  --device-batch-size 32 --total-batch-size 524288 --n-acc-steps 1 \
+  --num-steps -1 --target-param-data-ratio 10 --target-flops -1 --target-time -1 \
+  --warmup-steps 40 --warmdown-ratio 0.65 --final-lr-frac 0.05 \
+  --fp8-ffn-forward --cuda-graph-mode disabled \
+  --eval-bpb-every 400 --n-bpb-tokens 41943040 --eval-core-every 400 --n-core-tokens 500 \
+  --save-on-best --save-every 0 --sample-every 0 --log-every 10 --board wandb
 ```
 
-Training mode repeats validation on its allocation, then runs Muon, NorMuon,
-and spectral NorMuon sequentially. It stops on any validation or training failure.
-No more than eight GPUs are requested concurrently. The jobs use the existing
-`gpt-lab` secret (`HF_TOKEN`, `WANDB_API_KEY`) and `gpt-lab-cache`/`gpt-lab-runs`
-volumes in Modal's `main` environment; training data is not downloaded.
-Tracking uses the existing Forge W&B host/entity and `trainbase_ic1` project.
-Each W&B run name includes the launch prefix to keep repeated launches distinct.
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python runs/modal_trainbase.py \
+  --sha PUBLISHED_SHA --gpu H100 --gpus 8 --dtype bfloat16 \
+  --cpu 32 --memory 262144 --timeout 86400 --checkpoints \
+  --run-name ic1-d16-d20-normuon-spectral-v2 -- \
+  --model-name ic1-d16-d20-normuon-spectral --optim-config-path experiments/optimizer_comparison/configs/b_spectral.yaml \
+  --ds-name climbmix-base --tokenizer-model gpt2 --random-seed 42 --device cuda \
+  --depth 20 --aspect-ratio 64 --d-head 128 --act-func relu_squared \
+  --attn-impl fa3 --max-seq-len 2048 --tie-embeddings 'embs;value_embs;head' \
+  --window-pattern SSSL --window-size 512 --softcap 18.0 \
+  --device-batch-size 32 --total-batch-size 524288 --n-acc-steps 1 \
+  --num-steps -1 --target-param-data-ratio 10 --target-flops -1 --target-time -1 \
+  --warmup-steps 40 --warmdown-ratio 0.65 --final-lr-frac 0.05 \
+  --fp8-ffn-forward --cuda-graph-mode disabled \
+  --eval-bpb-every 400 --n-bpb-tokens 41943040 --eval-core-every 400 --n-core-tokens 500 \
+  --save-on-best --save-every 0 --sample-every 0 --log-every 10 --board wandb
+```
+
+Append `--dry-run` before `--` to verify source and print a command without
+contacting Modal or launching compute. The image installs the FP8 extra when
+`--fp8-ffn-forward` is present. Jobs use the existing `gpt-lab` secret, volumes and
+Forge W&B defaults. Muon must finish at the same SHA before the NorMuon/spectral
+preflights allow GPU allocation. The three commands are independent blocking launches.
 
 The hardware gate checks all eight ranks: compiled spectral zero/near-rank-one,
 tall/wide cases; NCCL owner states versus averaged local updates; same-variant
@@ -75,9 +125,8 @@ acceptance checks. Resume comparisons use rtol 1e-5 / atol 1e-6, not bitwise cla
 The full-model gate uses synthetic tokens and does not establish learning quality.
 
 Artifacts are on `gpt-lab-runs/<run-name>/`: validation reports and traces under
-`validation/`, process logs and `launch.json` at the root, and each variant's
-models, W&B files, `initial_rank_N.json`, and `selected_result.json` in its own
-folder. Initial model/RNG and first data batch/position fingerprints must match
+`validation/`, `validation.log`, `train.log`, `launch.json`, models, W&B files,
+`initial_rank_N.json` and `selected_result.json`. Initial model/RNG and first data batch/position fingerprints must match
 before later variants execute their first update. The result report records the
 resolved horizon, rounded/actual tokens, storage policy and best/final paths.
 Validation checkpoints are small owner fixtures plus one full-model snapshot;

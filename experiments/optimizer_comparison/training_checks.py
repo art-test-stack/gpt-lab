@@ -1,22 +1,9 @@
-"""Production CLI with matched-initial-state checks and a final selection report."""
-import argparse
+"""Selected-run checks installed by the native Modal training entry point."""
 import json
 import os
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--expected-initial", type=Path, required=True)
-    args, training = parser.parse_known_args()
-    if training[:1] == ["--"]:
-        training = training[1:]
-    import torch
-    from gpt_lab.cli import main as cli
+def install(output, expected_initial):
     from gpt_lab.train.trainer import Trainer
     from gpt_lab.model.checkpoint import capture_rng_state
     from experiments.optimizer_comparison.check_h100 import fingerprint
@@ -30,18 +17,21 @@ def main():
             initial["first_payload"] = fingerprint(result[0])
             initial["data_position"] = result[1].model_dump() if result[1] else None
             rank_file = f"initial_rank_{self.config.comp_info.rank}.json"
-            expected_path = args.expected_initial/rank_file
-            if args.output != args.expected_initial:
+            expected_path = expected_initial/rank_file
+            if output != expected_initial:
                 expected = json.loads(expected_path.read_text())
                 if expected != initial:
                     raise RuntimeError("Initial model/RNG/data mismatch; stopping before first update")
-            (args.output/rank_file).write_text(json.dumps(initial, indent=2)+"\n")
+            (output/rank_file).write_text(json.dumps(initial, indent=2)+"\n")
         return result
 
     def train(self):
-        args.output.mkdir(parents=True, exist_ok=True)
+        output.mkdir(parents=True, exist_ok=True)
         storage = storage_summary(self.model)
-        initial.update(model=fingerprint(self.model.state_dict()), rng=fingerprint(capture_rng_state()))
+        rng = capture_rng_state()
+        # init_dist_groups seeds Torch CPU/CUDA, not Python or NumPy.
+        initial.update(model=fingerprint(self.model.state_dict()),
+                       rng=fingerprint({key: rng[key] for key in ("torch", "cuda")}))
         _, horizon = model_and_horizon()
         assert self.config.n_steps == horizon["horizon"]
         assert self.config.batch_lr_scale == horizon["base_training"]["batch_lr_scale"]
@@ -64,13 +54,5 @@ def main():
                           completed_updates=self.state.completed_steps, actual_tokens=self.state.n_tokens, horizon=horizon, parameter_storage=storage,
                           checkpoints={key:str(self.ckpt_manager.source_dir/f"checkpoint_step_{value:06d}") for key,value in selections.items()},
                           best_metrics=self.ckpt_state.model_dump(), config=self.config.model_dump(mode="json", exclude={"comp_info"}))
-            (args.output/"selected_result.json").write_text(json.dumps(report, indent=2, default=str)+"\n")
+            (output/"selected_result.json").write_text(json.dumps(report, indent=2, default=str)+"\n")
     Trainer.prepare_batch, Trainer.train = prepare, train
-    try:
-        cli(["train", "auto", *training])
-    finally:
-        Trainer.prepare_batch, Trainer.train = original_prepare, original_train
-
-
-if __name__ == "__main__":
-    main()
