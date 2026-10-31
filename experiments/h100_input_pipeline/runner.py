@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from recipe import (SHA, TRAIN_ARGS, ORDER, TOKENS, cpu_copy, tensor_hash,
+from recipe import (SHA, train_args, batch_config, BATCH_SIZES, ORDER, TOKENS, cpu_copy, tensor_hash,
                     tensor_dtypes, write, hardware_report, timing, restore_training_state)
 from cache import capture, Replay, cache_bytes, digest_batch, verify
 from tracing import FetchRange, ranges, summarize
@@ -52,8 +52,11 @@ def diagnostic(trainer, factory, output, warmup, measured, preflight):
     from gpt_lab.data.loader import DistDataLoader
     cfg = trainer.model.config
     assert (cfg.d_model,cfg.d_ffn,cfg.max_context,cfg.n_layers,cfg.act_func,cfg.attn_impl) == (768,3072,2048,12,"swiglu","fa3")
-    assert (trainer.config.n_steps,trainer.config.lr_warmup_steps,trainer.config.n_acc_steps,
-            trainer.config.device_batch_size,trainer.config.total_batch_size) == (2317,300,16,16,TOKENS)
+    resolved = batch_config(trainer.config,cfg.max_context)
+    print("Resolved production batch: " + json.dumps(resolved),flush=True)
+    assert resolved == preflight["resolved_batch"]
+    assert trainer.config.device_batch_size in BATCH_SIZES
+    assert (trainer.config.n_steps,trainer.config.lr_warmup_steps,trainer.config.total_batch_size) == (2317,300,TOKENS)
     assert trainer.dtype == torch.bfloat16 and trainer.scaler is None
     assert not trainer.config.fp8_ffn_forward and trainer.config.comp_info.world_size == 1
     model = trainer.model
@@ -63,7 +66,7 @@ def diagnostic(trainer, factory, output, warmup, measured, preflight):
     rng = capture_rng_state()
     parameter_dtypes = {name:str(t.dtype) for name,t in model.named_parameters()}
     identities = {name:id(t) for name,t in model.named_parameters()}
-    count = 16*(warmup+measured)+1  # include the production step's final prefetch
+    count = resolved["n_acc_steps"]*(warmup+measured)+1  # include the production step's final prefetch
     loader = factory()
     if type(loader) is not DistDataLoader:
         raise RuntimeError("Only the default production DistDataLoader is supported")
@@ -89,11 +92,13 @@ def diagnostic(trainer, factory, output, warmup, measured, preflight):
     overhead["replay_staging_cpu_bytes"] = replay.cpu.numel()*replay.cpu.element_size()
     overhead["replay_staging_gpu_bytes"] = sum(t.numel()*t.element_size() for t in (replay.gpu,replay.inputs,replay.targets))
     report = dict(production_sha=SHA, harness_sha=os.environ["INPUT_HARNESS_SHA"],
+                  resolved_batch=resolved, initial_optimizer_groups=optim["param_groups"],
                   model=cfg.model_dump(), trainer=trainer.config.model_dump(mode="json"),
                   torch=torch.__version__, cuda=torch.version.cuda, python=platform.python_version(),
                   gpu=torch.cuda.get_device_name(), gpu_properties=str(torch.cuda.get_device_properties(0)),
                   parameter_storage_dtypes=parameter_dtypes, optimizer_initial_dtypes=tensor_dtypes(optim),
                   initial_model_sha256=tensor_hash(weights.items()), data_order_sha256=order_hash,
+                  first_row_sha256=digest_batch((batches[0][0][0],batches[0][1][0])),
                   cached_microbatches=count, cache_memory=overhead, cache_capture_seconds=capture_seconds,
                   warmup_updates=warmup, measured_updates=measured, cpu_preflight=preflight,
                   order=ORDER, legs={})
@@ -171,7 +176,7 @@ def diagnostic(trainer, factory, output, warmup, measured, preflight):
             run_updates(trainer,traced,batch,warmup,2,profile=True)
         torch.cuda.synchronize()
     trace.export_chrome_trace(str(output/"trace.json"))
-    report["profile"] = summarize(output/"trace.json")
+    report["profile"] = summarize(output/"trace.json",expected_microsteps=resolved["n_acc_steps"])
     report["complete"] = True
     report["interpretation"] = "Production versus CPU cache removes reads/tokenization/packing; CPU versus GPU cache removes staging/transfer. Differences are interventions, not additive stage costs. Require repeat-control stability and trace evidence before attribution. All caches remain allocated in every timed leg; report their overhead separately."
     write(output/"report.json",report)
@@ -179,6 +184,7 @@ def diagnostic(trainer, factory, output, warmup, measured, preflight):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device-batch-size",type=int,choices=BATCH_SIZES,required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--preflight", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=25)
@@ -202,7 +208,7 @@ def main():
         return build(**kwargs)
     loader.build_dataloader = remember
     Trainer.train = lambda self:diagnostic(self,factories[0],args.output,args.warmup,args.measured,
-                                          json.loads(args.preflight.read_text()))
+                                          json.loads(args.preflight.read_text())["batches"][str(args.device_batch_size)])
     Trainer.save_checkpoint = lambda self:None
     CheckpointManager.save_training_config = lambda self,config:None
     # Auto-configuration normally autosaves metadata; keep it in report.json only.
@@ -217,7 +223,7 @@ def main():
           for folder in (Path(__file__).parent,Path(__file__).parent.parent/"h100_fp8_diagnostic") for path in folder.glob("*.py")})
     hardware_report(args.output/"nvidia-smi-start.xml")
     try:
-        cli([*TRAIN_ARGS,"--run-name",args.output.name,
+        cli([*train_args(args.device_batch_size),"--run-name",args.output.name,
              "--model-dir",".tmp/codex/h100-input-pipeline/models",
              "--board-dir",".tmp/codex/h100-input-pipeline/board",
              "--stop-after-step",str(args.warmup+args.measured)])

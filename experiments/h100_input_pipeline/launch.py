@@ -5,13 +5,17 @@ from pathlib import Path
 import re
 import subprocess
 
-from recipe import SHA, REPOSITORY, TRAIN_ARGS, ORDER
+from recipe import SHA, REPOSITORY, train_args, BATCH_SIZES, ORDER
 
 
 def gpu_worker(run_name, warmup, measured, runs, harness_sha):
     import os
+    import sys
+    import json
     from pathlib import Path
     import subprocess
+    sys.path.insert(0,"/opt/diagnostic/h100_input_pipeline")
+    from recipe import BATCH_SIZES, combine_reports
     root = Path("/runs")/run_name
     if not (root/"cpu-preflight.json").is_file():
         raise RuntimeError("CPU preflight must complete before GPU work")
@@ -19,21 +23,28 @@ def gpu_worker(run_name, warmup, measured, runs, harness_sha):
         raise FileExistsError("Refusing to overwrite an existing GPU run")
     environment = os.environ | {"GPTLAB_CACHE_DIR":"/cache/gpt_lab", "GPTLAB_DTYPE":"bfloat16",
         "PYTHONUNBUFFERED":"1", "OMP_NUM_THREADS":"1", "MKL_NUM_THREADS":"1",
-        "PYTORCH_ALLOC_CONF":"expandable_segments:True", "INPUT_HARNESS_SHA":harness_sha,
-        "TORCHINDUCTOR_CACHE_DIR":"/opt/gpt-lab/.tmp/codex/h100-input-pipeline/compiler_cache"}
-    command = ["/opt/gpt-lab/.venv/bin/python","/opt/diagnostic/h100_input_pipeline/runner.py",
-               "--output",str(root),"--preflight",str(root/"cpu-preflight.json"),
-               "--warmup",str(warmup),"--measured",str(measured)]
+        "PYTORCH_ALLOC_CONF":"expandable_segments:True", "INPUT_HARNESS_SHA":harness_sha}
     try:
         with (root/"worker.log").open("x",buffering=1) as log:
-            with subprocess.Popen(command,cwd="/opt/gpt-lab",env=environment,
-                                  stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True) as process:
-                for line in process.stdout:
-                    print(line,end="",flush=True)
-                    log.write(line)
-                code = process.wait()
-        if code:
-            raise RuntimeError(f"Worker failed ({code}); inspect {run_name}/worker.log and partial reports")
+            reports = {}
+            for batch_size in BATCH_SIZES:
+                output = root/f"batch-{batch_size}"
+                output.mkdir(exist_ok=False)
+                environment["TORCHINDUCTOR_CACHE_DIR"] = f"/opt/gpt-lab/.tmp/codex/h100-input-pipeline/compiler_cache/batch-{batch_size}"
+                command = ["/opt/gpt-lab/.venv/bin/python","/opt/diagnostic/h100_input_pipeline/runner.py",
+                           "--output",str(output),"--preflight",str(root/"cpu-preflight.json"),
+                           "--device-batch-size",str(batch_size),"--warmup",str(warmup),"--measured",str(measured)]
+                with subprocess.Popen(command,cwd="/opt/gpt-lab",env=environment,
+                                      stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True) as process:
+                    for line in process.stdout:
+                        print(line,end="",flush=True)
+                        log.write(line)
+                    code = process.wait()
+                if code:
+                    raise RuntimeError(f"Batch {batch_size} failed ({code}); inspect {run_name}/worker.log and partial reports")
+                reports[str(batch_size)] = json.loads((output/"report.json").read_text())
+                summary = combine_reports(reports) if len(reports) == len(BATCH_SIZES) else {}
+                (root/"report.json").write_text(json.dumps(dict(batches=reports,complete=len(reports)==len(BATCH_SIZES),**summary),indent=2)+"\n")
     finally:
         runs.commit()
     return str(root/"report.json")
@@ -57,7 +68,8 @@ def main(argv=None):
     print(json.dumps(dict(production_sha=SHA,harness_sha=harness_sha,repository=REPOSITORY,
                          gpu="H100:1",workers=1,cpu_preflight_first=True,cpu_only=args.cpu_only,
                          warmup=args.warmup,measured=args.measured,order=ORDER,
-                         training=TRAIN_ARGS,environment="main"),indent=2),flush=True)
+                         training={str(size):train_args(size) for size in BATCH_SIZES},
+                         device_batch_sizes=BATCH_SIZES,environment="main"),indent=2),flush=True)
     if args.dry_run:
         return
     dirty = subprocess.check_output(["git","-C",str(root),"status","--porcelain","--",

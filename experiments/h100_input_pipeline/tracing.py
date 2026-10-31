@@ -52,7 +52,7 @@ class FetchRange:
             return next(self.loader)
 
 
-def summarize(path, expected_updates=2, expected_microsteps=16):
+def summarize(path, *, expected_microsteps, expected_updates=2):
     events = json.loads(path.read_text())["traceEvents"]
     spans = [event for event in events if event.get("ph") == "X" and event.get("dur", 0) > 0]
     gpu = [(e["ts"], e["ts"]+e["dur"]) for e in spans

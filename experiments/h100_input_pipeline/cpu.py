@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import time
 
-from recipe import timing
+from recipe import timing, BATCH_SIZES, resolve_cpu_batch
 
 
 def production_factory(cache, batch_size=16, seq_len=2048):
@@ -40,21 +40,27 @@ def preflight(run_name, warmup, measured):
         raise RuntimeError("Empty cached shard")
     if (Path("/runs")/run_name).exists():
         raise FileExistsError("Choose a fresh run name")
-    setup_start = time.perf_counter()
-    factory = production_factory(cache)
-    tokenizer_setup = time.perf_counter()-setup_start
-    # Separate startup from sustained CPU-only preparation. No H2D evidence here.
-    result = measure(factory, 16*(warmup+measured))
-    loader = factory()
-    digest = hashlib.sha256()
-    for _ in range(16*(warmup+measured)+1):
-        digest.update(digest_batch(next(loader)).encode())
-    result.update(tokenizer_setup_seconds=tokenizer_setup, data_order_sha256=digest.hexdigest(), source="production Modal cache",
-                  host=platform.platform(), torch=torch.__version__,
-                  torch_threads=torch.get_num_threads(), cpu_count=os.cpu_count(),
-                  shards=[dict(name=p.name, bytes=p.stat().st_size) for p in shards],
-                  metadata=meta, batch_size=16, sequence_length=2048,
-                  note="CPU-only preparation; excludes H2D and concurrent training contention")
+    results = {}
+    for batch_size in BATCH_SIZES:
+        resolved = resolve_cpu_batch(batch_size)
+        print("Resolved CPU preflight batch: " + json.dumps(resolved),flush=True)
+        setup_start = time.perf_counter()
+        factory = production_factory(cache,batch_size=resolved["device_batch_size"],seq_len=resolved["seq_len"])
+        tokenizer_setup = time.perf_counter()-setup_start
+        count = resolved["n_acc_steps"]*(warmup+measured)
+        # Separate startup from sustained CPU-only preparation. No H2D evidence here.
+        result = measure(factory,count)
+        loader = factory()
+        digest = hashlib.sha256()
+        for _ in range(count+1):
+            digest.update(digest_batch(next(loader)).encode())
+        result.update(tokenizer_setup_seconds=tokenizer_setup,data_order_sha256=digest.hexdigest(),
+                      resolved_batch=resolved,source="production Modal cache",
+                      host=platform.platform(),torch=torch.__version__,
+                      torch_threads=torch.get_num_threads(),cpu_count=os.cpu_count(),
+                      note="CPU-only preparation; excludes H2D and concurrent training contention")
+        results[str(batch_size)] = result
+    result = dict(batches=results,shards=[dict(name=p.name,bytes=p.stat().st_size) for p in shards],metadata=meta)
     return result
 
 

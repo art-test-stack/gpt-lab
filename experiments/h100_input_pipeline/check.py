@@ -14,16 +14,20 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0,str(HERE))
 from cache import capture, Replay, verify, owned, digest_batch
 from fixture import factory
-from recipe import SHA, TRAIN_ARGS, ORDER, cpu_copy
+from recipe import SHA, train_args, BATCH_SIZES, ORDER, cpu_copy, resolve_cpu_batch, batch_config, combine_reports
 from runner import restore, run_updates
 from tracing import summarize, ranges, FetchRange
 
 
-def test_plan_and_literal_transfer_tail():
+@pytest.mark.parametrize("device_batch_size,expected_accumulation", [(16,16),(32,8)])
+def test_plan_and_literal_transfer_tail(device_batch_size,expected_accumulation):
     from gpt_lab.cli.parser import build_parser
     from gpt_lab.data.loader import DistDataLoader
-    args = build_parser().parse_args(TRAIN_ARGS)
-    assert (args.num_steps,args.warmup_steps,args.n_acc_steps,args.device_batch_size,args.max_seq_len) == (2317,300,16,16,2048)
+    args = build_parser().parse_args(train_args(device_batch_size))
+    assert (args.num_steps,args.warmup_steps,args.n_acc_steps,args.device_batch_size,args.max_seq_len) == (2317,300,-1,device_batch_size,2048)
+    resolved = resolve_cpu_batch(device_batch_size)
+    assert resolved == dict(device_batch_size=device_batch_size,seq_len=2048,world_size=1,
+                            n_acc_steps=expected_accumulation,total_batch_size=524288)
     assert args.total_batch_size == 524288 and args.target_param_data_ratio == 8
     assert args.act_func == "swiglu" and args.attn_impl == "fa3" and not args.fp8_ffn_forward
     assert (args.save_every,args.eval_bpb_every,args.eval_core_every,args.sample_every) == (0,0,0,0)
@@ -40,6 +44,10 @@ def test_plan_and_literal_transfer_tail():
     assert plan["production_sha"] == SHA and plan["order"] == ORDER
     assert (plan["warmup"],plan["measured"],plan["workers"]) == (25,50,1)
     assert plan["cpu_preflight_first"]
+    assert plan["device_batch_sizes"] == list(BATCH_SIZES)
+    for size in BATCH_SIZES:
+        planned = build_parser().parse_args(plan["training"][str(size)])
+        assert planned.n_acc_steps == -1 and planned.device_batch_size == size
 
 
 def test_real_file_cache_ownership_and_strides(tmp_path):
@@ -76,19 +84,27 @@ class TinyLM(torch.nn.Module):
         return torch.nn.functional.cross_entropy(self.head(self.embed(x)).flatten(0,1),y.flatten())
 
 
-def test_restore_and_complete_production_updates_across_paths(tmp_path):
+@pytest.mark.parametrize("device_batch_size", [2,4])
+def test_restore_and_complete_production_updates_across_paths(tmp_path,device_batch_size):
     from gpt_lab.model.checkpoint import capture_rng_state
     from gpt_lab.train.trainer import Trainer
     from gpt_lab.utils.distributed import ComputeContext
     from gpt_lab.utils.schemas import TrainerConfig
     from gpt_lab.optim.factory import OptimizerFactory
-    make = factory(tmp_path/"data")
-    packed,batches,_ = capture(make(),7)
+    from gpt_lab.model.auto import AutoGPTConfig
+    auto = AutoGPTConfig(run_name="fixture",device_batch_size=device_batch_size,max_seq_len=8,
+                         total_batch_size=64,n_acc_steps=-1,
+                         comp_info=ComputeContext(torch.device("cpu"),compute_dtype=torch.float32))
+    auto.n_acc_steps = auto.compute_accumulation_steps(auto.total_batch_size)
+    resolved = batch_config(auto,auto.max_seq_len)
+    make = factory(tmp_path/"data",batch_size=resolved["device_batch_size"],seq_len=resolved["seq_len"])
+    packed,batches,_ = capture(make(),resolved["n_acc_steps"]*3+1)
     model = TinyLM()
     optimizer = OptimizerFactory([dict(params=list(model.parameters()),opt="adamw",lr=.001,
                                       betas=(.9,.99),eps=1e-8,weight_decay=.01)],
                                  comp_info=ComputeContext(torch.device("cpu")))
-    config = TrainerConfig(n_steps=10,n_acc_steps=2,total_batch_size=32,device_batch_size=2,n_flops_per_token=100,
+    config = TrainerConfig(n_steps=10,n_acc_steps=resolved["n_acc_steps"],total_batch_size=resolved["total_batch_size"],
+                           device_batch_size=resolved["device_batch_size"],n_flops_per_token=100,
                            comp_info=ComputeContext(torch.device("cpu"),compute_dtype=torch.float32))
     trainer = Trainer(model,None,make(),None,config=config,optimizer=optimizer,
                       checkpoint_manager=SimpleNamespace(source_dir=tmp_path/"model"))
@@ -114,7 +130,7 @@ def test_restore_and_complete_production_updates_across_paths(tmp_path):
             batch,seconds,losses,schedules = run_updates(trainer,actual_iterator,batch,0,3)
         assert (torch.Tensor.backward,torch.Tensor.copy_) == original_methods
         assert trainer.state.completed_steps == 3 and optimizer.state
-        assert trainer.state.n_tokens == 96
+        assert trainer.state.n_tokens == 3*resolved["total_batch_size"]
         assert not all(torch.equal(model.state_dict()[key],value) for key,value in weights.items())
         results.append((cpu_copy(model.state_dict()),losses,schedules,digest_batch((*batch[0],batch[1]))))
     assert all(torch.equal(random_samples[0],sample) for sample in random_samples[1:])
@@ -124,17 +140,38 @@ def test_restore_and_complete_production_updates_across_paths(tmp_path):
             torch.testing.assert_close(value,results[0][0][key],rtol=0,atol=0)
 
 
-def test_idle_gaps_use_union_and_report_temporal_overlap(tmp_path):
+@pytest.mark.parametrize("device_batch_size", BATCH_SIZES)
+def test_idle_gaps_use_union_and_report_temporal_overlap(tmp_path,device_batch_size):
     def span(name,start,duration,cat="user_annotation"):
         return dict(name=name,ts=start,dur=duration,cat=cat,ph="X")
-    events = [span("diagnostic/update/25",0,100),span("input/fetch",10,50),
-              span("input/transfer",40,20),span("kernel",0,20,"kernel"),
-              span("kernel",10,20,"kernel"),span("copy",50,10,"gpu_memcpy"),
-              span("kernel",70,30,"kernel")]
-    events += [span("compute/forward",1,1),span("compute/backward",2,1),span("compute/optimizer",99,1)]
+    resolved = resolve_cpu_batch(device_batch_size)
+    events = [span("diagnostic/update/25",0,100),span("kernel",0,20,"kernel"),
+              span("kernel",10,20,"kernel"),span("copy",50,10,"gpu_memcpy"),span("kernel",70,30,"kernel")]
+    events += [span("compute/optimizer",99,1)]
+    for _ in range(resolved["n_acc_steps"]):
+        events += [span("input/fetch",10,50),span("input/transfer",40,20),
+                   span("compute/forward",1,1),span("compute/backward",2,1)]
     path = tmp_path/"trace.json"
     path.write_text(json.dumps(dict(traceEvents=events)))
-    result = summarize(path,expected_updates=1,expected_microsteps=1)["updates"][0]
+    result = summarize(path,expected_updates=1,expected_microsteps=resolved["n_acc_steps"])["updates"][0]
     assert result["gpu_idle_ms"] == pytest.approx(.03)
     assert result["idle_overlapping_fetch_ms"] == pytest.approx(.02)
     assert result["idle_overlapping_transfer_ms"] == pytest.approx(.01)
+
+
+def test_summary_separates_batch_and_input_effects():
+    reports = {}
+    for size,accumulation in ((16,16),(32,8)):
+        legs = {name:dict(global_tokens_per_second=float(size),timing=dict(median_ms=100/size,p95_ms=120/size),
+                          schedules=[dict(lrm=.1)],peak_allocated_bytes=size*100,peak_reserved_bytes=size*200)
+                for name in ORDER}
+        reports[str(size)] = dict(complete=True,initial_model_sha256="same",initial_optimizer_groups=[],model={},
+                                 parameter_storage_dtypes={},first_row_sha256="same",trainer=dict(n_steps=2317,
+                                 n_acc_steps=accumulation,device_batch_size=size),
+                                 resolved_batch=dict(n_acc_steps=accumulation),legs=legs)
+    result = combine_reports(reports)
+    assert len(result["configurations"]) == len(BATCH_SIZES)*len(ORDER)
+    assert result["batch32_vs_batch16_same_path"]["production-before"]["throughput_ratio"] == 2
+    reports["32"]["initial_model_sha256"] = "different"
+    with pytest.raises(AssertionError,match="initial_model"):
+        combine_reports(reports)
