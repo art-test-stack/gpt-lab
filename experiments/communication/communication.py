@@ -2,7 +2,7 @@
 
 The runner never starts a job by itself. Example (from the repository root)::
 
-    uv run --extra gpu python scripts/benchmark/communication.py \
+    uv run --extra gpu python experiments/communication/communication.py \
       --communication pipeline --optimizer muon --updates 35 \
       --bucket-mib 16 --output-dir .tmp/codex/comm-buckets/pipeline
 

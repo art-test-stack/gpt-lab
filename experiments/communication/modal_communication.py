@@ -31,11 +31,13 @@ WARMUP_UPDATES = 25
 SCREEN_UPDATES = 55
 MIN_THROUGHPUT_GAIN = 0.01
 REQUIRED = (
-    "scripts/benchmark/modal_communication.py", "scripts/benchmark/communication.py",
+    "experiments/communication/modal_communication.py", "experiments/communication/communication.py",
     "src/gpt_lab/optim/communication.py", "src/gpt_lab/optim/factory.py",
     "src/gpt_lab/optim/strategy.py", "src/gpt_lab/optim/strategies/muon.py",
-    "src/gpt_lab/train/trainer.py", "tests/test_communication.py",
-    "configs/optim.yaml", "configs/normuon.yaml", "docs/communication-buckets.md",
+    "src/gpt_lab/train/trainer.py", "experiments/communication/test_communication.py",
+    "configs/optim.yaml", "configs/normuon.yaml", "experiments/communication/DESIGN.md",
+    "experiments/communication/README.md", "experiments/communication/RESULTS.md",
+    "experiments/communication/results.json",
 )
 
 
@@ -133,7 +135,7 @@ def correctness(directory, optimizer, modes, world, env, volume, timeout):
                      "GPTLAB_COMM_TEST_SMOKE_ONLY": "1",
                      "GPTLAB_COMM_TEST_REPORT": str(report)}
     junit = directory / "junit.xml"
-    command = [PYTHON, "-m", "pytest", "tests/test_communication.py",
+    command = [PYTHON, "-m", "pytest", "experiments/communication/test_communication.py",
                "-k", "test_nccl_buckets_accumulation_padding_ties_and_resume", "-s", "-q",
                f"--junitxml={junit}", f"--basetemp={basetemp}"]
     run_process(command, directory, run_env, volume, timeout)
@@ -193,7 +195,7 @@ def run_suite(stage, run_name, results_run, sha, bucket_mib, optimizer, volume, 
     def candidate(label, mode, updates, reference=None, profile=False):
         output = directory / label
         command = [str(REPO / ".venv/bin/torchrun"), "--standalone", f"--nproc_per_node={world}",
-                   "--max_restarts=0", "scripts/benchmark/communication.py",
+                   "--max_restarts=0", "experiments/communication/communication.py",
                    "--optimizer", optimizer, "--communication", mode,
                    "--bucket-mib", str(bucket_mib), "--updates", str(updates),
                    "--warmup-updates", str(WARMUP_UPDATES), "--output-dir", str(output)]

@@ -7,7 +7,7 @@ Inspection date: 2026-10-30. No paid compute launched.
 - Existing branch: `feat/comm-backward`, commit `192bbe2921e4774d24324b2d07852311b7bc4dcf`.
 - New branch: `exp/anvil-normuon`, created directly from that commit.
 - The existing branch had no tracked working-tree changes. Its commits and the ignored local `runs/modal_trainbase.py` are preserved.
-- A/B are implemented in `configs/anvil/a_normuon.yaml` and `configs/anvil/b_spectral.yaml`, selected by the optional Boolean `anvil_spectral` group setting. Omitting it keeps existing NorMuon behavior. The second option, momentum variants C/D, and diagnostic instrumentation remain pending the next implementation steps.
+- A/B are implemented in `experiments/optimizer_comparison/configs/a_normuon.yaml` and `experiments/optimizer_comparison/configs/b_spectral.yaml`, selected by the optional Boolean `anvil_spectral` group setting. Omitting it keeps existing NorMuon behavior. The second option, momentum variants C/D, and diagnostic instrumentation remain pending the next implementation steps.
 
 ## Historical source and provenance
 

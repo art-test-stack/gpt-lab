@@ -462,12 +462,14 @@ NorMuon uses a compiled update kernel; fusion may change intermediate BF16
 rounding relative to the eager reference implementation.
 
 Use `--optim-config-path configs/normuon.yaml` for a NorMuon override profile.
+Explicit preserved Muon/NorMuon/spectral-only ANVIL experiment profiles are in
+[optimizer comparison](experiments/optimizer_comparison/README.md).
 Its hyperparameters are starting values, not calibrated replacements for the
 current Muon profile. Existing defaults and Muon checkpoints retain their behavior.
 Choose NorMuon for a fresh run; changing a saved group's optimizer name is not a
 checkpoint conversion because normalization state layouts can differ.
 
-The isolated [communication experiment](docs/communication-buckets.md) compares
+The isolated [communication experiment](experiments/communication/README.md) compares
 the original transport, fixed buckets, a packing pipeline, and backward hooks.
 It includes user-launched NCCL checks and size sweeps; GPU speedups are unverified.
 

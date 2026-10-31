@@ -1,0 +1,279 @@
+{
+  "experiment": "communication",
+  "configuration": {
+    "gpus": "A100-SXM4-80GB",
+    "dtype": "BF16 compute with existing mixed storage",
+    "ffn": "SwiGLU",
+    "sequence_length": 2048,
+    "microbatch_per_gpu": 16,
+    "global_batch_tokens": 524288,
+    "seed": 42,
+    "scheduler_horizon": 2317,
+    "lr_warmup": 300,
+    "captured_backward": false
+  },
+  "selection_rule": "Retain baseline unless screen and confirmation each improve throughput by at least 1%; no confidence interval is claimed.",
+  "runs": [
+    {
+      "run_id": "comm-a100-20261031-r2",
+      "source_sha": "8956f6e2cb8aae856c467c40ff2e3f37824dff75",
+      "optimizer": "muon",
+      "status": "completed",
+      "finished_at": "2026-10-31T10:09:43.065417+00:00",
+      "bucket_mib": 64.0,
+      "world_size": 4,
+      "evidence_volume": "gpt-lab-runs",
+      "evidence_prefix": "comm-a100-20261031-r2",
+      "screen_updates": 35,
+      "warmup_updates": 25,
+      "screen_global_tokens_per_second": {
+        "baseline": 621800.8182720992,
+        "buckets": 618277.6149592059,
+        "pipeline": 617411.339299264,
+        "backward": 617730.3683837709
+      },
+      "confirmation_updates": 150,
+      "baseline": {
+        "mode": "baseline",
+        "steady_updates": 125,
+        "global_tokens_per_second": 618856.8948738398,
+        "wall_step_ms": {
+          "median_ms": 847.7320360000249,
+          "p95_ms": 849.6835280000141
+        },
+        "peak_allocated_bytes_per_gpu": 27266230272,
+        "peak_reserved_bytes_per_gpu": 32577159168,
+        "process_startup_to_first_update_rank_max_s": 46.77941063399993,
+        "collective_count": 28,
+        "gradient_collective_count": 15,
+        "parameter_gathers": 13,
+        "control_collective_count": 0,
+        "reduction_input_bytes": 1148389728,
+        "padding_bytes": 576,
+        "gather_output_bytes": 1148389632,
+        "persistent_transport_bytes": 0
+      },
+      "candidate": {
+        "mode": "buckets",
+        "steady_updates": 125,
+        "global_tokens_per_second": 615255.0790824948,
+        "wall_step_ms": {
+          "median_ms": 852.5444509999716,
+          "p95_ms": 854.566009999985
+        },
+        "peak_allocated_bytes_per_gpu": 30408950272,
+        "peak_reserved_bytes_per_gpu": 32577159168,
+        "process_startup_to_first_update_rank_max_s": 48.25906193499998,
+        "collective_count": 48,
+        "gradient_collective_count": 34,
+        "parameter_gathers": 13,
+        "control_collective_count": 1,
+        "reduction_input_bytes": 1827866976,
+        "padding_bytes": 679477824,
+        "gather_output_bytes": 1148389632,
+        "persistent_transport_bytes": 3138165124
+      },
+      "throughput_ratio_to_baseline": 0.9941798890483733,
+      "recommendation": "baseline",
+      "nccl_fixture": {
+        "updates": 4,
+        "accumulation_microsteps": 2,
+        "execution": "force_eager",
+        "ranks": 4,
+        "max_abs_errors": {
+          "buckets": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          },
+          "pipeline": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          },
+          "backward": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          }
+        }
+      }
+    },
+    {
+      "run_id": "comm-a100-128m-20261031",
+      "source_sha": "8956f6e2cb8aae856c467c40ff2e3f37824dff75",
+      "optimizer": "muon",
+      "status": "completed",
+      "finished_at": "2026-10-31T10:37:04.630290+00:00",
+      "bucket_mib": 128.0,
+      "world_size": 4,
+      "evidence_volume": "gpt-lab-runs",
+      "evidence_prefix": "comm-a100-128m-20261031",
+      "screen_updates": 35,
+      "warmup_updates": 25,
+      "screen_global_tokens_per_second": {
+        "baseline": 619499.3820847328,
+        "buckets": 619212.6167985313,
+        "pipeline": 619611.7145768522,
+        "backward": 618246.0526650782
+      },
+      "confirmation_updates": 150,
+      "baseline": {
+        "mode": "baseline",
+        "steady_updates": 125,
+        "global_tokens_per_second": 617488.1261894206,
+        "wall_step_ms": {
+          "median_ms": 849.4537779999973,
+          "p95_ms": 852.4815970000645
+        },
+        "peak_allocated_bytes_per_gpu": 27266230272,
+        "peak_reserved_bytes_per_gpu": 32577159168,
+        "process_startup_to_first_update_rank_max_s": 48.43944087300008,
+        "collective_count": 28,
+        "gradient_collective_count": 15,
+        "parameter_gathers": 13,
+        "control_collective_count": 0,
+        "reduction_input_bytes": 1148389728,
+        "padding_bytes": 576,
+        "gather_output_bytes": 1148389632,
+        "persistent_transport_bytes": 0
+      },
+      "candidate": {
+        "mode": "pipeline",
+        "steady_updates": 125,
+        "global_tokens_per_second": 615618.7696335623,
+        "wall_step_ms": {
+          "median_ms": 852.0398140000225,
+          "p95_ms": 855.2870460000577
+        },
+        "peak_allocated_bytes_per_gpu": 29556277760,
+        "peak_reserved_bytes_per_gpu": 32577159168,
+        "process_startup_to_first_update_rank_max_s": 48.077055548999965,
+        "collective_count": 29,
+        "gradient_collective_count": 15,
+        "parameter_gathers": 13,
+        "control_collective_count": 1,
+        "reduction_input_bytes": 1148389728,
+        "padding_bytes": 576,
+        "gather_output_bytes": 1148389632,
+        "persistent_transport_bytes": 2288818564
+      },
+      "throughput_ratio_to_baseline": 0.996972643721274,
+      "recommendation": "baseline",
+      "nccl_fixture": {
+        "updates": 4,
+        "accumulation_microsteps": 2,
+        "execution": "force_eager",
+        "ranks": 4,
+        "max_abs_errors": {
+          "buckets": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          },
+          "pipeline": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          },
+          "backward": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          }
+        }
+      }
+    },
+    {
+      "run_id": "comm-normuon-128m-20261031",
+      "source_sha": "2795b42e96d444b285ffff5dedd3955e68550804",
+      "optimizer": "normuon",
+      "status": "completed",
+      "finished_at": "2026-10-31T11:13:28.214765+00:00",
+      "bucket_mib": 128.0,
+      "world_size": 4,
+      "evidence_volume": "gpt-lab-runs",
+      "evidence_prefix": "comm-normuon-128m-20261031",
+      "screen_updates": 55,
+      "warmup_updates": 25,
+      "screen_global_tokens_per_second": {
+        "baseline": 616357.9004042147,
+        "buckets": 614316.9833865713,
+        "pipeline": 614365.0601950801,
+        "backward": 614295.0855261788
+      },
+      "confirmation_updates": 150,
+      "baseline": {
+        "mode": "baseline",
+        "steady_updates": 125,
+        "global_tokens_per_second": 613867.8904172513,
+        "wall_step_ms": {
+          "median_ms": 854.1830369999843,
+          "p95_ms": 858.0646949999391
+        },
+        "peak_allocated_bytes_per_gpu": 27266202624,
+        "peak_reserved_bytes_per_gpu": 32577159168,
+        "process_startup_to_first_update_rank_max_s": 48.96247822199996,
+        "collective_count": 28,
+        "gradient_collective_count": 15,
+        "parameter_gathers": 13,
+        "control_collective_count": 0,
+        "reduction_input_bytes": 1148389728,
+        "padding_bytes": 576,
+        "gather_output_bytes": 1148389632,
+        "persistent_transport_bytes": 0
+      },
+      "candidate": {
+        "mode": "pipeline",
+        "steady_updates": 125,
+        "global_tokens_per_second": 611847.8741529098,
+        "wall_step_ms": {
+          "median_ms": 857.0042069999317,
+          "p95_ms": 860.549246000005
+        },
+        "peak_allocated_bytes_per_gpu": 29556250112,
+        "peak_reserved_bytes_per_gpu": 32577159168,
+        "process_startup_to_first_update_rank_max_s": 48.430825166999966,
+        "collective_count": 29,
+        "gradient_collective_count": 15,
+        "parameter_gathers": 13,
+        "control_collective_count": 1,
+        "reduction_input_bytes": 1148389728,
+        "padding_bytes": 576,
+        "gather_output_bytes": 1148389632,
+        "persistent_transport_bytes": 2288818564
+      },
+      "throughput_ratio_to_baseline": 0.9967093632101063,
+      "recommendation": "baseline",
+      "nccl_fixture": {
+        "updates": 4,
+        "accumulation_microsteps": 2,
+        "execution": "force_eager",
+        "ranks": 4,
+        "max_abs_errors": {
+          "buckets": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          },
+          "pipeline": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          },
+          "backward": {
+            "gradient_max_abs": 0.0,
+            "parameter_max_abs": 0.0,
+            "state_max_abs": 0.0
+          }
+        }
+      }
+    }
+  ],
+  "limitations": [
+    "One matched confirmation per configuration; no repeated-trial confidence interval.",
+    "Counts and bytes describe API payload/layout, not measured physical-link traffic.",
+    "Optimizer, packing and exposed-wait timing require separate profiler runs.",
+    "Tiny eager NCCL equality does not establish 150-update compiled full-model equality."
+  ]
+}

@@ -315,7 +315,7 @@ def test_nccl_buckets_accumulation_padding_ties_and_resume(tmp_path):
 
 @pytest.mark.parametrize("optimizer", ["muon", "normuon"])
 def test_diagnostic_cli_preserves_native_overrides_and_scheduler_horizon(tmp_path, optimizer):
-    runner = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/benchmark/communication.py"))
+    runner = runpy.run_path(str(Path(__file__).resolve().parents[2] / "experiments/communication/communication.py"))
     from gpt_lab.cli.parser import build_parser
     args, forwarded = runner["parse_args"]([
         "--optimizer", optimizer, "--communication", "backward", "--bucket-mib", "32",
@@ -336,7 +336,7 @@ def test_diagnostic_cli_preserves_native_overrides_and_scheduler_horizon(tmp_pat
 def test_diagnostic_failure_preserves_error_without_new_collectives(tmp_path, monkeypatch):
     from gpt_lab.train.trainer import Trainer
     from gpt_lab.model.checkpoint import CheckpointManager
-    runner = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/benchmark/communication.py"))
+    runner = runpy.run_path(str(Path(__file__).resolve().parents[2] / "experiments/communication/communication.py"))
     for name in ("__init__", "train", "train_step", "optimizer_step", "prepare_batch", "save_checkpoint"):
         monkeypatch.setattr(Trainer, name, getattr(Trainer, name))  # Restore runner-installed wrappers after this test.
     monkeypatch.setattr(CheckpointManager, "save_training_config", CheckpointManager.save_training_config)
