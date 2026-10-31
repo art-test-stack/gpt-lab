@@ -610,6 +610,72 @@ the rank-0 files, while subsequent local checkpoints use `"full"`.
 With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)
 for module-mode launches and checkpoint selection.
 
+#### Explicit CUDA capture (experimental)
+
+`--cuda-graph-mode forward_backward` opts into fixed-shape forward/backward
+capture around compiled kernels. `disabled` preserves existing compiled execution.
+The captured path disables compiler-managed CUDA graphs to avoid nested capture.
+It requires CUDA, FP32 or BF16, the default `compute_loss`, and a fixed pair of
+input/label tensors. FP16/scaler and FP8 capture are currently rejected.
+
+One graph replay consumes one microbatch. Inputs and gradients use persistent
+storage; gradient accumulation, dataloader work, finite-loss checks, scheduler,
+optimizer and communication remain outside capture. Gradients are cleared in
+place after the update. Warmup restores parameters, model buffers, gradients and
+CPU/CUDA RNG state. Python forward side effects and changing parameter usage
+are unsupported. Evaluation uses the uncaptured evaluation path; resuming
+rebuilds the graph over restored state. Omit the mode to retain a saved mode on
+resume, or explicitly pass `disabled` when resuming without capture.
+
+`train/capture_startup_seconds` reports compilation/warmup/capture separately
+from step timing. This first boundary has CPU regression coverage; real CUDA
+equivalence tests in `tests/test_cuda_graph.py` still need to run on user-provided
+hardware. Optimizer-update and communication capture are pending. No throughput
+or CUDA correctness claim is made from CPU checks.
+
+The standalone [`scripts/modal_cuda_graphs.py`](scripts/modal_cuda_graphs.py)
+launcher follows the existing local `runs/modal_trainbase.py` launcher. Install
+`modal==1.6.2` in your launcher environment and run `modal setup`. Run the four
+commands below from this worktree, waiting for each to finish. First commit and
+push the capture changes and launcher: the script requires a clean attached
+branch with local HEAD equal to its live origin tip, and clones that exact SHA.
+
+```bash
+python scripts/modal_cuda_graphs.py --gpus 1 --mode disabled --run-name cg-1-compiled
+python scripts/modal_cuda_graphs.py --gpus 1 --mode forward_backward --run-name cg-1-captured
+python scripts/modal_cuda_graphs.py --gpus 4 --mode disabled --run-name cg-4-compiled
+python scripts/modal_cuda_graphs.py --gpus 4 --mode forward_backward --run-name cg-4-captured
+```
+
+Add `--dry-run` to validate the Git source and print a command without importing
+Modal. `--detach` submits an individual run in the background; wait for it to
+finish before launching the next run. Repeated runs need new run names.
+
+All four default to A100-80GB, BF16, seed 42, depth 12, width 768, sequence
+length 2048, device batch 16, global batch 524288 tokens, fused attention and
+`configs/normuon.yaml`. Accumulation is 16 microbatches on one GPU and four on
+four GPUs. The scheduler horizon stays at 2317 with 300 warmup steps; each run
+stops at 150 updates. Evaluation, generation and all checkpoint saves (including
+the final save) are disabled. Compiler-managed graphs are disabled in both
+modes. Each rank gets a fresh compiler cache for that run. Apply any training
+overrides identically to all four commands.
+
+The launcher reuses `gpt-lab-cache` and `gpt-lab-runs` Modal volumes and the
+`gpt-lab` secret with `HF_TOKEN` and `WANDB_API_KEY`. Data and tokenizer must
+already be cached; a CPU preflight checks them before requesting GPUs. W&B
+defaults match the reference launcher; pass `--board dummy` consistently to
+disable W&B logging.
+
+Results appear in the runs volume under `/runs/<run-name>/`: `launch.json`,
+`train.log`, per-rank `rank_N.json` and `summary.json`. Compare
+`steady_global_tokens_per_second` for updates 11–150 within each GPU count.
+This uses the slowest rank's full loop duration, including logging and metrics;
+`steady_mean_train_step_ms` separately reports the trainer's narrower step
+timer. Startup reports setup before the first update, time through the first
+update, and capture setup (compilation, warmup and recording together). Modal
+image build and provisioning time are outside these training timers and remain
+in Modal's logs. These short runs measure throughput, not convergence quality.
+
 #### Customizing the trainer
 
 Subclass [`Trainer`](src/gpt_lab/train/trainer.py) and override `train_step` for a
