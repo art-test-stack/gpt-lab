@@ -7,12 +7,16 @@ preserve the BF16 path unless FP8 is explicitly requested.
 The frozen, single-worker H100 dispatch/profiling and BF16→FP8→BF16 diagnostic
 lives in [`h100_fp8_diagnostic/`](h100_fp8_diagnostic/README.md).
 
+The H100 input-pipeline results and diagnostic tooling live in
+[`h100_input_pipeline/`](h100_input_pipeline/README.md).
+
 Run these modules from the repository root with the installed project environment.
 They are separate from the `gpt-lab` CLI; the old `scripts/benchmark/` entry points
 have moved here. Use `--help` for all options and defaults.
 
-Create each new experiment in a dedicated subfolder containing its scripts,
-checks, configuration and notes. The FFN experiment lives in
+Create each new experiment in `YYYYMMDD-experiment-name/`, using its start date,
+and keep its scripts, checks, configuration and notes together. The FFN
+experiment lives in
 [`ffn_ablation/`](ffn_ablation/README.md).
 
 ## Dataloader benchmark
