@@ -118,43 +118,43 @@ def test_single_device_and_legacy_config(monkeypatch, tmp_path):
     cleanup_dist_groups()
 
 
-def _mesh_worker(rank, port, output_dir):
+def _mesh_worker(rank, port, output_dir, adopt_existing):
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2",
                       MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), GLOO_SOCKET_IFNAME="lo0" if sys.platform == "darwin" else "lo")
-    # Also cover adopting an existing process group and creating a fresh one.
-    for cycle in range(2):
-        if cycle == 0:
-            dist.init_process_group("gloo", timeout=timedelta(seconds=30))
-        context = init_dist_groups("cpu")
-        try:
-            assert context.rank == context.dp_rank == context.local_rank == rank
-            assert context.world_size == 2 and context.is_distributed
-            assert context.mesh.mesh_dim_names == ("dp",)
-            assert context.dp_mesh.size() == 2
-            assert get_comp_info("cpu") is context
-            config = TrainerConfig(comp_info=context)
-            assert "comp_info" not in config.model_dump()
-            path = output_dir / f"config-{rank}-{cycle}.safetensors"
-            save_tensor_state(config.model_dump(), path)
-            assert TrainerConfig.model_validate(load_tensor_state(path)).comp_info.rank == rank
-            model = torch.nn.Linear(1, 1, bias=False)
-            with torch.no_grad():
-                model.weight.fill_(rank + 1)
-            broadcast_model(model, context)
-            assert model.weight.item() == 1
-            total = torch.tensor(float(rank + 1))
-            dist.all_reduce(total, group=context.dp_mesh.get_group())
-            assert total.item() == 3
-        finally:
-            cleanup_dist_groups()
-        assert not dist.is_initialized()
+    if adopt_existing:
+        dist.init_process_group("gloo", timeout=timedelta(seconds=30))
+    context = init_dist_groups("cpu")
+    try:
+        assert context.rank == context.dp_rank == context.local_rank == rank
+        assert context.world_size == 2 and context.is_distributed
+        assert context.mesh.mesh_dim_names == ("dp",)
+        assert context.dp_mesh.size() == 2
+        assert get_comp_info("cpu") is context
+        config = TrainerConfig(comp_info=context)
+        assert "comp_info" not in config.model_dump()
+        path = output_dir / f"config-{rank}.safetensors"
+        save_tensor_state(config.model_dump(), path)
+        assert TrainerConfig.model_validate(load_tensor_state(path)).comp_info.rank == rank
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(rank + 1)
+        broadcast_model(model, context)
+        assert model.weight.item() == 1
+        total = torch.tensor(float(rank + 1))
+        dist.all_reduce(total, group=context.dp_mesh.get_group())
+        assert total.item() == 3
+    finally:
+        cleanup_dist_groups()
+    assert not dist.is_initialized()
 
 
-def test_two_process_cpu_mesh(tmp_path):
+@pytest.mark.parametrize("adopt_existing", [True, False], ids=["existing-group", "fresh-group"])
+def test_two_process_cpu_mesh(tmp_path, adopt_existing):
+    # Use fresh workers for each case to avoid racing process-group reinitialization.
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_mesh_worker, args=(port, tmp_path), nprocs=2, join=True)
+    mp.spawn(_mesh_worker, args=(port, tmp_path, adopt_existing), nprocs=2, join=True)
 
 
 def _optimizer_worker(rank, port):

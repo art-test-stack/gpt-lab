@@ -282,9 +282,11 @@ class DenseTransformer(BaseTransformer):
         return nb_of_params["blocks"] + self.lm_head.weight.numel()
     
     def estimate_flops(self) -> float:
-        """Estimate FLOPs per token based on model configuration.
+        """Estimate useful forward/backward FLOPs per token (2 FLOPs/FMA).
 
-        Adapted from: karpathy/nanochat
+        Count dense projections and inclusive causal attention pairs; exclude
+        elementwise operations, optimizer work, conversion and recomputation.
+        Projection accounting adapted from karpathy/nanochat.
         """
         n_params_per_layer = self.n_params_per_layer()
         # Tying saves storage, but the output projection still does the same work.
@@ -295,8 +297,9 @@ class DenseTransformer(BaseTransformer):
         attn_flops = 0
         for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
+            span = t if window < 0 else min(window + 1, t)
+            pairs = span * (span + 1) // 2 + (t - span) * span
+            attn_flops += 12 * h * q * pairs / t
         num_flops_per_token = 6 * matmul_params + attn_flops
         return num_flops_per_token
     

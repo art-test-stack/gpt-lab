@@ -66,6 +66,8 @@ def train_base(
     depth=12,
     aspect_ratio=64,
     d_head=128,
+    act_func="relu_squared",
+    fp8_ffn_forward=False,
     n_kv_heads=None,
     tie_embeddings="embs;value_embs;head",
     window_pattern=None,
@@ -140,6 +142,9 @@ def train_base(
     comp_info = init_dist_groups(device_type=device_type, random_seed=random_seed)
     board_instance = None
     try:
+        if fp8_ffn_forward:
+            from gpt_lab.model.fp8 import check_fp8_support
+            check_fp8_support(comp_info.device, comp_info.compute_dtype)
         is_master_process = comp_info.rank == 0
 
         device = comp_info.device
@@ -354,13 +359,14 @@ def build_auto_config(parameters: dict, device, comp_info: ComputeContext):
         depth=parameters["depth"],
         aspect_ratio=parameters["aspect_ratio"],
         d_head=parameters["d_head"],
+        act_func=parameters.get("act_func", "relu_squared"),
         n_kv_heads=parameters["n_kv_heads"],
         tie_embeddings=parameters["tie_embeddings"],
         window_pattern=parameters["window_pattern"],
         window_size=parameters["window_size"],
         softcap=parameters["softcap"],
         attn_softcap=parameters["attn_softcap"],
-        attn_impl=parameters["attn_impl"], # for now, only support 'sdpa' and 'fused'
+        attn_impl=parameters["attn_impl"],
         # training horizon targets
         n_steps=parameters["num_steps"],
         target_flops=parameters["target_flops"],
@@ -377,6 +383,7 @@ def build_trainer_config(parameters: dict, comp_info: ComputeContext, base_train
     from gpt_lab.utils.schemas import TrainerConfig
 
     return TrainerConfig(
+        fp8_ffn_forward=parameters.get("fp8_ffn_forward", False),
         stop_after_step=parameters.get("stop_after_step"),
         cuda_graph_mode=parameters.get("cuda_graph_mode") or "disabled",
         optim_config=parameters["optim_config"],

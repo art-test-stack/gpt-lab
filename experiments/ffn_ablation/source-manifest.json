@@ -1,0 +1,119 @@
+{
+  "baseline_sha": "10ac35ff94e9d3ebec68f00280fc3c35913d8cdd",
+  "source_sha256": {
+    "experiments/ffn_architecture.py": "1e0c0f4d250dec85504808ae863931a7ca75156e18bb456eeafc9ad1a88b0307",
+    "experiments/benchmark_ffn.py": "e76b977e95255ab87743fe518b058c8b44e33315f011ddf0ea973eca612361a6",
+    "experiments/ffn_baseline.json": "754806e39f080b6cfc5060c9ba832c49b48c7c61eadaf8f046515e6964f99722",
+    "experiments/modal_ffn.py": "4e89f7b1ada7df068e8366bb9e9b7a7e3d8ee401be8c61a4645e538670e9b348"
+  },
+  "gpu": "A100-80GB",
+  "world_size": 1,
+  "precision": "bfloat16",
+  "commands": [
+    [
+      "1-A",
+      [
+        "/opt/gpt-lab/.venv/bin/python",
+        "-m",
+        "experiments.benchmark_ffn",
+        "--architecture",
+        "A",
+        "--warmup",
+        "8",
+        "--updates",
+        "10",
+        "--output",
+        "/runs/ffn/ffn-a100-01/1-A"
+      ]
+    ],
+    [
+      "2-B",
+      [
+        "/opt/gpt-lab/.venv/bin/python",
+        "-m",
+        "experiments.benchmark_ffn",
+        "--architecture",
+        "B",
+        "--warmup",
+        "8",
+        "--updates",
+        "10",
+        "--output",
+        "/runs/ffn/ffn-a100-01/2-B"
+      ]
+    ],
+    [
+      "3-C",
+      [
+        "/opt/gpt-lab/.venv/bin/python",
+        "-m",
+        "experiments.benchmark_ffn",
+        "--architecture",
+        "C",
+        "--warmup",
+        "8",
+        "--updates",
+        "10",
+        "--output",
+        "/runs/ffn/ffn-a100-01/3-C"
+      ]
+    ],
+    [
+      "4-C",
+      [
+        "/opt/gpt-lab/.venv/bin/python",
+        "-m",
+        "experiments.benchmark_ffn",
+        "--architecture",
+        "C",
+        "--warmup",
+        "8",
+        "--updates",
+        "10",
+        "--output",
+        "/runs/ffn/ffn-a100-01/4-C"
+      ]
+    ],
+    [
+      "5-B",
+      [
+        "/opt/gpt-lab/.venv/bin/python",
+        "-m",
+        "experiments.benchmark_ffn",
+        "--architecture",
+        "B",
+        "--warmup",
+        "8",
+        "--updates",
+        "10",
+        "--output",
+        "/runs/ffn/ffn-a100-01/5-B"
+      ]
+    ],
+    [
+      "6-A",
+      [
+        "/opt/gpt-lab/.venv/bin/python",
+        "-m",
+        "experiments.benchmark_ffn",
+        "--architecture",
+        "A",
+        "--warmup",
+        "8",
+        "--updates",
+        "10",
+        "--output",
+        "/runs/ffn/ffn-a100-01/6-A"
+      ]
+    ]
+  ],
+  "status": "finished",
+  "completed": [
+    "1-A",
+    "2-B",
+    "3-C",
+    "4-C",
+    "5-B",
+    "6-A"
+  ]
+}

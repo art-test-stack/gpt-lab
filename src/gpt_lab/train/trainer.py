@@ -228,6 +228,9 @@ class Trainer:
         self.use_amp = self.dtype in (torch.float16, torch.bfloat16)
         if isinstance(model, DenseTransformer):
             model._enforce_precision(self.dtype)
+        if getattr(config, "fp8_ffn_forward", False):
+            from gpt_lab.model.fp8 import enable_fp8_ffn_forward
+            enable_fp8_ffn_forward(model, self.dtype)
 
         # Optimizer
         if optimizer is None:
@@ -261,7 +264,7 @@ class Trainer:
         def val_context(model):
             with ExitStack() as stack:
                 stack.enter_context(amp_context())
-                if self.config.fp8:
+                if self.config.fp8 or getattr(self.config, "fp8_ffn_forward", False):
                     from gpt_lab.model.fp8 import DisableFP8
                     stack.enter_context(DisableFP8(model))
                 yield model
@@ -526,7 +529,8 @@ class Trainer:
         """Update per-step state and return the metric dict consumed by log_metrics.
 
         Called every step, including when logging is disabled. Reduce step time
-        with MAX across ranks, update loss smoothing and token/time counters,
+        with MAX across ranks, average loss across ranks before smoothing,
+        update token/time counters,
         and append the reduced duration to total_dt for ETA and time limits.
         """
         step = self.state.step
@@ -544,7 +548,13 @@ class Trainer:
 
         step_dt = step_dt_tensor.item()
 
-        loss_accum = step_metrics["loss"].item()
+        # Equal token counts per rank make the rank mean the global batch loss.
+        # Reduce a detached copy so reporting cannot change the training loss.
+        loss_tensor = step_metrics["loss"].detach().float().clone()
+        if self.config.comp_info.is_distributed:
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            loss_tensor.div_(world_size)
+        loss_accum = loss_tensor.item()
         eff_global_tokens = step_metrics["tokens"]
 
         smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum

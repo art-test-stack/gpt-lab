@@ -12,6 +12,7 @@ from gpt_lab.utils.schemas import (
     MetaConfig,
     TokenizerTrainerConfig,
     TransformerConfig,
+    FFNActivation,
     AttnImplTypes,
 )
 from gpt_lab.utils.common import print0, print0_dict
@@ -80,6 +81,7 @@ class AutoGPTConfig(BaseModel):
     d_head: int = 2**9 # 512
     n_kv_heads: Optional[int] = None
     tie_embeddings: str = "embs;value_embs;head"
+    act_func: FFNActivation = "relu_squared"
     # Deprecated compatibility alias. The old field was named as a dimension
     # but was always consumed as a head count.
     d_kv_head: Optional[int] = Field(default=None, exclude=True)
@@ -187,6 +189,7 @@ class AutoGPTConfig(BaseModel):
             max_context=self.max_seq_len,
             d_model=d_model,
             d_ffn=self.compute_ffn_width(d_model),
+            act_func=self.act_func,
             n_layers=depth,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,

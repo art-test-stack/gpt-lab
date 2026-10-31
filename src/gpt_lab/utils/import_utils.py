@@ -1,6 +1,7 @@
 from packaging import version
 from functools import lru_cache
 import warnings
+import traceback
 
 @lru_cache()
 def is_torch_available() -> bool:
@@ -62,7 +63,8 @@ def is_flash_attn3_available_from_kernel() -> bool:
         return True
     except Exception:
         warnings.warn(
-            "FlashAttention 3 is not available. Falling back to PyTorch SDPA.",
+            "FlashAttention 3 is not available. Falling back to PyTorch SDPA.\n"
+            + traceback.format_exc(),
             UserWarning,
             stacklevel=2,
         )
