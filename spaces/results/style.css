@@ -35,3 +35,20 @@ header{display:flex;justify-content:space-between;gap:20px;align-items:center;ma
 main{margin:0;padding:24px 17px}h1{font-size:27px}.actions{flex-wrap:wrap}.run-controls{padding:14px}.run-controls-head{gap:12px}.experiment-label{width:100%;justify-content:space-between}.experiment-label select{flex:1;min-width:0}.search-label{max-width:none}.run-actions{margin-left:0}.run-list{max-height:160px}.run-item{flex:1;min-width:180px}
 .summary-grid{grid-template-columns:1fr 1fr}.charts{grid-template-columns:1fr}.plot-controls{flex-wrap:wrap;gap:10px}.chart{min-height:240px}footer{flex-direction:column}.panel-title>span{font-size:7px}.demo-banner button{float:none;display:block;margin-top:8px}.empty{min-height:370px;padding:25px}.empty h2{font-size:21px}
 }
+/* Modal evidence remains available independently of training-curve snapshots. */
+.archive-panel { margin-top: 24px; }
+.archive-panel select, .archive-panel input { max-width: 100%; }
+.archive-group { margin-top: 32px; }
+.archive-group > h2 { font-size: 22px; margin-bottom: 16px; }
+.archive-run { margin-bottom: 16px; padding: 24px; }
+.archive-run-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.archive-run-head h3 { margin: 0; overflow-wrap: anywhere; }
+.archive-run details { margin-top: 14px; }
+.archive-run summary { cursor: pointer; font-weight: 600; }
+.archive-run pre { max-height: 360px; overflow: auto; font-size: 12px; }
+.archive-run .table-wrap { max-height: 400px; overflow: auto; }
+.archive-commits { font-family: monospace; font-size: 13px; }
+.archive-artifacts { list-style: none; padding: 0; }
+.archive-artifacts li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 8px 0; border-bottom: 1px solid #edf0f3; }
+.archive-artifacts a { overflow-wrap: anywhere; }
+.archive-artifacts small { color: #697886; }

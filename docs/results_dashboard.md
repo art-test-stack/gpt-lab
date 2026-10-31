@@ -2,7 +2,8 @@
 
 `spaces/results/` is a static Hugging Face Space for reviewing gpt-lab experiments.
 It has no backend, training dependencies, or account connection. The viewer reads
-one `results.json` snapshot and can also open a local snapshot in the browser.
+one `results.json` training snapshot and an optional `experiments.json` evidence archive,
+and can also open a local training snapshot in the browser.
 Import replaces the displayed snapshot; it does not upload or persist the file.
 Reloading returns to the hosted snapshot.
 
@@ -19,6 +20,17 @@ The default snapshot contains no runs. An explicit synthetic preview demonstrate
 the interface with generic example runs. Preview data has no relationship to Muon,
 gpt-lab performance, or any measured training run. Synthetic exports retain their
 label when imported again.
+
+## Archive Modal evidence
+
+The **Experiment archive** view groups Modal reports, logs, configurations,
+figures and downloadable profiler traces by experiment, retaining failed and
+inconclusive runs. The collector excludes models/checkpoints before downloading,
+records checksums and source commits, and uses no Modal compute. See
+[`experiments/modal_results/README.md`](../experiments/modal_results/README.md)
+for collection and publication commands. Publication preserves existing training
+snapshots, Space metadata and earlier archive runs. Unclassified runs remain
+visible and can be assigned with an explicit mapping.
 
 ## Export existing W&B runs
 

@@ -131,7 +131,7 @@ function configs() {
 function render() {
   for (const chart of charts.values()) chart.destroy(); charts.clear();
   $('loss-description').textContent = Number($('smoothing').value) ? `EMA · ${$('smoothing').value} · NATS` : 'RAW LOSS · NATS';
-  runList(); $('empty').hidden = snapshot.runs.length > 0; $('workspace').hidden = !snapshot.runs.length;
+  runList(); $('empty').hidden = tab === 'evidence' || snapshot.runs.length > 0; $('workspace').hidden = tab === 'evidence' || !snapshot.runs.length;
   $('demo-banner').hidden = !synthetic; $('download').disabled = !chosen().length;
   $('snapshot-info').textContent = synthetic ? 'Synthetic interface preview' : `${snapshot.runs.length} runs · ${snapshot.exported_at ? `Snapshot ${snapshot.exported_at}` : 'Imported snapshot'}`;
   summary(); configs(); tasks();
@@ -140,9 +140,9 @@ function render() {
 }
 for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => {
   tab = button.dataset.tab;
-  for (const node of document.querySelectorAll('[data-tab]')) { node.classList.toggle('active',node === button); node.setAttribute('aria-pressed', node === button); }
+  for (const node of document.querySelectorAll('[data-tab]')) { node.classList.toggle('active',node.dataset.tab === tab); node.setAttribute('aria-pressed', node.dataset.tab === tab); }
   for (const node of document.querySelectorAll('.tab-panel')) node.hidden = node.id !== tab;
-  const names = {overview:'Experiment overview', evaluation:'Evaluation results', configuration:'Training configuration'};
+  const names = {overview:'Experiment overview', evaluation:'Evaluation results', configuration:'Training configuration', evidence:'Experiment archive'};
   $('page-title').replaceChildren(document.createTextNode(names[tab]),Object.assign(document.createElement('span'),{textContent:'.'}));
   $('selection-label').textContent = tab === 'overview' ? 'Learning curves' : tab === 'evaluation' ? 'Evaluation checkpoints' : 'Compare every setting';
   $('smoothing-label').hidden = tab !== 'overview'; $('axis').parentElement.hidden = tab === 'configuration'; render();
