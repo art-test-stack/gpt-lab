@@ -41,6 +41,7 @@ TOKEN = re.compile(r"\b(?:hf_[A-Za-z0-9]{16,}|(?:sk|wandb)_[A-Za-z0-9_-]{16,})\b
 ASSIGNMENT = re.compile(r'''(?i)((?:["']?)(?:[a-z0-9_]*(?:api_key|apikey|access_token|hf_token|wandb_api_key|password|secret|authorization))["']?\s*[:=]\s*)(["'])([^\r\n"']*)(\2)''')
 BARE_SECRET = re.compile(r"(?i)((?:HF_TOKEN|WANDB_API_KEY|MODAL_TOKEN_ID|MODAL_TOKEN_SECRET|API_KEY|PASSWORD|AUTHORIZATION)\s*=\s*)[^\s,;]+")
 SUMMARY_KEYS = {
+    "steady_global_tokens_per_second", "steady_mean_train_step_ms", "process_startup_inclusive_seconds",
     "steady_tokens_per_second", "steady_train_loop_tokens_per_second", "steady_throughput",
     "tokens_per_second", "tokens_per_sec", "throughput", "median_ms", "p95_ms", "mean_ms",
     "median_step_ms", "mean_step_ms", "mean_step_seconds", "steady_step_ms", "median_update_ms",
