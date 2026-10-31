@@ -6,6 +6,9 @@ from gpt_lab.optim.strategies.muon import MuonStrategy
 class NorMuonStrategy(MuonStrategy):
     step_kernel = staticmethod(normuon_step_fused)
 
+    def _kernel_kwargs(self, group: dict) -> dict:
+        return {"anvil_spectral": group.get("anvil_spectral", False)}
+
     @staticmethod
     def _normalization_dim(shape) -> int:
         if len(shape) != 2:

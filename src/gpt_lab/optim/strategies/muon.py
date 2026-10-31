@@ -25,6 +25,9 @@ class MuonStrategy(OptimizerStrategy):
     @staticmethod
     def _learning_rate(group: dict, shape) -> float:
         return group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5
+
+    def _kernel_kwargs(self, group: dict) -> dict:
+        return {}
     
     def local_step(self, group: dict) -> None:
         params: list[torch.Tensor] = group["params"]
@@ -59,6 +62,7 @@ class MuonStrategy(OptimizerStrategy):
             self.opt.scalars.muon_lr_t, self.opt.scalars.muon_wd_t,
             self.opt.scalars.muon_beta2_t, group["ns_steps"], red_dim,
             self.opt.comp_info.compute_dtype,
+            **self._kernel_kwargs(group),
         )
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
     
@@ -189,6 +193,7 @@ class MuonStrategy(OptimizerStrategy):
                 self.opt.scalars.muon_momentum_t, self.opt.scalars.muon_lr_t,
                 self.opt.scalars.muon_wd_t, self.opt.scalars.muon_beta2_t,
                 group["ns_steps"], red_dim, self.opt.comp_info.compute_dtype,
+                **self._kernel_kwargs(group),
             )
             updated_params[:num_owned].copy_(stacked_owned)
         

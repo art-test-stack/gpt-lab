@@ -22,6 +22,9 @@ remain subject to their original license terms.
 - License copy: [LICENSES/modded-nanogpt-MIT.txt](LICENSES/modded-nanogpt-MIT.txt)
 - Affected material: `src/gpt_lab/optim/kernels/muon.py` and the
   Newton–Schulz iteration in `src/gpt_lab/optim/kernels/normuon.py`.
+- ANVIL2 spectral maps and the spectral input guard in `normuon.py` are
+  adapted from Deven Pietrzak's archived record source at
+  `records/track_1_short/2026-08-30_ANVIL2/this_pr/01b2f094-4536-479c-b0dd-cb14eba4844c.txt`.
 
 ## NorMuon
 

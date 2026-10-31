@@ -55,6 +55,21 @@ def test_normuon_override_profile():
     assert groups["embeddings"]["opt"] == groups["head"]["opt"] == "adamw"
 
 
+def test_anvil_spectral_profiles_are_matched():
+    baseline = OptimizerConfig.from_file("configs/normuon.yaml").group_configs()
+    for variant, spectral in (("a_normuon", False), ("b_spectral", True)):
+        groups = OptimizerConfig.from_file(f"configs/anvil/{variant}.yaml").group_configs()
+        assert groups["transformer"].pop("anvil_spectral") is spectral
+        assert groups == baseline
+
+
+def test_anvil_spectral_requires_boolean(tmp_path):
+    path = tmp_path / "invalid.yaml"
+    path.write_text('transformer:\n  opt: normuon\n  anvil_spectral: "false"\n')
+    with pytest.raises(ValueError, match="anvil_spectral must be a boolean"):
+        OptimizerConfig.from_file(path)
+
+
 @pytest.mark.parametrize('contents', [
     'batch_size: 64',
     'transformer:\n  n_steps: 8',

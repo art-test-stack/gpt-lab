@@ -448,8 +448,9 @@ class OptimizerConfig(BaseModel):
         allowed = set().union(*(spec.required_keys for spec in OPTIMIZER_REGISTRY.values()))
         for index, (name, group) in enumerate(self.group_configs().items()):
             _validate_group(group, index)
-            if set(group) - allowed:
-                raise ValueError(f"Unsupported optimizer parameters in {name}: {sorted(set(group) - allowed)}")
+            group_allowed = allowed | ({"anvil_spectral"} if group["opt"] == "normuon" else set())
+            if set(group) - group_allowed:
+                raise ValueError(f"Unsupported optimizer parameters in {name}: {sorted(set(group) - group_allowed)}")
             for key in ("lr", "weight_decay"):
                 if not isinstance(group[key], (int, float)) or not math.isfinite(group[key]) or group[key] < 0:
                     raise ValueError(f"{name}.{key} must be finite and non-negative")

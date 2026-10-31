@@ -226,7 +226,7 @@ def _muon_bucket_worker(rank, port):
     dist.init_process_group("gloo", timeout=timedelta(seconds=30))
     try:
         context = init_dist_groups("cpu")
-        for opt_name in ("muon", "normuon"):
+        for opt_name, spectral in (("muon", False), ("normuon", False), ("normuon", True)):
             params = [
                 torch.nn.Parameter(torch.linspace(-0.3, 0.7, 6).reshape(2, 3) + index / 10)
                 for index in range(5)
@@ -234,8 +234,9 @@ def _muon_bucket_worker(rank, port):
             reference = [torch.nn.Parameter(parameter.detach().clone()) for parameter in params]
 
             def group(parameters):
+                options = {"anvil_spectral": spectral} if opt_name == "normuon" else {}
                 return dict(params=parameters, opt=opt_name, lr=0.01, momentum=0.95,
-                            beta=0.95, ns_steps=5, weight_decay=0.1)
+                            beta=0.95, ns_steps=5, weight_decay=0.1, **options)
 
             optimizer = OptimizerFactory([group(params)], comp_info=context)
             local = OptimizerFactory([group(reference)], comp_info=ComputeContext(device=torch.device("cpu")))

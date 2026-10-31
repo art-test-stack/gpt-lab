@@ -57,6 +57,8 @@ def _validate_group(group: dict[str, Any], idx: int) -> None:
         )
 
     if opt_name == "normuon":
+        if not isinstance(group.get("anvil_spectral", False), bool):
+            raise ValueError("NorMuon anvil_spectral must be a boolean")
         for key in ("lr", "weight_decay", "momentum", "beta"):
             value = group[key]
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
