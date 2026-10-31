@@ -202,7 +202,7 @@ def test_checkpoint_metadata_preserves_tying_mode(tmp_path, version, missing_fie
 
 @pytest.mark.parametrize("extension", ["pt", "pth"])
 def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatch, extension):
-    config = _config()
+    config = _config(act_func="swiglu")
     model = build_meta_model(config).to_empty(device="cpu")
     model.init_weights()
     model.eval()
@@ -213,6 +213,7 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
     meta = MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=config, base_train={})
     metadata = meta.model_dump(mode="json")
     metadata["version"] = "0.1.0"
+    metadata["model_cfg"].pop("act_func")
     metadata["model_cfg"]["tie_word_embeddings"] = True
     metadata["model_cfg"].pop("tie_embeddings")
     (run_dir / "meta.json").write_text(json.dumps(json.dumps(metadata)))
@@ -229,6 +230,7 @@ def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatc
         comp_info=ComputeContext(device=torch.device("cpu")),
     )
     assert restored.config.tie_embeddings == "embs;head;value_embs"
+    assert restored.config.act_func == "swiglu"
     assert (step_dir / "model.safetensors").exists()
     assert (step_dir / f"model.{extension}").read_bytes() == original
     _assert_sharing(restored)
@@ -268,4 +270,4 @@ def test_checkpoint_migrates_boolean_tying(flags, expected):
 
     saved = dict(flags)
     _migrate_model_config(saved, "0.1.1")
-    assert saved == {"tie_embeddings": expected}
+    assert saved == {"tie_embeddings": expected, "act_func": "swiglu"}

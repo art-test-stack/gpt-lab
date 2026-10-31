@@ -2,8 +2,8 @@ import math
 import json
 import torch
 
-from pydantic import BaseModel, Field, ConfigDict, PrivateAttr, field_validator
-from typing import Any, Dict, List, Literal, Optional, Union
+from pydantic import BaseModel, Field, ConfigDict, PrivateAttr, field_validator, BeforeValidator
+from typing import Any, Dict, List, Literal, Optional, Union, Annotated
 from pathlib import Path
 import os, time
 import json, pickle
@@ -267,6 +267,15 @@ def parse_embedding_groups(value: str) -> list[tuple[str, ...]]:
     return groups
 
 
+def _normalize_act_func(value):
+    if value is None:
+        return "swiglu"
+    return "relu_squared" if value == "relu_squarred" else value
+
+
+FFNActivation = Annotated[Literal["swiglu", "relu_squared"], BeforeValidator(_normalize_act_func)]
+
+
 class TransformerConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     tf_type: TfTypes = "dense"
@@ -294,10 +303,10 @@ class TransformerConfig(BaseModel):
     norm_before_attn: bool = True
     normalization: NormalizationTypes = "rms"  # Options: "rms", "layer"
     norm_eps: float = 1e-5
-    act_func: str = "swiglu" # TODO: make it compatible with model.DenseTransformer implementation
+    act_func: FFNActivation = "relu_squared"
 
     # TODO: padged attention implementation
-    attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not recommended : "impl" if return_weights=False.
+    attn_impl: AttnImplTypes = "sdpa"  # Kernel: sdpa, fa2, fa3; fused is legacy-only.
     # TODO: # layer_types: Optional[List[TParams]] = None  # e.g., ["standard", "standard", "moe", ...] length must be n_layers
     use_gqa: bool = False
     
@@ -538,6 +547,7 @@ class TrainerConfig(BaseModel):
     
     # Dtype settings
     fp8: bool = False
+    fp8_ffn_forward: bool = False
 
     # Evaluatement settings
     eval_bpb_every: int = 250 # Evaluate val bpb every N steps (-1 = disable)
