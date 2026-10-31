@@ -69,12 +69,31 @@ class OptimizerFactory(torch.optim.Optimizer):
         if comp_info is None:
             comp_info = get_comp_info()
         self.comp_info = comp_info
+        self.communication = None
         
         # Select backend
         if comp_info.is_distributed:
             self.backend = _DistributedBackend(self)
         else:
             self.backend = _LocalBackend(self)
+
+    def configure_communication(self, mode: str, bucket_bytes: int, timing: bool = False) -> None:
+        """Select an experimental transport without changing optimizer state/groups."""
+        if self.communication is not None:
+            self.communication.close()
+            self.communication = None
+        if mode != "baseline":
+            from gpt_lab.optim.communication import BucketCommunication
+            self.communication = BucketCommunication(self, mode, bucket_bytes, timing)
+
+    def begin_backward_communication(self, final_microstep: bool) -> None:
+        if self.communication is not None:
+            self.communication.begin_backward(final_microstep)
+
+    def finish_gradient_communication(self) -> None:
+        """Drain optimizer reductions before an independent trainer collective."""
+        if self.communication is not None:
+            self.communication.finish_reductions()
     
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -92,6 +111,8 @@ class OptimizerFactory(torch.optim.Optimizer):
     
     def load_state_dict(self, state_dict: dict) -> None:
         """Load optimizer state dict."""
+        if self.communication is not None:
+            self.communication.reset()
         super().load_state_dict(state_dict)
         # Older checkpoints predate the schedule baselines.
         for group in self.param_groups:

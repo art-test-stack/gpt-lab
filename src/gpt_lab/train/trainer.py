@@ -610,6 +610,10 @@ class Trainer:
         covers accumulation, prefetch, scheduling, and the optimizer step;
         reduction across ranks happens in update_metrics().
         """
+        communication = getattr(self.optimizer, "communication", None)
+        if communication is not None and communication.mode == "backward":
+            if self.scaler is not None or getattr(self.config, "cuda_graph_mode", "disabled") not in (None, False, "disabled", "none"):
+                raise ValueError("Backward communication requires unscaled gradients and disabled CUDA capture")
         step = self.state.step
         n_acc_steps = self.config.n_acc_steps
         world_size = self.config.comp_info.world_size
@@ -628,6 +632,9 @@ class Trainer:
             with self.train_context():
                 loss = self.compute_loss(payload)
             loss = loss / n_acc_steps
+
+            if hasattr(self.optimizer, "begin_backward_communication"):
+                self.optimizer.begin_backward_communication(acc_step == n_acc_steps - 1)
 
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
@@ -681,6 +688,8 @@ class Trainer:
                     dist.all_reduce(g, op=dist.ReduceOp.MAX)
 
         if self.config.monitor_grad_norms and should_log_step:
+            if hasattr(self.optimizer, "finish_gradient_communication"):
+                self.optimizer.finish_gradient_communication()
             self.log_gradients()
 
         if self.scaler is not None:
