@@ -220,6 +220,9 @@ class Trainer:
         self.use_amp = self.dtype in (torch.float16, torch.bfloat16)
         if isinstance(model, DenseTransformer):
             model._enforce_precision(self.dtype)
+        if getattr(config, "fp8_ffn_forward", False):
+            from gpt_lab.model.fp8 import enable_fp8_ffn_forward
+            enable_fp8_ffn_forward(model, self.dtype)
 
         # Optimizer
         if optimizer is None:
@@ -253,7 +256,7 @@ class Trainer:
         def val_context(model):
             with ExitStack() as stack:
                 stack.enter_context(amp_context())
-                if self.config.fp8:
+                if self.config.fp8 or getattr(self.config, "fp8_ffn_forward", False):
                     from gpt_lab.model.fp8 import DisableFP8
                     stack.enter_context(DisableFP8(model))
                 yield model

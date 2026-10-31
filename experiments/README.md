@@ -1,5 +1,9 @@
 # Experiments
 
+Optional FP8 training checks and launch instructions live in
+[`fp8_training/`](fp8_training/README.md). They keep the architecture fixed and
+preserve the BF16 path unless FP8 is explicitly requested.
+
 Run these modules from the repository root with the installed project environment.
 They are separate from the `gpt-lab` CLI; the old `scripts/benchmark/` entry points
 have moved here. Use `--help` for all options and defaults.

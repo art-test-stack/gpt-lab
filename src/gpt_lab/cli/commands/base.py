@@ -51,6 +51,7 @@ def add_auto_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--target-param-data-ratio', type=float, default=11.0, help='Target parameter-to-data ratio for auto-configured models.')
     parser.add_argument('--target-time', type=float, default=-1.0, help='Target training time in seconds for auto-configured models. This parameter overrides num-steps. ')
     parser.add_argument('--fp8', action='store_true', help='Legacy experimental flag, retained but unused by the training pipeline.')
+    parser.add_argument('--fp8-ffn-forward', action='store_true', help='Opt-in torchao FP8 SwiGLU FFN forward GEMMs on H100/H200; BF16 backward. Requires the fp8 extra, --act-func swiglu and aligned dimensions. Default training precision is unchanged.')
     parser.add_argument('--n-acc-steps', type=int, default=-1, help='Number of acc_step iterations (gradient accumulation) per optimizer step (-1 automatically sets; 0 disables). Recommended: -1.')
     parser.add_argument('--total-batch-size', type=int, default=-1, help='Override the total tokens per optimizer step across devices; -1 uses the scaling law. With automatic accumulation, must be divisible by device_batch_size * max_seq_len * world_size.')
     parser.add_argument('--warmup-steps', type=int, default=40, help='Number of warmup steps for learning rate scheduler.')

@@ -547,6 +547,7 @@ class TrainerConfig(BaseModel):
     
     # Dtype settings
     fp8: bool = False
+    fp8_ffn_forward: bool = False
 
     # Evaluatement settings
     eval_bpb_every: int = 250 # Evaluate val bpb every N steps (-1 = disable)
