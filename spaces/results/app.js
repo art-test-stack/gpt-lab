@@ -6,7 +6,7 @@ const fmt = (n, digits = 3) => finite(n) ? n.toLocaleString('en-US', {maximumFra
 const compact = n => new Intl.NumberFormat('en-US', {notation:'compact', maximumFractionDigits:1}).format(n);
 const duration = n => !finite(n) ? '—' : n >= 3600 ? `${fmt(n / 3600, 1)} h` : n >= 60 ? `${fmt(n / 60, 1)} min` : `${fmt(n, 1)} s`;
 const title = run => String(run.label || run.id);
-let snapshot = {schema_version: 1, runs: []}, realSnapshot = snapshot, selected = new Set(), synthetic = false, tab = 'overview';
+let snapshot = {schema_version: 1, runs: []}, realSnapshot = snapshot, selected = new Set(), synthetic = false, tab = 'evidence';
 const inExperiment = run => !$('experiment').value || JSON.stringify(run.group || '') === $('experiment').value;
 const chosen = () => snapshot.runs.filter(run => inExperiment(run) && selected.has(run.id));
 const visibleRuns = () => snapshot.runs.filter(run => inExperiment(run) && `${title(run)} ${run.group || ''} ${run.status || ''}`.toLowerCase().includes($('search').value.toLowerCase()));
@@ -138,15 +138,20 @@ function render() {
   if (tab === 'overview') { chart('loss-chart','train/raw_loss',{smooth:true}); chart('bpb-chart','eval/bpb'); chart('throughput-chart','train/tokens_per_sec'); chart('mfu-chart','train/mfu',{unit:'%'}); }
   if (tab === 'evaluation') { chart('core-chart','core/core'); chart('eval-chart','core/step_time_ms',{factor:0.001}); }
 }
-for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => {
-  tab = button.dataset.tab;
+function showTab(next, updateHash = true) {
+  tab = ['overview', 'evaluation', 'configuration', 'evidence'].includes(next) ? next : 'evidence';
   for (const node of document.querySelectorAll('[data-tab]')) { node.classList.toggle('active',node.dataset.tab === tab); node.setAttribute('aria-pressed', node.dataset.tab === tab); }
   for (const node of document.querySelectorAll('.tab-panel')) node.hidden = node.id !== tab;
-  const names = {overview:'Experiment overview', evaluation:'Evaluation results', configuration:'Training configuration', evidence:'Experiment archive'};
+  for (const node of document.querySelectorAll('[data-training-action]')) node.hidden = tab === 'evidence';
+  const names = {overview:'Training overview', evaluation:'Evaluation results', configuration:'Training configuration', evidence:'Experiments'};
   $('page-title').replaceChildren(document.createTextNode(names[tab]),Object.assign(document.createElement('span'),{textContent:'.'}));
   $('selection-label').textContent = tab === 'overview' ? 'Learning curves' : tab === 'evaluation' ? 'Evaluation checkpoints' : 'Compare every setting';
-  $('smoothing-label').hidden = tab !== 'overview'; $('axis').parentElement.hidden = tab === 'configuration'; render();
-});
+  $('smoothing-label').hidden = tab !== 'overview'; $('axis').parentElement.hidden = tab === 'configuration';
+  if (updateHash) history.replaceState(null, '', '#' + tab);
+  render();
+}
+for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => showTab(button.dataset.tab));
+window.addEventListener('hashchange', () => showTab(location.hash.slice(1), false));
 for (const id of ['axis','smoothing','differences','experiment']) $(id).addEventListener('change', render);
 $('import-button').addEventListener('click', () => $('import').click());
 $('search').addEventListener('input', runList);
@@ -163,6 +168,6 @@ $('import').addEventListener('change', async event => {
 $('download').addEventListener('click', () => {
   downloadJSON({...snapshot, runs:chosen(), ...(synthetic ? {synthetic:true} : {})}, synthetic ? 'synthetic-preview.json' : 'gpt-lab-results.json');
 });
-render();
+showTab(location.hash.slice(1), false);
 try { const response = await fetch('./results.json', {cache:'no-cache'}); if (!response.ok) throw new Error(`HTTP ${response.status}`); setSnapshot(await response.json()); }
 catch { message('No hosted snapshot could be loaded. You can still import a results JSON file.'); }

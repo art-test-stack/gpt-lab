@@ -11,22 +11,22 @@
   <aside class="sidebar">
     <a class="brand" href="#" aria-label="gpt-lab home" title="gpt-lab"><img src="logo.png" width="48" height="48" alt=""></a>
     <nav aria-label="Dashboard sections">
-      <button class="nav active" data-tab="overview" aria-label="Overview" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16h16M7 14l4-5 4 3 5-7"/></svg></button>
+      <button class="nav" data-tab="overview" aria-label="Overview" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16h16M7 14l4-5 4 3 5-7"/></svg></button>
       <button class="nav" data-tab="evaluation" aria-label="Evaluation" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16M7 16v-5m5 5V5m5 11V8"/></svg></button>
       <button class="nav" data-tab="configuration" aria-label="Configuration" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h6m4 0h6M4 17h10m4 0h2M10 4v6m4 4v6"/></svg></button>
-      <button class="nav" data-tab="evidence" aria-label="Experiment archive" title="Experiment archive" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v14H3zM2 3h20v4H2zM9 11h6"/></svg></button>
+      <button class="nav active" data-tab="evidence" aria-label="Experiment archive" title="Experiment archive" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v14H3zM2 3h20v4H2zM9 11h6"/></svg></button>
     </nav>
     <a class="rail-footer" href="https://github.com/art-test-stack/gpt-lab" target="_blank" rel="noopener noreferrer" aria-label="View gpt-lab on GitHub"><img src="vendor/github.svg" width="24" height="24" alt=""></a>
   </aside>
 
   <main>
     <header>
-      <div><div class="product-name">gpt-lab</div><h1 id="page-title">Experiment overview<span>.</span></h1><p>Follow the learning. Compare the details.</p></div>
-      <div class="actions"><button class="button secondary" data-tab="evidence" aria-pressed="false">Experiment archive</button><button id="demo" class="button secondary">Preview example</button><button id="import-button" class="button secondary">Import JSON</button><input id="import" type="file" accept=".json,application/json" hidden><button id="download" class="button primary">Export selection ↓</button></div>
+      <div><div class="product-name">gpt-lab</div><h1 id="page-title">Experiments<span>.</span></h1><p>What changed, what was measured, and the evidence behind it.</p></div>
+      <div class="actions"><button class="button secondary" data-tab="evidence" aria-pressed="false">Experiment archive</button><button data-training-action id="demo" class="button secondary">Preview example</button><button data-training-action id="import-button" class="button secondary">Import JSON</button><input id="import" type="file" accept=".json,application/json" hidden><button data-training-action id="download" class="button primary">Export selection ↓</button></div>
     </header>
     <div id="message" class="message" role="status" aria-live="polite" hidden></div>
     <div id="demo-banner" class="demo-banner" hidden>SYNTHETIC PREVIEW · Illustrative data only. These curves are not measured results. <button id="clear-demo">Return to real results</button></div>
-    <section id="empty" class="empty panel"><div class="empty-icon">↗</div><h2>Your experiments, in one place.</h2><p>Import a results snapshot or export your existing W&amp;B runs.<br>Learning curves, evaluations, and configurations will appear here.</p><button id="empty-demo" class="button primary">Explore the example →</button><p class="small">Imported files stay in this browser session. Nothing is uploaded.</p></section>
+    <section id="empty" class="empty panel" hidden><div class="empty-icon">↗</div><h2>Your experiments, in one place.</h2><p>Import a results snapshot or export your existing W&amp;B runs.<br>Learning curves, evaluations, and configurations will appear here.</p><button id="empty-demo" class="button primary">Explore the example →</button><p class="small">Imported files stay in this browser session. Nothing is uploaded.</p></section>
 
     <div id="workspace" hidden>
       <section class="panel run-controls" aria-label="Experiment and run selection">
@@ -60,7 +60,9 @@
       <article class="panel runs-panel"><div class="panel-title"><h2>Run recap</h2><span>LAST RECORDED VALUES</span></div><div id="recap-table" class="table-wrap"></div></article>
       <p class="footnote">Training time excludes evaluation in gpt-lab. Logged elapsed time includes intervals between metric logs; neither is a Modal billing measurement. MFU is an estimate based on model FLOPs and configured peak compute. Missing axis values are omitted, not interpolated. Scores are not automatically ranked as comparable experiments.</p>
     </div>
-    <section id="evidence" class="tab-panel archive-panel" hidden>
+    <section id="evidence" class="tab-panel archive-panel">
+      <div id="archive-summary" class="archive-summary"></div>
+      <div id="archive-experiments" class="experiment-grid" aria-label="Experiment families"></div>
       <p id="archive-status-message" class="table-note" role="status">Loading experiment archive…</p>
       <section class="panel run-controls"><div class="run-controls-head">
         <label>Experiment <select id="archive-experiment"><option value="">All experiments</option></select></label>
@@ -70,7 +72,7 @@
         <button id="archive-download" class="button secondary">Download index ↓</button>
       </div><p id="archive-count" class="small">0 runs</p></section>
       <p class="table-note">Reports retain the recorded protocol and units. Download profiler traces and open them in <a href="https://ui.perfetto.dev/" target="_blank" rel="noopener noreferrer">Perfetto</a>. Missing measurements stay missing.</p>
-      <div id="archive-runs"></div>
+      <div class="archive-layout"><div id="archive-runs"></div><section id="archive-detail" class="panel archive-detail" aria-label="Selected run"></section></div>
     </section>
     <footer><span>gpt-lab <b>/</b> A small record of what changed.</span><span id="snapshot-info">No results loaded</span></footer>
   </main>

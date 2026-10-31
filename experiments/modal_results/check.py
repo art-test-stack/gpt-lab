@@ -156,6 +156,23 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual([call for call in calls if call[0] == "read"], [("read", "cg-a/summary.json")])
         self.assertEqual(result["runs"][0]["source"]["type"], "modal-volume")
 
+    def test_viewer_only_publication_never_stages_evidence_or_training_data(self):
+        spec = importlib.util.spec_from_file_location("publish_viewer", Path(__file__).with_name("publish_viewer.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        class Api:
+            def repo_info(self, **kwargs):
+                return SimpleNamespace(sdk="static", sha="CURRENT")
+            def upload_folder(self, **kwargs):
+                paths = {p.relative_to(kwargs["folder_path"]).as_posix() for p in Path(kwargs["folder_path"]).rglob("*") if p.is_file()}
+                assert set(module.VIEWER_FILES) <= paths
+                assert not {"results.json", "experiments.json", "README.md", "archive-files.json"} & paths
+                assert not any(p.startswith("archive/") for p in paths)
+                assert kwargs["parent_commit"] == "CURRENT"
+                assert "delete_patterns" not in kwargs
+                return "viewer-updated"
+        self.assertEqual(module.publish_viewer("owner/space", api=Api()), "viewer-updated")
+
     def test_publish_refuses_non_static_space_before_any_upload(self):
         api = SimpleNamespace(repo_info=lambda **kwargs: SimpleNamespace(sdk="gradio", sha="HEAD"))
         with self.assertRaisesRegex(ValueError, "static"):
