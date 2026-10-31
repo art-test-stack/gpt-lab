@@ -86,7 +86,8 @@ def default_cli_args(output_dir: Path) -> list[str]:
         "--window-pattern", "SSSL",
         "--window-size", "512",
         "--softcap", "18",
-        "--attn-impl", "fused",
+        "--attn-impl", "fa2",
+        "--act-func", "swiglu",
         "--device-batch-size", "16",
         "--target-param-data-ratio", "8",
         "--total-batch-size", "524288",
@@ -112,7 +113,8 @@ def invariant_cli_args(optimizer: str = "muon", updates: int = 150) -> list[str]
         "--device-batch-size", "16",
         "--total-batch-size", "524288",
         "--random-seed", "42",
-        "--attn-impl", "fused",
+        "--attn-impl", "fa2",
+        "--act-func", "swiglu",
         "--target-param-data-ratio", "8",
         "--model-name", "ic1",
         "--tokenizer-model", "gpt2",
@@ -442,7 +444,7 @@ def install_runner(args: argparse.Namespace, output_dir: Path, seed: int, resolv
         if not gpu.name.startswith("NVIDIA A100"):
             raise ValueError(f"fixed communication diagnostics require an A100, got {gpu.name}")
         if (self.model.config.n_layers != 12 or self.model.config.d_head != 128
-                or self.model.config.max_context != 2048 or self.model.config.attn_impl != "fused"):
+                or self.model.config.max_context != 2048 or self.model.config.attn_impl != "fa2"):
             raise ValueError("resolved model differs from the fixed depth-12/head-128/context-2048 diagnostic architecture")
         from gpt_lab.model.layers import SwigLUFeedForward
         if len(self.model.blocks) != 12 or any(type(block.ffn) is not SwigLUFeedForward for block in self.model.blocks):

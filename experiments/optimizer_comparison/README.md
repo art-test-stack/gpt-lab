@@ -5,5 +5,5 @@ Twin-rail momentum, delayed blending, terminal averaging and parameter-storage c
 Profiles: `configs/muon.yaml`, `configs/a_normuon.yaml`, `configs/b_spectral.yaml`; select with `--optim-config-path`.
 Muon beta2/decay are 0.9/0.28; NorMuon A/B are 0.95/0.1; base matrix LR is 0.02 for all three.
 CPU spectral/norm/state/resume and owner-update checks passed; compiled spectral GPU/NCCL checks and learning quality remain unverified.
-Recommendation: capture off, baseline communication, explicit profile; GPU validation before matched learning runs is Agent A's follow-up.
+Current recipe/ownership: [INTEGRATION.md](INTEGRATION.md), [selected-runs.json](selected-runs.json); Agent A owns GPU validation and remaining run prerequisites.
 Entry: `uv run --locked --extra cpu --group dev pytest experiments/optimizer_comparison`; evidence and coefficients: `results.json`, `REPORT.md`.

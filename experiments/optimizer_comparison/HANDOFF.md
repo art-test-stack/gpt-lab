@@ -1,5 +1,8 @@
 # Agent C consolidation handoff to Agent A
 
+Historical handoff: the current branch ownership and depth-20 H100 run recipe
+supersede the remaining-work instructions below; see [INTEGRATION.md](INTEGRATION.md).
+
 ## Preserved history
 
 - Starting NorMuon/development source: `192bbe2921e4774d24324b2d07852311b7bc4dcf`.

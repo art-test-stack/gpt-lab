@@ -83,6 +83,7 @@ DEFAULT_TRAIN = {
     "ds_name": "climbmix-base",
     "tokenizer_model": "gpt2",
     "depth": 12,
+    "act_func": "swiglu",
     "aspect_ratio": 64,
     "d_head": 128,
     "max_seq_len": 2048,
@@ -90,7 +91,7 @@ DEFAULT_TRAIN = {
     "window_pattern": "SSSL",
     "window_size": 512,
     "softcap": 18.0,
-    "attn_impl": "fused",
+    "attn_impl": "fa2",
     "device_batch_size": 16,
     "target_param_data_ratio": 8,
     "total_batch_size": 524288,
@@ -394,7 +395,15 @@ def gpu_probe(world_size, dtype, attn_impl, require_sxm=False):
         probe += "; assert all(name == 'NVIDIA A100-SXM4-80GB' for name in names), f'SXM4 required; allocated: {names}'"
     if dtype == "bfloat16":
         probe += "; assert torch.cuda.is_bf16_supported()"
-    if attn_impl == "fused":
+    if attn_impl == "fa2":
+        probe += ("; from gpt_lab.model.flash_attn import _flash_attn2; "
+                  "assert _flash_attn2 is not None, 'FlashAttention 2 unavailable'; "
+                  "print('Attention backend: FA2')")
+    elif attn_impl == "fa3":
+        probe += ("; from gpt_lab.model.flash_attn import _flash_attn; "
+                  "assert _flash_attn is not None, 'FlashAttention 3 unavailable'; "
+                  "print('Attention backend: FA3')")
+    elif attn_impl == "fused":
         probe += ("; from gpt_lab.model.flash_attn import _flash_attn2, _flash_attn; "
                   "assert _flash_attn2 is not None or _flash_attn is not None, 'Fused attention unavailable'; "
                   "print('Attention backend:', 'FA3' if _flash_attn is not None else 'FA2')")

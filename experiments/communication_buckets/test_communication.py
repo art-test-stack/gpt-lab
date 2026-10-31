@@ -329,6 +329,7 @@ def test_diagnostic_cli_preserves_native_overrides_and_scheduler_horizon(tmp_pat
     assert args.communication == "backward" and args.bucket_mib == 32
     assert resolved.device_batch_size == 16 and resolved.random_seed == 42
     assert resolved.num_steps == 2317 and resolved.stop_after_step == 150
+    assert resolved.act_func == "swiglu" and resolved.attn_impl == "fa2"
     assert resolved.eval_bpb_every == resolved.eval_core_every == resolved.sample_every == resolved.save_every == 0
     assert resolved.optim_config_path.endswith("configs/optim.yaml" if optimizer == "muon" else "configs/normuon.yaml")
 

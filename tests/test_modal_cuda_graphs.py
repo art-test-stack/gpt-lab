@@ -36,6 +36,7 @@ def test_dry_run_builds_matched_native_commands(monkeypatch, capsys, gpus, mode)
     assert settings.num_steps == 2317 and settings.warmup_steps == 300
     assert settings.random_seed == 42 and settings.device == "cuda"
     assert settings.total_batch_size == 524288
+    assert settings.act_func == "swiglu" and settings.attn_impl == "fa2"
     assert settings.total_batch_size // (gpus * settings.device_batch_size * settings.max_seq_len) == 16 // gpus
     assert (settings.save_every, settings.eval_bpb_every, settings.eval_core_every, settings.sample_every) == (0, 0, 0, 0)
     compile(launcher.SHORT_RUNNER, "train_short.py", "exec")

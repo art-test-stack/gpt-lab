@@ -63,7 +63,7 @@ def run_check(profile_path, context, output_dir, *, n_acc_steps=3, updates=6, at
     reference = DenseTransformer(TransformerConfig(
         vocab_size=128, max_context=16, n_layers=2, d_model=64, d_ffn=128,
         n_heads=1, n_kv_heads=1, d_head=64, window_pattern="SL", window_size=8,
-        attn_impl=attn_impl, dropout=0, attention_dropout=0,
+        act_func="swiglu", attn_impl=attn_impl, dropout=0, attention_dropout=0,
     )).to(context.device)
     reference.init_weights()
     reference._enforce_precision(dtype)
@@ -157,7 +157,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--optim-config-path", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--attn-impl", default="fused", choices=("fused", "sdpa"))
+    parser.add_argument("--attn-impl", default="fused", choices=("fused", "sdpa", "fa2", "fa3"))
     parser.add_argument("--n-acc-steps", type=int, default=2)
     args = parser.parse_args()
     if args.n_acc_steps < 1:

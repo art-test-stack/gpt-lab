@@ -66,5 +66,8 @@ and mocked scaling resume. They do not run a full tokenizer sweep.
 
 ## Preserved training experiments
 
+- [Current integration and selected training recipe](optimizer_comparison/INTEGRATION.md): one active branch/PR, owned by Agent A.
+- [CUDA graph capture](cuda_graphs/README.md): preserved correctness and negative throughput/memory results.
+- [Modal evidence archive](modal_results/README.md): collect non-model artifacts and publish them to the existing results Space without GPU allocation.
 - [Communication buckets and overlap](communication_buckets/README.md): explicit baseline/bucket/pipeline/hook choices and measured negative results.
 - [Optimizer comparison](optimizer_comparison/README.md): existing Muon, NorMuon and NorMuon with ANVIL spectral maps; remaining GPU validation belongs to Agent A.

@@ -1,0 +1,19 @@
+{
+  "source_commit": "a5d46414cca0351276b65f30f873d40034f9a7f0",
+  "source_report": "docs/cuda-graphs/README.md",
+  "run_name": "cg-8-b32-matched-v2",
+  "hardware": "8x A100-SXM4-80GB",
+  "precision": "BF16",
+  "optimizer": "NorMuon",
+  "depth": 12,
+  "sequence_length": 2048,
+  "device_batch_size": 32,
+  "global_tokens_per_update": 524288,
+  "total_updates": 150,
+  "timed_updates": "11-150",
+  "compiled": {"global_tokens_per_second": 1298919, "mean_training_step_ms": 403.32, "process_elapsed_seconds": 199.88, "peak_reserved_gib_per_gpu": 59.05},
+  "captured": {"global_tokens_per_second": 1292484, "mean_training_step_ms": 405.36, "process_elapsed_seconds": 199.93, "peak_reserved_gib_per_gpu": 68.90},
+  "conclusion": "No measured speedup in one matched trial; preserve compiled default and capture opt-in",
+  "limits": "One timing trial; small-model distributed equivalence is not full-configuration validation; no hardware utilization counters",
+  "new_gpu_experiment": false
+}
