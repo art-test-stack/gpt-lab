@@ -1,6 +1,9 @@
 import copy
 import importlib.util
 from pathlib import Path
+import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -31,12 +34,31 @@ def test_nested_equivalence_reports_tensor_and_counter_mismatches():
         equivalence.run_check("configs/normuon.yaml", ComputeContext(device=torch.device("cpu")), ".")
 
 
+def test_single_microstep_cli_also_checks_accumulation(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(equivalence.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(equivalence, "init_dist_groups", lambda *args, **kwargs:
+                        SimpleNamespace(rank=0, world_size=8))
+    monkeypatch.setattr(equivalence, "cleanup_dist_groups", lambda: None)
+    def check(profile, context, output, *, n_acc_steps, attn_impl):
+        calls.append(n_acc_steps)
+        return dict(passed=True, rank=0, world_size=8, n_acc_steps=n_acc_steps)
+    monkeypatch.setattr(equivalence, "run_check", check)
+    monkeypatch.setattr(sys, "argv", ["check", "--optim-config-path", "configs/normuon.yaml",
+                                    "--output-dir", str(tmp_path), "--n-acc-steps", "1"])
+    equivalence.main()
+    assert calls == [1, 2]
+    result = json.loads((tmp_path / "rank_0.json").read_text())
+    assert [check["n_acc_steps"] for check in result["accumulation_checks"]] == [1, 2]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires real CUDA capture")
-def test_production_normuon_compiled_capture_equivalence(tmp_path):
+@pytest.mark.parametrize("n_acc_steps", [1, 2])
+def test_production_normuon_compiled_capture_equivalence(tmp_path, n_acc_steps):
     from gpt_lab.utils.distributed import get_comp_info
     torch.manual_seed(17)
     result = equivalence.run_check("configs/normuon.yaml", get_comp_info("cuda"), tmp_path,
-                                   n_acc_steps=2, updates=6, attn_impl="fused")
+                                   n_acc_steps=n_acc_steps, updates=6, attn_impl="fused")
     assert result["passed"]
     assert {"loss", "gradients", "parameters", "optimizer"} <= result["max_absolute_errors"].keys()
 

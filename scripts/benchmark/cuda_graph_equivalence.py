@@ -160,14 +160,21 @@ def main():
     parser.add_argument("--attn-impl", default="fused", choices=("fused", "sdpa"))
     parser.add_argument("--n-acc-steps", type=int, default=2)
     args = parser.parse_args()
-    if args.n_acc_steps < 2:
-        parser.error("Equivalence requires at least two accumulation microsteps")
+    if args.n_acc_steps < 1:
+        parser.error("Equivalence requires positive accumulation microsteps")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable: equivalence was NOT verified")
     context = init_dist_groups("cuda", random_seed=17)
     try:
-        result = run_check(args.optim_config_path, context, args.output_dir,
-                           n_acc_steps=args.n_acc_steps, attn_impl=args.attn_impl)
+        counts = sorted({args.n_acc_steps, max(2, args.n_acc_steps)})
+        results = []
+        for count in counts:
+            torch.manual_seed(17)
+            output = Path(args.output_dir) / f"accumulation_{count}" if len(counts) > 1 else Path(args.output_dir)
+            results.append(run_check(args.optim_config_path, context, output,
+                                     n_acc_steps=count, attn_impl=args.attn_impl))
+        result = results[0] if len(results) == 1 else results[0] | {"accumulation_checks": results}
+        (Path(args.output_dir) / f"rank_{context.rank}.json").write_text(json.dumps(result, indent=2) + "\n")
         if context.rank == 0:
             print(json.dumps(result, indent=2), flush=True)
     finally:

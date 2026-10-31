@@ -19,7 +19,7 @@ Optimizer defaults come from that exact commit. The branch must support
 stop_after_step and completed_steps.
 The gpt-lab Modal secret needs HF_TOKEN and WANDB_API_KEY. Existing Volumes:
 gpt-lab-cache (/cache/gpt_lab) and gpt-lab-runs (/runs). No data downloads.
-Every GPU job first runs six compiled-versus-captured updates on a tiny
+Every GPU job first runs six compiled-versus-captured updates per accumulation setting on a tiny
 production transformer with the selected optimizer and real NCCL when distributed.
 Timing is blocked unless every rank passes. Paired modes run sequentially on
 one allocation in fresh seeded processes and verify identical state/data reset.
@@ -336,10 +336,11 @@ def check_inputs(arguments, run_name, world_size, check_data=True):
     ):
         raise ValueError("Explicit n_acc_steps must be positive and match total_batch_size.")
     if world_size == 8 and (
-        settings["device_batch_size"], settings["max_seq_len"], batch,
-        settings["num_steps"], settings["warmup_steps"], cap, settings["n_acc_steps"]
-    ) not in ((16, 2048, 524288, 2317, 300, 150, -1), (16, 2048, 524288, 2317, 300, 150, 2)):
-        raise ValueError("8-GPU comparison requires microbatch 16, sequence 2048, global batch 524288, horizon 2317, warmup 300, cap 150 and two accumulation microsteps")
+        settings["device_batch_size"] not in (16, 32)
+        or (settings["max_seq_len"], batch, settings["num_steps"], settings["warmup_steps"], cap)
+        != (2048, 524288, 2317, 300, 150)
+    ):
+        raise ValueError("8-GPU comparison requires microbatch 16 or 32, sequence 2048, global batch 524288, horizon 2317, warmup 300 and cap 150")
     if not check_data:
         return settings
     data = CACHE / "data" / settings["ds_name"]
@@ -584,7 +585,7 @@ def main(argv=None):
     print(f"Verified: local {branch} == origin/{branch} == {sha}", flush=True)
     print(shlex.join(["gpt-lab", "train", "auto", *arguments]), flush=True)
     print(f"Hardware: {args.gpus} x A100-80GB; dtype: {args.dtype}; capture mode: {args.mode}", flush=True)
-    print("Gate: six compiled-versus-captured optimizer updates must pass on every rank before timing.", flush=True)
+    print("Gate: six compiled-versus-captured updates per accumulation setting must pass on every rank before timing.", flush=True)
     if args.mode == "paired":
         print("Plan: disabled then forward_backward on the same allocation, with fresh state/data reset.", flush=True)
     if args.profile:

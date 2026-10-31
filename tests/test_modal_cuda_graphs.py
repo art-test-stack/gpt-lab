@@ -92,15 +92,20 @@ def test_summary_excludes_startup_and_uses_global_tokens_once():
         launcher.summarize(ranks)
 
 
-def test_eight_gpu_preflight_preserves_matched_settings(monkeypatch, tmp_path):
-    monkeypatch.setattr(launcher, "REPO", Path(__file__).parents[1])
-    monkeypatch.setattr(launcher, "PYTHON", sys.executable)
+@pytest.mark.parametrize("microbatch,accumulation", [(16, -1), (16, 2), (32, -1), (32, 1)])
+def test_eight_gpu_preflight_preserves_matched_settings(monkeypatch, tmp_path, microbatch, accumulation):
+    monkeypatch.setattr(launcher.subprocess, "check_output", lambda command, **kwargs:
+                        json.dumps(vars(build_parser().parse_args(command[3:]))))
     monkeypatch.setattr(launcher, "RUNS", tmp_path)
-    arguments = launcher.cli_defaults(launcher.DEFAULT_TRAIN)
+    arguments = launcher.cli_defaults(launcher.DEFAULT_TRAIN | dict(
+        device_batch_size=microbatch, n_acc_steps=accumulation))
     settings = launcher.check_inputs(arguments, "new-run", 8, check_data=False)
-    assert settings["total_batch_size"] // (8 * settings["device_batch_size"] * settings["max_seq_len"]) == 2
+    assert settings["total_batch_size"] // (8 * settings["device_batch_size"] * settings["max_seq_len"]) == 32 // microbatch
     with pytest.raises(ValueError, match="8-GPU comparison"):
         launcher.check_inputs([*arguments, "--num-steps", "150"], "new-run", 8, check_data=False)
+    if microbatch == 32:
+        with pytest.raises(ValueError, match="Explicit n_acc_steps"):
+            launcher.check_inputs([*arguments, "--n-acc-steps", "2"], "new-run", 8, check_data=False)
 
 
 def test_preflight_worker_needs_no_project_packages(tmp_path):
@@ -148,7 +153,9 @@ def test_pair_requires_identical_reset_and_data(field):
 
 
 @pytest.mark.parametrize("gate_passes", [False, True])
-def test_same_allocation_pair_is_blocked_by_failed_equivalence(monkeypatch, tmp_path, gate_passes):
+@pytest.mark.parametrize("world,microbatch,accumulation,gate_accumulation", [(1, 16, -1, 16), (8, 32, 1, 1)])
+def test_same_allocation_pair_is_blocked_by_failed_equivalence(monkeypatch, tmp_path, gate_passes,
+                                                              world, microbatch, accumulation, gate_accumulation):
     monkeypatch.setattr(launcher, "REPO", tmp_path)
     monkeypatch.setattr(launcher, "RUNS", tmp_path / "runs")
     monkeypatch.setattr(launcher, "git", lambda directory, *args: "sha" if args[0] == "rev-parse" else "")
@@ -159,11 +166,13 @@ def test_same_allocation_pair_is_blocked_by_failed_equivalence(monkeypatch, tmp_
             events.append("probe")
             return
         events.append("equivalence")
+        assert command[command.index("--n-acc-steps") + 1] == str(gate_accumulation)
         if not gate_passes:
             raise subprocess.CalledProcessError(1, command)
         directory = Path(command[command.index("--output-dir") + 1])
         directory.mkdir(parents=True)
-        (directory / "rank_0.json").write_text(json.dumps(dict(passed=True, world_size=1)))
+        for rank in range(world):
+            (directory / f"rank_{rank}.json").write_text(json.dumps(dict(passed=True, world_size=world)))
     monkeypatch.setattr(launcher.subprocess, "run", run)
     def train_one(arguments, name, sha, branch, env, settings, world, volume, directory):
         mode = settings["cuda_graph_mode"]
@@ -171,20 +180,23 @@ def test_same_allocation_pair_is_blocked_by_failed_equivalence(monkeypatch, tmp_
         if mode == "forward_backward":
             assert env["GPTLAB_EXPECTED_INITIAL"] == str(directory.parent / "disabled")
         directory.mkdir()
-        (directory / "rank_0.json").write_text(json.dumps(initial_rank()))
+        for rank in range(world):
+            result = initial_rank(rank) | dict(world_size=world, device_batch_size=microbatch,
+                                               n_acc_steps=16 if world == 1 else 1)
+            (directory / f"rank_{rank}.json").write_text(json.dumps(result))
         (directory / "summary.json").write_text(json.dumps(dict(mode=mode)))
     monkeypatch.setattr(launcher, "train_one", train_one)
     env = dict(GPTLAB_DTYPE="bfloat16", GPTLAB_REQUIRE_SXM="1", GPTLAB_PROFILE="0",
                GPTLAB_DIAGNOSTIC_MODE="paired")
-    settings = launcher.DEFAULT_TRAIN | {"n_acc_steps": -1}
+    settings = launcher.DEFAULT_TRAIN | dict(n_acc_steps=accumulation, device_batch_size=microbatch)
     volume = SimpleNamespace(commit=lambda: None)
     if gate_passes:
-        result = launcher.train([], "pair", "sha", "branch", env, settings, 1, volume)
+        result = launcher.train([], "pair", "sha", "branch", env, settings, world, volume)
         assert result["identical_initial_state_and_data_position"]
         assert events == ["probe", "equivalence", "disabled", "forward_backward"]
     else:
         with pytest.raises(subprocess.CalledProcessError):
-            launcher.train([], "pair", "sha", "branch", env, settings, 1, volume)
+            launcher.train([], "pair", "sha", "branch", env, settings, world, volume)
         assert events == ["probe", "equivalence"]
         result = json.loads((tmp_path / "runs/pair/comparison.json").read_text())
         assert result["status"] == "failed" and "results" not in result

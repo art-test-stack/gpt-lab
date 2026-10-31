@@ -653,7 +653,8 @@ reduce/scatter/gather backend outside capture. Checks collect every rank's
 result before allowing timing. A skipped or failed check cannot authorize a run.
 
 The small check uses batch 2 and sequence 16, with the requested run's accumulation
-count (16/4/2 for 1/4/8 GPUs). Floating-point comparisons use rtol/atol
+count. If the timed run uses one microstep, the gate checks both one and two
+microsteps from matching seeded states. Floating-point comparisons use rtol/atol
 `1e-3/1e-6` for BF16 and `1e-5/1e-6` for FP32; Python counters and state keys
 must match exactly. It saves observed maximum absolute errors and all failures.
 These tolerances are explicit initial acceptance criteria; real-CUDA checks
@@ -671,8 +672,9 @@ uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_
 
 The optional matched eight-GPU comparison verifies distributed equivalence again
 on its own allocation before either timed run. The eight-GPU preflight enforces
-microbatch 16, sequence 2048, global batch 524288, two accumulation microsteps,
-horizon 2317, warmup 300 and cap 150. Both modes retain BF16, seed 42, depth 12,
+microbatch 16 or 32, sequence 2048, global batch 524288,
+horizon 2317, warmup 300 and cap 150. Microbatch 16 uses two accumulation
+microsteps; microbatch 32 uses one. Both modes retain BF16, seed 42, depth 12,
 width 768, fused attention, and the same explicit optimizer profile. Evaluation,
 generation and all model/optimizer checkpoint saves are disabled.
 
@@ -681,6 +683,11 @@ uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_
   --gpus 8 --mode paired --require-sxm --run-name cg-8-matched-v1 \
   -- --optim-config-path configs/normuon.yaml --board dummy --n-acc-steps 2
 ```
+
+For device batch 32, use `--device-batch-size 32 --n-acc-steps 1` after the
+`--` separator in both the paired timing and separate profile commands. Use
+distinct run names such as `cg-8-b32-matched-v1` and `cg-8-b32-profile-v1`.
+The global batch and scheduler remain unchanged.
 
 Paired runs execute sequentially within one GPU worker, keeping the allocation
 and topology fixed. Each mode reconstructs initial state in a fresh process from
