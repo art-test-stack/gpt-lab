@@ -610,6 +610,135 @@ the rank-0 files, while subsequent local checkpoints use `"full"`.
 With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)
 for module-mode launches and checkpoint selection.
 
+#### Explicit CUDA capture (experimental)
+
+`--cuda-graph-mode forward_backward` opts into fixed-shape forward/backward
+capture around compiled kernels. `disabled` preserves existing compiled execution.
+The captured path disables compiler-managed CUDA graphs to avoid nested capture.
+It requires CUDA, FP32 or BF16, the default `compute_loss`, and a fixed pair of
+input/label tensors. FP16/scaler and FP8 capture are currently rejected.
+
+One graph replay consumes one microbatch. Inputs and gradients use persistent
+storage; gradient accumulation, dataloader work, finite-loss checks, scheduler,
+optimizer and communication remain outside capture. Gradients are cleared in
+place after the update. Warmup restores parameters, model buffers, gradients and
+CPU/CUDA RNG state. Python forward side effects and changing parameter usage
+are unsupported. Evaluation uses the uncaptured evaluation path; resuming
+rebuilds the graph over restored state. Omit the mode to retain a saved mode on
+resume, or explicitly pass `disabled` when resuming without capture.
+
+`train/capture_startup_seconds` reports compilation/warmup/capture separately
+from step timing. Small-model real-CUDA equivalence checks passed on eight A100
+SXM4 GPUs. See the [experiment README](docs/cuda-graphs/README.md) for measured
+results and limits. Optimizer-update and communication capture are pending.
+
+The standalone [`scripts/modal_cuda_graphs.py`](scripts/modal_cuda_graphs.py)
+launcher follows the existing local `runs/modal_trainbase.py`. It requires a
+clean branch whose HEAD matches its live origin tip, Modal 1.6.2 authentication,
+the `gpt-lab` secret (`HF_TOKEN`, `WANDB_API_KEY`), and existing `gpt-lab-cache`
+and `gpt-lab-runs` volumes. It clones the exact selected SHA; it never uploads
+local source or starts a GPU for `--dry-run`.
+
+Every GPU job first runs the small real-CUDA equivalence check in
+[`scripts/benchmark/cuda_graph_equivalence.py`](scripts/benchmark/cuda_graph_equivalence.py).
+It uses a two-layer production transformer, the explicitly selected optimizer
+profile, and six updates with changing production LR/momentum/decay schedules.
+Both paths use compiled kernels with compiler-managed graphs disabled. It
+compares accumulated loss, pre-update accumulated gradients, parameters, and
+all optimizer state after each update. It also checks in-place gradient clearing,
+fixed gradient addresses, warmup restoration of model/buffers/optimizer/RNG,
+and replicated parameters across ranks. Distributed checks use the actual NCCL
+reduce/scatter/gather backend outside capture. Checks collect every rank's
+result before allowing timing. A skipped or failed check cannot authorize a run.
+
+The small check uses batch 2 and sequence 16, with the requested run's accumulation
+count. If the timed run uses one microstep, the gate checks both one and two
+microsteps from matching seeded states. Floating-point comparisons use rtol/atol
+`1e-3/1e-6` for BF16 and `1e-5/1e-6` for FP32; Python counters and state keys
+must match exactly. It saves observed maximum absolute errors and all failures.
+These tolerances are explicit acceptance criteria; the experiment README records
+the completed user-launched CUDA checks. No optimizer or communication capture
+is added.
+
+Run these commands from the `exp/cuda-graphs` worktree after pushing. They
+allocate paid GPUs only when the user executes them. First run the small check:
+
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 1 --mode verify --require-sxm --run-name cg-check-1-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy
+```
+
+The optional matched eight-GPU comparison verifies distributed equivalence again
+on its own allocation before either timed run. The eight-GPU preflight enforces
+microbatch 16 or 32, sequence 2048, global batch 524288,
+horizon 2317, warmup 300 and cap 150. Microbatch 16 uses two accumulation
+microsteps; microbatch 32 uses one. Both modes retain BF16, seed 42, depth 12,
+width 768, fused attention, and the same explicit optimizer profile. Evaluation,
+generation and all model/optimizer checkpoint saves are disabled.
+
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 8 --mode paired --require-sxm --run-name cg-8-matched-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy --n-acc-steps 2
+```
+
+For device batch 32, use `--device-batch-size 32 --n-acc-steps 1` after the
+`--` separator in both the paired timing and separate profile commands. Use
+distinct run names such as `cg-8-b32-matched-v1` and `cg-8-b32-profile-v1`.
+The global batch and scheduler remain unchanged.
+
+Paired runs execute sequentially within one GPU worker, keeping the allocation
+and topology fixed. Each mode reconstructs initial state in a fresh process from
+the same seed and restarts the deterministic dataloader at its initial position.
+Before capture starts, the second process must match the first process's model,
+optimizer, RNG, first-input hashes and initial data position. Final data positions
+and execution settings must also match before a paired comparison is accepted.
+This is a verified fresh-process reset, not a continuation from the first run.
+Each timed process has a fresh compiler cache. Compiler build threads are fixed
+to one per rank to bound concurrent compilation on eight ranks.
+
+Collect the separate short profile with the same model/data settings:
+
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 8 --mode paired --profile --require-sxm --run-name cg-8-profile-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy --n-acc-steps 2
+```
+
+Profile jobs preserve the 2317/300 scheduler and use a separate 14-update
+execution cap. PyTorch CPU/CUDA profiling waits ten updates, warms up one, then
+records three. Open `trace_rank_N.json` in Perfetto or a Chrome trace viewer to
+inspect host gaps, CUDA launches and kernel activities. `kernels_rank_N.txt`
+contains the top 40 entries by self device time. Regions label batch preparation,
+accumulated updates and optimizer/communication. Profiling overhead is excluded
+from all throughput comparisons by using separate jobs and profile-only summaries.
+
+The runs volume stores `/runs/<run-name>/comparison.json`, `equivalence.log`,
+per-rank equivalence JSON, `gpus.csv` (all GPU names/UUIDs/bus IDs/memory/driver),
+and `topology.txt` (`nvidia-smi topo -m`).
+The status of each hardware query is recorded in `hardware_metadata.json`
+and the root comparison, with stdout/stderr saved separately. If an NVML query
+fails, execution continues with explicitly partial hardware metadata and attempts
+`cuda_connectivity.json` for GPU names/memory and CUDA peer-access capability.
+This fallback does not identify physical NVLink/PCIe links or their bandwidth.
+GPU validation and the all-rank equivalence gate remain mandatory before timing.
+Execution-mode directories `disabled/`
+and `forward_backward/` contain launch settings, logs, per-rank metrics and
+`summary.json`. Timed summaries report global tokens/s over updates 11–150,
+per-rank startup/steady peak allocated and reserved memory, trainer elapsed time
+including capture setup, and complete subprocess elapsed time including model
+initialization, compilation, data setup and shutdown. The root comparison also
+reports equivalence time and total worker elapsed time. Modal image build and
+provisioning remain outside worker timers and appear in Modal logs.
+
+Use new run names for retries. `--require-sxm` rejects allocations other than
+`NVIDIA A100-SXM4-80GB` before checking/training; it cannot force Modal placement.
+`--mode disabled` and `--mode forward_backward` remain available for individual
+runs, and `--gpus` accepts 1, 4 or 8. `--mode verify` needs no cached dataset.
+`--detach` submits one worker in the background. These diagnostics do not measure
+convergence quality; timing and profile claims await real user-launched results.
+
 #### Customizing the trainer
 
 Subclass [`Trainer`](src/gpt_lab/train/trainer.py) and override `train_step` for a

@@ -188,6 +188,14 @@ class Trainer:
             )
         self.config = config
         self.compiled_training_loss = None
+        self._forward_backward_graph = None
+        if config.cuda_graph_mode != "disabled":
+            if config.comp_info.device_type != "cuda":
+                raise ValueError("CUDA graph capture requires CUDA")
+            if self.__class__.compute_loss is not Trainer.compute_loss:
+                raise ValueError("CUDA graph capture currently requires the default compute_loss")
+            if config.fp8 or scaler is not None or config.comp_info.compute_dtype in (torch.float16, "float16"):
+                raise ValueError("CUDA graph capture currently supports FP32/BF16 without a gradient scaler or FP8")
         
         if checkpoint_manager is None:
             model_name = self.model.__class__.__name__
@@ -367,9 +375,10 @@ class Trainer:
         )
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
-            self.compiled_model = torch.compile(self.model, dynamic=False)
+            compile_options = {"triton.cudagraphs": False} if self.config.cuda_graph_mode != "disabled" else None
+            self.compiled_model = torch.compile(self.model, dynamic=False, options=compile_options)
             if use_scalar_loss:
-                self.compiled_training_loss = torch.compile(self.model.training_loss, dynamic=False)
+                self.compiled_training_loss = torch.compile(self.model.training_loss, dynamic=False, options=compile_options)
         else:
             self.compiled_model = self.model
             if use_scalar_loss:
@@ -402,6 +411,14 @@ class Trainer:
 
         # Prepare for training
         self.compiled_model.train()
+        if self.config.cuda_graph_mode == "forward_backward":
+            from gpt_lab.train.cuda_graph import CapturedForwardBackward
+            capture_start = time.perf_counter()
+            self._forward_backward_graph = CapturedForwardBackward(
+                self.model, self.compute_loss, batch[0], self.config.n_acc_steps,
+                self.train_context,
+            )
+            self.board.log({"train/capture_startup_seconds": time.perf_counter() - capture_start}, step=step)
         
         total_dt = []  # For ETA calculation
         
@@ -492,6 +509,7 @@ class Trainer:
         del self.compiled_model  # Clean up compiled model if it exists
         self.compiled_model = None
         self.compiled_training_loss = None
+        self._forward_backward_graph = None
         
         print0("=" * 70)
         print0(f"Training completed!")
@@ -625,14 +643,17 @@ class Trainer:
             eff_global_tokens += token_count * world_size
 
             self.state.train_loader_state = dataloader_state
-            with self.train_context():
-                loss = self.compute_loss(payload)
-            loss = loss / n_acc_steps
-
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
+            if self._forward_backward_graph is not None:
+                loss = self._forward_backward_graph.replay(payload)
             else:
-                loss.backward()
+                with self.train_context():
+                    loss = self.compute_loss(payload)
+                loss = loss / n_acc_steps
+
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
             loss_accum.add_(loss.detach().float())
 
@@ -689,7 +710,7 @@ class Trainer:
         else:
             self.optimizer.step()
 
-        self.compiled_model.zero_grad(set_to_none=True)
+        self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
 
     def evaluate_bpb(self):
         """Run BPB validation, log metrics, and update the best checkpoint.
