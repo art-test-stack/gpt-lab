@@ -58,7 +58,10 @@ CPU safeguards (no torchao installation or GPU required):
 
 ```sh
 uv run --locked --extra cpu --group dev pytest -q \
-  experiments/fp8_training/check_cpu.py
+  experiments/fp8_training/check_cpu.py \
+  experiments/fp8_training/check_attention_backends.py \
+  experiments/fp8_training/check_attention_diagnostics.py \
+  experiments/fp8_training/check_h100_plan.py
 ```
 
 These check the untouched BF16 loss/gradients, lazy imports, device rejection,
@@ -119,6 +122,14 @@ Append `--dry-run` to print the paired commands without Git or Modal requests.
 The run names are `fp8-1h100-01-bf16` and `fp8-1h100-01-fp8-forward`.
 
 The launcher retains HF/W&B secrets and reports the selected FA2/FA3 backend.
+The paired H100 runs explicitly use `--attn-impl fa3`. If its Hub load fails, both model
+setup and the fused-attention preflight raise an error chained from the original
+exception instead of using SDPA. Ordinary CPU imports remain usable.
+`--attn-impl sdpa` uses PyTorch SDPA; `fa2` and `fa3` require their named kernels.
+All three use the same packed QKV linear projection and split tensor views.
+Legacy model configs with `fused` remain readable through their compatibility path;
+new CLI launches accept only the explicit kernel names. Weight keys and shapes
+are unchanged. Kernel changes can introduce numerical differences.
 It does not change attention to FP8. Checkpoints retain ordinary weight keys;
 the saved trainer flag reconstructs FP8 modules for training resume. Inference
 loads ordinary linears. Dynamic scaling is recomputed from current operands on

@@ -13,6 +13,7 @@ def test_matched_one_gpu_plans():
     for command in (baseline, fp8):
         for flag, value in {"--gpus": "1", "--gpu": "H100", "--dtype": "bfloat16",
                             "--act-func": "swiglu", "--n-acc-steps": "16",
+                            "--attn-impl": "fa3",
                             "--num-steps": "2317", "--stop-after-step": "10",
                             "--total-batch-size": "524288"}.items():
             assert command[command.index(flag)+1] == value

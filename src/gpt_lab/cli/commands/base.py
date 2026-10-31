@@ -45,7 +45,7 @@ def add_auto_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--window-size', type=str, default=None, help='Window size for pattern smalls (S).')
     parser.add_argument('--softcap', type=float, default=18.0, help='Soft cap for model logits to prevent overflow.')
     parser.add_argument('--attn-softcap', type=float, default=None, help='Soft cap for attention scores to prevent overflow.')
-    parser.add_argument('--attn-impl', type=str, default='sdpa', help="Attention implementation to use for auto-configured models. Options are 'sdpa' and 'fused'. Both shoulf exhibit same results but 'fused' should be slightly faster (if runned under cuda device).")
+    parser.add_argument('--attn-impl', choices=('sdpa', 'fa2', 'fa3'), default='sdpa', help="Attention kernel. FA2/FA3 require their CUDA backend and fail if unavailable. QKV always uses one packed linear projection.")
     parser.add_argument('--num-steps', type=int, default=-1, help='Complete scheduling horizon; -1 infers it. Use --stop-after-step to limit execution without shortening schedules.')
     parser.add_argument('--target-flops', type=float, default=-1.0, help='Target FLOPS for auto-configured models.')
     parser.add_argument('--target-param-data-ratio', type=float, default=11.0, help='Target parameter-to-data ratio for auto-configured models.')

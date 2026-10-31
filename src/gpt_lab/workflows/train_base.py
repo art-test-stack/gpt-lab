@@ -360,7 +360,7 @@ def build_auto_config(parameters: dict, device, comp_info: ComputeContext):
         window_size=parameters["window_size"],
         softcap=parameters["softcap"],
         attn_softcap=parameters["attn_softcap"],
-        attn_impl=parameters["attn_impl"], # for now, only support 'sdpa' and 'fused'
+        attn_impl=parameters["attn_impl"],
         # training horizon targets
         n_steps=parameters["num_steps"],
         target_flops=parameters["target_flops"],

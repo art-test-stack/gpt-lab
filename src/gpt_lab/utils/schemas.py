@@ -306,7 +306,7 @@ class TransformerConfig(BaseModel):
     act_func: FFNActivation = "relu_squared"
 
     # TODO: padged attention implementation
-    attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not recommended : "impl" if return_weights=False.
+    attn_impl: AttnImplTypes = "sdpa"  # Kernel: sdpa, fa2, fa3; fused is legacy-only.
     # TODO: # layer_types: Optional[List[TParams]] = None  # e.g., ["standard", "standard", "moe", ...] length must be n_layers
     use_gqa: bool = False
     

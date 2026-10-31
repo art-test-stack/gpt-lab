@@ -21,7 +21,7 @@ def commands(prefix):
         raise ValueError("run-prefix must contain 1–80 letters, digits, underscores or hyphens")
     common = [sys.executable, str(ROOT/"runs/modal_trainbase.py"),
               "--gpu", "H100", "--gpus", "1", "--dtype", "bfloat16"]
-    training = ["--act-func", "swiglu", "--max-seq-len", "2048",
+    training = ["--act-func", "swiglu", "--attn-impl", "fa3", "--max-seq-len", "2048",
                 "--device-batch-size", "16", "--total-batch-size", "524288",
                 "--n-acc-steps", "16", "--num-steps", "2317",
                 "--warmup-steps", "300", "--stop-after-step", "10"]
