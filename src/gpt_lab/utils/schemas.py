@@ -585,8 +585,24 @@ class TrainerConfig(BaseModel):
             return progress * 1.0 + (1 - progress) * self.final_lr_ratio
     
     def muon_momentum_schedule(self, step: int) -> float:
-        """Keep configured momentum fixed; custom schedules return multipliers."""
-        return 1.0
+        """Nanochat Muon momentum schedule, relative to the configured base momentum."""
+        warmdown_iters = round(self.lr_warmdown_ratio * self.n_steps)
+        warmdown_start = self.n_steps - warmdown_iters
+        if step < 400:
+            frac = step / 400
+            target_momentum = (1 - frac) * 0.85 + frac * 0.97
+        elif step >= warmdown_start:
+            progress = (step - warmdown_start) / warmdown_iters
+            target_momentum = 0.97 * (1 - progress) + 0.90 * progress
+        else:
+            target_momentum = 0.97
+
+        # OptimizerFactory multiplies each group's initial_momentum by this value.
+        # Preserve the existing config contract, where momentum is normally 0.95.
+        base_momentum = 0.95
+        if self.optim_config is not None:
+            base_momentum = self.optim_config.group_configs()["transformer"]["momentum"]
+        return target_momentum / base_momentum
     
     def weight_decay_schedule(self, step: int) -> float:
         # New profiles apply decay scaling when building the optimizer.

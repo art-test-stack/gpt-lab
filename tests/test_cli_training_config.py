@@ -76,3 +76,25 @@ def test_legacy_trainer_keeps_saved_decay_schedule():
     # Old pickled TrainerConfig instances do not contain newly added fields.
     config.__dict__.pop('optim_config')
     assert config.weight_decay_schedule(0) == 3.0
+
+
+def test_nanochat_muon_momentum_schedule_and_optimizer_application():
+    config = TrainerConfig(n_steps=4364, lr_warmdown_ratio=0.65)
+    # The scheduler emits a multiplier; the optimizer owns the base momentum.
+    base = 0.95
+    warmdown_start = 4364 - round(0.65 * 4364)
+    for step, expected in (
+        (0, 0.85),
+        (200, 0.91),
+        (399, 0.85 + 399 / 400 * 0.12),
+        (400, 0.97),
+        (warmdown_start, 0.97),
+        (4364, 0.90),
+    ):
+        assert base * config.muon_momentum_schedule(step) == pytest.approx(expected)
+
+    profile = OptimizerConfig.from_file("configs/normuon.yaml")
+    configured = TrainerConfig(n_steps=4364, optim_config=profile)
+    normuon_base = profile.group_configs()["transformer"]["momentum"]
+    assert normuon_base * configured.muon_momentum_schedule(0) == pytest.approx(0.85)
+    assert normuon_base * configured.muon_momentum_schedule(4364) == pytest.approx(0.90)
