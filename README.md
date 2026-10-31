@@ -267,6 +267,14 @@ to unset; resume retains a saved cap unless explicitly overridden. A capped
 run uses normal final checkpointing. See [the PR35 comparison](docs/pr35-execution-cap.md)
 for the pinned Modal adapter and verification results.
 
+Training raw loss and its smoothed value use the mean across ranks (equal
+token counts per rank). The default momentum schedule keeps each optimizer
+group's configured momentum fixed, independently of LR warmup and warmdown;
+an explicit `Trainer(muon_momentum_schedule=...)` still overrides the multiplier.
+This corrects the previous LR-shaped momentum multiplier and changes resumed
+training trajectories under the default schedule. Checkpoint formats are unchanged.
+Old checkpoints' loss EMA retains its previous rank-local history until it decays.
+
 Next sections detail the different generated components.
 
 ### Tokenization

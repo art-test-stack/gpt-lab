@@ -5,6 +5,29 @@ import torch
 from gpt_lab.optim.factory import OptimizerFactory
 from gpt_lab.optim.kernels.muon import muon_step_fused
 from torch.utils._python_dispatch import TorchDispatchMode
+from gpt_lab.utils.schemas import TrainerConfig
+
+
+@pytest.mark.parametrize("momentum", [0.9, 0.95])
+def test_default_momentum_is_independent_of_lr_warmup_and_warmdown(momentum):
+    context = ComputeContext(device=torch.device("cpu"))
+    config = TrainerConfig(comp_info=context, n_steps=2317, lr_warmup_steps=300)
+    param = torch.nn.Parameter(torch.zeros(2, 2))
+    optimizer = OptimizerFactory(
+        [dict(params=[param], opt="muon", lr=0.02, momentum=momentum,
+              beta=0.9, ns_steps=5, weight_decay=0.28)],
+        comp_info=context,
+    )
+
+    # Revisit an early step to cover resume/reapplication without compounding.
+    for step in (0, 149, 299, 300, 944, 2316, 149):
+        optimizer.update_hyperparams(
+            lrm=config.lr_multiplier_schedule(step),
+            muon_momentum=config.muon_momentum_schedule(step),
+        )
+        group = optimizer.param_groups[0]
+        assert group["momentum"] == pytest.approx(momentum)
+        assert group["lr"] == pytest.approx(0.02 * config.lr_multiplier_schedule(step))
 
 
 @pytest.mark.parametrize("compute_dtype", [torch.bfloat16, torch.float32])
