@@ -31,16 +31,12 @@ saving (`--save-every -1`; independent best saves remain enabled). Model names
 retain the requested `ic1-d16-d20` form; run names are arbitrary labels.
 
 No recipe-equality checks or naming/dependency rules are imposed by the launcher.
-Native CLI configuration determines the actual model, batch and scheduler. The
-hardware gate receives those parsed settings and resolves them through the same
-AutoGPTConfig implementation. FP8 GEMM dispatch counts use the resolved number
-of layers and accumulation microsteps. Initial model, seeded Torch CPU/CUDA RNG,
-first inputs and data position are recorded for comparison without rejecting runs
-based on labels or a stale recipe snapshot.
+Native CLI configuration determines the actual model, batch and scheduler. Training starts directly through the native CLI. No experiment gate, fingerprint
+hooks or prior-run checks are run automatically.
 
 Run the following direct commands one at a time from the clean published branch.
 Replace `PUBLISHED_SHA` with its full commit SHA. Each allocates eight H100s and
-runs actual hardware validation before training. There is no execution cap unless
+starts training directly. There is no execution cap unless
 `--stop-after-step N` is explicitly supplied. No `--full-run` option is needed.
 
 ```bash
@@ -103,23 +99,7 @@ contacting Modal or launching compute. The image installs the FP8 extra when
 Forge W&B defaults. The three commands are independent blocking launches. Run one at a time to
 respect the eight-GPU concurrency limit.
 
-The hardware gate checks all eight ranks: compiled spectral zero/near-rank-one,
-tall/wide cases; NCCL owner states versus averaged local updates; same-variant
-sharded checkpoint/resume; the resolved full model at batch 32; actual compiled
-FP8 GEMM operands and BF16 backward; FA3 CUDA kernels; finite losses/gradients,
-parameters and state; memory; full-model FP8 checkpoint/resume; and BF16 evaluation.
-Dispatch evidence must be observed, not inferred from an enabled flag. The gate
-may reject an unrecognized compiler lowering; inspect its trace before changing
-acceptance checks. Resume comparisons use rtol 1e-5 / atol 1e-6, not bitwise claims.
-The full-model gate uses synthetic tokens and does not establish learning quality.
-
-Artifacts are on `gpt-lab-runs/<run-name>/`: validation reports and traces under
-`validation/`, `validation.log`, `train.log`, `launch.json`, models, W&B files,
-`initial_rank_N.json` and `selected_result.json`. Initial model/RNG and first data batch/position fingerprints are recorded
-for comparing completed runs. The result report records the
-resolved horizon, rounded/actual tokens, storage policy and best/final paths.
-Validation checkpoints are small owner fixtures plus one full-model snapshot;
-these are diagnostic artifacts, separate from production checkpoints.
-
-CPU checks do not verify native FP8, CUDA/NCCL, H100 memory fit or learning quality.
-No paid compute has been launched by the agent.
+The standalone `check_h100.py` diagnostic is preserved for explicit use; it is
+not part of these training commands. Native FP8 backend/device requirements
+still apply. Existing CUDA/NCCL validation remains unverified; no paid compute
+has been launched by the agent.

@@ -92,3 +92,12 @@ Revised-parameter validation: eight focused checks passed, including arbitrary
 labels and valid overrides, native parser/preflight in an isolated checkout,
 automatic batch/horizon resolution and failed hardware-gate ordering. No paid
 compute was launched; native GPU dispatch and memory fit remain unverified.
+
+User-directed fast path: the native Modal launcher now starts training directly.
+Automatic experiment validation, fingerprint hooks and prior-run checks are
+removed. Standalone diagnostics remain available for explicit use. Normal source,
+cache and native backend requirements remain; no paid compute was launched.
+
+Fast-path verification: eight focused checks passed. The process-order test now
+asserts one native training launch, no check_h100 invocation and no experiment
+fingerprint hooks. No cloud job was launched for this change.

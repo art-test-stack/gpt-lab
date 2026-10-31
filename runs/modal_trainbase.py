@@ -69,16 +69,12 @@ DEFAULT_TRAIN = {
     "sample_every": 0,
 }
 
-# Native CLI execution; optional selected-run instrumentation does not replace it.
+# Native CLI execution; no automatic experiment validation or fingerprint hooks.
 SHORT_RUNNER = '''import json, os, sys
 from pathlib import Path
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 from gpt_lab.cli import main
 from gpt_lab.train.trainer import Trainer
-if os.environ.get("GPTLAB_SELECTED_RUN") == "1":
-    sys.path.insert(0, "/opt/gpt-lab")
-    from experiments.optimizer_comparison.training_checks import install
-    install(Path(os.environ["GPTLAB_LAUNCH_DIR"]))
 if os.environ["GPTLAB_CHECKPOINTS"] == "0":
     Trainer.save_checkpoint = lambda self: None
 original_train = Trainer.train
@@ -186,7 +182,6 @@ def check_inputs(arguments, run_name, world_size, checkpoints=False, sha=None):
     tokenizer = settings["tokenizer_model"] or "gpt2"
     if not any(p.is_file() for p in (CACHE / "tokenizers" / tokenizer).rglob("*")):
         raise ValueError(f"Cached tokenizer {tokenizer!r} is missing.")
-    settings["_hardware_gate"] = bool(world_size == 8 and settings["fp8_ffn_forward"])
     return settings
 
 
@@ -218,10 +213,6 @@ def train(arguments, run_name, sha, branch, environment, checkpoints, settings, 
         "GPTLAB_CHECKPOINTS": str(int(checkpoints)), "PYTHONUNBUFFERED": "1",
         "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
     }
-    selected = settings.get("_hardware_gate")
-    if selected:
-        env.update(GPTLAB_SELECTED_RUN="1", GPTLAB_SELECTED_SHA=sha,
-                   TORCHINDUCTOR_COMPILE_THREADS="1", PYTORCH_ALLOC_CONF="expandable_segments:True")
     record = dict(git_sha=sha, git_branch=branch, repository=git(REPO, "remote", "get-url", "origin"),
                   command=command, environment=environment,
                   checkpoint_export=checkpoints, status="starting",
@@ -236,17 +227,6 @@ def train(arguments, run_name, sha, branch, environment, checkpoints, settings, 
         record["status"] = "running"
         (directory / "launch.json").write_text(json.dumps(record, indent=2) + "\n")
         run_volume.commit()
-        if selected:
-            gate = [str(REPO / ".venv/bin/torchrun"), "--standalone", "--nnodes=1",
-                    f"--nproc_per_node={world_size}", "--max_restarts=0",
-                    "experiments/optimizer_comparison/check_h100.py", "--output", str(directory / "validation"),
-                    "--settings", str(directory / "requested_settings.json")]
-            record["validation_command"] = gate
-            run_process(gate, directory / "validation.log", env)
-            evidence = json.loads((directory / "validation/passed.json").read_text())
-            if evidence.get("status") != "passed" or evidence.get("ranks") != 8:
-                raise RuntimeError("Eight-rank hardware validation did not pass")
-            run_volume.commit()
         run_process(command, directory / "train.log", env)
         resolved = json.loads((directory / "resolved_run.json").read_text())
         expected = resolved["n_steps"]

@@ -1,5 +1,5 @@
 {
-  "status": "prepared_pending_user_launched_hardware_validation",
+  "status": "training_commands_ready_hardware_validation_not_run",
   "integration_branch": "exp/anvil-normuon",
   "owner": "Agent A",
   "hardware": {
@@ -34,7 +34,8 @@
   "execution": {
     "compiled": true,
     "cuda_graph_mode": "disabled",
-    "communication": "baseline"
+    "communication": "baseline",
+    "automatic_experiment_validation": false
   },
   "horizon": {
     "target_data_to_parameter_ratio": 10,
@@ -84,11 +85,6 @@
     "spectral_active_from_update_zero": true,
     "twin_momentum_rails_and_delayed_blending": "not implemented"
   },
-  "pending_before_training": [
-    "Run prepared eight-H100 CUDA/NCCL gate: compiled FA3, FP8 forward/BF16 backward dispatch, finite updates and batch-32 memory",
-    "Pass compiled spectral zero/near-rank-one/tall/wide checks, owner-state comparisons and same-variant disk resume",
-    "Launch commands must use the final published integration SHA; each direct selected run executes the gate before training"
-  ],
   "paid_compute_launched": false,
   "frozen_defaults": {
     "random_seed": 42,
@@ -126,8 +122,11 @@
   "entrypoints": {
     "launcher": "runs/modal_trainbase.py",
     "hardware_gate": "experiments/optimizer_comparison/check_h100.py",
-    "native_training": "gpt-lab train auto",
-    "reporting_checks": "experiments/optimizer_comparison/training_checks.py"
+    "native_training": "gpt-lab train auto"
   },
-  "launcher_policy": "Native CLI overrides are authoritative; no recipe equality, label, or prior-run constraints. Hardware validation uses the requested settings."
+  "launcher_policy": "Start native training directly; no automatic experiment gate, fingerprint hooks, recipe equality or prior-run checks.",
+  "optional_validation_not_run": [
+    "Run prepared eight-H100 CUDA/NCCL gate: compiled FA3, FP8 forward/BF16 backward dispatch, finite updates and batch-32 memory",
+    "Pass compiled spectral zero/near-rank-one/tall/wide checks, owner-state comparisons and same-variant disk resume"
+  ]
 }

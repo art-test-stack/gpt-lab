@@ -43,20 +43,25 @@ def test_three_direct_plans_preserve_recipe_without_implicit_cap(monkeypatch, ca
     compile(launch.SHORT_RUNNER, "native-training-entry", "exec")
 
 
-def test_failed_hardware_gate_prevents_native_training(monkeypatch, tmp_path):
+def test_launcher_starts_native_training_directly(monkeypatch, tmp_path):
     sha = "e"*40
     monkeypatch.setattr(launch, "RUNS", tmp_path)
     monkeypatch.setattr(launch, "REPO", tmp_path)
     monkeypatch.setattr(launch, "git", lambda directory, *args: "" if args[0] == "status" else sha)
     monkeypatch.setattr(launch.subprocess, "run", Mock())
-    process = Mock(side_effect=subprocess.CalledProcessError(1, "hardware gate"))
+    def finish(command, log_path, env):
+        assert "check_h100.py" not in " ".join(command)
+        assert "GPTLAB_SELECTED_RUN" not in env
+        (tmp_path/"probe/resolved_run.json").write_text(json.dumps(dict(
+            completed_steps=3, n_steps=3, stop_after_step=None)))
+    process = Mock(side_effect=finish)
     monkeypatch.setattr(launch, "run_process", process)
-    with pytest.raises(subprocess.CalledProcessError):
-        launch.train([], "probe", sha, "exp/anvil-normuon", {"GPTLAB_DTYPE": "bfloat16"},
-                     True, {"attn_impl": "fa3", "_hardware_gate": True}, 8, Mock())
+    launch.train([], "probe", sha, "exp/anvil-normuon", {"GPTLAB_DTYPE": "bfloat16"},
+                 True, {"attn_impl": "fa3", "fp8_ffn_forward": True}, 8, Mock())
     process.assert_called_once()
-    assert any("check_h100.py" in item for item in process.call_args.args[0])
-    assert json.loads((tmp_path/"probe/launch.json").read_text())["status"] == "failed"
+    assert process.call_args.args[0][-1].endswith("train_short.py")
+    assert json.loads((tmp_path/"probe/launch.json").read_text())["status"] == "finished"
+    assert "training_checks" not in launch.SHORT_RUNNER
 
 
 def test_resolved_parameter_horizon_and_fingerprint():
@@ -138,7 +143,7 @@ arguments = recipe.arguments(variant, name, launch.RUNS/name)
 launch.main(["--sha", "e"*40, "--run-name", name, "--gpu", "H100", "--gpus", "8", "--checkpoints", "--dry-run", "--", *arguments])
 settings = launch.check_inputs(arguments, name, 8, True, "e"*40)
 assert settings["num_steps"] == -1 and settings["stop_after_step"] is None
-assert settings["_hardware_gate"]
+assert "_hardware_gate" not in settings
 # Valid overrides and arbitrary labels must not be vetoed by an experiment snapshot.
 for variant in recipe.SELECTION["variants"]:
     arguments = recipe.arguments(variant, "arbitrary-label", launch.RUNS/"arbitrary-label")
