@@ -628,10 +628,9 @@ rebuilds the graph over restored state. Omit the mode to retain a saved mode on
 resume, or explicitly pass `disabled` when resuming without capture.
 
 `train/capture_startup_seconds` reports compilation/warmup/capture separately
-from step timing. This first boundary has CPU regression coverage; real CUDA
-equivalence tests in `tests/test_cuda_graph.py` still need to run on user-provided
-hardware. Optimizer-update and communication capture are pending. No throughput
-or CUDA correctness claim is made from CPU checks.
+from step timing. Small-model real-CUDA equivalence checks passed on eight A100
+SXM4 GPUs. See the [experiment README](docs/cuda-graphs/README.md) for measured
+results and limits. Optimizer-update and communication capture are pending.
 
 The standalone [`scripts/modal_cuda_graphs.py`](scripts/modal_cuda_graphs.py)
 launcher follows the existing local `runs/modal_trainbase.py`. It requires a
@@ -657,9 +656,9 @@ count. If the timed run uses one microstep, the gate checks both one and two
 microsteps from matching seeded states. Floating-point comparisons use rtol/atol
 `1e-3/1e-6` for BF16 and `1e-5/1e-6` for FP32; Python counters and state keys
 must match exactly. It saves observed maximum absolute errors and all failures.
-These tolerances are explicit initial acceptance criteria; real-CUDA checks
-remain unverified until run on user-provided hardware. No optimizer or
-communication capture is added.
+These tolerances are explicit acceptance criteria; the experiment README records
+the completed user-launched CUDA checks. No optimizer or communication capture
+is added.
 
 Run these commands from the `exp/cuda-graphs` worktree after pushing. They
 allocate paid GPUs only when the user executes them. First run the small check:
