@@ -1,8 +1,0 @@
-# Existing Muon profile; auxiliary groups inherit the bundled defaults.
-transformer:
-  opt: muon
-  lr: 0.02
-  momentum: 0.95
-  beta: 0.9
-  ns_steps: 5
-  weight_decay: 0.28

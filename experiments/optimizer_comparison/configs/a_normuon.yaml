@@ -1,9 +1,0 @@
-# A: existing NorMuon baseline. Other groups inherit the bundled profile.
-transformer:
-  opt: normuon
-  lr: 0.02
-  momentum: 0.95
-  beta: 0.95
-  ns_steps: 5
-  weight_decay: 0.1
-  anvil_spectral: false

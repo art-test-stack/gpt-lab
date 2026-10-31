@@ -2,7 +2,6 @@
 
 import builtins
 import copy
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +27,7 @@ def test_bf16_default_never_imports_torchao(monkeypatch, tmp_path):
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
-        if name.startswith("torchao") or name.endswith("torchao_fp8"):
+        if name.startswith("torchao"):
             pytest.fail("default BF16 path imported optional backend")
         return original_import(name, *args, **kwargs)
 
@@ -86,7 +85,7 @@ class Float8Proxy(Linear):
 @pytest.mark.parametrize("activation", ["swiglu", "relu_squared"])
 def test_conversion_identity_current_weights_and_state_keys(monkeypatch, activation):
     monkeypatch.setattr(fp8, "check_fp8_support", lambda device, dtype: None)
-    monkeypatch.setitem(sys.modules, "gpt_lab.model.torchao_fp8", SimpleNamespace(Float8FFNLinear=Float8Proxy))
+    monkeypatch.setattr(fp8, "_float8_linear_class", lambda: Float8Proxy)
     candidate = model(activation)
     original = dict(candidate.named_parameters())
     state = copy.deepcopy(candidate.state_dict())
@@ -115,7 +114,12 @@ def test_conversion_identity_current_weights_and_state_keys(monkeypatch, activat
 
 def test_missing_extra_and_wrong_architecture_fail_before_conversion(monkeypatch):
     monkeypatch.setattr(fp8, "check_fp8_support", lambda device, dtype: None)
-    monkeypatch.setitem(sys.modules, "gpt_lab.model.torchao_fp8", None)
+    original_import = builtins.__import__
+    def without_torchao(name, *args, **kwargs):
+        if name.startswith("torchao"):
+            raise ImportError("optional backend unavailable")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", without_torchao)
     candidate = model()
     original = [block.ffn.w_1 for block in candidate.blocks]
     with pytest.raises(ImportError, match="extra fp8"):
