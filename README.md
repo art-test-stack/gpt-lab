@@ -650,6 +650,12 @@ python scripts/modal_cuda_graphs.py --gpus 4 --mode forward_backward --run-name 
 Add `--dry-run` to validate the Git source and print a command without importing
 Modal. `--detach` submits an individual run in the background; wait for it to
 finish before launching the next run. Repeated runs need new run names.
+Add `--require-sxm` for a comparison against an SXM4 baseline: the hardware
+probe rejects any allocated GPU whose name is not `NVIDIA A100-SXM4-80GB`
+before training begins. This flag verifies the allocation; Modal's
+`A100-80GB` request does not let this launcher choose SXM4 versus PCIe.
+For the single-GPU captured rerun, use `--gpus 1 --mode forward_backward
+--require-sxm --run-name cg-1-captured-sxm`.
 
 All four default to A100-80GB, BF16, seed 42, depth 12, width 768, sequence
 length 2048, device batch 16, global batch 524288 tokens, fused attention and

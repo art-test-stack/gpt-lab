@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import shlex
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,9 +21,11 @@ spec.loader.exec_module(launcher)
 def test_dry_run_builds_matched_native_commands(monkeypatch, capsys, gpus, mode):
     monkeypatch.setattr(launcher, "resolve_source", lambda _: ("https://example.com/repo", "exp/cuda-graphs", "a" * 40))
     monkeypatch.setitem(sys.modules, "modal", None)  # Dry run must not load Modal.
-    launcher.main(["--dry-run", "--gpus", str(gpus), "--mode", mode, "--run-name", "test-capture",
+    launcher.main(["--dry-run", "--gpus", str(gpus), "--mode", mode, "--require-sxm", "--run-name", "test-capture",
                    "--", "--save-every", "1", "--eval-bpb-every", "1"])
-    command = capsys.readouterr().out.splitlines()[1]
+    output = capsys.readouterr().out
+    assert "Required device: NVIDIA A100-SXM4-80GB" in output
+    command = output.splitlines()[1]
     settings = build_parser().parse_args(shlex.split(command)[1:])
     assert settings.cuda_graph_mode == mode
     assert settings.optim_config_path == "configs/normuon.yaml"
@@ -33,6 +36,24 @@ def test_dry_run_builds_matched_native_commands(monkeypatch, capsys, gpus, mode)
     assert settings.total_batch_size // (gpus * settings.device_batch_size * settings.max_seq_len) == 16 // gpus
     assert (settings.save_every, settings.eval_bpb_every, settings.eval_core_every, settings.sample_every) == (0, 0, 0, 0)
     compile(launcher.SHORT_RUNNER, "train_short.py", "exec")
+
+
+@pytest.mark.parametrize("names,require_sxm,accepted", [
+    (["NVIDIA A100-SXM4-80GB"], True, True),
+    (["NVIDIA A100 80GB PCIe"], True, False),
+    (["NVIDIA A100-SXM4-80GB"] * 3 + ["NVIDIA A100 80GB PCIe"], True, False),
+    (["NVIDIA A100 80GB PCIe"], False, True),
+])
+def test_gpu_probe_enforces_opt_in_sxm_guard(monkeypatch, names, require_sxm, accepted):
+    cuda = SimpleNamespace(device_count=lambda: len(names), get_device_name=lambda index: names[index],
+                           is_bf16_supported=lambda: True)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    probe = launcher.gpu_probe(len(names), "bfloat16", "sdpa", require_sxm)
+    if accepted:
+        exec(probe, {})
+    else:
+        with pytest.raises(AssertionError, match="SXM4 required"):
+            exec(probe, {})
 
 
 def test_summary_excludes_startup_and_uses_global_tokens_once():

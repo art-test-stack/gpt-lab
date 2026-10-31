@@ -25,6 +25,8 @@ Per-rank metrics, launch.json, train.log and summary.json are saved under
 global tokens/s over updates 11..150 (first ten excluded). Every process uses
 its own empty compiler cache, so one run cannot warm the next run's compiler.
 --dry-run contacts Git only, without importing Modal or allocating compute.
+--require-sxm rejects any GPU other than NVIDIA A100-SXM4-80GB before
+training. It validates the allocation; it does not control Modal placement.
 Adapted from the user's ~/gpt-lab/runs/modal_trainbase.py.
 """
 
@@ -270,6 +272,22 @@ def check_inputs(arguments, run_name, world_size):
     return settings
 
 
+def gpu_probe(world_size, dtype, attn_impl, require_sxm=False):
+    probe = (f"import torch; assert torch.cuda.device_count() == {world_size}; "
+             f"names = [torch.cuda.get_device_name(i) for i in range({world_size})]; "
+             "print('Allocated GPUs:', names, flush=True); "
+             "assert all('A100' in name for name in names), names")
+    if require_sxm:
+        probe += "; assert all(name == 'NVIDIA A100-SXM4-80GB' for name in names), f'SXM4 required; allocated: {names}'"
+    if dtype == "bfloat16":
+        probe += "; assert torch.cuda.is_bf16_supported()"
+    if attn_impl == "fused":
+        probe += ("; from gpt_lab.model.flash_attn import _flash_attn2, _flash_attn; "
+                  "assert _flash_attn2 is not None or _flash_attn is not None, 'Fused attention unavailable'; "
+                  "print('Attention backend:', 'FA3' if _flash_attn is not None else 'FA2')")
+    return probe
+
+
 def train(arguments, run_name, sha, branch, environment, settings, world_size, run_volume):
     actual = git(REPO, "rev-parse", "HEAD")
     if actual != sha or git(REPO, "status", "--porcelain", "--untracked-files=no"):
@@ -291,14 +309,8 @@ def train(arguments, run_name, sha, branch, environment, settings, world_size, r
                   checkpoint_export=False, settings=settings, status="starting",
                   started_at=datetime.now(timezone.utc).isoformat())
     try:
-        probe = (f"import torch; assert torch.cuda.device_count() == {world_size}; "
-                 f"assert all('A100' in torch.cuda.get_device_name(i) for i in range({world_size}))")
-        if environment["GPTLAB_DTYPE"] == "bfloat16":
-            probe += "; assert torch.cuda.is_bf16_supported()"
-        if settings["attn_impl"] == "fused":
-            probe += ("; from gpt_lab.model.flash_attn import _flash_attn2, _flash_attn; "
-                      "assert _flash_attn2 is not None or _flash_attn is not None, 'Fused attention unavailable'; "
-                      "print('Attention backend:', 'FA3' if _flash_attn is not None else 'FA2')")
+        probe = gpu_probe(world_size, environment["GPTLAB_DTYPE"], settings["attn_impl"],
+                          environment["GPTLAB_REQUIRE_SXM"] == "1")
         subprocess.run([PYTHON, "-c", probe], cwd=REPO, env=env, check=True)
         record["status"] = "running"
         (directory / "launch.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -348,6 +360,7 @@ def main(argv=None):
     parser.add_argument("--mode", required=True, choices=("disabled", "forward_backward"), help="Existing compiled execution or explicit forward/backward capture")
     parser.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float32"))
     parser.add_argument("--gpus", type=int, choices=(1, 4), default=1, help="A100-80GB GPU count on one node")
+    parser.add_argument("--require-sxm", action="store_true", help="Reject non-SXM4 A100 allocations before training; does not control placement")
     parser.add_argument("--cpu", type=int, default=16)
     parser.add_argument("--memory", type=int, default=65536, help="GPU worker RAM in MiB")
     parser.add_argument("--wandb-entity", default="art-test-stack-ntnu")
@@ -377,10 +390,13 @@ def main(argv=None):
     environment = dict(GPTLAB_DTYPE=args.dtype, WANDB_ENTITY=args.wandb_entity,
                        WANDB_PROJECT=args.wandb_project, WANDB_BASE_URL=args.wandb_base_url,
                        WANDB_APP_URL=args.wandb_app_url, WANDB_MODE="online",
+                       GPTLAB_REQUIRE_SXM=str(int(args.require_sxm)),
                        TORCHINDUCTOR_CUDAGRAPHS="0", PYTORCH_ALLOC_CONF="expandable_segments:False")
     print(f"Verified: local {branch} == origin/{branch} == {sha}", flush=True)
     print(shlex.join(["gpt-lab", "train", "auto", *arguments]), flush=True)
     print(f"Hardware: {args.gpus} x A100-80GB; dtype: {args.dtype}; capture mode: {args.mode}", flush=True)
+    if args.require_sxm:
+        print("Required device: NVIDIA A100-SXM4-80GB (other allocations will fail before training)", flush=True)
     if args.dry_run:
         return
     import modal
