@@ -159,7 +159,8 @@ def test_same_allocation_pair_is_blocked_by_failed_equivalence(monkeypatch, tmp_
     monkeypatch.setattr(launcher, "REPO", tmp_path)
     monkeypatch.setattr(launcher, "RUNS", tmp_path / "runs")
     monkeypatch.setattr(launcher, "git", lambda directory, *args: "sha" if args[0] == "rev-parse" else "")
-    monkeypatch.setattr(launcher.subprocess, "check_output", lambda *args, **kwargs: "test topology")
+    monkeypatch.setattr(launcher, "collect_hardware_metadata",
+                        lambda root: dict(physical_topology=dict(available=False, returncode=255)))
     events = []
     def run(command, **kwargs):
         if "scripts/benchmark/cuda_graph_equivalence.py" not in " ".join(command):
@@ -192,6 +193,7 @@ def test_same_allocation_pair_is_blocked_by_failed_equivalence(monkeypatch, tmp_
     volume = SimpleNamespace(commit=lambda: None)
     if gate_passes:
         result = launcher.train([], "pair", "sha", "branch", env, settings, world, volume)
+        assert not result["hardware_metadata"]["physical_topology"]["available"]
         assert result["identical_initial_state_and_data_position"]
         assert events == ["probe", "equivalence", "disabled", "forward_backward"]
     else:
@@ -200,3 +202,49 @@ def test_same_allocation_pair_is_blocked_by_failed_equivalence(monkeypatch, tmp_
         assert events == ["probe", "equivalence"]
         result = json.loads((tmp_path / "runs/pair/comparison.json").read_text())
         assert result["status"] == "failed" and "results" not in result
+
+
+@pytest.mark.parametrize("topology_code", [0, 255])
+def test_hardware_metadata_preserves_failure_and_collects_partial_fallback(monkeypatch, tmp_path, topology_code):
+    commands = []
+    def run(command, **kwargs):
+        commands.append(command)
+        assert kwargs["check"] is False and kwargs["stderr"] == subprocess.PIPE
+        if command[:3] == ["nvidia-smi", "topo", "-m"]:
+            return subprocess.CompletedProcess(command, topology_code, stdout="topology output",
+                                               stderr="topology error" if topology_code else "")
+        if command[0] == launcher.PYTHON:
+            return subprocess.CompletedProcess(command, 0, stdout='{"peer_access": [[null, true], [true, null]]}', stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="GPU CSV", stderr="")
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    reports = launcher.collect_hardware_metadata(tmp_path)
+    assert reports["physical_topology"]["available"] == (topology_code == 0)
+    assert reports["physical_topology"]["returncode"] == topology_code
+    assert (tmp_path / "topology.txt").read_text() == "topology output"
+    assert (tmp_path / "topology.txt.stderr.txt").read_text() == ("topology error" if topology_code else "")
+    assert json.loads((tmp_path / "hardware_metadata.json").read_text()) == reports
+    assert ("cuda_connectivity" in reports) == bool(topology_code)
+    assert len(commands) == (3 if topology_code else 2)
+
+
+def test_cuda_connectivity_report_does_not_infer_physical_topology(monkeypatch, capsys):
+    cuda = SimpleNamespace(
+        device_count=lambda: 2, get_device_name=lambda index: "NVIDIA A100-SXM4-80GB",
+        get_device_properties=lambda index: SimpleNamespace(total_memory=80 * 1024**3),
+        can_device_access_peer=lambda left, right: True,
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    exec(launcher.CUDA_CONNECTIVITY_PROBE, {})
+    report = json.loads(capsys.readouterr().out)
+    assert report["peer_access"] == [[None, True], [True, None]]
+    assert "physical links and bandwidth are not determined" in report["scope"]
+
+
+def test_hardware_report_timeout_keeps_partial_stdout_and_stderr(monkeypatch, tmp_path):
+    def run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, 30, output=b"partial stdout", stderr=b"partial stderr")
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    report = launcher.capture_hardware_report(tmp_path, "topology.txt", ["nvidia-smi", "topo", "-m"])
+    assert not report["available"] and report["returncode"] is None
+    assert (tmp_path / "topology.txt").read_text() == "partial stdout"
+    assert "partial stderr" in (tmp_path / "topology.txt.stderr.txt").read_text()

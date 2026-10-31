@@ -53,6 +53,28 @@ CACHE = Path("/cache/gpt_lab")
 RUNS = Path("/runs")
 PYTHON = str(REPO / ".venv/bin/python")
 
+CUDA_CONNECTIVITY_PROBE = """import json, torch
+count = torch.cuda.device_count()
+devices = [dict(index=i, name=torch.cuda.get_device_name(i),
+                total_memory_bytes=torch.cuda.get_device_properties(i).total_memory)
+           for i in range(count)]
+peers, errors = [], []
+for i in range(count):
+    row = []
+    for j in range(count):
+        if i == j:
+            row.append(None)
+            continue
+        try:
+            row.append(torch.cuda.can_device_access_peer(i, j))
+        except RuntimeError as error:
+            row.append(None)
+            errors.append(f"{i}->{j}: {error}")
+    peers.append(row)
+print(json.dumps(dict(scope="CUDA peer-access capability only; physical links and bandwidth are not determined",
+                      devices=devices, peer_access=peers, errors=errors)))
+"""
+
 DEFAULT_TRAIN = {
     "model_name": "ic1",
     "optim_config_path": "configs/normuon.yaml",
@@ -463,6 +485,45 @@ def verify_pair(left, right):
             raise RuntimeError("Paired data position could not be verified")
 
 
+def capture_hardware_report(root, filename, command):
+    """Preserve diagnostic failures without treating them as correctness failures."""
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=30, check=False)
+        code, stdout, stderr = result.returncode, result.stdout, result.stderr
+    except (OSError, subprocess.TimeoutExpired) as error:
+        code, stdout, stderr = None, getattr(error, "stdout", ""), getattr(error, "stderr", "")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        stderr = (stderr or "") + f"\n{type(error).__name__}: {error}"
+    stdout, stderr = stdout or "", stderr or ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    (root / filename).write_text(stdout)
+    (root / (filename + ".stderr.txt")).write_text(stderr)
+    return dict(available=code == 0, returncode=code, command=command,
+                stdout=filename, stderr=filename + ".stderr.txt")
+
+
+def collect_hardware_metadata(root):
+    reports = dict(
+        physical_topology=capture_hardware_report(root, "topology.txt", ["nvidia-smi", "topo", "-m"]),
+        gpu_identity=capture_hardware_report(
+            root, "gpus.csv",
+            ["nvidia-smi", "--query-gpu=index,uuid,name,pci.bus_id,memory.total,driver_version", "--format=csv"]),
+    )
+    if not all(report["available"] for report in reports.values()):
+        reports["cuda_connectivity"] = capture_hardware_report(
+            root, "cuda_connectivity.json", [PYTHON, "-c", CUDA_CONNECTIVITY_PROBE])
+        print("Hardware metadata is partial; inspect hardware_metadata.json. "
+              "CUDA peer access does not establish physical NVLink/PCIe topology. "
+              "Equivalence remains mandatory before timing.", flush=True)
+    (root / "hardware_metadata.json").write_text(json.dumps(reports, indent=2) + "\n")
+    return reports
+
+
 def train(arguments, run_name, sha, branch, environment, settings, world_size, run_volume):
     """One allocation: verify NCCL equivalence, then run independent restored processes."""
     if git(REPO, "rev-parse", "HEAD") != sha or git(REPO, "status", "--porcelain", "--untracked-files=no"):
@@ -477,11 +538,7 @@ def train(arguments, run_name, sha, branch, environment, settings, world_size, r
         probe = gpu_probe(world_size, environment["GPTLAB_DTYPE"], settings["attn_impl"],
                           environment["GPTLAB_REQUIRE_SXM"] == "1")
         subprocess.run([PYTHON, "-c", probe], cwd=REPO, env=os.environ | environment, check=True)
-        for filename, command in (
-            ("topology.txt", ["nvidia-smi", "topo", "-m"]),
-            ("gpus.csv", ["nvidia-smi", "--query-gpu=index,uuid,name,pci.bus_id,memory.total,driver_version", "--format=csv"]),
-        ):
-            (root / filename).write_text(subprocess.check_output(command, text=True))
+        record["hardware_metadata"] = collect_hardware_metadata(root)
         command = [str(REPO / ".venv/bin/torchrun"), "--standalone", "--nnodes=1",
                    f"--nproc_per_node={world_size}", "--max_restarts=0",
                    str(REPO / "scripts/benchmark/cuda_graph_equivalence.py"),

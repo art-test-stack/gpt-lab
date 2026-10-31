@@ -717,7 +717,14 @@ from all throughput comparisons by using separate jobs and profile-only summarie
 
 The runs volume stores `/runs/<run-name>/comparison.json`, `equivalence.log`,
 per-rank equivalence JSON, `gpus.csv` (all GPU names/UUIDs/bus IDs/memory/driver),
-and `topology.txt` (`nvidia-smi topo -m`). Execution-mode directories `disabled/`
+and `topology.txt` (`nvidia-smi topo -m`).
+The status of each hardware query is recorded in `hardware_metadata.json`
+and the root comparison, with stdout/stderr saved separately. If an NVML query
+fails, execution continues with explicitly partial hardware metadata and attempts
+`cuda_connectivity.json` for GPU names/memory and CUDA peer-access capability.
+This fallback does not identify physical NVLink/PCIe links or their bandwidth.
+GPU validation and the all-rank equivalence gate remain mandatory before timing.
+Execution-mode directories `disabled/`
 and `forward_backward/` contain launch settings, logs, per-rank metrics and
 `summary.json`. Timed summaries report global tokens/s over updates 11–150,
 per-rank startup/steady peak allocated and reserved memory, trainer elapsed time
