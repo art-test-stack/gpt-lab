@@ -9,7 +9,10 @@ The final pushed branch SHA and final working-tree status are in the closing han
 Implemented ANVIL mechanism: spectral-only six ANVIL2 polynomial maps, BF16
 spectral input guard `d=1.05*sqrt(trace(G_raw))+1e-6`, first Gram reuse and
 original NorMuon row rescale/norm restoration. Opt-in `anvil_spectral: true`
-in `experiments/optimizer_comparison/configs/b_spectral.yaml`; `experiments/optimizer_comparison/configs/a_normuon.yaml` explicitly false. Existing
+in `experiments/optimizer_comparison/configs/b_spectral.yaml`; `experiments/optimizer_comparison/configs/a_normuon.yaml` explicitly false. Native CLI
+selection is `--optim-config-path experiments/optimizer_comparison/configs/a_normuon.yaml` or
+`--optim-config-path experiments/optimizer_comparison/configs/b_spectral.yaml`. These are handoff flags,
+not instructions to launch another run. Existing
 NorMuon momentum, beta2, LR/decay, parameter/optimizer-state storage and ownership
 are retained. The baseline remains unchanged; six maps apply only when opted in.
 
@@ -32,5 +35,12 @@ communication NCCL results predate ANVIL and do not validate spectral updates.
 No new communication sweep, longer loss run or cross-agent review is authorized
 by this consolidation. Agent A owns subsequent optimizer decisions.
 
-The complete optimizer consolidation handoff and remaining A-owned work are in
-[`../optimizer_comparison/HANDOFF.md`](../optimizer_comparison/HANDOFF.md).
+The prior handoff commit `f923f9a` records consolidation checks: 106 passed, four skipped, one deselected across the focused
+optimizer/config/distributed/communication/trainer/CUDA-graph checks. No GPU
+job was launched. The original tracked patch and every original untracked file
+were compared byte-for-byte against preservation commit `90adc9f` and matched.
+
+Final relocated-folder validation: 32 optimizer/profile/spectral/owner checks
+and 24 communication/launcher/trainer checks passed; one GPU check skipped.
+See [`../optimizer_comparison/HANDOFF.md`](../optimizer_comparison/HANDOFF.md)
+for the full Agent A ownership and remaining-work handoff.

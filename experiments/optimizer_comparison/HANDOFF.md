@@ -18,6 +18,8 @@
 - The later published communication closure `8bade9af520bd185f30b9f9d9ba4332fac1f6680`
   is retained in this merge; its canonical `communication_buckets` folder, saved
   summary, legacy dispatchers and documentation redirects are preserved.
+- The subsequent handoff-note commit `f923f9ab3f3102e0edfe6bbaba04e6b4e139c899`
+  is also retained, including its reported preservation checks.
 - Source branches and original result-pinned checkouts are not rewritten.
   No unsuccessful experiment was squashed or discarded. No GPU job was rerun.
 
