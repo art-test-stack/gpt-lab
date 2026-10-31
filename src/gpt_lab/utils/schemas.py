@@ -506,6 +506,7 @@ class TrainerConfig(BaseModel):
     # Training hparams
     n_steps: int = 1 # Scheduling horizon in optimizer steps.
     stop_after_step: Optional[int] = Field(default=None, ge=0)
+    cuda_graph_mode: Literal["disabled", "forward_backward"] = "disabled"
     n_acc_steps: int = 100
     target_time: float = -1.0 # in seconds, overrides n_steps if > 0
     total_batch_size: int = -1 # Overrides device_batch_size if > 0

@@ -26,6 +26,7 @@ def add_common_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--device-batch-size', type=int, default=32, help='Batch size for each device during training. Batch size define further effective batch size as device_batch_size * max_seq_len * n_acc_steps.')
     parser.add_argument('--use-nanochat-dataloader', action='store_true', help='Whether to use the nanochat dataloader instead of the default dataloader.')
     parser.add_argument('--stop-after-step', type=int, default=None, help='Absolute cap on completed optimizer steps, including before resume; >=0. Leaves the scheduling horizon unchanged. Unset retains the saved cap on resume.')
+    parser.add_argument('--cuda-graph-mode', choices=('disabled', 'forward_backward'), default=None, help='Opt-in fixed-shape compiled forward/backward CUDA capture (FP32/BF16). Unset retains the saved mode on resume.')
 
 
 def add_auto_arguments(parser: ArgumentParser) -> None:
