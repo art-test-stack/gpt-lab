@@ -15,6 +15,9 @@
   with readiness notifications only in ordinary backward. Backward-hook
   communication rejects capture/scaling as before. Compiled execution, original
   communication and existing Muon remain the defaults.
+- The later published communication closure `8bade9af520bd185f30b9f9d9ba4332fac1f6680`
+  is retained in this merge; its canonical `communication_buckets` folder, saved
+  summary, legacy dispatchers and documentation redirects are preserved.
 - Source branches and original result-pinned checkouts are not rewritten.
   No unsuccessful experiment was squashed or discarded. No GPU job was rerun.
 
@@ -46,8 +49,8 @@ remain in `REPORT.md` explicitly labeled as unimplemented.
 
 ```bash
 uv run --locked --extra cpu --group dev pytest experiments/optimizer_comparison
-uv run --locked --extra cpu --group dev pytest experiments/communication
-python experiments/communication/modal_communication.py --help
+uv run --locked --extra cpu --group dev pytest experiments/communication_buckets
+python experiments/communication_buckets/modal_communication.py --help
 ```
 
 The relocated checks preserve scalar spectral behavior, tall/wide BF16 matrix
@@ -55,11 +58,13 @@ examples, update norms, owner-local state memory and same-variant disk resume.
 The real two-process Gloo checks exercise averaged owner updates for Muon,
 NorMuon and the spectral option, plus bucket layout/accumulation/resume for the
 communication experiment. Defaults and trainer accumulation/capture rejection
-are checked locally. Actual validation results are recorded in the final
-handoff response; large local test outputs are not committed.
+are checked locally. Final validation passed 32 optimizer/profile/spectral/owner
+checks and 24 communication/launcher/trainer checks, with one CUDA/NCCL check
+skipped on this CPU machine. `git diff --check` and explicit-default checks passed;
+large local test outputs are not committed.
 
 Tracked compact evidence: this folder's `results.json`, `REPORT.md`, and
-`../communication/results.json`. The communication JSON includes source SHAs,
+`../communication_buckets/results.json`. The communication JSON includes source SHAs,
 run IDs and Modal volume locations for all three completed sweeps, including
 negative results. Logs/traces/checkpoints remain outside Git.
 

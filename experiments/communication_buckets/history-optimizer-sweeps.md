@@ -1,8 +1,6 @@
-> Archived measured results; paths for current reproduction are relocated under `experiments/communication/`. Original pinned checkouts and large evidence remain unchanged.
-
 # Optimizer-specific communication sweeps
 
-The original orchestration branch, `exp/comm-optimizer-sweeps`, started at
+This branch, `exp/comm-optimizer-sweeps`, starts at
 `8956f6e2cb8aae856c467c40ff2e3f37824dff75` and changes the Modal orchestration,
 its checks, and documentation only. The communication implementation, kernels,
 optimizer profiles, model, trainer, and data loader are unchanged. No new
@@ -160,7 +158,7 @@ byte-for-byte against the preserved Muon SHA.
 
 ## User-launched commands
 
-From the clean consolidated `exp/anvil-normuon` checkout, with the existing Modal
+From the new clean `exp/comm-optimizer-sweeps` checkout, with the existing Modal
 cache/results volumes and `gpt-lab` secret (`HF_TOKEN`):
 
 ```bash
@@ -168,17 +166,17 @@ SHA=$(git rev-parse HEAD)
 
 # No Modal job: verify the pushed source and selected optimizer.
 uv run --no-project --python 3.12 --with modal==1.6.2 python \
-  experiments/communication/modal_communication.py sweep --optimizer normuon \
+  scripts/benchmark/modal_communication.py sweep --optimizer normuon \
   --sha "$SHA" --run-name comm-normuon-128m-20261031 --bucket-mib 128 --dry-run
 
 # User-launched 4 x A100-80GB NCCL gate, screen, then confirmation.
 uv run --no-project --python 3.12 --with modal==1.6.2 python \
-  experiments/communication/modal_communication.py sweep --optimizer normuon \
+  scripts/benchmark/modal_communication.py sweep --optimizer normuon \
   --sha "$SHA" --run-name comm-normuon-128m-20261031 --bucket-mib 128
 
 # Optional, only after that sweep completes: separate NorMuon profiler run.
 uv run --no-project --python 3.12 --with modal==1.6.2 python \
-  experiments/communication/modal_communication.py profile --optimizer normuon \
+  scripts/benchmark/modal_communication.py profile --optimizer normuon \
   --sha "$SHA" --run-name comm-normuon-profile-20261031 \
   --results-run comm-normuon-128m-20261031
 ```

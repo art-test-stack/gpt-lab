@@ -51,5 +51,5 @@ and mocked scaling resume. They do not run a full tokenizer sweep.
 
 ## Preserved training experiments
 
-- [Communication buckets and overlap](communication/README.md): explicit baseline/bucket/pipeline/hook choices and measured negative results.
+- [Communication buckets and overlap](communication_buckets/README.md): explicit baseline/bucket/pipeline/hook choices and measured negative results.
 - [Optimizer comparison](optimizer_comparison/README.md): existing Muon, NorMuon and NorMuon with ANVIL spectral maps; remaining GPU validation belongs to Agent A.

@@ -72,4 +72,3 @@ def test_anvil_spectral_update_norm_state_memory_and_resume(shape, tmp_path):
                     torch.testing.assert_close(parameter, resumed_parameter, rtol=0, atol=0)
                 for key, value in state.items():
                     torch.testing.assert_close(value, resumed.state[resumed_parameters[0]][key], rtol=0, atol=0)
-

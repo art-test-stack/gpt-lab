@@ -1,10 +1,8 @@
-> Archived implementation handoff; historical commands below target their original source SHAs. Current entry: `experiments/communication/modal_communication.py`; see `README.md` and `RESULTS.md`.
-
 # Communication bucketing and overlap experiment
 
 This note preserves the original implementation handoff. For measured Muon
 64/128 MiB results and the new optimizer-selectable NorMuon sweep, use
-[Optimizer-specific communication sweeps](RESULTS.md).
+[Optimizer-specific communication sweeps](communication-optimizer-sweeps.md).
 The original launcher/source remains pinned in the original checkout for
 same-SHA profiling; the new launcher lives on `exp/comm-optimizer-sweeps`.
 

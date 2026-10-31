@@ -78,4 +78,3 @@ def test_two_process_gloo_muon_buckets_preserve_owners():
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     mp.spawn(_muon_bucket_worker, args=(port,), nprocs=2, join=True)
-

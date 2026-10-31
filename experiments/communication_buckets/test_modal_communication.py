@@ -10,7 +10,7 @@ import pytest
 
 
 def launcher():
-    path = Path(__file__).resolve().parents[2] / "experiments/communication/modal_communication.py"
+    path = Path(__file__).resolve().parents[2] / "experiments/communication_buckets/modal_communication.py"
     return runpy.run_path(str(path))
 
 

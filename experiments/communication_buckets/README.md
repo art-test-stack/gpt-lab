@@ -5,5 +5,5 @@ Muon 64 MiB B: -0.582%; Muon 128 MiB C: -0.303%; NorMuon 128 MiB C: -0.329% vers
 128 MiB removes excess padding (576 bytes remain), but adds ~2.13 GiB/GPU and one control collective; no demonstrated speedup.
 Tiny four-rank NCCL gradients/updates/state matched exactly; eager fixtures do not establish full-model compiled equivalence or useful overlap.
 Recommendation: baseline communication and capture off; preserve all modes as explicit options; no learning-quality conclusion.
-Entry: `python experiments/communication/modal_communication.py --help`; checks: `pytest experiments/communication`.
-Tracked evidence: `results.json`, `RESULTS.md`, `DESIGN.md`; large evidence: Modal `gpt-lab-runs/<run_id>` recorded in the summary.
+Entry: `python experiments/communication_buckets/modal_communication.py --help`; checks: `pytest experiments/communication`.
+Tracked evidence: `results.json`, `RESULTS.md`, `history-buckets.md`; large evidence: Modal `gpt-lab-runs/<run_id>` recorded in the summary.

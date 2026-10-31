@@ -21,4 +21,3 @@ def test_anvil_spectral_requires_boolean(tmp_path):
     path.write_text('transformer:\n  opt: normuon\n  anvil_spectral: "false"\n')
     with pytest.raises(ValueError, match="anvil_spectral must be a boolean"):
         OptimizerConfig.from_file(path)
-
