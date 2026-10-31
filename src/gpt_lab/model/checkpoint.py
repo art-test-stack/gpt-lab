@@ -237,7 +237,7 @@ def _get_checkpoint_step(checkpoint_dir, step: Optional[Union[int, str]] = None)
         # TODO: look at step = -1 checkpoint_state and find the best step from there -> pb: best may not be saved under .../checkpoint_step_*/
         raw = _load_state_dict(checkpoint_dir, "checkpoint_state.safetensors", map_location="cpu", weight_only=False)
         checkpoint_state = CheckpointState.model_validate(raw)
-        if not checkpoint_state.best_eval_step:
+        if checkpoint_state.best_eval_value is None:
             log_error(f"Checkpoint state in {checkpoint_dir} does not contain a best step for 'best' checkpoint selection.", logger=logger, error_type=ValueError)
         step = checkpoint_state.best_eval_step
     else:

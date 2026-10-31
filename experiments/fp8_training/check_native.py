@@ -52,7 +52,7 @@ def milliseconds(fn):
     return {"median_ms": statistics.median(times), "samples_ms": times}
 
 
-def run(output):
+def run(output, activation="swiglu"):
     check_fp8_support(torch.device("cuda"), torch.bfloat16)
     from torchao.float8.float8_scaling_utils import hp_tensor_to_float8_dynamic
     from torchao.float8.float8_training_tensor import GemmInputRole
@@ -61,7 +61,7 @@ def run(output):
     output.mkdir(parents=True, exist_ok=False)
     torch.manual_seed(42)
     model = DenseTransformer(TransformerConfig(vocab_size=512, d_model=128, d_ffn=512,
-        n_layers=1, n_heads=2, d_head=64, max_context=16, act_func="swiglu")).to("cuda")
+        n_layers=1, n_heads=2, d_head=64, max_context=16, act_func=activation)).to("cuda")
     model._enforce_precision(torch.bfloat16)
     model.init_weights()
     with torch.no_grad():
@@ -148,7 +148,7 @@ def run(output):
         candidate(x)
         torch.cuda.synchronize()
     profile.export_chrome_trace(str(output/"trace.json"))
-    report = {"torch": torch.__version__, "torchao": torchao.__version__, "gpu": torch.cuda.get_device_name(),
+    report = {"activation": activation, "torch": torch.__version__, "torchao": torchao.__version__, "gpu": torch.cuda.get_device_name(),
               "allow_bf16_reduced_precision_reduction": torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
               "fp8_use_fast_accum": candidate.w_1.config.gemm_config_output.use_fast_accum,
               "native_fp8_operands_dispatched": fp8_ops, "GEMM_traces": traces,
@@ -165,4 +165,6 @@ def run(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path(".tmp/codex/fp8-training/native-check"))
-    run(parser.parse_args().output)
+    parser.add_argument("--activation", choices=("swiglu", "relu_squared"), default="swiglu")
+    args = parser.parse_args()
+    run(args.output, args.activation)

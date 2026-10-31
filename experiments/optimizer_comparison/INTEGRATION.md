@@ -27,8 +27,9 @@ also include `d20` to expose that distinction. Derive the new horizon from
 data:parameter ratio 10 and report the scaling parameter definition and rounding.
 
 The JSON is a recipe and handoff, not an executable launcher or completed run.
-Agent A must implement its listed pending prerequisites, generate pinned launch
-commands and report validation before long training. FP8 currently means FFN
+The selected-run launcher, ReLU-squared conversion and post-update evaluation/
+checkpoint prerequisites are now implemented locally. Native hardware validation
+is still mandatory before long training. FP8 currently means FFN
 forward only, with BF16 backward. Evaluation disables FP8 consistently. Keep
 initialization, data and schedules matched. Run the three 8-H100 jobs sequentially
 under the available eight-GPU concurrency limit. No paid job was launched here.
@@ -49,3 +50,17 @@ not run successfully because this host rejects Gloo socket operations; they
 were excluded from the successful repeat, not counted as passing. No CUDA/NCCL,
 native FP8 dispatch, training quality or authenticated archive publication was
 validated by this consolidation.
+
+Remaining work stays on `exp/anvil-normuon` and consolidated PR #44. The selected
+recipe now explicitly retains the existing tying-aware BF16-embedding/FP32-other
+storage policy; no all-FP32 option was added. The approved unspecified CLI defaults
+include warmup 40. See README.md for the gated launcher and resolved 8,728-update
+horizon. The earlier validation counts above describe consolidation, not proof
+that the newly prepared H100 gate has run.
+
+Selected-run prerequisite validation: 178 focused CPU checks passed (including
+conversion wiring, trainer counters, checkpoint compatibility, CLI/workflows,
+embedding tying, spectral/profile checks and offline launcher plans). The known
+socket-dependent distributed-metrics test was deselected. Entrypoint compilation
+and `git diff --check` passed. The eight-H100 gate is prepared but has not run;
+CUDA/NCCL, native dispatch, memory fit and learning quality remain unverified.

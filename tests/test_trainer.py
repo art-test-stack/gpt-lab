@@ -207,7 +207,7 @@ def test_gradient_monitor_reads_accumulated_parameter_gradients(tmp_path):
 @pytest.mark.fast
 @pytest.mark.parametrize("step,previous_best,save_on_best,should_save", [
     (5, None, True, True),
-    (10, 2.0, True, False),  # The scheduled checkpoint will save this step.
+    (10, 2.0, True, True),  # Best selection is independent of periodic saving.
     (5, 1.0, True, False),
     (5, 2.0, False, False),
 ])
@@ -223,6 +223,7 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
         "n_bpb_tokens": 9, "save_every": 10, "save_on_best": save_on_best,
     })
     trainer.state.step = step
+    trainer.state.completed_steps = step + 1
     trainer.ckpt_state.best_eval_value = previous_best
     trainer.ckpt_state.best_eval_step = 1
     trainer.save_checkpoint = Mock()
@@ -250,9 +251,10 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     assert trainer.save_checkpoint.call_count == int(should_save)
     assert trainer.compiled_model.training
     values, logged_step = board.records[-1]
-    assert logged_step == step
+    assert logged_step == step + 1
+    assert trainer.ckpt_state.best_eval_completed_steps == (step + 1 if improved else None)
     assert values["eval/best_bpb"] == best
-    assert trainer.eval_metrics.step == [step]
+    assert trainer.eval_metrics.step == [step + 1]
     assert trainer.eval_metrics.bpb == [1.5]
     assert trainer.eval_metrics.loss == [2.0]
     assert trainer.eval_metrics.step_time_ms == [values["eval/step_time_ms"]]
@@ -263,6 +265,9 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
 def test_evaluate_core_tracks_metrics_and_best_score(tmp_path, monkeypatch, previous_best):
     trainer, model, board = _make_trainer(tmp_path)
     trainer.state.step = 5
+    trainer.state.completed_steps = 6
+    trainer.config = trainer.config.model_copy(update={"save_on_best": True})
+    trainer.save_checkpoint = Mock()
     trainer.ckpt_state.best_core_value = previous_best
     trainer.ckpt_state.best_core_step = 1
     results = {
@@ -291,10 +296,12 @@ def test_evaluate_core_tracks_metrics_and_best_score(tmp_path, monkeypatch, prev
     assert trainer.ckpt_state.best_core_value == (0.6 if previous_best is None else 1.0)
     assert trainer.ckpt_state.best_core_step == (5 if previous_best is None else 1)
     values, step = board.records[-1]
-    assert step == 5
+    assert step == 6
+    assert trainer.ckpt_state.best_core_completed_steps == (6 if previous_best is None else None)
+    assert trainer.save_checkpoint.call_count == int(previous_best is None)
     assert values["core/core"] == 0.6
     assert values["core/task/accuracy"] == 0.8
-    assert trainer.core_metrics.step == [5]
+    assert trainer.core_metrics.step == [6]
     assert trainer.core_metrics.core == [0.6]
     assert trainer.core_metrics.accuracy == [0.7]
     assert trainer.core_metrics.results == [results["all_core_results"]]
@@ -705,3 +712,28 @@ class TestModelTrainer:
     #         self.trainer.fit()
     #     except NotImplementedError:
     #         pass  # Since fit is not implemented, we just ensure it raises NotImplementedError
+
+
+@pytest.mark.parametrize("interval,expected", [(2, [2, 4, 5]), (-1, [5]), (0, [])])
+def test_evaluation_runs_after_completed_updates_and_includes_final(tmp_path, monkeypatch, interval, expected):
+    trainer, model, _ = _make_trainer(tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer)
+    trainer.config = trainer.config.model_copy(update=dict(
+        n_steps=9, stop_after_step=5, n_acc_steps=1, total_batch_size=3,
+        n_flops_per_token=100, eval_bpb_every=interval, eval_core_every=interval,
+        sample_every=0, save_every=2, log_every=0))
+    trainer.train_loader = itertools.repeat(dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3, state=None))
+    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    trainer.optimizer.update_hyperparams = lambda **kwargs: None
+    observations = {"bpb": [], "core": [], "save": []}
+    def record(kind):
+        observations[kind].append(trainer.state.completed_steps)
+        assert trainer.state.step + 1 == trainer.state.completed_steps
+        assert trainer.state.n_tokens == trainer.state.completed_steps * 3
+    trainer.evaluate_bpb = lambda: record("bpb")
+    trainer.evaluate_core = lambda: record("core")
+    trainer.save_checkpoint = lambda: record("save")
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+    for name in ("collect", "freeze", "disable"):
+        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
+    trainer.train()
+    assert observations == {"bpb": expected, "core": expected, "save": [2, 4, 5]}

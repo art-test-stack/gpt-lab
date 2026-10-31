@@ -354,13 +354,13 @@ class Trainer:
     def train(self):
         """
         Main training loop.
-        
+
         Performs gradient accumulation, validation, checkpointing, and logging.
         """
         print0("=" * 70)
         print0(f"Starting training for {self.config.n_steps:,} steps -- {self.config.total_batch_size:,} tokens per step.")
         print0("=" * 70)
-        
+
         # Extracte main constants from config
         step = self.state.completed_steps
         n_steps = self.config.n_steps
@@ -371,7 +371,7 @@ class Trainer:
             if self.config.stop_after_step is not None:
                 self.board.log({"train/completed_steps": step}, step=self.state.step)
             return
-        
+
         use_scalar_loss = (
             type(self).compute_loss is Trainer.compute_loss
             and callable(getattr(self.model, "training_loss", None))
@@ -422,9 +422,9 @@ class Trainer:
                 self.train_context,
             )
             self.board.log({"train/capture_startup_seconds": time.perf_counter() - capture_start}, step=step)
-        
+
         total_dt = []  # For ETA calculation
-        
+
         while step < step_limit:
             self.state.step = step
             last_step = (step == step_limit - 1)
@@ -436,40 +436,6 @@ class Trainer:
                 )
             )
             self.synchronize()
-            
-            # ================================================================
-            # Validation on 'val_loader' every 'eval_every' steps
-            # ================================================================
-            
-            if (
-                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
-                (self.config.eval_bpb_every > 0 and step > 0 and # eval every eval_bpb_every steps except the first step
-                (last_step or step % self.config.eval_bpb_every == 0)) 
-            ):
-                self.evaluate_bpb()
-
-            # ================================================================
-            # Validation on CORE metric every 'core_eval_every' steps
-            # ================================================================
-            
-            if (
-                (self.config.eval_core_every == -1 and last_step) or
-                (self.config.eval_core_every > 0 and (
-                last_step or (step > 0 and step % self.config.eval_core_every == 0)))
-            ):
-                self.evaluate_core()
-            
-            # ================================================================
-            # Sample some outputs every 'sample_every' steps
-            # ================================================================
-
-            if (
-                self.config.comp_info.rank == 0 and
-                ((self.config.sample_every == -1 and last_step) or
-                (self.config.sample_every > 0 and 
-                (last_step or (step > 0 and step % self.config.sample_every == 0))))
-            ):
-                self.evaluate_samples()
 
             # ================================================================
             # Training step with gradient accumulation
@@ -480,23 +446,58 @@ class Trainer:
             # ================================================================
             # Logging and metrics
             # ================================================================
-            
+
             metrics = self.update_metrics(step_metrics, total_dt)
             self.state.completed_steps = step + 1
             metrics["train/completed_steps"] = self.state.completed_steps
             if should_log_step:
                 self.log_metrics(metrics)
 
+            completed = self.state.completed_steps
+            # ================================================================
+            # Validation on 'val_loader' every 'eval_every' steps
+            # ================================================================
+
+            if (
+                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
+                (self.config.eval_bpb_every > 0 and completed > 0 and # eval every eval_bpb_every steps except the first step
+                (last_step or completed % self.config.eval_bpb_every == 0))
+            ):
+                self.evaluate_bpb()
+
+            # ================================================================
+            # Validation on CORE metric every 'core_eval_every' steps
+            # ================================================================
+
+            if (
+                (self.config.eval_core_every == -1 and last_step) or
+                (self.config.eval_core_every > 0 and (
+                last_step or (completed > 0 and completed % self.config.eval_core_every == 0)))
+            ):
+                self.evaluate_core()
+
+            # ================================================================
+            # Sample some outputs every 'sample_every' steps
+            # ================================================================
+
+            if (
+                self.config.comp_info.rank == 0 and
+                ((self.config.sample_every == -1 and last_step) or
+                (self.config.sample_every > 0 and
+                (last_step or (completed > 0 and completed % self.config.sample_every == 0))))
+            ):
+                self.evaluate_samples()
+
             # ================================================================
             # Checkpointing
             # ================================================================
-            if (self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0):
+            if self.config.save_every > 0 and completed % self.config.save_every == 0:
                 self.save_checkpoint()
-            
+
             if (sum(total_dt) > self.config.target_time * 60) and self.config.target_time > 0:
                 print0(f"Reached target time of {self.config.target_time} minutes. Stopping training.")
                 break
-            
+
             # ================================================================
             # Cleanup
             # ================================================================
@@ -506,20 +507,20 @@ class Trainer:
                 gc.disable()
             elif step % 5000 == 0:
                 gc.collect()
-            
+
             step += 1
 
         del self.compiled_model  # Clean up compiled model if it exists
         self.compiled_model = None
         self.compiled_training_loss = None
         self._forward_backward_graph = None
-        
+
         print0("=" * 70)
         print0(f"Training completed!")
         print0(f"Total tokens: {self.state.n_tokens:,}")
         print0(f"Total time: {self.state.total_training_time/60:.1f} minutes")
         print0("=" * 70)
-        
+
         # Final checkpoint
         self.save_checkpoint()
         if self.config.stop_after_step is not None:
@@ -736,7 +737,7 @@ class Trainer:
 
         Override this method to customize evaluation. Scheduling stays in train().
         """
-        step = self.state.step
+        step = self.state.completed_steps
         start_bpb_eval = time.time()
         self.compiled_model.eval()
         tokens_per_eval_step = (
@@ -767,11 +768,9 @@ class Trainer:
             (val_res['bpb'] < self.ckpt_state.best_eval_value)
         ):
             self.ckpt_state.best_eval_value = val_res['bpb']
-            self.ckpt_state.best_eval_step = step
-            if (
-                self.config.save_on_best and
-                not ((self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0)) # already saving this step
-                ):
+            self.ckpt_state.best_eval_step = self.state.step
+            self.ckpt_state.best_eval_completed_steps = step
+            if self.config.save_on_best:
                 self.save_checkpoint()
 
         board_dict = {
@@ -789,7 +788,7 @@ class Trainer:
 
         Override this method to customize evaluation. Scheduling stays in train().
         """
-        step = self.state.step
+        step = self.state.completed_steps
         n_steps = self.config.n_steps
         self.model.eval()
         with self.val_context(self.model):
@@ -820,7 +819,10 @@ class Trainer:
             (results["core/core"] > self.ckpt_state.best_core_value)
         ):
             self.ckpt_state.best_core_value = results["core/core"]
-            self.ckpt_state.best_core_step = step
+            self.ckpt_state.best_core_step = self.state.step
+            self.ckpt_state.best_core_completed_steps = step
+            if self.config.save_on_best:
+                self.save_checkpoint()
         self.board.log(board_dict, step=step)
         self.core_metrics.append(results, step=step)
         self.model.train()
@@ -959,7 +961,7 @@ class Trainer:
                     "trainer did not create a scaler."
                 )
             trainer.scaler.load_state_dict(ckpt_data.scaler_state)
-        log0(f"Resumed trainer from checkpoint at step {trainer.state.step} with best eval bpb {trainer.ckpt_state.best_eval_value:.6f} at step {trainer.ckpt_state.best_eval_step}.", logger=logger)
+        log0(f"Resumed trainer from checkpoint at step {trainer.state.step} with best eval bpb {trainer.ckpt_state.best_eval_value} at step {trainer.ckpt_state.best_eval_step}.", logger=logger)
         log0(f"Trainer instance created has no 'train_loader' or 'val_loader'. Please set these manually before calling 'trainer.train()'. Maybe consider using 'trainer.state.dataloader_state'", level="warning", logger=logger)
 
         return trainer

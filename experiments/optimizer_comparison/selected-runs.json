@@ -1,8 +1,11 @@
 {
-  "status": "selected_recipe_not_yet_gpu_validated",
+  "status": "prepared_pending_user_launched_hardware_validation",
   "integration_branch": "exp/anvil-normuon",
   "owner": "Agent A",
-  "hardware": {"gpu": "H100", "world_size": 8},
+  "hardware": {
+    "gpu": "H100",
+    "world_size": 8
+  },
   "model": {
     "name_prefix": "ic1-d16",
     "depth": 20,
@@ -19,9 +22,18 @@
     "compute": "bfloat16",
     "ffn_forward": "float8_e4m3fn",
     "ffn_backward": "bfloat16",
-    "parameter_storage": "float32"
+    "parameter_storage": {
+      "input_and_value_embeddings": "bfloat16 unless tied to the FP32 output table",
+      "other_parameters": "float32",
+      "weight_tying": "preserve shared Parameter identity",
+      "identical_across_variants": true
+    }
   },
-  "execution": {"compiled": true, "cuda_graph_mode": "disabled", "communication": "baseline"},
+  "execution": {
+    "compiled": true,
+    "cuda_graph_mode": "disabled",
+    "communication": "baseline"
+  },
   "horizon": {
     "target_data_to_parameter_ratio": 10,
     "derive_from_resolved_model": true,
@@ -39,11 +51,27 @@
     "same_datasets_and_budgets_for_all_variants": true,
     "precision": "bfloat16_with_fp8_disabled"
   },
-  "checkpoints": {"retain": ["best_bpb", "best_core", "final_resumable"], "independent_best_selection": true},
+  "checkpoints": {
+    "retain": [
+      "best_bpb",
+      "best_core",
+      "final_resumable"
+    ],
+    "independent_best_selection": true
+  },
   "variants": [
-    {"model_name": "ic1-d16-d20-muon", "optimizer_config": "experiments/optimizer_comparison/configs/muon.yaml"},
-    {"model_name": "ic1-d16-d20-normuon", "optimizer_config": "experiments/optimizer_comparison/configs/a_normuon.yaml"},
-    {"model_name": "ic1-d16-d20-normuon-spectral", "optimizer_config": "experiments/optimizer_comparison/configs/b_spectral.yaml"}
+    {
+      "model_name": "ic1-d16-d20-muon",
+      "optimizer_config": "experiments/optimizer_comparison/configs/muon.yaml"
+    },
+    {
+      "model_name": "ic1-d16-d20-normuon",
+      "optimizer_config": "experiments/optimizer_comparison/configs/a_normuon.yaml"
+    },
+    {
+      "model_name": "ic1-d16-d20-normuon-spectral",
+      "optimizer_config": "experiments/optimizer_comparison/configs/b_spectral.yaml"
+    }
   ],
   "comparison": {
     "match_initialization_seed_tokenizer_data_order_and_schedule": true,
@@ -54,12 +82,45 @@
     "twin_momentum_rails_and_delayed_blending": "not implemented"
   },
   "pending_before_training": [
-    "Support native ReLU-squared FFN conversion; current FP8 converter requires SwiGLU",
-    "Save best-CORE checkpoints independently; current evaluator only tracks the best CORE score",
-    "Verify post-update evaluation/checkpoint counters, including the final update",
-    "Verify compiled FA3 and FP8 dispatch, memory at batch 32 on 8 H100s, and finite forward/backward",
-    "Validate compiled spectral CUDA/NCCL owner states and same-variant checkpoint/resume",
-    "Generate exact launch commands pinned to the final published integration SHA"
+    "Run prepared eight-H100 CUDA/NCCL gate: compiled FA3, FP8 forward/BF16 backward dispatch, finite updates and batch-32 memory",
+    "Pass compiled spectral zero/near-rank-one/tall/wide checks, owner-state comparisons and same-variant disk resume",
+    "Launch commands must use the final published integration SHA; train mode repeats the gate before any long run"
   ],
-  "paid_compute_launched": false
+  "paid_compute_launched": false,
+  "frozen_defaults": {
+    "random_seed": 42,
+    "tokenizer": "gpt2",
+    "dataset": "climbmix-base",
+    "aspect_ratio": 64,
+    "d_head": 128,
+    "tie_embeddings": "embs;value_embs;head",
+    "window_pattern": "SSSL",
+    "window_size": 512,
+    "softcap": 18.0,
+    "lr_warmup_updates": 40,
+    "lr_warmdown_ratio": 0.65,
+    "final_lr_ratio": 0.05,
+    "bpb_tokens": 41943040,
+    "core_examples_per_task": 500
+  },
+  "resolved_plan": {
+    "parameter_count": 1165886680,
+    "scaling_parameters": 457606320,
+    "scaling_parameter_definition": "decoder blocks plus output table, counting a tied output table once; excludes other embedding tables and residual scalars",
+    "target_tokens": 4576063200,
+    "horizon": 8728,
+    "rounded_tokens": 4575985664,
+    "rounding": "floor(target_tokens / 524288)"
+  },
+  "implemented_locally": [
+    "Native ReLU-squared and SwiGLU FP8 conversion preserves Parameter identities and checkpoint keys",
+    "Post-update evaluation and periodic checkpoint counters, including final evaluation",
+    "Independent best BPB/CORE checkpoint saving, with zero-based directory compatibility",
+    "Offline selected-run plan, pinned sequential Modal launcher and fail-closed hardware gate"
+  ],
+  "entrypoints": {
+    "launcher": "experiments/optimizer_comparison/launch.py",
+    "hardware_gate": "experiments/optimizer_comparison/check_h100.py",
+    "production_runner": "experiments/optimizer_comparison/train_selected.py"
+  }
 }

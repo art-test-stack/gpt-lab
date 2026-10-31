@@ -17,9 +17,9 @@ from gpt_lab.utils.distributed import ComputeContext
 from gpt_lab.utils.schemas import TrainerConfig, TransformerConfig
 
 
-def model():
+def model(activation="swiglu"):
     result = DenseTransformer(TransformerConfig(vocab_size=64, d_model=32, d_ffn=128,
-        n_layers=2, n_heads=2, d_head=16, max_context=8, act_func="swiglu"))
+        n_layers=2, n_heads=2, d_head=16, max_context=8, act_func=activation))
     result.init_weights()
     return result
 
@@ -83,10 +83,11 @@ class Float8Proxy(Linear):
         return result
 
 
-def test_conversion_identity_current_weights_and_state_keys(monkeypatch):
+@pytest.mark.parametrize("activation", ["swiglu", "relu_squared"])
+def test_conversion_identity_current_weights_and_state_keys(monkeypatch, activation):
     monkeypatch.setattr(fp8, "check_fp8_support", lambda device, dtype: None)
     monkeypatch.setitem(sys.modules, "gpt_lab.model.torchao_fp8", SimpleNamespace(Float8FFNLinear=Float8Proxy))
-    candidate = model()
+    candidate = model(activation)
     original = dict(candidate.named_parameters())
     state = copy.deepcopy(candidate.state_dict())
     context = ComputeContext(torch.device("cpu"), compute_dtype=torch.bfloat16)
@@ -120,9 +121,9 @@ def test_missing_extra_and_wrong_architecture_fail_before_conversion(monkeypatch
     with pytest.raises(ImportError, match="extra fp8"):
         fp8.enable_fp8_ffn_forward(candidate, torch.bfloat16)
     assert original == [block.ffn.w_1 for block in candidate.blocks]
-    wrong = DenseTransformer(TransformerConfig(vocab_size=64, d_model=32, d_ffn=128,
-        n_layers=1, n_heads=2, d_head=16, max_context=8, act_func="relu_squared"))
-    with pytest.raises(ValueError, match="act-func swiglu"):
+    wrong = model()
+    wrong.blocks[0].ffn = torch.nn.Identity()
+    with pytest.raises(ValueError, match="native SwiGLU or squared-ReLU"):
         fp8.enable_fp8_ffn_forward(wrong, torch.bfloat16)
 
 

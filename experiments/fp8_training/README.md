@@ -10,3 +10,9 @@ establish reliable speedup or native compiled dispatch. See [RESULTS.md](RESULTS
 Reproduction: `python experiments/fp8_training/run_h100_compare.py --help`;
 prefer the prepared [complete diagnostic](../h100_fp8_diagnostic/README.md).
 Backend precision/storage/checkpoint details and prior commands: [BACKEND.md](BACKEND.md).
+
+The native converter also accepts ReLU-squared FFNs, preserving parameter identities
+and checkpoint keys. CPU wiring checks cover both architectures; native ReLU-squared
+CUDA dispatch remains a required hardware check. Prepare it with
+`python experiments/fp8_training/check_native.py --activation relu_squared --output <fresh-directory>`
+on an H100 with the GPU and FP8 extras installed. This command runs GPU work.

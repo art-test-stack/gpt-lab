@@ -789,6 +789,9 @@ class CheckpointState(BaseModel):
     version: int = 1
     best_eval_step: int = 0
     best_core_step: int = 0
+    # Directory indices stay zero-based; these record evaluated update counts.
+    best_eval_completed_steps: Optional[int] = None
+    best_core_completed_steps: Optional[int] = None
     best_eval_value: Optional[float] = None  # lower is better
     best_core_value: Optional[float] = None  # higher is better
 

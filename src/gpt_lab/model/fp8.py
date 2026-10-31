@@ -1,6 +1,6 @@
 import torch
 
-from gpt_lab.model.layers import Linear, SwigLUFeedForward
+from gpt_lab.model.layers import Linear, SquaredReLUFeedForward, SwigLUFeedForward
 
 
 def check_fp8_support(device, compute_dtype):
@@ -14,13 +14,13 @@ def check_fp8_support(device, compute_dtype):
 
 
 def enable_fp8_ffn_forward(model, compute_dtype):
-    """Convert only SwiGLU FFN matrices, preserving Parameter objects and keys.
+    """Convert native SwiGLU or squared-ReLU FFN matrices, preserving Parameter objects and keys.
 
     Scaling is dynamic and stateless; checkpoints need no quantization history.
     """
     check_fp8_support(next(model.parameters()).device, compute_dtype)
-    if any(type(block.ffn) is not SwigLUFeedForward for block in model.blocks):
-        raise ValueError("FP8 experiment requires --act-func swiglu; architecture is never changed automatically")
+    if any(type(block.ffn) not in (SwigLUFeedForward, SquaredReLUFeedForward) for block in model.blocks):
+        raise ValueError("FP8 requires native SwiGLU or squared-ReLU FFNs; architecture is never changed automatically")
     locations = [(block.ffn, name) for block in model.blocks for name in ("w_1", "w_2")]
     for parent, name in locations:
         linear = getattr(parent, name)
