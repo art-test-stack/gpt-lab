@@ -15,8 +15,10 @@
   },
   "batch": {
     "device_sequences": 32,
-    "global_tokens_per_update": 524288,
-    "accumulation_microsteps": 1
+    "global_tokens_per_update": -1,
+    "accumulation_microsteps": -1,
+    "resolved_global_tokens_per_update": 1048576,
+    "resolved_accumulation_microsteps": 2
   },
   "precision": {
     "compute": "bfloat16",
@@ -57,7 +59,8 @@
       "best_core",
       "final_resumable"
     ],
-    "independent_best_selection": true
+    "independent_best_selection": true,
+    "periodic_save_every": -1
   },
   "variants": [
     {
@@ -95,12 +98,12 @@
     "d_head": 128,
     "tie_embeddings": "embs;value_embs;head",
     "window_pattern": "SSSL",
-    "window_size": 512,
-    "softcap": 18.0,
+    "window_size": 258,
+    "softcap": 12.0,
     "lr_warmup_updates": 40,
     "lr_warmdown_ratio": 0.65,
     "final_lr_ratio": 0.05,
-    "bpb_tokens": 41943040,
+    "bpb_tokens": 4194300,
     "core_examples_per_task": 500
   },
   "resolved_plan": {
@@ -108,9 +111,11 @@
     "scaling_parameters": 457606320,
     "scaling_parameter_definition": "decoder blocks plus output table, counting a tied output table once; excludes other embedding tables and residual scalars",
     "target_tokens": 4576063200,
-    "horizon": 8728,
+    "horizon": 4364,
     "rounded_tokens": 4575985664,
-    "rounding": "floor(target_tokens / 524288)"
+    "rounding": "floor(target_tokens / resolved_global_batch)",
+    "global_tokens_per_update": 1048576,
+    "accumulation_microsteps": 2
   },
   "implemented_locally": [
     "Native ReLU-squared and SwiGLU FP8 conversion preserves Parameter identities and checkpoint keys",
@@ -123,5 +128,6 @@
     "hardware_gate": "experiments/optimizer_comparison/check_h100.py",
     "native_training": "gpt-lab train auto",
     "reporting_checks": "experiments/optimizer_comparison/training_checks.py"
-  }
+  },
+  "launcher_policy": "Native CLI overrides are authoritative; no recipe equality, label, or prior-run constraints. Hardware validation uses the requested settings."
 }

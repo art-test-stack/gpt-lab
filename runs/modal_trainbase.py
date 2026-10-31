@@ -78,7 +78,7 @@ from gpt_lab.train.trainer import Trainer
 if os.environ.get("GPTLAB_SELECTED_RUN") == "1":
     sys.path.insert(0, "/opt/gpt-lab")
     from experiments.optimizer_comparison.training_checks import install
-    install(Path(os.environ["GPTLAB_LAUNCH_DIR"]), Path(os.environ["GPTLAB_REFERENCE_RUN"]))
+    install(Path(os.environ["GPTLAB_LAUNCH_DIR"]))
 if os.environ["GPTLAB_CHECKPOINTS"] == "0":
     Trainer.save_checkpoint = lambda self: None
 original_train = Trainer.train
@@ -186,22 +186,7 @@ def check_inputs(arguments, run_name, world_size, checkpoints=False, sha=None):
     tokenizer = settings["tokenizer_model"] or "gpt2"
     if not any(p.is_file() for p in (CACHE / "tokenizers" / tokenizer).rglob("*")):
         raise ValueError(f"Cached tokenizer {tokenizer!r} is missing.")
-    # Reviewed production model names request the required hardware/resume gate.
-    import sys
-    sys.path.insert(0, str(REPO))
-    from experiments.optimizer_comparison.recipe import selected_run
-    selected = selected_run(settings, run_name, world_size)
-    if selected:
-        if not checkpoints:
-            raise ValueError("Selected production runs require --checkpoints")
-        for previous in {selected["reference_run"], selected["predecessor_run"]} - {run_name}:
-            path = RUNS / previous / "launch.json"
-            if not path.is_file():
-                raise ValueError(f"Finish {previous} at the same SHA before this run")
-            baseline = json.loads(path.read_text())
-            if baseline.get("status") != "finished" or baseline.get("git_sha") != sha:
-                raise ValueError(f"Finish {previous} at the same SHA before this run")
-        settings["_selected_run"] = selected
+    settings["_hardware_gate"] = bool(world_size == 8 and settings["fp8_ffn_forward"])
     return settings
 
 
@@ -224,6 +209,7 @@ def train(arguments, run_name, sha, branch, environment, checkpoints, settings, 
     directory = RUNS / run_name
     directory.mkdir(parents=True, exist_ok=False)
     (directory / "train_short.py").write_text(SHORT_RUNNER)
+    (directory / "requested_settings.json").write_text(json.dumps(settings, indent=2)+"\n")
     command = [str(REPO / ".venv/bin/torchrun"), "--standalone", "--nnodes=1",
                f"--nproc_per_node={world_size}", "--max_restarts=0", str(directory / "train_short.py"),
                *arguments]
@@ -232,10 +218,9 @@ def train(arguments, run_name, sha, branch, environment, checkpoints, settings, 
         "GPTLAB_CHECKPOINTS": str(int(checkpoints)), "PYTHONUNBUFFERED": "1",
         "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
     }
-    selected = settings.get("_selected_run")
+    selected = settings.get("_hardware_gate")
     if selected:
         env.update(GPTLAB_SELECTED_RUN="1", GPTLAB_SELECTED_SHA=sha,
-                   GPTLAB_REFERENCE_RUN=str(RUNS / selected["reference_run"]),
                    TORCHINDUCTOR_COMPILE_THREADS="1", PYTORCH_ALLOC_CONF="expandable_segments:True")
     record = dict(git_sha=sha, git_branch=branch, repository=git(REPO, "remote", "get-url", "origin"),
                   command=command, environment=environment,
@@ -254,7 +239,8 @@ def train(arguments, run_name, sha, branch, environment, checkpoints, settings, 
         if selected:
             gate = [str(REPO / ".venv/bin/torchrun"), "--standalone", "--nnodes=1",
                     f"--nproc_per_node={world_size}", "--max_restarts=0",
-                    "experiments/optimizer_comparison/check_h100.py", "--output", str(directory / "validation")]
+                    "experiments/optimizer_comparison/check_h100.py", "--output", str(directory / "validation"),
+                    "--settings", str(directory / "requested_settings.json")]
             record["validation_command"] = gate
             run_process(gate, directory / "validation.log", env)
             evidence = json.loads((directory / "validation/passed.json").read_text())

@@ -21,7 +21,7 @@ def test_three_direct_plans_preserve_recipe_without_implicit_cap(monkeypatch, ca
     commands = re.findall(r"```bash\n(.*?)\n```", (recipe.ROOT/"experiments/optimizer_comparison/README.md").read_text(), re.S)
     assert len(commands) == 3
     for command, variant in zip(commands, recipe.SELECTION["variants"]):
-        name = variant["model_name"]+"-v2"
+        name = re.search(r"--run-name (\S+)", command).group(1)
         parts = shlex.split(command.replace("\\\n", ""))
         arguments = parts[parts.index("runs/modal_trainbase.py")+1:]
         arguments[arguments.index("--sha")+1] = "e"*40
@@ -34,7 +34,8 @@ def test_three_direct_plans_preserve_recipe_without_implicit_cap(monkeypatch, ca
         assert settings["model_name"] == variant["model_name"]
         assert settings["optim_config_path"] == variant["optimizer_config"]
         assert settings["run_name"] == name and settings["stop_after_step"] is None
-        assert recipe.selected_run(settings, name, 8)["reference_run"] == "ic1-d16-d20-muon-v2"
+        assert "--n-acc-steps" not in arguments
+        assert settings["n_acc_steps"] == -1
     generic = vars(build_parser().parse_args(["train", "auto", *launch.cli_defaults(launch.DEFAULT_TRAIN)]))
     assert generic["stop_after_step"] is None
     capped = vars(build_parser().parse_args(["train", "auto", *launch.cli_defaults(launch.DEFAULT_TRAIN), "--stop-after-step", "15"]))
@@ -52,9 +53,9 @@ def test_failed_hardware_gate_prevents_native_training(monkeypatch, tmp_path):
     monkeypatch.setattr(launch, "run_process", process)
     with pytest.raises(subprocess.CalledProcessError):
         launch.train([], "probe", sha, "exp/anvil-normuon", {"GPTLAB_DTYPE": "bfloat16"},
-                     True, {"attn_impl": "fa3", "_selected_run": {"reference_run": "probe"}}, 8, Mock())
+                     True, {"attn_impl": "fa3", "_hardware_gate": True}, 8, Mock())
     process.assert_called_once()
-    assert "check_h100.py" in process.call_args.args[0][-3]
+    assert any("check_h100.py" in item for item in process.call_args.args[0])
     assert json.loads((tmp_path/"probe/launch.json").read_text())["status"] == "failed"
 
 
@@ -70,8 +71,10 @@ def test_resolved_parameter_horizon_and_fingerprint():
     assert report["target_tokens"] == 10*report["scaling_parameters"]
     model._enforce_precision(torch.bfloat16)
     assert set(recipe.storage_summary(model)) == {"torch.bfloat16", "torch.float32"}
-    assert report["horizon"]*524288 == report["rounded_tokens"]
-    assert 0 <= report["target_tokens"]-report["rounded_tokens"] < 524288
+    batch = report["base_training"]["total_batch_size"]
+    assert batch == 1048576 and report["base_training"]["n_acc_steps"] == 2
+    assert report["horizon"]*batch == report["rounded_tokens"]
+    assert 0 <= report["target_tokens"]-report["rounded_tokens"] < batch
     import numpy as np
     rng_array = np.arange(10000)
     changed_rng = rng_array.copy()
@@ -130,23 +133,19 @@ launch.PYTHON = project_python
 launch.CACHE = Path(cache)
 launch.RUNS = Path(cache)/"outputs"
 variant = recipe.SELECTION["variants"][0]
-name = variant["model_name"]+"-v2"
+name = "ic1-d20-20261031-muon-v2"
 arguments = recipe.arguments(variant, name, launch.RUNS/name)
 launch.main(["--sha", "e"*40, "--run-name", name, "--gpu", "H100", "--gpus", "8", "--checkpoints", "--dry-run", "--", *arguments])
 settings = launch.check_inputs(arguments, name, 8, True, "e"*40)
 assert settings["num_steps"] == -1 and settings["stop_after_step"] is None
-assert settings["_selected_run"]["reference_run"] == name
-# Later independent commands must use a completed Muon reference at this SHA.
-reference = launch.RUNS/name
-reference.mkdir(parents=True)
-(reference/"launch.json").write_text(json.dumps(dict(status="finished", git_sha="e"*40)))
-for variant in recipe.SELECTION["variants"][1:]:
-    later = variant["model_name"]+"-v2"
-    settings = launch.check_inputs(recipe.arguments(variant, later, launch.RUNS/later), later, 8, True, "e"*40)
-    assert settings["_selected_run"]["reference_run"] == name
-    finished = launch.RUNS/later
-    finished.mkdir()
-    (finished/"launch.json").write_text(json.dumps(dict(status="finished", git_sha="e"*40)))
+assert settings["_hardware_gate"]
+# Valid overrides and arbitrary labels must not be vetoed by an experiment snapshot.
+for variant in recipe.SELECTION["variants"]:
+    arguments = recipe.arguments(variant, "arbitrary-label", launch.RUNS/"arbitrary-label")
+    arguments += ["--window-size", "133", "--softcap", "8", "--n-bpb-tokens", "100"]
+    settings = launch.check_inputs(arguments, "arbitrary-label", 8, True, "e"*40)
+    assert settings["window_size"] == "133" and settings["softcap"] == 8
+    assert settings["n_bpb_tokens"] == 100
 print("isolated direct preflight passed")
 '''
     result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(checkout),

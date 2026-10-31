@@ -78,3 +78,17 @@ literal README commands, cap handling, failed-gate ordering, existing diagnostic
 plans, and isolated preflight from tracked files with no personal launcher files.
 The native CLI parser was exercised through the project interpreter. Hardware
 validation has not been rerun and no paid compute was launched.
+
+CLI-authority correction: removed frozen-recipe comparisons, model/run-name
+constraints and prior-run dependencies. The launcher accepts native CLI overrides
+and supplies parsed settings to the hardware gate. Reporting no longer asserts a
+hardcoded horizon, batch or checkpoint/evaluation policy. The revised 20261031
+commands use window 258, softcap 12, automatic batch/accumulation, BPB budget
+4,194,300 and save-every -1; native scaling resolves 1,048,576 tokens/update,
+two microsteps and 4,364 updates. Initial fingerprints are recorded for later
+comparison rather than vetoing runs based on labels or stale settings.
+
+Revised-parameter validation: eight focused checks passed, including arbitrary
+labels and valid overrides, native parser/preflight in an isolated checkout,
+automatic batch/horizon resolution and failed hardware-gate ordering. No paid
+compute was launched; native GPU dispatch and memory fit remain unverified.

@@ -131,7 +131,7 @@ def owner_checks(context, output):
     return records
 
 
-def model_check(context, output):
+def model_check(context, output, settings):
     import torch
     import torch.distributed as dist
     from torch._inductor.select_algorithm import extern_kernels
@@ -141,17 +141,18 @@ def model_check(context, output):
     from gpt_lab.utils.schemas import TrainerConfig, OptimizerConfig, TrainerState, CheckpointState
     from gpt_lab.tokenizer import Tokenizer
     from experiments.optimizer_comparison.recipe import model_and_horizon, storage_summary
-    require_flash_attn3()
-    tokenizer = Tokenizer.from_pretrained("gpt2")
-    assert ((tokenizer.vocab_size+63)//64)*64 == 50304
-    torch.manual_seed(42)
-    model, horizon = model_and_horizon(context.device)
+    if settings["attn_impl"] == "fa3":
+        require_flash_attn3()
+    tokenizer = Tokenizer.from_pretrained(settings["tokenizer_model"])
+    torch.manual_seed(settings["random_seed"])
+    model, horizon = model_and_horizon(context.device, settings, context, tokenizer.vocab_size)
     model._enforce_precision(torch.bfloat16)
     model.init_weights()
     parameter_storage = storage_summary(model)
     config = TrainerConfig(comp_info=context, **horizon["base_training"], fp8_ffn_forward=True,
-        lr_warmup_steps=40, eval_bpb_every=0, eval_core_every=0,
-        optim_config=OptimizerConfig.from_file("experiments/optimizer_comparison/configs/b_spectral.yaml"))
+        lr_warmup_steps=settings["warmup_steps"], lr_warmdown_ratio=settings["warmdown_ratio"],
+        final_lr_ratio=settings["final_lr_frac"], eval_bpb_every=0, eval_core_every=0,
+        optim_config=OptimizerConfig.from_file(settings["optim_config_path"]))
     trainer = Trainer(model, tokenizer, None, None, config=config,
         checkpoint_manager=SimpleNamespace(source_dir=output/"model"))
     trainer.compiled_model = torch.compile(model, dynamic=False)
@@ -178,8 +179,8 @@ def model_check(context, output):
     losses = []
     try:
         generator = torch.Generator(device=context.device).manual_seed(100+context.rank)
-        x = torch.randint(50304, (32, 2048), generator=generator, device=context.device)
-        y = torch.randint(50304, (32, 2048), generator=generator, device=context.device)
+        x = torch.randint(tokenizer.vocab_size, (config.device_batch_size, model.config.max_context), generator=generator, device=context.device)
+        y = torch.randint(tokenizer.vocab_size, (config.device_batch_size, model.config.max_context), generator=generator, device=context.device)
         def batches():
             while True:
                 yield x, y, None
@@ -204,14 +205,16 @@ def model_check(context, output):
             torch.cuda.synchronize()
         profile.export_chrome_trace(str(output/f"trace_rank_{context.rank}.json"))
         forward = [r for r in records if r["operator"] == "_scaled_mm"]
-        assert len(forward) == 40, f"Native compiled FP8 dispatch not proven: {len(forward)} / 40; inspect trace"
+        expected = 2 * model.config.n_layers * config.n_acc_steps
+        assert len(forward) == expected, f"Native compiled FP8 dispatch not proven: {len(forward)} / {expected}; inspect trace"
         assert all(r["dtypes"] == ["torch.float8_e4m3fn"]*2 for r in forward)
-        backward = [r for r in records if r["operator"] != "_scaled_mm" and any(5120 in shape for shape in r["shapes"])]
-        assert len(backward) == 80, f"BF16 FFN backward dispatch not proven: {len(backward)} / 80"
+        backward = [r for r in records if r["operator"] != "_scaled_mm" and any(width in shape for shape in r["shapes"] for width in (model.blocks[0].ffn.w_1.out_features, model.blocks[0].ffn.w_2.in_features))]
+        assert len(backward) == expected * 2, f"BF16 FFN backward dispatch not proven: {len(backward)} / {expected * 2}"
         assert all(r["dtypes"] == ["torch.bfloat16"]*2 for r in backward)
         events = json.loads((output/f"trace_rank_{context.rank}.json").read_text())["traceEvents"]
         flash = [e["name"] for e in events if e.get("cat") == "kernel" and "flash" in e.get("name", "").lower()]
-        assert flash, "Compiled FA3 CUDA kernels not identified; inspect trace before training"
+        if settings["attn_impl"] in ("fa2", "fa3"):
+            assert flash, "Compiled attention CUDA kernels not identified; inspect trace before training"
         dispatch_records = copy.deepcopy(records)
         expected_weights = cpu_copy(model.state_dict())
         expected_optimizer = cpu_copy(trainer.optimizer.state_dict())
@@ -238,7 +241,7 @@ def model_check(context, output):
                     actual_gemm_dispatch=dispatch_records, fa3_kernel_names=sorted(set(flash)),
                     peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                     peak_reserved_bytes=torch.cuda.max_memory_reserved(),
-                    note="Synthetic batch-32 memory/dispatch check; not a learning-quality or throughput result")
+                    note="Synthetic requested-microbatch memory/dispatch check; not a learning-quality or throughput result")
     finally:
         for name, original in originals.items():
             setattr(extern_kernels, name, original)
@@ -250,8 +253,10 @@ def main():
     from gpt_lab.utils.distributed import init_dist_groups, cleanup_dist_groups
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--settings", required=True, type=Path)
     args = parser.parse_args()
-    context = init_dist_groups("cuda", random_seed=42)
+    settings = json.loads(args.settings.read_text())
+    context = init_dist_groups("cuda", random_seed=settings["random_seed"])
     args.output.mkdir(parents=True, exist_ok=True)
     try:
         assert context.world_size == 8 and dist.get_backend() == "nccl"
@@ -260,7 +265,7 @@ def main():
         print("Allocated GPUs:", names, flush=True)
         owners = owner_checks(context, args.output)
         torch.manual_seed(42)
-        report = model_check(context, args.output)
+        report = model_check(context, args.output, settings)
         report.update(status="passed", owner_checks=owners, gpu_models=names, rank=context.rank)
         (args.output/f"rank_{context.rank}.json").write_text(json.dumps(report, indent=2)+"\n")
         dist.barrier()

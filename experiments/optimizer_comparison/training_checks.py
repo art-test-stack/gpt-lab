@@ -1,13 +1,12 @@
-"""Selected-run checks installed by the native Modal training entry point."""
+"""Record actual run state without imposing a frozen experiment recipe."""
 import json
 import os
 
 
-def install(output, expected_initial):
+def install(output):
     from gpt_lab.train.trainer import Trainer
     from gpt_lab.model.checkpoint import capture_rng_state
     from experiments.optimizer_comparison.check_h100 import fingerprint
-    from experiments.optimizer_comparison.recipe import model_and_horizon, storage_summary
     original_train, original_prepare = Trainer.train, Trainer.prepare_batch
     initial = {}
 
@@ -16,43 +15,22 @@ def install(output, expected_initial):
         if "first_payload" not in initial:
             initial["first_payload"] = fingerprint(result[0])
             initial["data_position"] = result[1].model_dump() if result[1] else None
-            rank_file = f"initial_rank_{self.config.comp_info.rank}.json"
-            expected_path = expected_initial/rank_file
-            if output != expected_initial:
-                expected = json.loads(expected_path.read_text())
-                if expected != initial:
-                    raise RuntimeError("Initial model/RNG/data mismatch; stopping before first update")
-            (output/rank_file).write_text(json.dumps(initial, indent=2)+"\n")
+            (output/f"initial_rank_{self.config.comp_info.rank}.json").write_text(json.dumps(initial, indent=2)+"\n")
         return result
 
     def train(self):
         output.mkdir(parents=True, exist_ok=True)
-        storage = storage_summary(self.model)
         rng = capture_rng_state()
-        # init_dist_groups seeds Torch CPU/CUDA, not Python or NumPy.
         initial.update(model=fingerprint(self.model.state_dict()),
                        rng=fingerprint({key: rng[key] for key in ("torch", "cuda")}))
-        _, horizon = model_and_horizon()
-        assert self.config.n_steps == horizon["horizon"]
-        assert self.config.batch_lr_scale == horizon["base_training"]["batch_lr_scale"]
-        assert self.config.weight_decay_scale == horizon["base_training"]["weight_decay_scale"]
-        assert self.config.stop_after_step is None
-        assert self.config.cuda_graph_mode == "disabled" and self.config.fp8_ffn_forward
-        assert (self.config.n_acc_steps, self.config.device_batch_size, self.config.total_batch_size) == (1, 32, 524288)
         original_train(self)
-        assert self.state.completed_steps == self.config.n_steps
-        assert self.state.n_tokens == horizon["rounded_tokens"]
-        assert self.eval_metrics.step[-1] == self.state.completed_steps
-        assert self.core_metrics.step[-1] == self.state.completed_steps
-        selections = dict(best_bpb=self.ckpt_state.best_eval_step,
-                          best_core=self.ckpt_state.best_core_step,
-                          final_resumable=self.state.step)
-        for index in selections.values():
-            assert (self.ckpt_manager.source_dir/f"checkpoint_step_{index:06d}").is_dir()
         if self.config.comp_info.rank == 0:
             report = dict(sha=os.environ["GPTLAB_SELECTED_SHA"], status="finished",
-                          completed_updates=self.state.completed_steps, actual_tokens=self.state.n_tokens, horizon=horizon, parameter_storage=storage,
-                          checkpoints={key:str(self.ckpt_manager.source_dir/f"checkpoint_step_{value:06d}") for key,value in selections.items()},
-                          best_metrics=self.ckpt_state.model_dump(), config=self.config.model_dump(mode="json", exclude={"comp_info"}))
+                completed_updates=self.state.completed_steps, actual_tokens=self.state.n_tokens,
+                parameter_count=sum(p.numel() for p in self.model.parameters()),
+                scaling_parameters=self.model.n_scaling_params(),
+                horizon=self.config.n_steps, total_batch_size=self.config.total_batch_size,
+                n_acc_steps=self.config.n_acc_steps, best_metrics=self.ckpt_state.model_dump(),
+                config=self.config.model_dump(mode="json", exclude={"comp_info"}))
             (output/"selected_result.json").write_text(json.dumps(report, indent=2, default=str)+"\n")
     Trainer.prepare_batch, Trainer.train = prepare, train
