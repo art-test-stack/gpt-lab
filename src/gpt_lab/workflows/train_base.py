@@ -77,6 +77,7 @@ def train_base(
     attn_impl='sdpa',
     num_steps=-1,
     stop_after_step=None,
+    cuda_graph_mode=None,
     target_flops=-1.0,
     target_param_data_ratio=11.0,
     target_time=-1.0,
@@ -245,6 +246,11 @@ def train_base(
             assert type(trainer_config) == TrainerConfig, "Trainer config loaded from checkpoint is not of type TrainerConfig. Please check the checkpoint data and trainer config."
             if stop_after_step is not None:
                 trainer_config = trainer_config.model_copy(update={"stop_after_step": stop_after_step})
+            if cuda_graph_mode is not None:
+                trainer_config = TrainerConfig.model_validate(
+                    trainer_config.model_dump() | {"cuda_graph_mode": cuda_graph_mode, "comp_info": comp_info}
+                )
+            if stop_after_step is not None or cuda_graph_mode is not None:
                 ckpt_manager.save_training_config(trainer_config)
             # TODO: add option to override some trainer config parameters from CLI args even when resuming (eg: evaluation frequency, save frequency, etc.)
         else:
@@ -379,6 +385,7 @@ def build_trainer_config(parameters: dict, comp_info: ComputeContext, base_train
     return TrainerConfig(
         fp8_ffn_forward=parameters.get("fp8_ffn_forward", False),
         stop_after_step=parameters.get("stop_after_step"),
+        cuda_graph_mode=parameters.get("cuda_graph_mode") or "disabled",
         optim_config=parameters["optim_config"],
         lr_warmup_steps=parameters["warmup_steps"],
         lr_warmdown_ratio=parameters["warmdown_ratio"],

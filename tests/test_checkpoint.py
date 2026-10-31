@@ -350,3 +350,10 @@ def test_checkpoint_manager_migrates_legacy_stop_after_updates(tmp_path):
     save_tensor_state(raw, path)
 
     assert manager.load_training_config().stop_after_step == 7
+
+
+def test_best_checkpoint_after_first_completed_update_resolves_index_zero(tmp_path):
+    from gpt_lab.model.checkpoint import _get_checkpoint_step
+    save_tensor_state(CheckpointState(best_eval_step=0, best_eval_value=1.5,
+        best_eval_completed_steps=1).model_dump(), tmp_path/"checkpoint_state.safetensors")
+    assert _get_checkpoint_step(tmp_path, "best") == 0

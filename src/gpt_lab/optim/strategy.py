@@ -108,6 +108,9 @@ class _DistributedBackend:
     
     def step(self) -> None:
         """Execute one distributed optimizer step with async communication."""
+        if self.opt.communication is not None:
+            self.opt.communication.step(self.strategies, self._finish_gathers)
+            return
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         

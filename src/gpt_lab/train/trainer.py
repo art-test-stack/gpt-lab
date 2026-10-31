@@ -188,6 +188,14 @@ class Trainer:
             )
         self.config = config
         self.compiled_training_loss = None
+        self._forward_backward_graph = None
+        if config.cuda_graph_mode != "disabled":
+            if config.comp_info.device_type != "cuda":
+                raise ValueError("CUDA graph capture requires CUDA")
+            if self.__class__.compute_loss is not Trainer.compute_loss:
+                raise ValueError("CUDA graph capture currently requires the default compute_loss")
+            if config.fp8 or scaler is not None or config.comp_info.compute_dtype in (torch.float16, "float16"):
+                raise ValueError("CUDA graph capture currently supports FP32/BF16 without a gradient scaler or FP8")
         
         if checkpoint_manager is None:
             model_name = self.model.__class__.__name__
@@ -346,13 +354,13 @@ class Trainer:
     def train(self):
         """
         Main training loop.
-        
+
         Performs gradient accumulation, validation, checkpointing, and logging.
         """
         print0("=" * 70)
         print0(f"Starting training for {self.config.n_steps:,} steps -- {self.config.total_batch_size:,} tokens per step.")
         print0("=" * 70)
-        
+
         # Extracte main constants from config
         step = self.state.completed_steps
         n_steps = self.config.n_steps
@@ -363,16 +371,17 @@ class Trainer:
             if self.config.stop_after_step is not None:
                 self.board.log({"train/completed_steps": step}, step=self.state.step)
             return
-        
+
         use_scalar_loss = (
             type(self).compute_loss is Trainer.compute_loss
             and callable(getattr(self.model, "training_loss", None))
         )
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
-            self.compiled_model = torch.compile(self.model, dynamic=False)
+            compile_options = {"triton.cudagraphs": False} if self.config.cuda_graph_mode != "disabled" else None
+            self.compiled_model = torch.compile(self.model, dynamic=False, options=compile_options)
             if use_scalar_loss:
-                self.compiled_training_loss = torch.compile(self.model.training_loss, dynamic=False)
+                self.compiled_training_loss = torch.compile(self.model.training_loss, dynamic=False, options=compile_options)
         else:
             self.compiled_model = self.model
             if use_scalar_loss:
@@ -405,9 +414,17 @@ class Trainer:
 
         # Prepare for training
         self.compiled_model.train()
-        
+        if self.config.cuda_graph_mode == "forward_backward":
+            from gpt_lab.train.cuda_graph import CapturedForwardBackward
+            capture_start = time.perf_counter()
+            self._forward_backward_graph = CapturedForwardBackward(
+                self.model, self.compute_loss, batch[0], self.config.n_acc_steps,
+                self.train_context,
+            )
+            self.board.log({"train/capture_startup_seconds": time.perf_counter() - capture_start}, step=step)
+
         total_dt = []  # For ETA calculation
-        
+
         while step < step_limit:
             self.state.step = step
             last_step = (step == step_limit - 1)
@@ -419,40 +436,6 @@ class Trainer:
                 )
             )
             self.synchronize()
-            
-            # ================================================================
-            # Validation on 'val_loader' every 'eval_every' steps
-            # ================================================================
-            
-            if (
-                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
-                (self.config.eval_bpb_every > 0 and step > 0 and # eval every eval_bpb_every steps except the first step
-                (last_step or step % self.config.eval_bpb_every == 0)) 
-            ):
-                self.evaluate_bpb()
-
-            # ================================================================
-            # Validation on CORE metric every 'core_eval_every' steps
-            # ================================================================
-            
-            if (
-                (self.config.eval_core_every == -1 and last_step) or
-                (self.config.eval_core_every > 0 and (
-                last_step or (step > 0 and step % self.config.eval_core_every == 0)))
-            ):
-                self.evaluate_core()
-            
-            # ================================================================
-            # Sample some outputs every 'sample_every' steps
-            # ================================================================
-
-            if (
-                self.config.comp_info.rank == 0 and
-                ((self.config.sample_every == -1 and last_step) or
-                (self.config.sample_every > 0 and 
-                (last_step or (step > 0 and step % self.config.sample_every == 0))))
-            ):
-                self.evaluate_samples()
 
             # ================================================================
             # Training step with gradient accumulation
@@ -463,23 +446,58 @@ class Trainer:
             # ================================================================
             # Logging and metrics
             # ================================================================
-            
+
             metrics = self.update_metrics(step_metrics, total_dt)
             self.state.completed_steps = step + 1
             metrics["train/completed_steps"] = self.state.completed_steps
             if should_log_step:
                 self.log_metrics(metrics)
 
+            completed = self.state.completed_steps
+            # ================================================================
+            # Validation on 'val_loader' every 'eval_every' steps
+            # ================================================================
+
+            if (
+                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
+                (self.config.eval_bpb_every > 0 and completed > 0 and # eval every eval_bpb_every steps except the first step
+                (last_step or completed % self.config.eval_bpb_every == 0))
+            ):
+                self.evaluate_bpb()
+
+            # ================================================================
+            # Validation on CORE metric every 'core_eval_every' steps
+            # ================================================================
+
+            if (
+                (self.config.eval_core_every == -1 and last_step) or
+                (self.config.eval_core_every > 0 and (
+                last_step or (completed > 0 and completed % self.config.eval_core_every == 0)))
+            ):
+                self.evaluate_core()
+
+            # ================================================================
+            # Sample some outputs every 'sample_every' steps
+            # ================================================================
+
+            if (
+                self.config.comp_info.rank == 0 and
+                ((self.config.sample_every == -1 and last_step) or
+                (self.config.sample_every > 0 and
+                (last_step or (completed > 0 and completed % self.config.sample_every == 0))))
+            ):
+                self.evaluate_samples()
+
             # ================================================================
             # Checkpointing
             # ================================================================
-            if (self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0):
+            if self.config.save_every > 0 and completed % self.config.save_every == 0:
                 self.save_checkpoint()
-            
+
             if (sum(total_dt) > self.config.target_time * 60) and self.config.target_time > 0:
                 print0(f"Reached target time of {self.config.target_time} minutes. Stopping training.")
                 break
-            
+
             # ================================================================
             # Cleanup
             # ================================================================
@@ -489,19 +507,20 @@ class Trainer:
                 gc.disable()
             elif step % 5000 == 0:
                 gc.collect()
-            
+
             step += 1
 
         del self.compiled_model  # Clean up compiled model if it exists
         self.compiled_model = None
         self.compiled_training_loss = None
-        
+        self._forward_backward_graph = None
+
         print0("=" * 70)
         print0(f"Training completed!")
         print0(f"Total tokens: {self.state.n_tokens:,}")
         print0(f"Total time: {self.state.total_training_time/60:.1f} minutes")
         print0("=" * 70)
-        
+
         # Final checkpoint
         self.save_checkpoint()
         if self.config.stop_after_step is not None:
@@ -620,6 +639,10 @@ class Trainer:
         covers accumulation, prefetch, scheduling, and the optimizer step;
         reduction across ranks happens in update_metrics().
         """
+        communication = getattr(self.optimizer, "communication", None)
+        if communication is not None and communication.mode == "backward":
+            if self.scaler is not None or getattr(self.config, "cuda_graph_mode", "disabled") not in (None, False, "disabled", "none"):
+                raise ValueError("Backward communication requires unscaled gradients and disabled CUDA capture")
         step = self.state.step
         n_acc_steps = self.config.n_acc_steps
         world_size = self.config.comp_info.world_size
@@ -635,14 +658,20 @@ class Trainer:
             eff_global_tokens += token_count * world_size
 
             self.state.train_loader_state = dataloader_state
-            with self.train_context():
-                loss = self.compute_loss(payload)
-            loss = loss / n_acc_steps
-
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
+            if self._forward_backward_graph is not None:
+                loss = self._forward_backward_graph.replay(payload)
             else:
-                loss.backward()
+                with self.train_context():
+                    loss = self.compute_loss(payload)
+                loss = loss / n_acc_steps
+
+                if hasattr(self.optimizer, "begin_backward_communication"):
+                    self.optimizer.begin_backward_communication(acc_step == n_acc_steps - 1)
+
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
             loss_accum.add_(loss.detach().float())
 
@@ -691,6 +720,8 @@ class Trainer:
                     dist.all_reduce(g, op=dist.ReduceOp.MAX)
 
         if self.config.monitor_grad_norms and should_log_step:
+            if hasattr(self.optimizer, "finish_gradient_communication"):
+                self.optimizer.finish_gradient_communication()
             self.log_gradients()
 
         if self.scaler is not None:
@@ -699,14 +730,14 @@ class Trainer:
         else:
             self.optimizer.step()
 
-        self.compiled_model.zero_grad(set_to_none=True)
+        self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
 
     def evaluate_bpb(self):
         """Run BPB validation, log metrics, and update the best checkpoint.
 
         Override this method to customize evaluation. Scheduling stays in train().
         """
-        step = self.state.step
+        step = self.state.completed_steps
         start_bpb_eval = time.time()
         self.compiled_model.eval()
         tokens_per_eval_step = (
@@ -737,11 +768,9 @@ class Trainer:
             (val_res['bpb'] < self.ckpt_state.best_eval_value)
         ):
             self.ckpt_state.best_eval_value = val_res['bpb']
-            self.ckpt_state.best_eval_step = step
-            if (
-                self.config.save_on_best and
-                not ((self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0)) # already saving this step
-                ):
+            self.ckpt_state.best_eval_step = self.state.step
+            self.ckpt_state.best_eval_completed_steps = step
+            if self.config.save_on_best:
                 self.save_checkpoint()
 
         board_dict = {
@@ -759,7 +788,7 @@ class Trainer:
 
         Override this method to customize evaluation. Scheduling stays in train().
         """
-        step = self.state.step
+        step = self.state.completed_steps
         n_steps = self.config.n_steps
         self.model.eval()
         with self.val_context(self.model):
@@ -790,7 +819,10 @@ class Trainer:
             (results["core/core"] > self.ckpt_state.best_core_value)
         ):
             self.ckpt_state.best_core_value = results["core/core"]
-            self.ckpt_state.best_core_step = step
+            self.ckpt_state.best_core_step = self.state.step
+            self.ckpt_state.best_core_completed_steps = step
+            if self.config.save_on_best:
+                self.save_checkpoint()
         self.board.log(board_dict, step=step)
         self.core_metrics.append(results, step=step)
         self.model.train()
@@ -929,7 +961,7 @@ class Trainer:
                     "trainer did not create a scaler."
                 )
             trainer.scaler.load_state_dict(ckpt_data.scaler_state)
-        log0(f"Resumed trainer from checkpoint at step {trainer.state.step} with best eval bpb {trainer.ckpt_state.best_eval_value:.6f} at step {trainer.ckpt_state.best_eval_step}.", logger=logger)
+        log0(f"Resumed trainer from checkpoint at step {trainer.state.step} with best eval bpb {trainer.ckpt_state.best_eval_value} at step {trainer.ckpt_state.best_eval_step}.", logger=logger)
         log0(f"Trainer instance created has no 'train_loader' or 'val_loader'. Please set these manually before calling 'trainer.train()'. Maybe consider using 'trainer.state.dataloader_state'", level="warning", logger=logger)
 
         return trainer

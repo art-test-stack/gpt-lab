@@ -11,7 +11,7 @@ import torch
 
 from gpt_lab.optim.registry import OPTIMIZER_REGISTRY, OptimizerSpec, _validate_group, register_optimizer
 from gpt_lab.optim.strategy import ScalarCache, _DistributedBackend, _LocalBackend
-from gpt_lab.optim.strategies import AdamWStrategy, MuonStrategy
+from gpt_lab.optim.strategies import AdamWStrategy, MuonStrategy, NorMuonStrategy
 from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 
 # ── Register built-in optimizers ──────────────────────────────────────────────
@@ -32,12 +32,20 @@ register_optimizer(
     )
 )
 
+register_optimizer(
+    OptimizerSpec(
+        name="normuon",
+        required_keys=frozenset({"opt", "lr", "momentum", "beta", "ns_steps", "weight_decay"}),
+        strategy_class=NorMuonStrategy,
+    )
+)
+
 
 
 class OptimizerFactory(torch.optim.Optimizer):
     """Registry-based optimizer factory.
     
-    Supports mixed optimizer groups (AdamW + Muon) with minimal code duplication.
+    Supports mixed AdamW, Muon, and NorMuon groups.
     Automatically detects and uses distributed backend if DDP is initialized.
     """
     
@@ -49,7 +57,7 @@ class OptimizerFactory(torch.optim.Optimizer):
             _validate_group(group, idx)
             group.setdefault("initial_lr", group["lr"])
             group.setdefault("initial_weight_decay", group["weight_decay"])
-            if group["opt"] == "muon":
+            if group["opt"] in ("muon", "normuon"):
                 group.setdefault("initial_momentum", group["momentum"])
         
         super().__init__(param_groups, defaults={})
@@ -61,12 +69,31 @@ class OptimizerFactory(torch.optim.Optimizer):
         if comp_info is None:
             comp_info = get_comp_info()
         self.comp_info = comp_info
+        self.communication = None
         
         # Select backend
         if comp_info.is_distributed:
             self.backend = _DistributedBackend(self)
         else:
             self.backend = _LocalBackend(self)
+
+    def configure_communication(self, mode: str, bucket_bytes: int, timing: bool = False) -> None:
+        """Select an experimental transport without changing optimizer state/groups."""
+        if self.communication is not None:
+            self.communication.close()
+            self.communication = None
+        if mode != "baseline":
+            from gpt_lab.optim.communication import BucketCommunication
+            self.communication = BucketCommunication(self, mode, bucket_bytes, timing)
+
+    def begin_backward_communication(self, final_microstep: bool) -> None:
+        if self.communication is not None:
+            self.communication.begin_backward(final_microstep)
+
+    def finish_gradient_communication(self) -> None:
+        """Drain optimizer reductions before an independent trainer collective."""
+        if self.communication is not None:
+            self.communication.finish_reductions()
     
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -84,12 +111,14 @@ class OptimizerFactory(torch.optim.Optimizer):
     
     def load_state_dict(self, state_dict: dict) -> None:
         """Load optimizer state dict."""
+        if self.communication is not None:
+            self.communication.reset()
         super().load_state_dict(state_dict)
         # Older checkpoints predate the schedule baselines.
         for group in self.param_groups:
             group.setdefault("initial_lr", group["lr"])
             group.setdefault("initial_weight_decay", group["weight_decay"])
-            if group["opt"] == "muon":
+            if group["opt"] in ("muon", "normuon"):
                 group.setdefault("initial_momentum", group["momentum"])
     
     @torch.no_grad()
@@ -105,7 +134,7 @@ class OptimizerFactory(torch.optim.Optimizer):
         
         Args:
             lrm: Learning rate multiplier, applied via initial_lr to all groups.
-            muon_momentum: Momentum multiplier for Muon groups only.
+            muon_momentum: Momentum multiplier for Muon and NorMuon groups.
             weight_decay: Weight-decay multiplier for all groups.
         """
         for group in self.param_groups:
@@ -114,7 +143,7 @@ class OptimizerFactory(torch.optim.Optimizer):
             if weight_decay is not None:
                 group["weight_decay"] = group["initial_weight_decay"] * weight_decay
             
-            if group["opt"] == "muon" and muon_momentum is not None:
+            if group["opt"] in ("muon", "normuon") and muon_momentum is not None:
                 group["momentum"] = group["initial_momentum"] * muon_momentum
         
         return lrm, muon_momentum, weight_decay

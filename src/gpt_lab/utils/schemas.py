@@ -457,8 +457,9 @@ class OptimizerConfig(BaseModel):
         allowed = set().union(*(spec.required_keys for spec in OPTIMIZER_REGISTRY.values()))
         for index, (name, group) in enumerate(self.group_configs().items()):
             _validate_group(group, index)
-            if set(group) - allowed:
-                raise ValueError(f"Unsupported optimizer parameters in {name}: {sorted(set(group) - allowed)}")
+            group_allowed = allowed | ({"anvil_spectral"} if group["opt"] == "normuon" else set())
+            if set(group) - group_allowed:
+                raise ValueError(f"Unsupported optimizer parameters in {name}: {sorted(set(group) - group_allowed)}")
             for key in ("lr", "weight_decay"):
                 if not isinstance(group[key], (int, float)) or not math.isfinite(group[key]) or group[key] < 0:
                     raise ValueError(f"{name}.{key} must be finite and non-negative")
@@ -515,6 +516,7 @@ class TrainerConfig(BaseModel):
     # Training hparams
     n_steps: int = 1 # Scheduling horizon in optimizer steps.
     stop_after_step: Optional[int] = Field(default=None, ge=0)
+    cuda_graph_mode: Literal["disabled", "forward_backward"] = "disabled"
     n_acc_steps: int = 100
     target_time: float = -1.0 # in seconds, overrides n_steps if > 0
     total_batch_size: int = -1 # Overrides device_batch_size if > 0
@@ -583,8 +585,24 @@ class TrainerConfig(BaseModel):
             return progress * 1.0 + (1 - progress) * self.final_lr_ratio
     
     def muon_momentum_schedule(self, step: int) -> float:
-        """Keep configured momentum fixed; custom schedules return multipliers."""
-        return 1.0
+        """Nanochat Muon momentum schedule, relative to the configured base momentum."""
+        warmdown_iters = round(self.lr_warmdown_ratio * self.n_steps)
+        warmdown_start = self.n_steps - warmdown_iters
+        if step < 400:
+            frac = step / 400
+            target_momentum = (1 - frac) * 0.85 + frac * 0.97
+        elif step >= warmdown_start:
+            progress = (step - warmdown_start) / warmdown_iters
+            target_momentum = 0.97 * (1 - progress) + 0.90 * progress
+        else:
+            target_momentum = 0.97
+
+        # OptimizerFactory multiplies each group's initial_momentum by this value.
+        # Preserve the existing config contract, where momentum is normally 0.95.
+        base_momentum = 0.95
+        if self.optim_config is not None:
+            base_momentum = self.optim_config.group_configs()["transformer"]["momentum"]
+        return target_momentum / base_momentum
     
     def weight_decay_schedule(self, step: int) -> float:
         # New profiles apply decay scaling when building the optimizer.
@@ -787,6 +805,9 @@ class CheckpointState(BaseModel):
     version: int = 1
     best_eval_step: int = 0
     best_core_step: int = 0
+    # Directory indices stay zero-based; these record evaluated update counts.
+    best_eval_completed_steps: Optional[int] = None
+    best_core_completed_steps: Optional[int] = None
     best_eval_value: Optional[float] = None  # lower is better
     best_core_value: Optional[float] = None  # higher is better
 

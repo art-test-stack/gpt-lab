@@ -20,7 +20,21 @@ remain subject to their original license terms.
 - License: MIT
 - Copyright: Copyright (c) 2024 Keller Jordan
 - License copy: [LICENSES/modded-nanogpt-MIT.txt](LICENSES/modded-nanogpt-MIT.txt)
-- Affected material: `src/gpt_lab/optim/kernels/muon.py`.
+- Affected material: `src/gpt_lab/optim/kernels/muon.py` and the
+  Newton–Schulz iteration in `src/gpt_lab/optim/kernels/normuon.py`.
+- ANVIL2 spectral maps and the spectral input guard in `normuon.py` are
+  adapted from Deven Pietrzak's archived record source at
+  `records/track_1_short/2026-08-30_ANVIL2/this_pr/01b2f094-4536-479c-b0dd-cb14eba4844c.txt`.
+
+## NorMuon
+
+- Project: [zichongli5/NorMuon](https://github.com/zichongli5/NorMuon)
+- License: MIT
+- Copyright: Copyright (c) 2025 zichongli5
+- License copy: [LICENSES/NorMuon-MIT.txt](LICENSES/NorMuon-MIT.txt)
+- Affected material: `src/gpt_lab/optim/kernels/normuon.py` and the
+  reference-update check in `tests/test_optim.py`.
+- Modified for GPT-Lab's batched kernels and existing whole-matrix sharding.
 
 ## plainLM
 

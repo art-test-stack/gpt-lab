@@ -1,0 +1,8 @@
+# Overrides for the bundled optimizer profile; embeddings/head stay on AdamW.
+transformer:
+  opt: normuon
+  lr: 0.02
+  momentum: 0.95
+  beta: 0.95  # Reference NorMuon's beta2 (row-wise second moment).
+  ns_steps: 5
+  weight_decay: 0.1

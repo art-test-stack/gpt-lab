@@ -166,7 +166,7 @@ def _optimizer_worker(rank, port):
     dist.init_process_group("gloo", timeout=timedelta(seconds=30))
     context = init_dist_groups("cpu")
     try:
-        shapes = [(8,), (32, 32), (2, 3), (2, 3), (2, 3)]
+        shapes = [(8,), (32, 32), (2, 3), (2, 3), (2, 3), (3, 2), (3, 2), (3, 2)]
         parameters = [torch.nn.Parameter(torch.linspace(-0.3, 0.7, torch.Size(shape).numel()).reshape(shape))
                       for shape in shapes]
         reference = [torch.nn.Parameter(parameter.detach().clone()) for parameter in parameters]
@@ -174,7 +174,8 @@ def _optimizer_worker(rank, port):
         def groups(params):
             return [
                 dict(params=params[:2], opt="adamw", lr=0.01, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1),
-                dict(params=params[2:], opt="muon", lr=0.01, momentum=0.95, beta=0.9, ns_steps=2, weight_decay=0.1),
+                dict(params=params[2:5], opt="muon", lr=0.01, momentum=0.95, beta=0.9, ns_steps=2, weight_decay=0.1),
+                dict(params=params[5:], opt="normuon", lr=0.01, momentum=0.95, beta=0.95, ns_steps=5, weight_decay=0.1),
             ]
 
         optimizer = OptimizerFactory(groups(parameters), comp_info=context)
@@ -201,9 +202,10 @@ def _optimizer_worker(rank, port):
                             expected = expected.chunk(2)[rank]
                         torch.testing.assert_close(actual_state[key], expected)
                 owned = 2 if rank == 0 else 1
-                for key in ("momentum_buffer", "second_momentum_buffer"):
-                    expected = local.state[reference[2]][key][rank * 2:rank * 2 + owned]
-                    torch.testing.assert_close(optimizer.state[parameters[2]][key][:owned], expected)
+                for start in (2, 5):
+                    for key in ("momentum_buffer", "second_momentum_buffer"):
+                        expected = local.state[reference[start]][key][rank * 2:rank * 2 + owned]
+                        torch.testing.assert_close(optimizer.state[parameters[start]][key][:owned], expected)
     finally:
         cleanup_dist_groups()
 
