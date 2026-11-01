@@ -302,7 +302,7 @@ class ShardManager:
         batch_size: int = 128,
     ) -> Iterator[Tuple[List[str], DataLoaderState]]:
         is_resuming = start_state is not None
-        state = start_state or DataLoaderState()
+        state = start_state.model_copy(deep=True) if start_state is not None else DataLoaderState()
         max_read_retries = 5
         row_group_start = 0 if self.split == "train" else self.ddp_rank
         row_group_stride = 1 if self.split == "train" else self.world_size
@@ -318,16 +318,19 @@ class ShardManager:
 
                 try:
                     if is_resuming:
-                        base = state.row_group_idx // row_group_stride
-                        state.row_group_idx = (
-                            (base + 1) * row_group_stride + row_group_start
-                        )
+                        if state.cursor_version == 0:
+                            base = state.row_group_idx // row_group_stride
+                            state.row_group_idx = (
+                                (base + 1) * row_group_stride + row_group_start
+                            )
 
-                        if state.row_group_idx >= pf.num_row_groups:
-                            state.shard_idx += 1
-                            state.row_group_idx = row_group_start
-                            state.offset_in_row_group = 0
-                            continue
+                            if state.row_group_idx >= pf.num_row_groups:
+                                state.shard_idx += 1
+                                state.row_group_idx = row_group_start
+                                state.offset_in_row_group = 0
+                                # Resume advancement applies only to the saved shard.
+                                is_resuming = False
+                                continue
                     else:
                         state.row_group_idx = row_group_start
 
@@ -399,8 +402,9 @@ class ShardManager:
                             if is_resuming:
                                 is_resuming = False
 
+                            chunk = batch[i:i + batch_size]
                             yield (
-                                batch[i:i + batch_size],
+                                chunk,
                                 DataLoaderState(
                                     shard_idx=state.shard_idx,
                                     global_shard_idx=(
@@ -409,11 +413,16 @@ class ShardManager:
                                     row_group_idx=(
                                         state.row_group_idx
                                     ),
-                                    offset_in_row_group=i,
+                                    offset_in_row_group=i + len(chunk),
                                     epoch=state.epoch,
+                                    cursor_version=1,
                                 ),
                             )
 
+                        # An offset at or beyond the row-group length resumes in
+                        # the following row group without yielding from this one.
+                        if is_resuming and state.cursor_version == 1:
+                            is_resuming = False
                         state.offset_in_row_group = 0
                         state.row_group_idx += row_group_stride
 

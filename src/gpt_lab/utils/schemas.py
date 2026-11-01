@@ -792,7 +792,17 @@ class DataLoaderState(BaseModel):
     row_group_idx: int = 0
     offset_in_row_group: int = 0
     epoch: int = 1
+    # Version 0 advances to the next row group; version 1 uses next-unread offsets.
+    cursor_version: int = 0
     packing_strategy: Optional[PackingStrategy] = None
+    packing_state_version: Optional[int] = None
+    packing_batch_size: Optional[int] = None
+    packing_seq_len: Optional[int] = None
+    packing_bos_token_id: Optional[int] = None
+    packing_buffer_size: Optional[int] = None
+    packing_rank: Optional[int] = None
+    packing_world_size: Optional[int] = None
+    packing_doc_buffer: List[List[int]] = Field(default_factory=list)
     pending_tokens: List[int] = Field(default_factory=list)
     pending_is_document_start: bool = False
     carry_token: Optional[int] = None
