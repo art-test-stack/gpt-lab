@@ -793,7 +793,7 @@ class DataLoaderState(BaseModel):
     offset_in_row_group: int = 0
     epoch: int = 1
     # Version 0 advances to the next row group; version 1 uses next-unread offsets.
-    cursor_version: int = 0
+    cursor_version: Literal[0, 1] = 0
     packing_strategy: Optional[PackingStrategy] = None
     packing_state_version: Optional[int] = None
     packing_batch_size: Optional[int] = None

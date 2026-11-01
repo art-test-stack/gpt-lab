@@ -392,13 +392,18 @@ class ShardManager:
 
                         batch = rg.column(self.column_name).to_pylist()
 
-                        for i in range(0, len(batch), batch_size):
-                            if (
-                                is_resuming
-                                and i < state.offset_in_row_group
-                            ):
-                                continue
+                        start_offset = (
+                            state.offset_in_row_group
+                            if is_resuming and state.cursor_version == 1
+                            else 0
+                        )
+                        if start_offset > len(batch):
+                            raise ValueError(
+                                "Dataloader cursor offset exceeds the saved row-group length: "
+                                f"{start_offset} > {len(batch)}"
+                            )
 
+                        for i in range(start_offset, len(batch), batch_size):
                             if is_resuming:
                                 is_resuming = False
 

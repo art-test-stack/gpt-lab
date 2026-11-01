@@ -8,6 +8,7 @@ from itertools import islice
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pydantic import ValidationError
 
 from gpt_lab.data.sharder import ShardManager
 from gpt_lab.utils.schemas import DataLoaderState
@@ -278,6 +279,50 @@ def test_next_unread_cursor_resumes_within_row_group(tmp_path, checkpoint_batch)
 
     assert actual == expected
     assert resumed_state.offset_in_row_group == saved_state.offset_in_row_group
+
+
+@pytest.mark.fast
+def test_next_unread_cursor_is_exact_when_document_batch_size_changes(tmp_path):
+    dataset_path = tmp_path / "resume-batch-size"
+    dataset_path.mkdir()
+    pq.write_table(
+        pa.table({"text": [f"row-{i}" for i in range(9)]}),
+        dataset_path / "shard_00000.parquet",
+        row_group_size=9,
+    )
+    pq.write_table(
+        pa.table({"text": ["validation"]}),
+        dataset_path / "shard_00001.parquet",
+    )
+    manager = ShardManager(
+        name="resume-batch-size",
+        cachedir=tmp_path,
+        split="train",
+        max_shards=1,
+        comp_info=SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu"), is_distributed=False),
+    )
+    uninterrupted = manager.iterate(batch_size=3)
+    try:
+        _, saved_state = next(uninterrupted)
+        assert saved_state.offset_in_row_group == 3
+        expected = next(uninterrupted)
+    finally:
+        uninterrupted.close()
+
+    resumed = manager.iterate(start_state=saved_state, batch_size=2)
+    try:
+        actual = next(resumed)
+    finally:
+        resumed.close()
+
+    assert actual[0] == expected[0][:2]
+    assert actual[1].offset_in_row_group == 5
+
+
+@pytest.mark.fast
+def test_unknown_cursor_version_is_rejected():
+    with pytest.raises(ValidationError):
+        DataLoaderState.model_validate({"cursor_version": 2})
 
 
 @pytest.mark.fast
