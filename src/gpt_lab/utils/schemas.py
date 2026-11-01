@@ -34,6 +34,7 @@ from gpt_lab.utils.types import (
     LossTypes,
     NormalizationTypes,
     PositionalEncodingTypes,
+    PackingStrategy,
     TfTypes,
     TokenizerSources,
     TpModes,
@@ -231,6 +232,7 @@ class DataLoaderConfig(BaseModel):
     buffer_size: int = 10000
     device: str = "cuda"
     use_pin_memory: bool = False
+    packing_strategy: PackingStrategy = "stream"
 
 class BaseConfig(BaseModel):
     data_dir: Union[str, Path] = DATA_DIR
@@ -523,6 +525,8 @@ class TrainerConfig(BaseModel):
     n_total_tokens: int = -1 # Overrides n_steps if > 0, calculated as total_batch_size * n_steps
     
     device_batch_size: int = 1 
+    packing_strategy: PackingStrategy = "stream"
+    best_fit_buffer_docs: int = Field(default=1000, ge=1)
 
     optim_config: Optional[OptimizerConfig] = None
     # Legacy fields retained for loading older trainer checkpoints.
@@ -788,7 +792,22 @@ class DataLoaderState(BaseModel):
     row_group_idx: int = 0
     offset_in_row_group: int = 0
     epoch: int = 1
-    # Add more fields as needed to track the state of the current iteration over a data shard
+    # Version 0 advances to the next row group; version 1 uses next-unread offsets.
+    cursor_version: Literal[0, 1] = 0
+    packing_strategy: Optional[PackingStrategy] = None
+    packing_state_version: Optional[int] = None
+    packing_batch_size: Optional[int] = None
+    packing_seq_len: Optional[int] = None
+    packing_bos_token_id: Optional[int] = None
+    packing_buffer_size: Optional[int] = None
+    packing_rank: Optional[int] = None
+    packing_world_size: Optional[int] = None
+    packing_doc_buffer: List[List[int]] = Field(default_factory=list)
+    pending_tokens: List[int] = Field(default_factory=list)
+    pending_is_document_start: bool = False
+    carry_token: Optional[int] = None
+    continuation_pending: bool = False
+    packing_stats: Dict[str, Any] = Field(default_factory=dict)
 
 class TrainerState(BaseModel):
     step: int = 0

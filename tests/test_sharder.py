@@ -3,12 +3,15 @@ from types import SimpleNamespace
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from pydantic import ValidationError
 
 from gpt_lab.data.sharder import ShardManager
+from gpt_lab.utils.schemas import DataLoaderState
 
 
 def _metadata_manager(tmp_path):
@@ -152,3 +155,204 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
 
     assert all_retrieved_texts == expected_texts
 
+
+@pytest.mark.fast
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("row_groups_per_rank", [1, 2])
+@pytest.mark.parametrize(
+    "split,resume_shard",
+    [("train", 0), ("train", 1), ("val", 0)],
+    ids=["next-shard", "train-epoch-wrap", "val-epoch-wrap"],
+)
+def test_resume_after_last_row_group_matches_uninterrupted_iteration(
+    tmp_path, monkeypatch, rank, row_groups_per_rank, split, resume_shard
+):
+    dataset_name = "resume-boundary"
+    dataset_path = tmp_path / dataset_name
+    dataset_path.mkdir()
+    world_size = 2
+    num_train_shards = 4
+    rows_per_group = 3
+
+    for shard_idx in range(num_train_shards + 1):
+        # Training partitions files; validation partitions row groups by rank.
+        num_groups = row_groups_per_rank
+        if shard_idx == num_train_shards:
+            num_groups *= world_size
+        pq.write_table(
+            pa.table({
+                "text": [
+                    f"shard-{shard_idx}-row-{row_idx}"
+                    for row_idx in range(num_groups * rows_per_group)
+                ],
+            }),
+            dataset_path / f"shard_{shard_idx:05d}.parquet",
+            row_group_size=rows_per_group,
+        )
+
+    manager = ShardManager(
+        name=dataset_name,
+        cachedir=tmp_path,
+        split=split,
+        max_shards=num_train_shards,
+        comp_info=SimpleNamespace(rank=rank, world_size=world_size, device=torch.device("cpu"), is_distributed=False),
+    )
+    batches_per_shard = row_groups_per_rank * 2
+    following_batches = batches_per_shard + 1
+    uninterrupted = manager.iterate(batch_size=2)
+    try:
+        for _ in range((resume_shard + 1) * batches_per_shard):
+            _, checkpoint = next(uninterrupted)
+        # Save after the final partial chunk, including its nonzero offset.
+        assert checkpoint.cursor_version == 1
+        saved_state = checkpoint.model_dump_json()
+        expected = [
+            (texts, state.model_dump())
+            for texts, state in islice(uninterrupted, following_batches)
+        ]
+    finally:
+        uninterrupted.close()
+
+    original_parquet_file = pq.ParquetFile
+    opened_paths = []
+
+    def bounded_parquet_file(path, *args, **kwargs):
+        opened_paths.append(path.name)
+        # Fail deterministically if resume loops over files without yielding.
+        assert len(opened_paths) <= following_batches + 2, (
+            f"Resume keeps reopening shards without progress: {opened_paths}"
+        )
+        return original_parquet_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "ParquetFile", bounded_parquet_file)
+    resumed = manager.iterate(
+        start_state=DataLoaderState.model_validate_json(saved_state),
+        batch_size=2,
+    )
+    try:
+        actual = [
+            (texts, state.model_dump())
+            for texts, state in islice(resumed, following_batches)
+        ]
+    finally:
+        resumed.close()
+
+    assert actual == expected
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("checkpoint_batch", [0, 1, 2])
+def test_next_unread_cursor_resumes_within_row_group(tmp_path, checkpoint_batch):
+    dataset_path = tmp_path / "resume-row-group"
+    dataset_path.mkdir()
+    pq.write_table(
+        pa.table({"text": [f"row-{i}" for i in range(8)]}),
+        dataset_path / "shard_00000.parquet",
+        row_group_size=8,
+    )
+    pq.write_table(
+        pa.table({"text": ["validation"]}),
+        dataset_path / "shard_00001.parquet",
+    )
+    manager = ShardManager(
+        name="resume-row-group",
+        cachedir=tmp_path,
+        split="train",
+        max_shards=1,
+        comp_info=SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu"), is_distributed=False),
+    )
+    uninterrupted = manager.iterate(batch_size=2)
+    try:
+        for _ in range(checkpoint_batch + 1):
+            _, saved_state = next(uninterrupted)
+        saved_json = saved_state.model_dump_json()
+        expected = next(uninterrupted)
+    finally:
+        uninterrupted.close()
+
+    resumed_state = DataLoaderState.model_validate_json(saved_json)
+    resumed = manager.iterate(start_state=resumed_state, batch_size=2)
+    try:
+        actual = next(resumed)
+    finally:
+        resumed.close()
+
+    assert actual == expected
+    assert resumed_state.offset_in_row_group == saved_state.offset_in_row_group
+
+
+@pytest.mark.fast
+def test_next_unread_cursor_is_exact_when_document_batch_size_changes(tmp_path):
+    dataset_path = tmp_path / "resume-batch-size"
+    dataset_path.mkdir()
+    pq.write_table(
+        pa.table({"text": [f"row-{i}" for i in range(9)]}),
+        dataset_path / "shard_00000.parquet",
+        row_group_size=9,
+    )
+    pq.write_table(
+        pa.table({"text": ["validation"]}),
+        dataset_path / "shard_00001.parquet",
+    )
+    manager = ShardManager(
+        name="resume-batch-size",
+        cachedir=tmp_path,
+        split="train",
+        max_shards=1,
+        comp_info=SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu"), is_distributed=False),
+    )
+    uninterrupted = manager.iterate(batch_size=3)
+    try:
+        _, saved_state = next(uninterrupted)
+        assert saved_state.offset_in_row_group == 3
+        expected = next(uninterrupted)
+    finally:
+        uninterrupted.close()
+
+    resumed = manager.iterate(start_state=saved_state, batch_size=2)
+    try:
+        actual = next(resumed)
+    finally:
+        resumed.close()
+
+    assert actual[0] == expected[0][:2]
+    assert actual[1].offset_in_row_group == 5
+
+
+@pytest.mark.fast
+def test_unknown_cursor_version_is_rejected():
+    with pytest.raises(ValidationError):
+        DataLoaderState.model_validate({"cursor_version": 2})
+
+
+@pytest.mark.fast
+def test_legacy_cursor_keeps_approximate_next_row_group_behavior(tmp_path):
+    dataset_path = tmp_path / "resume-legacy"
+    dataset_path.mkdir()
+    pq.write_table(
+        pa.table({"text": [f"row-{i}" for i in range(8)]}),
+        dataset_path / "shard_00000.parquet",
+        row_group_size=4,
+    )
+    pq.write_table(
+        pa.table({"text": ["validation"]}),
+        dataset_path / "shard_00001.parquet",
+    )
+    manager = ShardManager(
+        name="resume-legacy",
+        cachedir=tmp_path,
+        split="train",
+        max_shards=1,
+        comp_info=SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu"), is_distributed=False),
+    )
+    resumed = manager.iterate(
+        start_state=DataLoaderState(shard_idx=0, row_group_idx=0, offset_in_row_group=0),
+        batch_size=2,
+    )
+    try:
+        texts, state = next(resumed)
+    finally:
+        resumed.close()
+
+    assert texts == ["row-4", "row-5"]
+    assert state.cursor_version == 1

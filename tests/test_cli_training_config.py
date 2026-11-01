@@ -98,3 +98,27 @@ def test_nanochat_muon_momentum_schedule_and_optimizer_application():
     normuon_base = profile.group_configs()["transformer"]["momentum"]
     assert normuon_base * configured.muon_momentum_schedule(0) == pytest.approx(0.85)
     assert normuon_base * configured.muon_momentum_schedule(4364) == pytest.approx(0.90)
+
+
+@pytest.mark.parametrize("strategy", ["stream", "bos_aligned", "bos_bestfit_crop"])
+def test_packing_configuration_roundtrip_and_resume_overrides(strategy):
+    from gpt_lab.cli.parser import build_parser
+    from gpt_lab.workflows.train_base import resolve_packing_options
+    args = build_parser().parse_args(["train", "--packing-strategy", strategy, "--best-fit-buffer-docs", "7"])
+    policy, size = resolve_packing_options(args.packing_strategy, args.best_fit_buffer_docs, args.use_nanochat_dataloader)
+    saved = TrainerConfig.model_validate_json(TrainerConfig(packing_strategy=policy, best_fit_buffer_docs=size).model_dump_json())
+    assert resolve_packing_options(None, None, None, saved) == (strategy, 7)
+    assert resolve_packing_options(strategy, 7, None, saved) == (strategy, 7)
+    with pytest.raises(ValueError, match="conflicts"):
+        resolve_packing_options(None, 8, None, saved)
+    other = "stream" if strategy != "stream" else "bos_bestfit_crop"
+    with pytest.raises(ValueError, match="conflicts"):
+        resolve_packing_options(other, None, None, saved)
+
+
+def test_packing_fresh_defaults_and_legacy_alias():
+    from gpt_lab.workflows.train_base import resolve_packing_options
+    assert resolve_packing_options(None, None, None) == ("stream", 1000)
+    assert resolve_packing_options(None, 4, True) == ("bos_bestfit_crop", 4)
+    with pytest.raises(ValueError, match="conflicts"):
+        resolve_packing_options("bos_aligned", None, True)
