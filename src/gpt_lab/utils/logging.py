@@ -136,4 +136,4 @@ def log_dict(title, info, logger=logger, level=logging.INFO, only_rank0=True, st
     if not only_rank0:
         msg = _with_rank(msg)
 
-    logger.log(level, msg, stacklevel=4)
+    logger.log(level, msg, stacklevel=level)

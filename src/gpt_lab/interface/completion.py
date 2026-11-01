@@ -1,11 +1,11 @@
 
 import os
 from openai import OpenAI
-import load_dotenv
+from dotenv import load_dotenv
 from gpt_lab.interface.config import ConfigChat
 from typing import List, Dict
 
-load_dotenv.load_dotenv()
+load_dotenv()
 
 class ModelCompletion:
     def __init__(

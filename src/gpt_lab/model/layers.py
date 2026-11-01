@@ -1,5 +1,5 @@
 from gpt_lab.utils.schemas import TransformerConfig
-from gpt_lab.model.flash_attn import flash_attn, scaled_dot_product_attention
+from gpt_lab.model.flash_attn import flash_attn, scaled_dot_product_attention, require_flash_attn3, require_flash_attn2
 from gpt_lab.model.utils import apply_rope, has_ve
 from gpt_lab.utils.types import AttnImplTypes, NormalizationTypes
 from gpt_lab.utils.default import DEVICE
@@ -33,11 +33,12 @@ def apply_layer_norm(x: torch.Tensor, eps: float = 1e-5, torch_impl: bool = True
 def build_norm(normalization: NormalizationTypes, eps: float = 1e-5, torch_impl: bool = True) -> Callable[[torch.Tensor], torch.Tensor]:
     def norm(x: torch.Tensor) -> torch.Tensor:
         if normalization == 'rms':
-            return apply_rms_norm(x, eps=eps, torch_impl=torch_impl)
+            output = apply_rms_norm(x, eps=eps, torch_impl=torch_impl)
         elif normalization == 'layer':
-            return apply_layer_norm(x, eps=eps, torch_impl=torch_impl)
+            output = apply_layer_norm(x, eps=eps, torch_impl=torch_impl)
         else:
             raise ValueError(f'Unknown normalization: {normalization}. Supported normalizations are in {get_args(NormalizationTypes)}.')
+        return output.to(x.dtype)
     return norm
 
 
@@ -86,6 +87,10 @@ class Linear(nn.Linear, Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = False, device: torch.device = DEVICE, dtype=None) -> None:
         super().__init__(in_features=in_features, out_features=out_features, bias=bias, device=device, dtype=dtype)
         # TODO: Reparametrize weights and bias here
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Temporary forward casts preserve parameter storage (nanochat; LICENSES/nanochat-MIT.txt).
+        return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
 
     def init_weights(self, std: float = 0.01, method: str ='uniform') -> None:
         assert method in ['uniform', 'normal', 'zero'], 'Method must be "uniform", "normal" or "zero"'
@@ -140,6 +145,15 @@ class CausalSelfAttention(Module):
         super().__init__()
         assert config.d_model == config.d_head * config.n_heads, f'Dimensions are not correct. dim_model must be equal to d_head * n_heads. Got dim_model={config.d_model}, d_head={config.d_head}, n_heads={config.n_heads}'
         assert config.attn_impl in get_args(AttnImplTypes), f'Attention implementation {config.attn_impl} is not supported. Supported attention implementations are in {get_args(AttnImplTypes)}.'
+        if (config.attn_impl == "fused" and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] >= 9):
+            require_flash_attn3()
+        if config.attn_impl == "fa3":
+            require_flash_attn3()
+            if config.dropout != 0.0 or config.attention_dropout != 0.0:
+                raise ValueError("FA3 does not support attention dropout in this integration")
+        elif config.attn_impl == "fa2":
+            require_flash_attn2()
         assert config.normalization in get_args(NormalizationTypes), f'Normalization {config.normalization} is not supported. Supported normalizations are in {get_args(NormalizationTypes)}.'
         assert config.n_heads % config.n_kv_heads == 0, f'Number of heads must be divisible by number of key-value heads. Got n_heads={config.n_heads}, n_kv_heads={config.n_kv_heads}.'
         
@@ -153,7 +167,6 @@ class CausalSelfAttention(Module):
 
         self.norm = build_norm(config.normalization, eps=config.norm_eps, torch_impl=True)
         self.attn_impl = config.attn_impl
-        # TODO: try an implementation with separate q, k, v proj
         self.qkv_proj = Linear(config.d_model, (config.n_heads + 2 * config.n_kv_heads) * config.d_head, bias=False)
         self.o_proj = Linear(config.d_model, config.d_model, bias=False)
 
@@ -171,6 +184,8 @@ class CausalSelfAttention(Module):
                 kv_cache=None, attn_mask=None, return_attn_weights: bool = False
         ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         B, Tq, E = x.size()
+        if self.attn_impl in ("fa2", "fa3") and (return_attn_weights or attn_mask is not None):
+            raise ValueError("Explicit FA2/FA3 requests do not support attention weights or arbitrary masks; use sdpa")
         if kv_cache is not None:
             kv_cache.check_sizes(B, Tq, x.device, x.dtype)
 
@@ -179,8 +194,8 @@ class CausalSelfAttention(Module):
 
         qkv = qkv.view(B, Tq, Hq + 2 * Hk, D)
         
-        q = qkv[:, :, :Hq, :].clone()
-        k = qkv[:, :, Hq:Hq+Hk, :].clone()
+        q = qkv[:, :, :Hq, :]
+        k = qkv[:, :, Hq:Hq+Hk, :]
         v = qkv[:, :, Hq+Hk:, :]
         
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
@@ -197,14 +212,13 @@ class CausalSelfAttention(Module):
             q = self.norm(q)
             k = self.norm(k)
 
-        if (rope_cache is not None) or self.norm_before_attn:
+        if self.attn_impl == "fused" and ((rope_cache is not None) or self.norm_before_attn):
             qkv = torch.cat([q, k, v], dim=-2)
 
         attn_weights = None
         # interpretability mode - not optimized for memory efficiency
         if return_attn_weights:
             # q, k, v = torch.split(qkv, [Hq, Hk, Hk], dim=-2)
-            q, k, v = self.unfused(qkv)
             if kv_cache is not None:
                 k, v = kv_cache.update(k, v)
             x, attn_weights = scaled_dot_product_attention(
@@ -215,8 +229,7 @@ class CausalSelfAttention(Module):
             )
         
         # inference-efficient mode
-        if (not self.training) and (kv_cache is not None):
-            q, k, v = self.unfused(qkv)
+        elif (not self.training) and (kv_cache is not None):
             k_cache, v_cache = kv_cache.layer(self.layer_idx)
             k_cache, v_cache = k_cache.to(q.device, dtype=q.dtype), v_cache.to(v.device, dtype=q.dtype)
             
@@ -225,10 +238,11 @@ class CausalSelfAttention(Module):
                 cache_seqlens=kv_cache.seqlens,
                 causal=True,
                 window_size=window_size if window_size is not None else (-1, -1),
+                backend=None if self.attn_impl == "fused" else self.attn_impl,
             )
 
         # qkv-fused training mode
-        if self.attn_impl == 'fused':
+        elif self.attn_impl == 'fused':
             assert Hq == Hk, f'Fused attention implementation does not support GQA. Please set attn_impl to "sdpa" if you want to use GQA. Got Hq={Hq}, Hk={Hk}.'
             qkv = qkv.view(B, Tq, 3, Hq, D).contiguous()  
             x = flash_attn.flash_attn_qkvpacked_func(
@@ -238,14 +252,14 @@ class CausalSelfAttention(Module):
                 causal=True
             )
 
-        # qkv-unfused training mode
-        elif self.attn_impl == 'sdpa':
-            q, k, v = self.unfused(qkv)
+        # Kernel choice is independent of the packed projection.
+        elif self.attn_impl in ('sdpa', 'fa2', 'fa3'):
             x = flash_attn.flash_attn_func(
                 q, k, v,
                 dropout_p=self.dropout_rate if self.training else 0.0,
                 window_size=window_size,
-                causal=True
+                causal=True,
+                backend=self.attn_impl,
             )
         else:
             raise ValueError(f'Attention implementation {self.attn_impl} is not supported. Supported attention implementations are in {get_args(AttnImplTypes)}.')
@@ -259,9 +273,6 @@ class CausalSelfAttention(Module):
         Hq, Hk, D = self.n_heads, self.n_kv_heads, self.d_head
         q, k, v = torch.split(qkv, [Hq, Hk, Hk], dim=-2)
 
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
         return q, k, v
     
 # -------------- DenseTransformer layers definitions -------------- #
@@ -314,6 +325,21 @@ class SwigLUFeedForward(Module):
         return output
     
     
+class SquaredReLUFeedForward(Module):
+    '''Squared-ReLU FFN with the inner residual preserved (architecture C).'''
+    def __init__(self, d_in: int, d_latent: int, dropout: float, device=DEVICE) -> None:
+        super().__init__()
+        self.w_1 = Linear(d_in, d_latent, device=device)
+        self.w_2 = Linear(d_latent, d_in, device=device)
+        self.dropout_rate = dropout
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.w_2(F.relu(self.w_1(x)).square())
+        if self.training and self.dropout_rate > 0.0:
+            h = F.dropout(h, p=self.dropout_rate, training=True)
+        return h + x
+
+
 class DecoderLayer(Module):
     '''Decoder layer'''
     def __init__(self, config: TransformerConfig, layer_idx: int = 0) -> None:
@@ -324,9 +350,8 @@ class DecoderLayer(Module):
         self.norm = build_norm(config.normalization, eps=config.norm_eps, torch_impl=True)
         self.attention = CausalSelfAttention(config=config, layer_idx=layer_idx) 
         
-        # self.ffn = FeedForward(d_in=dim_model, d_latent=dim_ffn, dropout=dropout)
-        # TODO: try SwigLU + make it configurable
-        self.ffn = SwigLUFeedForward(d_in=config.d_model, d_latent=config.d_ffn, dropout=config.dropout) 
+        ffn_class = SquaredReLUFeedForward if config.act_func == "relu_squared" else SwigLUFeedForward
+        self.ffn = ffn_class(d_in=config.d_model, d_latent=config.d_ffn, dropout=config.dropout)
         self.dropout_rate = config.dropout
 
         self.norm = build_norm(config.normalization, eps=1e-8, torch_impl=True)

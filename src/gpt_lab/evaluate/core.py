@@ -2,6 +2,9 @@
 Functions for evaluating the CORE metric, as described in the DCLM paper.
 https://arxiv.org/abs/2406.11794
 Adapted from https://github.com/karpathy/nanochat/blob/master/nanochat/core_eval.py
+Copyright (c) 2025 Andrej Karpathy
+Licensed under the MIT License; see LICENSES/nanochat-MIT.txt.
+Modified for GPT-Lab by Arthur Testard.
 
 TODOs:
 - All tasks ~match except for squad. We get 31% reference is 37%. Figure out why.

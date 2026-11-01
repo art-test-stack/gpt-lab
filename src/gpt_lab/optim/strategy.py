@@ -108,6 +108,9 @@ class _DistributedBackend:
     
     def step(self) -> None:
         """Execute one distributed optimizer step with async communication."""
+        if self.opt.communication is not None:
+            self.opt.communication.step(self.strategies, self._finish_gathers)
+            return
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         
@@ -130,7 +133,7 @@ class _DistributedBackend:
     def _finish_gathers(gather_list: list) -> None:
         """Wait for all async gathers and copy params back from comm buffers."""
         for info in gather_list:
-            info["future"].wait()
+            info["work"].wait()
             if info["params"] is not None:
                 # Muon: copy from stacked buffer back to individual params
                 torch._foreach_copy_(

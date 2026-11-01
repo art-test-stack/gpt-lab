@@ -1,126 +1,231 @@
-"""
-Phase 4 (auto): tokenizer orchestration helpers.
+"""Automatic vocabulary sizing and tokenizer orchestration helpers.
 
-Introduced in Phase 4 of the tokenizer refactor. This module centralizes
-tokenizer selection, optimal-vocab computations and build-or-load
-orchestration so `AutoGPTConfig` can remain thin and model-config driven.
-
-Note: This module may import from model config utilities (scaling laws
-require architecture information). Model config MUST NOT import from
-this module to avoid cycles; the dependency is one-way.
+The scaling-law calculation in this module is intentionally pure. Model
+construction remains in :mod:`gpt_lab.model`, which owns the architecture and
+can therefore supply the real hidden size and non-vocabulary parameter count.
 """
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Optional
 
+from gpt_lab.tokenizer.base import _BaseTokenizer
 from gpt_lab.tokenizer.tokenizer import Tokenizer, get_closest_tokenizer_size
-from gpt_lab.utils.special_tokens import SpecialTokens
+from gpt_lab.utils.default import TOKENIZERS_FOLDER
 from gpt_lab.utils.schemas import TokenizerConfig, TokenizerTrainerConfig
-from gpt_lab.utils.logging import log0, log_error
+from gpt_lab.utils.special_tokens import SpecialTokens
 
 
-def compute_optimal_vocab_size(depth: int, aspect_ratio: int, train_tokenizer: bool, tokenizer_model: Optional[str], special_tokens: SpecialTokens, get_closest=get_closest_tokenizer_size) -> int:
-    """Compute optimal vocab size using the project's scaling-law approximation.
+# Exact Approach-1 coefficients from the reference implementation for
+# Tao et al. (2024), "Scaling Laws with Vocabulary".
+_K_NON_VOCAB = math.exp(-2.4846510161625193)
+_K_VOCAB = math.exp(-1.589031299255507)
+_ALPHA_NON_VOCAB = 0.5
+_ALPHA_VOCAB = 0.4163622634135234
 
-    Returns the vocabulary size including special tokens.
+
+def compute_optimal_vocab_size(
+    n_non_vocab_params: int,
+    d_model: int,
+) -> float:
+    """Estimate the Approach-1 compute-optimal vocabulary size.
+
+    This eliminates the compute budget from the fitted relationships
+
+    ``N_nv = k_nv * C**alpha_nv`` and
+    ``N_v = k_v * C**alpha_v``,
+
+    then converts vocabulary parameters to vocabulary entries with
+    ``V = N_v / d_model``.
+
+    The estimate assumes that model parameters and training data are allocated
+    compute-optimally. Selection of a cached tokenizer, integer rounding, and
+    special-token handling deliberately happen outside this function.
     """
-    # Build a small helper to create the meta model for the depth
-    def build_meta_model_from_depth(d: int, vocab_size: int = -1):
-        # Import here to avoid circular dependency with gpt_lab.model.auto
-        from gpt_lab.utils.schemas import TransformerConfig
-        from gpt_lab.model.checkpoint import build_meta_model
-        
-        config = TransformerConfig(
-            tf_type="dense",
-            vocab_size=vocab_size,
-            max_context=2048,
-            d_model=(d * aspect_ratio),
-            d_ffn=4 * (d * aspect_ratio),
-            n_layers=d,
-            n_heads=1,
-            d_head=1,
-        )
-        return build_meta_model(config)
+    if n_non_vocab_params <= 0:
+        raise ValueError("n_non_vocab_params must be positive")
+    if d_model <= 0:
+        raise ValueError("d_model must be positive")
 
-    assert (tokenizer_model is None) or (tokenizer_model == "auto") or (not train_tokenizer)
-
-    if tokenizer_model not in (None, "auto"):
-        tokenizer = Tokenizer.from_pretrained(tokenizer_model)
-        return tokenizer.vocab_size
-
-    _mmodel = build_meta_model_from_depth(depth, vocab_size=1)
-    n_non_vocab_scaling_params = _mmodel.n_params
-    power = 0.84
-    coeff = .2 / (.08 ** power) / (depth * aspect_ratio)
-    opt_vocab_size = coeff * (n_non_vocab_scaling_params ** power)
-    del _mmodel
-    log0(f"Number of non-vocabulary scaling parameters for depth {depth}: {n_non_vocab_scaling_params:.2e}")
-
-    if not train_tokenizer:
-        _, vocab_size = get_closest(opt_vocab_size)
-    else:
-        step = 10 ** (int(math.log10(opt_vocab_size)) - 1)
-        vocab_size = round(opt_vocab_size / step) * step
-
-    if vocab_size < 256:
-        raise ValueError(f"Computed optimal vocab size {vocab_size} is <256; increase model size or set vocab_size explicitly.")
-
-    return int(vocab_size) + len(special_tokens.list())
+    gamma = _ALPHA_VOCAB / _ALPHA_NON_VOCAB
+    optimal_vocab_params = _K_VOCAB * (
+        n_non_vocab_params / _K_NON_VOCAB
+    ) ** gamma
+    return optimal_vocab_params / d_model
 
 
-def resolve_tokenizer(name: Optional[str], vocab_size: int, special_tokens: SpecialTokens) -> str:
-    """Return a tokenizer name to use given an explicit name or a vocab size.
+def round_vocab_size(
+    vocab_size: float,
+    *,
+    multiple: int = 128,
+    minimum: int = 256,
+) -> int:
+    """Round a vocabulary target to a supported integer model vocabulary."""
+    if not math.isfinite(vocab_size) or vocab_size <= 0:
+        raise ValueError("vocab_size must be a finite positive number")
+    if multiple <= 0:
+        raise ValueError("multiple must be positive")
+    if minimum <= 0:
+        raise ValueError("minimum must be positive")
 
-    If `name` is provided and not 'auto', return it. Otherwise choose the
-    closest cached tokenizer name for `vocab_size`.
+    rounded = int(math.floor(vocab_size / multiple + 0.5)) * multiple
+    return max(rounded, minimum)
+
+
+def resolve_tokenizer(
+    name: Optional[str],
+    vocab_size: int,
+    special_tokens: SpecialTokens,
+) -> str:
+    """Resolve an explicit name or the closest tokenizer for a total size.
+
+    ``Tokenizer.vocab_size`` includes special tokens, whereas the tokenizer
+    size registry records mergeable ranks. The special-token count is removed
+    before comparing the target with registry entries.
     """
     if name not in (None, "auto"):
         return name
-    return get_closest_tokenizer_size(vocab_size)[0]
+
+    n_mergeable = vocab_size - len(special_tokens)
+    if n_mergeable < 256:
+        raise ValueError(
+            "A byte-level tokenizer must retain at least 256 mergeable byte "
+            f"tokens; got {n_mergeable}."
+        )
+    return get_closest_tokenizer_size(n_mergeable)[0]
+
+
+def load_tokenizer(
+    name: str,
+    *,
+    special_tokens: SpecialTokens,
+    tokenizer_dir: str | Path = TOKENIZERS_FOLDER,
+) -> _BaseTokenizer:
+    """Load a local project tokenizer or a supported pretrained tokenizer.
+
+    A present-but-invalid local tokenizer is treated as corruption and its
+    error is allowed to propagate; only a genuinely absent local config falls
+    through to pretrained source discovery.
+    """
+    tokenizer_dir = Path(tokenizer_dir)
+    try:
+        local_config = TokenizerConfig.from_directory(name, cachedir=tokenizer_dir)
+    except FileNotFoundError:
+        local_config = None
+
+    if local_config is not None:
+        if local_config.special_tokens != special_tokens:
+            raise ValueError(
+                f"Local tokenizer {name!r} uses different special tokens from "
+                "the requested configuration."
+            )
+        return Tokenizer.from_disk(name, cachedir=tokenizer_dir)
+
+    return Tokenizer.from_pretrained(name, special_tokens=special_tokens)
+
+
+def train_new_tokenizer(
+    *,
+    name: str,
+    vocab_size: int,
+    pat_str: str,
+    special_tokens: SpecialTokens,
+    data_dir: str | Path,
+    random_seed: int,
+    tokenizer_dir: str | Path = TOKENIZERS_FOLDER,
+    trainer_config: Optional[TokenizerTrainerConfig] = None,
+) -> Tokenizer:
+    """Train and optionally persist a tokenizer using a local tokenizer config."""
+    from gpt_lab.tokenizer.corpus import TokenizerCorpus
+
+    trainer_config = (
+        trainer_config.model_copy(deep=True)
+        if trainer_config is not None
+        else TokenizerTrainerConfig()
+    )
+    if trainer_config.source != "huggingface":
+        raise NotImplementedError(
+            "Automatic tokenizer training currently supports only the "
+            "Hugging Face trainer backend."
+        )
+
+    config = TokenizerConfig(
+        name=name,
+        dirname=tokenizer_dir,
+        source="local",
+        vocab_size=vocab_size,
+        pat_str=pat_str,
+        special_tokens=special_tokens,
+        trainer=trainer_config,
+    )
+
+    corpus_kwargs = {
+        "corpus_dir": data_dir,
+        "random_seed": random_seed,
+    }
+    if trainer_config.max_bytes > 0:
+        corpus_kwargs["max_bytes"] = trainer_config.max_bytes
+    if trainer_config.bytes_per_doc > 0:
+        corpus_kwargs["bytes_per_doc"] = trainer_config.bytes_per_doc
+
+    corpus = TokenizerCorpus.from_sources(**corpus_kwargs)
+    tokenizer = Tokenizer.train_from_iterator(
+        text_iterator=corpus.iterator(),
+        config=config,
+    )
+    if tokenizer.vocab_size != vocab_size:
+        raise ValueError(
+            f"Trained tokenizer has vocabulary size {tokenizer.vocab_size}, "
+            f"expected {vocab_size}."
+        )
+    return tokenizer
 
 
 def build_or_load_tokenizer(
-        name: Optional[str], 
-        vocab_size: int, 
-        train_tokenizer: bool, 
-        base_name: str, 
-        pat_str: str, 
-        special_tokens: SpecialTokens, 
-        data_dir, 
-        random_seed: int, 
-        dirname=None
-    ) -> Tokenizer:
-    """Orchestrate loading or training of a tokenizer.
+    name: Optional[str],
+    vocab_size: int,
+    train_tokenizer: bool,
+    base_name: str,
+    pat_str: str,
+    special_tokens: SpecialTokens,
+    data_dir: str | Path,
+    random_seed: int,
+    dirname: Optional[str | Path] = None,
+    *,
+    tokenizer_dir: Optional[str | Path] = None,
+    trainer_config: Optional[TokenizerTrainerConfig] = None,
+) -> _BaseTokenizer:
+    """Compatibility dispatcher around the explicit load and train paths.
 
-    - If `not train_tokenizer`, attempt to load a pretrained tokenizer.
-    - Else, train a new tokenizer using the corpus and `TokenizerTrainerConfig`.
-    Returns a `Tokenizer` instance.
+    ``dirname`` is the legacy name for the tokenizer cache directory.
+    ``tokenizer_dir`` is preferred, and conflicting values are rejected.
     """
-    if name in ("auto", None):
-        name = resolve_tokenizer(name, vocab_size, special_tokens)
-    if not train_tokenizer:
-        name_or_choice = name or resolve_tokenizer(name, vocab_size, special_tokens)
-        try:
-            return Tokenizer.from_pretrained(name_or_choice)
-        except Exception as e:
-            log0(f"Error loading tokenizer {name_or_choice}: {e}", level="warning")
-            # Try to construct from config/disk
-            try:
-                cfg = TokenizerConfig(name=name_or_choice, source="tiktoken", vocab_size=vocab_size, special_tokens=special_tokens, pat_str=pat_str)
-                return Tokenizer.from_config(cfg)
-            except Exception as e2:
-                log0(f"Fallback to local tokenizer load failed: {e2}", level="warning")
-                cfg2 = TokenizerConfig.from_directory(name_or_choice)
-                mergeable = cfg2.get_mergeable_ranks()
-                return Tokenizer(mergeable_ranks=mergeable, special_tokens=special_tokens.list(), config=cfg2)
+    if dirname is not None and tokenizer_dir is not None:
+        if Path(dirname) != Path(tokenizer_dir):
+            raise ValueError("dirname and tokenizer_dir refer to different paths")
+    tokenizer_dir = tokenizer_dir or dirname or TOKENIZERS_FOLDER
 
-    # Train a new tokenizer
-    from gpt_lab.tokenizer.corpus import TokenizerCorpus
-    
-    _tname = base_name
-    trainer_cfg = TokenizerTrainerConfig() # cfg should be adapted
-    cfg = TokenizerConfig(name=_tname, source="huggingface", vocab_size=vocab_size, pat_str=pat_str, special_tokens=special_tokens, trainer=trainer_cfg)
-    corpus = TokenizerCorpus.from_sources(corpus_dir=data_dir, max_bytes=vocab_size * 4 * 100, random_seed=random_seed)
-    tokenizer = Tokenizer.train_from_iterator(text_iterator=corpus.iterator(), config=cfg)
-    return tokenizer
+    if train_tokenizer:
+        if name not in (None, "auto"):
+            raise ValueError(
+                "tokenizer_model must be None or 'auto' when training a new "
+                "tokenizer"
+            )
+        return train_new_tokenizer(
+            name=base_name,
+            vocab_size=vocab_size,
+            pat_str=pat_str,
+            special_tokens=special_tokens,
+            data_dir=data_dir,
+            random_seed=random_seed,
+            tokenizer_dir=tokenizer_dir,
+            trainer_config=trainer_config,
+        )
+
+    resolved_name = resolve_tokenizer(name, vocab_size, special_tokens)
+    return load_tokenizer(
+        resolved_name,
+        special_tokens=special_tokens,
+        tokenizer_dir=tokenizer_dir,
+    )

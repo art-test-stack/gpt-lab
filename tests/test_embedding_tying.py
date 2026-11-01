@@ -1,0 +1,273 @@
+from gpt_lab.utils.distributed import ComputeContext
+import json
+from types import SimpleNamespace
+
+import pytest
+import torch
+from safetensors.torch import load_file
+
+from gpt_lab.model.checkpoint import build_meta_model, build_model, capture_rng_state, load_checkpoint, load_meta_config, save_checkpoint
+from gpt_lab.utils.schemas import CheckpointState, MetaConfig, TrainerConfig, TrainerState, TransformerConfig
+
+
+def _config(**overrides):
+    values = dict(
+        vocab_size=300, max_context=4, d_model=16, d_ffn=32,
+        n_heads=2, n_kv_heads=2, n_layers=4, d_head=8,
+        window_pattern="L", attn_impl="sdpa",
+    )
+    values.update(overrides)
+    return TransformerConfig(**values)
+
+
+MODES = [
+    ("embs;head", False, False, False, False),
+    ("embs;value_embs;head", False, False, False, False),
+    (";value_embs;", False, False, False, False),
+    ("embs;value_embs:;head", True, False, False, False),
+    ("embs,head", False, True, False, False),
+    ("embs,head;value_embs:", True, True, False, False),
+    ("embs,head,value_embs:", True, True, True, True),
+    ("embs,head,value_embs", True, True, True, True),
+    ("embs,value_embs", True, False, True, False),
+    ("embs,value_embs:", True, False, True, False),
+    ("embs,value_embs;head", True, False, True, False),
+    ("head,value_embs:;embs", True, False, False, True),
+    ("value_embs,head", True, False, False, True),
+    ("value_embs:", True, False, False, False),
+]
+
+
+def _sharing(config):
+    if config.tie_embeddings in ("embs;value_embs;head", "embs;head;value_embs"):
+        return False, False, False, False
+    return next(mode[1:] for mode in MODES if mode[0] == config.tie_embeddings)
+
+
+def _assert_sharing(model):
+    values = list(model.value_embeds.values())
+    assert list(model.value_embeds) == ["1", "3"]
+    share_values, share_head, values_input, values_head = _sharing(model.config)
+    assert (values[0] is values[1]) == share_values
+    assert (model.lm_head.weight is model.embeds.weight) == share_head
+    assert all((ve.weight is model.embeds.weight) == values_input for ve in values)
+    assert all((ve.weight is model.lm_head.weight) == values_head for ve in values)
+
+
+@pytest.mark.parametrize("mode", [mode[0] for mode in MODES])
+@pytest.mark.parametrize("compute_dtype", [torch.float32, torch.bfloat16])
+def test_embedding_tying_lifecycle(mode, compute_dtype, tmp_path):
+    config = _config(tie_embeddings=mode)
+    model = build_meta_model(config)
+    _assert_sharing(model)
+    model.to_empty(device="cpu")
+    _assert_sharing(model)
+    model.init_weights()
+    assert model.embeds.weight.std().item() == pytest.approx(0.8, rel=0.15)
+    model.double().float()
+    assert all(p.dtype == torch.float32 for p in model.parameters())
+    model._enforce_precision(compute_dtype)
+    _assert_sharing(model)
+    assert model.lm_head.weight.dtype == torch.float32
+    for table in [model.embeds, *model.value_embeds.values()]:
+        expected_dtype = torch.float32 if table.weight is model.lm_head.weight else compute_dtype
+        assert table.weight.dtype == expected_dtype
+
+    counts = model.n_params_per_layer()
+    table_size = model.embeds.weight.numel()
+    assert counts["total"] == sum(p.numel() for p in model.parameters())
+    share_values, share_head, values_input, values_head = _sharing(config)
+    assert counts["lm_head"] == (0 if share_head else table_size)
+    expected_value_tables = 0 if values_input or values_head else 1 if share_values else 2
+    assert counts["value_embeds"] == expected_value_tables * table_size
+    assert model.n_non_vocab_params() == counts["blocks"] + counts["residuals"]
+    assert model.n_scaling_params() == counts["blocks"] + table_size
+    untied = build_meta_model(_config())
+    assert model.estimate_flops() == untied.estimate_flops()
+
+    optimizer = model.build_optimizer(TrainerConfig(comp_info=ComputeContext(device=torch.device("cpu"), compute_dtype=compute_dtype)))
+    optimized = [p for group in optimizer.param_groups for p in group["params"]]
+    assert len(optimized) == len({id(p) for p in optimized}) == len(list(model.parameters()))
+    assert {id(p) for p in optimized} == {id(p) for p in model.parameters()}
+    embedding_group = next(group for group in optimizer.param_groups if group["name"] == "embeddings")
+    assert any(p is model.embeds.weight for p in embedding_group["params"])
+    for ve in model.value_embeds.values():
+        owner = "embeddings" if values_input else "head" if values_head else "value_embeds"
+        group = next(group for group in optimizer.param_groups if group["name"] == owner)
+        assert any(p is ve.weight for p in group["params"])
+
+    # Nonzero output projections let value tables receive gradients on the first pass.
+    with torch.no_grad():
+        for block in model.blocks:
+            block.attention.o_proj.weight.fill_(0.01)
+    ids = torch.randint(0, config.vocab_size, (2, config.max_context))
+    labels = torch.randint(0, config.vocab_size, ids.shape)
+    observed_dtypes = []
+    hook = model.blocks[1].register_forward_pre_hook(
+        lambda module, args, kwargs: observed_dtypes.append((args[0].dtype, kwargs["value_embeds"].dtype)),
+        with_kwargs=True,
+    )
+    output = model(ids, labels)
+    hook.remove()
+    assert observed_dtypes == [(compute_dtype, compute_dtype)]
+    assert torch.isfinite(output.loss)
+    output.loss.backward()
+    for ve in model.value_embeds.values():
+        assert ve.weight.grad is not None
+        assert ve.weight.grad.dtype == ve.weight.dtype
+        assert torch.isfinite(ve.weight.grad).all()
+        assert ve.weight.grad.abs().sum() > 0
+
+    comp_info = ComputeContext(device=torch.device("cpu"))
+    save_checkpoint(model, tmp_path, step=7, trainer_state=TrainerState(step=7),
+                    checkpoint_state=CheckpointState(), comp_info=comp_info)
+    weights_path = tmp_path / "checkpoint_step_000007" / "model.safetensors"
+    assert not weights_path.with_suffix(".pt").exists()
+    assert set(load_file(weights_path)) == set(model.state_dict())
+    state = load_checkpoint(tmp_path, step=7, load_optim=False, load_trainer=False,
+                            load_scaler=False, load_rng=False, comp_info=comp_info).model_state
+    restored = build_meta_model(config).to_empty(device="cpu")
+    restored._enforce_precision(compute_dtype)
+    restored.precompute_pos_enc()
+    restored.load_state_dict(state, strict=True, assign=True)
+    _assert_sharing(restored)
+    torch.testing.assert_close(restored(ids, labels).logits, output.logits, rtol=0, atol=0)
+    restored.load_state_dict(state, strict=True)
+    _assert_sharing(restored)
+
+
+def test_full_tying_rejects_incompatible_value_width():
+    with pytest.raises(ValueError, match="value and input embedding widths must match"):
+        _config(n_kv_heads=1, tie_embeddings="embs,head,value_embs:")
+
+
+def test_frozen_configs_still_initialize_derived_fields():
+    _config()
+    config = _config(n_kv_heads=1, attn_impl="fused", window_pattern=None)
+    assert config.use_gqa
+    assert config.attn_impl == "sdpa"
+    assert config.window_pattern == "L"
+    assert config.window_size == 1
+    assert config.attention_dropout == 0.0
+    with pytest.raises(ValueError, match="frozen"):
+        config.d_model = 32
+
+
+@pytest.mark.parametrize("mode", ["embs;value_embs:;head", "embs,head", "embs,head;value_embs:"])
+def test_partial_tying_supports_gqa(mode):
+    model = build_meta_model(_config(n_kv_heads=1, tie_embeddings=mode)).to_empty(device="cpu")
+    model.init_weights()
+    _assert_sharing(model)
+    assert next(iter(model.value_embeds.values())).weight.shape == (320, 8)
+    ids = torch.randint(0, 300, (1, 4))
+    assert torch.isfinite(model(ids, ids).loss)
+
+
+@pytest.mark.parametrize("version,missing_fields,expected_tie", [
+    ("0.0.9", False, False),
+    ("0.1.0", True, False),
+    ("0.1.0", False, True),
+    ("0.1.1", True, True),
+    ("0.1.1", False, True),
+    ("0.2.0", True, True),
+    (None, True, False),
+    (None, False, True),
+])
+def test_checkpoint_metadata_preserves_tying_mode(tmp_path, version, missing_fields, expected_tie):
+    run_dir = tmp_path / "demo" / "run"
+    meta = MetaConfig(
+        name="demo", run_name="run", dirname=run_dir,
+        model_cfg=_config(tie_embeddings="embs,head"),
+        base_train={},
+    )
+    assert meta.version == "0.1.1"
+    metadata = meta.model_dump(mode="json")
+    if version is None:
+        metadata.pop("version")
+    else:
+        metadata["version"] = version
+    metadata["model_cfg"].pop("tie_embeddings")
+    metadata["model_cfg"]["tie_word_embeddings"] = True
+    if not missing_fields:
+        metadata["model_cfg"].update(tie_value_embeddings=False, tie_all_embeddings=False)
+    path = run_dir / "meta.json"
+    path.write_text(json.dumps(json.dumps(metadata)))
+    saved = path.read_text()
+    restored = load_meta_config("demo", run_name="run", model_cachedir=tmp_path)
+    assert restored.model_cfg.tie_embeddings == ("embs,head;value_embs" if expected_tie else "embs;head;value_embs")
+    assert restored.version == (version or "0.1.1")
+    assert restored.git_info == metadata["git_info"]
+    assert path.read_text() == saved
+
+
+@pytest.mark.parametrize("extension", ["pt", "pth"])
+def test_legacy_checkpoint_loads_distinct_embedding_weights(tmp_path, monkeypatch, extension):
+    config = _config(act_func="swiglu")
+    model = build_meta_model(config).to_empty(device="cpu")
+    model.init_weights()
+    model.eval()
+    with torch.no_grad():
+        for index, table in enumerate([model.embeds, model.lm_head, *model.value_embeds.values()]):
+            table.weight.fill_(0.1 * (index + 1))
+    run_dir = tmp_path / "demo" / "run"
+    meta = MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=config, base_train={})
+    metadata = meta.model_dump(mode="json")
+    metadata["version"] = "0.1.0"
+    metadata["model_cfg"].pop("act_func")
+    metadata["model_cfg"]["tie_word_embeddings"] = True
+    metadata["model_cfg"].pop("tie_embeddings")
+    (run_dir / "meta.json").write_text(json.dumps(json.dumps(metadata)))
+    step_dir = run_dir / "base" / "checkpoint_step_000007"
+    step_dir.mkdir(parents=True)
+    torch.save(model.state_dict(), step_dir / f"model.{extension}")
+    original = (step_dir / f"model.{extension}").read_bytes()
+    torch.save(capture_rng_state(), step_dir / "rng_state.pt")
+    (step_dir / "trainer_state.json").write_text(TrainerState(step=7).model_dump_json())
+    monkeypatch.setattr("gpt_lab.model.checkpoint.build_tokenizer", lambda _: SimpleNamespace(vocab_size=config.vocab_size))
+
+    restored, _, _, _ = build_model(
+        "demo", run_name="run", model_cachedir=tmp_path, step=7, phase="eval",
+        comp_info=ComputeContext(device=torch.device("cpu")),
+    )
+    assert restored.config.tie_embeddings == "embs;head;value_embs"
+    assert restored.config.act_func == "swiglu"
+    assert (step_dir / "model.safetensors").exists()
+    assert (step_dir / f"model.{extension}").read_bytes() == original
+    _assert_sharing(restored)
+    for name, weight in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], weight, rtol=0, atol=0)
+    ids = torch.tensor([[0, 1, 2, 3]])
+    torch.testing.assert_close(restored(ids).logits, model(ids).logits, rtol=0, atol=0)
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: pytest.fail("Converted checkpoints must use safetensors"))
+    reloaded, _, _, _ = build_model(
+        "demo", run_name="run", model_cachedir=tmp_path, step=7, phase="eval",
+        comp_info=ComputeContext(device=torch.device("cpu")),
+    )
+    torch.testing.assert_close(reloaded(ids).logits, model(ids).logits, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["embds", "h_embds", "embs:", "value_embs:1", "embs,,head", "embs;embs", "value_embs;value_embs:"])
+def test_embedding_tying_rejects_invalid_syntax(mode):
+    with pytest.raises(ValueError):
+        _config(tie_embeddings=mode)
+
+
+@pytest.mark.parametrize("mode", ["embs,value_embs", "head,value_embs:"])
+def test_value_tying_rejects_incompatible_width(mode):
+    with pytest.raises(ValueError, match="widths must match"):
+        _config(n_kv_heads=1, tie_embeddings=mode)
+
+
+@pytest.mark.parametrize("flags,expected", [
+    ({}, "embs;head;value_embs"),
+    ({"tie_value_embeddings": True}, "embs;head;value_embs:"),
+    ({"tie_word_embeddings": True}, "embs,head;value_embs"),
+    ({"tie_value_embeddings": True, "tie_word_embeddings": True}, "embs,head;value_embs:"),
+    ({"tie_all_embeddings": True}, "embs,head,value_embs:"),
+])
+def test_checkpoint_migrates_boolean_tying(flags, expected):
+    from gpt_lab.model.checkpoint import _migrate_model_config
+
+    saved = dict(flags)
+    _migrate_model_config(saved, "0.1.1")
+    assert saved == {"tie_embeddings": expected, "act_func": "swiglu"}

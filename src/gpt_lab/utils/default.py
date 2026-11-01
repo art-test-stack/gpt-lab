@@ -1,8 +1,10 @@
 import torch
 import os
-from pathlib import Path
 from typing import Tuple, Dict, Literal
-from functools import lru_cache
+from gpt_lab.utils.paths import (
+    get_cache_dir, CACHE_DIR, BOARD_DIR, DATA_DIR, OUTPUT_FOLDER,
+    MODELS_FOLDER, TOKENIZERS_FOLDER,
+)
 from gpt_lab.utils.special_tokens import SpecialTokens
 
 # ----------- PROCESSOR -----------
@@ -23,23 +25,8 @@ IS_TIKTOKEN = False # TODO: parse as arg
 
 SPECIAL_TOKENS = SpecialTokens()
 
-@lru_cache()
-def get_cache_dir() -> Path:
-    cache_dir = os.environ.get("GPTLAB_CACHE_DIR", None)
-    if cache_dir is not None:
-        return Path(cache_dir).expanduser().resolve()
-    else:
-        return Path.home() / ".cache" / "gpt_lab"
-cache_dir = os.environ.get("GPTLAB_CACHE_DIR", None)
-
-CACHE_DIR = get_cache_dir()
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-BOARD_DIR = CACHE_DIR / "runs"
-DATA_DIR = CACHE_DIR / "data"
 MIN_DOCUMENT_SIZE = 0
-OUTPUT_FOLDER = CACHE_DIR / "output"
-MODELS_FOLDER = CACHE_DIR / "models"
-TOKENIZERS_FOLDER = CACHE_DIR / "tokenizers"
 VOCAB_SIZE = 32_000
 MAX_TOKEN_LENGTH = 32
 

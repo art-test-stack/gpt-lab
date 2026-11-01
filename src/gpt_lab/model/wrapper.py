@@ -216,7 +216,7 @@ class Engine:
         if isinstance(generation_config, dict):
             generation_config = GenerationConfig.model_validate(**generation_config)
 
-        device = self.main.get_device()
+        device = self.device
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         rng = torch.Generator(device=device).manual_seed(generation_config.seed)
 

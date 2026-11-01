@@ -19,7 +19,7 @@ Devices = Literal["cpu", "cuda", "mps", "xpu", "meta"]
 TokenizerSources = Literal["tiktoken", "local", "huggingface", "dummy"]
 TokenizerTensors = Literal["pt", "np", "tf", "jax"]
 NormalizationTypes = Literal["rms", "layer"]
-AttnImplTypes = Literal["sdpa", "fused", "torch", "raw"] # raw = return attention weights^^
+AttnImplTypes = Literal["sdpa", "fa2", "fa3", "fused", "torch", "raw"]  # fused: legacy config compatibility
 PositionalEncodingTypes = Literal["positional", "rope"]
 TfTypes = Literal["dense", "moe"]
 Dtypes = Literal["float32", "float16", "bfloat16"]

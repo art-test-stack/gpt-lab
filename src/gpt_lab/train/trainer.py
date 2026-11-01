@@ -9,10 +9,9 @@ Key responsibilities:
 - Device management and memory optimization
 """
 
-from typing import Optional, Callable, Union, Dict
+from typing import Any, Optional, Callable, Union
 from pathlib import Path
-
-import numpy as np
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import time
 import gc
@@ -26,10 +25,9 @@ import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 
 from gpt_lab.utils.board import Board
-from gpt_lab.utils.default import CACHE_DIR, MODELS_FOLDER
-from gpt_lab.utils.distributed import _DTYPE_MAP, get_dist_info
-from gpt_lab.utils.common import print0, print0_dict
-from gpt_lab.utils.logging import log_error, log_critical, log0
+from gpt_lab.utils.distributed import ComputeContext, _DTYPE_MAP, get_comp_info
+from gpt_lab.utils.common import print0
+from gpt_lab.utils.logging import log_error, log0, log_dict
 from gpt_lab.utils.schemas import (
     CheckpointState,
     COREMetrics,
@@ -42,6 +40,7 @@ from gpt_lab.utils.schemas import (
 from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.evaluate.core import evaluate_core
 from gpt_lab.model.wrapper import Engine
+from gpt_lab.model.gpt import DenseTransformer
 from gpt_lab.model.checkpoint import CheckpointManager, make_default_run_name
 
 logger = logging.getLogger(__name__)
@@ -88,6 +87,46 @@ class Trainer:
     - Comprehensive metrics tracking
     - Memory optimization with gc management
 
+    Subclass extension points:
+        train_step(train_iter, batch, should_log_step):
+            Run one complete optimizer step, including accumulation, backward, prefetch,
+            hyperparameter scheduling, optimizer step, and timing. Return the
+            next prepared batch and a step_metrics dict; see the method contract.
+        prepare_batch(raw_batch):
+            Return (payload, state, local_token_count) per microbatch. The default
+            accepts (x, y, state) or (x, y), producing payload=(x, y) and counting
+            x.numel() tokens. State is a DataLoaderState or None. Missing state
+            on the first batch triggers a warning; checkpoints record None for
+            batches without state and cannot restore their dataloader position.
+        compute_loss(payload):
+            Return a scalar loss connected to the computation graph. train_step
+            supplies autocast, divides by n_acc_steps, and performs backward.
+            Override together with prepare_batch for custom payload formats.
+        optimizer_step(should_log_step):
+            Apply accumulated gradients and clear them. The default unscales
+            gradients, synchronizes distributed overflow flags, optionally logs
+            gradients, advances optimizer/scaler state, and clears gradients.
+            Hyperparameter scheduling stays in train_step().
+        update_metrics(step_metrics, total_dt):
+            Update counters, smoothed loss, and the duration history every step.
+            Return derived metrics; total_dt also controls ETA and time limits.
+        log_metrics(metrics):
+            Print, record, and send metrics to the board at train()'s logging
+            interval. Override reporting without changing per-step state.
+        evaluate_bpb(), evaluate_core(), evaluate_samples():
+            Replace evaluations independently; their scheduling stays in train().
+            Each override owns model modes, evaluation contexts, and any logging,
+            metrics, or best-score changes. Defaults restore training mode.
+
+    train() creates the public compiled_model attribute before invoking hooks
+    and sets it to None on completion. Use it for training forwards; model is
+    the original model used for generation and checkpoints. The base compute_loss
+    uses compiled_training_loss by default when the model provides training_loss.
+    Optimizers, schedules,
+    boards, and checkpoint managers can be injected through the constructor.
+    save_checkpoint() persists the standard model/optimizer/scaler/trainer state;
+    subclasses must explicitly persist any additional state they need to resume.
+
     Example:
     ```python
         trainer = Trainer(
@@ -113,7 +152,7 @@ class Trainer:
         lr_schedule: Optional[Callable] = None,
         muon_momentum_schedule: Optional[Callable] = None,
         weight_decay_schedule: Optional[Callable] = None,
-        scaler: Optional[GradScaler] = None, # only used if config.compute_dtype is float16 and for resume training
+        scaler: Optional[GradScaler] = None, # legacy checkpoint argument; not automatically created for BF16
         resume_state: Optional[TrainerState] = None,
         best_state: Optional[CheckpointState] = None,
     ):
@@ -132,7 +171,7 @@ class Trainer:
             lr_schedule: Learning rate schedule function (step -> lr multiplier). Default: TrainerConfig.lr_schedule
             muon_momentum_schedule: Momentum schedule for Muon optimizer (step -> momentum multiplier). Default: TrainerConfig.muon_momentum_schedule
             weight_decay_schedule: Weight decay schedule for Muon optimizer (step -> weight decay multiplier). Default: TrainerConfig.weight_decay_schedule
-            scaler: Gradient scaler for mixed precision training. Default: None (will be created if config.compute_dtype is float16)
+            scaler: Optional legacy gradient scaler; BF16 training does not require one.
         """
         self.training_type = "base" # for now we only have base training, TODO: extend to sft, grpo, etc.
         self.model = model
@@ -148,17 +187,26 @@ class Trainer:
                 "Please provide a TrainerConfig instance.", level="warning", logger=logger
             )
         self.config = config
+        self.compiled_training_loss = None
+        self._forward_backward_graph = None
+        if config.cuda_graph_mode != "disabled":
+            if config.comp_info.device_type != "cuda":
+                raise ValueError("CUDA graph capture requires CUDA")
+            if self.__class__.compute_loss is not Trainer.compute_loss:
+                raise ValueError("CUDA graph capture currently requires the default compute_loss")
+            if config.fp8 or scaler is not None or config.comp_info.compute_dtype in (torch.float16, "float16"):
+                raise ValueError("CUDA graph capture currently supports FP32/BF16 without a gradient scaler or FP8")
         
         if checkpoint_manager is None:
             model_name = self.model.__class__.__name__
             depth = getattr(self.model.config, "n_layers", "unknown")
-            model_run = make_default_run_name(model_name, depth, self.config.dist_info)
+            model_run = make_default_run_name(depth, model_name, self.config.comp_info)
             checkpoint_manager = CheckpointManager(
                 model_name=self.model.__class__.__name__,
                 model_run=model_run,
                 source=self.training_type, 
-                dist_info=self.config.dist_info,
-                mode="shard" if self.config.dist_info.get("IS_DDP_INITIALIZED", False) else "ddp", # naming is a bit dummy
+                comp_info=self.config.comp_info,
+                optimizer_state_layout="sharded" if self.config.comp_info.is_distributed else "full",
             )
         self.ckpt_manager = checkpoint_manager 
         self.dirname = self.ckpt_manager.source_dir
@@ -170,6 +218,20 @@ class Trainer:
             board = Board(board_type="dummy")
         self.board = board
         
+        # Select storage before creating optimizer groups; accept legacy dtype strings.
+        self.device_type = config.comp_info.device_type
+        self.device = torch.device(config.comp_info.device)
+        raw_dtype = self.config.comp_info.compute_dtype
+        self.dtype = _DTYPE_MAP.get(raw_dtype, raw_dtype)
+        if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported compute dtype: {raw_dtype!r}")
+        self.use_amp = self.dtype in (torch.float16, torch.bfloat16)
+        if isinstance(model, DenseTransformer):
+            model._enforce_precision(self.dtype)
+        if getattr(config, "fp8_ffn_forward", False):
+            from gpt_lab.model.fp8 import enable_fp8_ffn_forward
+            enable_fp8_ffn_forward(model, self.dtype)
+
         # Optimizer
         if optimizer is None:
             if hasattr(model, "build_optimizer"):
@@ -183,49 +245,55 @@ class Trainer:
         
         # State and metrics
         self.state = resume_state or TrainerState()
+        if self.state.completed_steps is None:
+            self.state.completed_steps = self.state.step + int(self.state.step > 0 or self.state.n_tokens > 0)
         self.ckpt_state = best_state or CheckpointState()
         self.metrics = TrainerMetrics()     # TODO
         self.eval_metrics = EvalMetrics()   # TODO
         self.core_metrics = COREMetrics()   # TODO
         
-        # Mixed precision
-        self.dtype = self.config.dist_info["compute_dtype"]
-        self.use_amp = self.dtype in ["float16", "bfloat16"]
         def amp_context():
             if self.use_amp:
                 return autocast(
-                    device_type=self.config.dist_info["DEVICE_TYPE"],
-                    dtype=_DTYPE_MAP[self.dtype]
+                    device_type=self.device_type,
+                    dtype=self.dtype,
                 )
-            else:
-                return DummyContext()
-            
-        def disable_fp8_context():
-            if self.config.fp8:
-                # TODO: this is a placeholder impl.
-                from gpt_lab.model.fp8 import DisableFP8
-                return DisableFP8
-            else:
-                return DummyContext
-        self.train_context = amp_context
-        self.val_context = disable_fp8_context()
+            return nullcontext()
 
-        self.scaler = None
-        if scaler is not None:
-            self.scaler = scaler
-        elif self.dtype == "float16":
-            self.scaler = GradScaler()
+        @contextmanager
+        def val_context(model):
+            with ExitStack() as stack:
+                stack.enter_context(amp_context())
+                if self.config.fp8 or getattr(self.config, "fp8_ffn_forward", False):
+                    from gpt_lab.model.fp8 import DisableFP8
+                    stack.enter_context(DisableFP8(model))
+                yield model
+
+        self.train_context = amp_context
+        self.val_context = val_context
+
+        self.scaler = scaler
+        if self.scaler is None and self.dtype == torch.float16:
+            if self.device_type != "cuda":
+                raise ValueError("float16 training is only supported on CUDA")
+            self.scaler = GradScaler(self.device_type)
+
+        actual_batch_size = getattr(self.train_loader, "B", None)
+        if (
+            actual_batch_size is not None
+            and actual_batch_size != self.config.device_batch_size
+        ):
+            raise ValueError(
+                "TrainerConfig.device_batch_size does not match the training "
+                f"loader: {self.config.device_batch_size} != {actual_batch_size}"
+            )
         
         # LR and other schedules
         self.lr_schedule = lr_schedule or config.lr_multiplier_schedule
         self.muon_momentum_schedule = muon_momentum_schedule or config.muon_momentum_schedule
         self.weight_decay_schedule = weight_decay_schedule or config.weight_decay_schedule
 
-        # Device config
-        self.device_type = config.dist_info.get("DEVICE_TYPE", "cpu")
-        self.device = torch.device(config.dist_info.get("DEVICE", "cpu"))
         self._get_sync_fn()
-        self._add_model_hook_for_grad_monitoring()
 
     def _get_sync_fn(self):
         """Set up device synchronization function."""
@@ -236,354 +304,200 @@ class Trainer:
             self.synchronize = lambda: None
             self.get_max_memory = lambda: 0
 
-    def _add_model_hook_for_grad_monitoring(self):
-        if not self.config.monitor_grad_norms or getattr(self, "_hooked", False):
-            return
-        self._grad_stats = {}
-
-        def _hook(name):
-            if not name.endswith("weight"):
-                return lambda grad: None  # only monitor weight gradients for now
-            param_name = name.replace('.', '/').replace('/weight', '')
-            def hook_fn(grad):
-                self._grad_stats[param_name] = {
-                    "rms": grad.square().mean().sqrt().detach(),
-                    "mean": grad.mean().detach(),
-                    "abs_mean": grad.abs().mean().detach(),
-                }
-            return hook_fn
-
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                param.register_hook(_hook(name))
-
-        self._hooked = True # avoid hooking multiple times
-
-    def _rm_model_hooks(self):
-        """Remove all hooks from model parameters."""
-        for param in self.model.parameters():
-            param._backward_hooks = {}
-        self._hooked = False
-
     def log_gradients(self):
-        "called between loss.backward() and optimizer.step() to log gradient norms and means"
-        if not hasattr(self, "_grad_stats"):
+        """Log accumulated pre-reduction gradient statistics.
+
+        Statistics are aggregated across rank-local accumulated gradients with
+        one small collective. This avoids a hook on every parameter for every
+        microbatch while still reporting all ranks, rather than only rank zero's
+        final microbatch.
+        """
+        names = []
+        stats = []
+        numels = []
+        for name, param in self.model.named_parameters():
+            if not name.endswith("weight") or param.grad is None:
+                continue
+            grad = param.grad.detach().float()
+            names.append(name.replace('.', '/').removesuffix('/weight'))
+            stats.append(torch.stack((
+                grad.square().sum(),
+                grad.sum(),
+                grad.abs().sum(),
+            )))
+            numels.append(param.numel())
+
+        if not stats:
             return
+
+        stats_tensor = torch.stack(stats)
+        world_size = self.config.comp_info.world_size
+        if self.config.comp_info.is_distributed:
+            dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
 
         logs = {}
-        for name, stats in self._grad_stats.items():
-            logs[f"grad_rms/{name}"] = stats["rms"].item()
-            logs[f"grad_mean/{name}"] = stats["mean"].item()
-            logs[f"grad_abs_mean/{name}"] = stats["abs_mean"].item()
-
-        self.board.log(logs, step=self.state.step)
-        self._grad_stats.clear()  # important: reset for next step
+        if self.config.comp_info.rank == 0:
+            # One device synchronization for the complete statistics table,
+            # rather than one .item() synchronization per metric.
+            stats_cpu = stats_tensor.detach().cpu()
+            for name, row, numel in zip(names, stats_cpu, numels):
+                denominator = numel * world_size
+                logs[f"grad_rms/{name}"] = (
+                    row[0] / denominator
+                ).sqrt().item()
+                logs[f"grad_mean/{name}"] = (row[1] / denominator).item()
+                logs[f"grad_abs_mean/{name}"] = (
+                    row[2] / denominator
+                ).item()
+            self.board.log(logs, step=self.state.step)
 
     def train(self):
         """
         Main training loop.
-        
+
         Performs gradient accumulation, validation, checkpointing, and logging.
         """
         print0("=" * 70)
         print0(f"Starting training for {self.config.n_steps:,} steps -- {self.config.total_batch_size:,} tokens per step.")
         print0("=" * 70)
-        
-        # Extracte main constants from config
-        step = self.state.step + int(self.state.step > 0) # start from the next step to avoid repeating the last step if resuming
-        n_steps = self.config.n_steps
-        n_flops_per_token = self.config.n_flops_per_token
-        total_batch_size = self.config.total_batch_size
-        n_acc_steps = self.config.n_acc_steps
 
-        world_size = self.config.dist_info.get("WORLD_SIZE", 1) if self.config.dist_info else 1
-        
+        # Extracte main constants from config
+        step = self.state.completed_steps
+        n_steps = self.config.n_steps
+        step_limit = min(n_steps, self.config.stop_after_step) if self.config.stop_after_step is not None else n_steps
+        if step >= step_limit:
+            self.compiled_model = None
+            self.save_checkpoint()
+            if self.config.stop_after_step is not None:
+                self.board.log({"train/completed_steps": step}, step=self.state.step)
+            return
+
+        use_scalar_loss = (
+            type(self).compute_loss is Trainer.compute_loss
+            and callable(getattr(self.model, "training_loss", None))
+        )
         # Compile model if using PyTorch 2.0+
         if parse(torch.__version__) >= parse("2.0"):
-            self._compiled_model = torch.compile(self.model, dynamic=False)
+            compile_options = {"triton.cudagraphs": False} if self.config.cuda_graph_mode != "disabled" else None
+            self.compiled_model = torch.compile(self.model, dynamic=False, options=compile_options)
+            if use_scalar_loss:
+                self.compiled_training_loss = torch.compile(self.model.training_loss, dynamic=False, options=compile_options)
         else:
-            self._compiled_model = self.model
+            self.compiled_model = self.model
+            if use_scalar_loss:
+                self.compiled_training_loss = self.model.training_loss
 
         train_iter = iter(self.train_loader)
-        x, y, dataloader_state = next(train_iter) # prefetch
+
+        rank = self.config.comp_info.rank
+
+        if self.config.comp_info.is_distributed:
+            dist.barrier()
+
+        batch = self.prepare_batch(next(train_iter)) # prefetch
+        _, dataloader_state, _ = batch
+
+        print(f"[rank={rank}] after prefetch", flush=True)
+        if dataloader_state is None:
+            self.state.train_loader_state = None
+            log0(
+                "No dataloader state provided. Dataloader state will not be saved "
+                "with checkpoints; the data position cannot be restored on resume.",
+                level="warning", logger=logger,
+            )
+        else:
+            log_dict(
+                "First dataloader_state",
+                dataloader_state.model_dump(),
+                logger=logger,
+            )
 
         # Prepare for training
-        self._compiled_model.train()
-        smooth_loss = self.state.smooth_train_loss
-        ema_beta = 0.9
-        
+        self.compiled_model.train()
+        if self.config.cuda_graph_mode == "forward_backward":
+            from gpt_lab.train.cuda_graph import CapturedForwardBackward
+            capture_start = time.perf_counter()
+            self._forward_backward_graph = CapturedForwardBackward(
+                self.model, self.compute_loss, batch[0], self.config.n_acc_steps,
+                self.train_context,
+            )
+            self.board.log({"train/capture_startup_seconds": time.perf_counter() - capture_start}, step=step)
+
         total_dt = []  # For ETA calculation
-        
-        while step < n_steps:
+
+        while step < step_limit:
             self.state.step = step
-            last_step = (step == n_steps - 1)
-            flops_so_far = n_flops_per_token * total_batch_size * step
+            last_step = (step == step_limit - 1)
+            should_log_step = (
+                (self.config.log_every == -1 and last_step)
+                or (
+                    self.config.log_every > 0
+                    and step % self.config.log_every == 0
+                )
+            )
             self.synchronize()
-            
-            # ================================================================
-            # Validation on 'val_loader' every 'eval_every' steps
-            # ================================================================
-            
-            if (
-                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
-                (self.config.eval_bpb_every > 0 and step > 0 and # eval every eval_bpb_every steps except the first step
-                (last_step or step % self.config.eval_bpb_every == 0)) 
-            ):
-                start_bpb_eval = time.time()
-                self._compiled_model.eval()
-                eval_steps = self.config.n_bpb_tokens // (self.config.device_batch_size * self.model.config.max_context * self.config.dist_info["WORLD_SIZE"])
-                with self.val_context(self._compiled_model):
-                    val_res = compute_bpb(
-                        self._compiled_model, 
-                        self.val_loader(), 
-                        eval_steps,
-                        dist_info=self.config.dist_info,
-                        token_bytes=self.tokenizer.token_bytes
-                    )
-                print0(f"Step {step:05d} | "\
-                       f"Validation bpb: {val_res['bpb']:.6f} | "\
-                    f"Validation loss: {val_res['loss']:.6f}")
-                
-                dt_bpb_eval = time.time() - start_bpb_eval
-
-                if (
-                    (self.ckpt_state.best_eval_value is None) or 
-                    (val_res['bpb'] < self.ckpt_state.best_eval_value)
-                ):
-                    self.ckpt_state.best_eval_value = val_res['bpb']
-                    self.ckpt_state.best_eval_step = step
-                    if (
-                        self.config.save_on_best and 
-                        not ((self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0)) # already saving this step
-                        ):
-                        self.save_checkpoint()
-                
-                log_dict = {
-                    "eval/loss": val_res['loss'],
-                    "eval/bpb": val_res['bpb'],
-                    "eval/best_bpb": self.ckpt_state.best_eval_value,
-                    "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
-                }
-                self.board.log(log_dict, step=step)
-                self.eval_metrics.append(log_dict, step=step)
-                self._compiled_model.train()
-
-            # ================================================================
-            # Validation on CORE metric every 'core_eval_every' steps
-            # ================================================================
-            
-            results = {}
-            if (
-                (self.config.eval_core_every == -1 and last_step) or
-                (self.config.eval_core_every > 0 and (
-                last_step or (step > 0 and step % self.config.eval_core_every == 0)))
-            ):
-                self.model.eval()
-                with self.val_context(self.model):
-                    results = evaluate_core(
-                        self.model,
-                        self.tokenizer,
-                        self.device,
-                        max_per_task=self.config.n_core_tokens,
-                    )
-                max_throughput = results.get("core/max_per_task", 0) * self.config.dist_info.get("WORLD_SIZE", 1) / results.get("core/step_time_ms", 1e-3) * 1000
-                print0(f"Step {step:05d}/{n_steps:05d} | "
-                       f"CORE: {results['core/core']:.4f} | "
-                       f"Accuracy: {results['core/accuracy']:.4f} | "
-                       f"Max per task: {int(results['core/max_per_task'])} | "
-                       f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
-                       f"Max throughput: {max_throughput:,.0f} tok/s")
-                log_dict = {
-                    "core/core": results["core/core"],
-                    "core/accuracy": results["core/accuracy"],
-                    "core/max_per_task": results["core/max_per_task"],
-                    "core/step_time_ms": results.get("core/step_time_ms", 0),
-                }
-                for task_label, task_results in results.get("all_core_results", {}).items():
-                    for task_metric, task_value in task_results.items():
-                        log_dict[f"core/{task_label}/{task_metric}"] = task_value
-                if (
-                    (self.ckpt_state.best_core_value is None) or 
-                    (results["core/core"] > self.ckpt_state.best_core_value)
-                ):
-                    self.ckpt_state.best_core_value = results["core/core"]
-                    self.ckpt_state.best_core_step = step
-                self.board.log(log_dict, step=step)
-                self.core_metrics.append(results, step=step)
-                self.model.train()
-            
-            # ================================================================
-            # Sample some outputs every 'sample_every' steps
-            # ================================================================
-
-            if (
-                self.config.dist_info["RANK"] == 0 and 
-                ((self.config.sample_every == -1 and last_step) or
-                (self.config.sample_every > 0 and 
-                (last_step or (step > 0 and step % self.config.sample_every == 0))))
-            ):
-                self.model.eval()
-                prompts = [
-                    "The capital of France is",
-                    "The chemical symbol of gold is",
-                    "If yesterday was Friday, then tomorrow will be",
-                    "The opposite of hot is",
-                    "The planets of the solar system are:",
-                    "My favorite color is",
-                    "If 5*x + 3 = 13, then x is",
-                ]
-                engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
-                with self.val_context(self.model):
-                    samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
-                # print0(self.tokenizer.decode(samples[0]))
-                self.model.train()
 
             # ================================================================
             # Training step with gradient accumulation
             # ================================================================
 
-            loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
+            batch, step_metrics = self.train_step(train_iter, batch, should_log_step)
 
-            eff_global_tokens = 0
-
-            self.synchronize()
-            step_start_time = time.perf_counter()
-            for _ in range(n_acc_steps):
-                eff_global_tokens += x.numel() * world_size
-
-                self.state.train_loader_state = dataloader_state
-                with self.train_context():
-                    loss = self._compute_loss(x, y)
-                loss = loss / n_acc_steps
-
-                if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-
-                loss_accum.add_(loss.detach().float())
-
-                if torch.isnan(loss_accum) or torch.isinf(loss_accum):
-                    torch.save(x, self.dirname / "bad_batch.pt")
-                    log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
-                        f"Loss is NaN or Inf at {step=}.\n" \
-                        f"Dataloader state: {dataloader_state.__dict__}.\n" \
-                        f"Model inputs shape: {x.shape}, values: {x}\n" \
-                        f"Model targets shape: {y.shape}, values: {y}\n" \
-                        f"Accumulated loss: {loss_accum}",
-                        error_type=ValueError, logger=logger  
-                    )
-                x, y, dataloader_state = next(train_iter)
-            
-            if dataloader_state is not None:
-                if isinstance(dataloader_state, DataLoaderState):
-                    self.state.n_epochs = dataloader_state.epoch
-                else:
-                    self.state.n_epochs = dataloader_state.get("epoch", 0)
-            
-            lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
-
-            if self.config.monitor_grad_norms and self.config.dist_info["RANK"] == 0:
-                self.log_gradients()
-
-            if self.scaler is not None:
-                self.scaler.unscale_(self.optimizer)
-                if self.config.dist_info["IS_DDP_INITIALIZED"]:
-                    for g in self.scaler._found_inf_per_device(self.optimizer).values():
-                        dist.all_reduce(g, op=dist.ReduceOp.MAX)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
-            
-            self._compiled_model.zero_grad(set_to_none=True)
-
-            self.synchronize()
-            step_end_time = time.perf_counter()
-            
             # ================================================================
             # Logging and metrics
             # ================================================================
-            
-            step_dt_tensor = torch.tensor(step_end_time - step_start_time, device=self.device)
 
-            if self.config.dist_info["IS_DDP_INITIALIZED"]:
-                dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
+            metrics = self.update_metrics(step_metrics, total_dt)
+            self.state.completed_steps = step + 1
+            metrics["train/completed_steps"] = self.state.completed_steps
+            if should_log_step:
+                self.log_metrics(metrics)
 
-            step_dt = step_dt_tensor.item()
+            completed = self.state.completed_steps
+            # ================================================================
+            # Validation on 'val_loader' every 'eval_every' steps
+            # ================================================================
 
-            loss_accum = loss_accum.item()
-            
-            smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
-            debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
-            
-            # Calculate throughput
-            if eff_global_tokens != total_batch_size:
-                log0(f"eff_global_tokens != total_batch_size, got {eff_global_tokens=} and {total_batch_size=}", logger=logger, level="warning")
+            if (
+                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
+                (self.config.eval_bpb_every > 0 and completed > 0 and # eval every eval_bpb_every steps except the first step
+                (last_step or completed % self.config.eval_bpb_every == 0))
+            ):
+                self.evaluate_bpb()
 
-            tokens_per_sec = eff_global_tokens / step_dt
+            # ================================================================
+            # Validation on CORE metric every 'core_eval_every' steps
+            # ================================================================
 
-            step_flops_per_sec = n_flops_per_token * tokens_per_sec
-            mfu = step_flops_per_sec / self.config.dist_info["gpu_peak_flops"] * 100 / world_size
-            
-            total_dt.append(step_dt)
-            self.state.n_tokens += eff_global_tokens
-            self.state.smooth_train_loss = smooth_loss
-            self.state.total_training_time += step_dt
-            
-            # Log every log_every steps
-            if step % self.config.log_every == 0:
-                pct_done = 100 * step / n_steps
-                
-                # ETA calculation
-                if len(total_dt) > 10:
-                    avg_step_time = sum(total_dt[-10:]) / 10
-                    eta_seconds = (n_steps - step) * avg_step_time
-                    eta_str = f" | ETA: {eta_seconds/60:.1f}m"
-                else:
-                    eta_str = ""
+            if (
+                (self.config.eval_core_every == -1 and last_step) or
+                (self.config.eval_core_every > 0 and (
+                last_step or (completed > 0 and completed % self.config.eval_core_every == 0)))
+            ):
+                self.evaluate_core()
 
-                if math.isnan(debiased_smooth_loss) or math.isinf(debiased_smooth_loss):
-                    log_error(f"Loss is NaN or Inf at {step=}, {debiased_smooth_loss=}. Check previous logs for details.", error_type=ValueError, logger=logger)
-                
-                print0(
-                    f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
-                    f"loss: {debiased_smooth_loss:.6f} | "
-                    f"lrm: {lrm:.2e} | "
-                    f"dt: {step_dt*1000:.2f}ms | "
-                    f"tok/s: {tokens_per_sec:,.0f}"
-                    f"{eta_str}"
-                )
-                log_dict = {
-                    "epochs": self.state.n_epochs,
-                    "train/loss": debiased_smooth_loss,
-                    "train/raw_loss": loss_accum,
-                    "train/tokens_per_sec": tokens_per_sec,
-                    "train/step_time_ms": step_dt * 1000,
-                    "train/total_tokens": self.state.n_tokens,
-                    "train/flops_per_sec": step_flops_per_sec,
-                    "train/mfu": mfu,
-                    "lrm": lrm,
-                    "muon_momentum": muon_momentum,
-                    "weight_decay": weight_decay,
-                    "train/total_training_flops": flops_so_far,
-                    "train/total_training_time": self.state.total_training_time,
-                    "train/eta_seconds": eta_seconds if len(total_dt) > 10 else float("inf"),
-                }
+            # ================================================================
+            # Sample some outputs every 'sample_every' steps
+            # ================================================================
 
-                self.metrics.append(log_dict, step)
-                self.board.log(log_dict, step=step)
-            
+            if (
+                self.config.comp_info.rank == 0 and
+                ((self.config.sample_every == -1 and last_step) or
+                (self.config.sample_every > 0 and
+                (last_step or (completed > 0 and completed % self.config.sample_every == 0))))
+            ):
+                self.evaluate_samples()
+
             # ================================================================
             # Checkpointing
             # ================================================================
-            if (self.config.save_every > 0 and step > 0 and step % self.config.save_every == 0):
+            if self.config.save_every > 0 and completed % self.config.save_every == 0:
                 self.save_checkpoint()
-            
+
             if (sum(total_dt) > self.config.target_time * 60) and self.config.target_time > 0:
                 print0(f"Reached target time of {self.config.target_time} minutes. Stopping training.")
                 break
-            
+
             # ================================================================
             # Cleanup
             # ================================================================
@@ -593,24 +507,379 @@ class Trainer:
                 gc.disable()
             elif step % 5000 == 0:
                 gc.collect()
-            
+
             step += 1
 
-        del self._compiled_model  # Clean up compiled model if it exists
-        self._compiled_model = None
-        
+        del self.compiled_model  # Clean up compiled model if it exists
+        self.compiled_model = None
+        self.compiled_training_loss = None
+        self._forward_backward_graph = None
+
         print0("=" * 70)
         print0(f"Training completed!")
         print0(f"Total tokens: {self.state.n_tokens:,}")
         print0(f"Total time: {self.state.total_training_time/60:.1f} minutes")
         print0("=" * 70)
-        
+
         # Final checkpoint
         self.save_checkpoint()
+        if self.config.stop_after_step is not None:
+            self.board.log({"train/completed_steps": self.state.completed_steps}, step=self.state.step)
 
-    def _compute_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Compute cross-entropy loss."""
-        output = self._compiled_model(x, y)
+    def update_metrics(self, step_metrics, total_dt):
+        """Update per-step state and return the metric dict consumed by log_metrics.
+
+        Called every step, including when logging is disabled. Reduce step time
+        with MAX across ranks, average loss across ranks before smoothing,
+        update token/time counters,
+        and append the reduced duration to total_dt for ETA and time limits.
+        """
+        step = self.state.step
+        n_steps = self.config.n_steps
+        n_flops_per_token = self.config.n_flops_per_token
+        total_batch_size = self.config.total_batch_size
+        world_size = self.config.comp_info.world_size
+        flops_so_far = n_flops_per_token * total_batch_size * step
+        ema_beta = 0.9
+        smooth_loss = self.state.smooth_train_loss
+        step_dt_tensor = torch.tensor(step_metrics["step_time"], device=self.device)
+
+        if self.config.comp_info.is_distributed:
+            dist.all_reduce(step_dt_tensor, op=dist.ReduceOp.MAX)
+
+        step_dt = step_dt_tensor.item()
+
+        # Equal token counts per rank make the rank mean the global batch loss.
+        # Reduce a detached copy so reporting cannot change the training loss.
+        loss_tensor = step_metrics["loss"].detach().float().clone()
+        if self.config.comp_info.is_distributed:
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            loss_tensor.div_(world_size)
+        loss_accum = loss_tensor.item()
+        eff_global_tokens = step_metrics["tokens"]
+
+        smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
+        debiased_smooth_loss = smooth_loss / (1 - ema_beta ** (step + 1))
+
+        # Calculate throughput
+        if eff_global_tokens != total_batch_size:
+            log0(f"eff_global_tokens != total_batch_size, got {eff_global_tokens=} and {total_batch_size=}", logger=logger, level="warning")
+
+        tokens_per_sec = eff_global_tokens / step_dt
+
+        step_flops_per_sec = n_flops_per_token * tokens_per_sec
+        mfu = step_flops_per_sec / self.config.comp_info.gpu_peak_flops * 100 / world_size
+
+        total_dt.append(step_dt)
+        self.state.n_tokens += eff_global_tokens
+        self.state.smooth_train_loss = smooth_loss
+        self.state.total_training_time += step_dt
+        if len(total_dt) > 10:
+            avg_step_time = sum(total_dt[-10:]) / 10
+            eta_seconds = (n_steps - step) * avg_step_time
+        else:
+            eta_seconds = float("inf")
+
+        return {
+            "epochs": self.state.n_epochs,
+            "train/loss": debiased_smooth_loss,
+            "train/raw_loss": loss_accum,
+            "train/tokens_per_sec": tokens_per_sec,
+            "train/step_time_ms": step_dt * 1000,
+            "train/total_tokens": self.state.n_tokens,
+            "train/flops_per_sec": step_flops_per_sec,
+            "train/mfu": mfu,
+            "lrm": step_metrics["lrm"],
+            "muon_momentum": step_metrics["muon_momentum"],
+            "weight_decay": step_metrics["weight_decay"],
+            "train/total_training_flops": flops_so_far,
+            "train/total_training_time": self.state.total_training_time,
+            "train/eta_seconds": eta_seconds,
+        }
+
+    def log_metrics(self, metrics):
+        """Print metrics, append metric history, and send them to the board.
+
+        train() controls logging cadence. Override to customize reporting without
+        changing per-step counters or loss smoothing in update_metrics().
+        """
+        step = self.state.step
+        n_steps = self.config.n_steps
+        pct_done = 100 * step / n_steps
+        loss = metrics["train/loss"]
+        eta_seconds = metrics["train/eta_seconds"]
+        eta_str = f" | ETA: {eta_seconds/60:.1f}m" if math.isfinite(eta_seconds) else ""
+        if math.isnan(loss) or math.isinf(loss):
+            log_error(f"Loss is NaN or Inf at {step=}, {loss=}. Check previous logs for details.", error_type=ValueError, logger=logger)
+        print0(
+            f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
+            f"loss: {loss:.6f} | "
+            f"lrm: {metrics['lrm']:.2e} | "
+            f"dt: {metrics['train/step_time_ms']:.2f}ms | "
+            f"tok/s: {metrics['train/tokens_per_sec']:,.0f}"
+            f"{eta_str}"
+        )
+        self.metrics.append(metrics, step)
+        self.board.log(metrics, step=step)
+
+    def train_step(self, train_iter, batch, should_log_step: bool):
+        """Run one optimizer step and return (next_batch, step_metrics).
+
+        batch and next_batch are prepared (payload, state, local_token_count)
+        tuples. Each acc_step consumes one microbatch. Run config.n_acc_steps
+        iterations, preserving the last consumed state for checkpoints and
+        prefetching the next batch.
+        Prepare each next batch without inspecting loss tensors on the host.
+        Validate the accumulated loss once after the complete loop; non-finite
+        loss aborts before the optimizer step. Failure diagnostics describe
+        the last consumed batch, not the first non-finite microbatch.
+
+        step_metrics keys are loss (detached accumulated tensor), tokens (global
+        count), step_time (local seconds), lrm, muon_momentum, and weight_decay. Timing
+        covers accumulation, prefetch, scheduling, and the optimizer step;
+        reduction across ranks happens in update_metrics().
+        """
+        communication = getattr(self.optimizer, "communication", None)
+        if communication is not None and communication.mode == "backward":
+            if self.scaler is not None or getattr(self.config, "cuda_graph_mode", "disabled") not in (None, False, "disabled", "none"):
+                raise ValueError("Backward communication requires unscaled gradients and disabled CUDA capture")
+        step = self.state.step
+        n_acc_steps = self.config.n_acc_steps
+        world_size = self.config.comp_info.world_size
+        payload, dataloader_state, token_count = batch
+        loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
+
+        eff_global_tokens = 0
+
+        self.synchronize()
+        step_start_time = time.perf_counter()
+
+        for acc_step in range(n_acc_steps):
+            eff_global_tokens += token_count * world_size
+
+            self.state.train_loader_state = dataloader_state
+            if self._forward_backward_graph is not None:
+                loss = self._forward_backward_graph.replay(payload)
+            else:
+                with self.train_context():
+                    loss = self.compute_loss(payload)
+                loss = loss / n_acc_steps
+
+                if hasattr(self.optimizer, "begin_backward_communication"):
+                    self.optimizer.begin_backward_communication(acc_step == n_acc_steps - 1)
+
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            loss_accum.add_(loss.detach().float())
+
+            last_consumed_dataloader_metadata = (
+                dataloader_state.model_dump() if dataloader_state is not None else None
+            )
+            payload, dataloader_state, token_count = self.prepare_batch(next(train_iter))
+
+        if not torch.isfinite(loss_accum):
+            log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
+                f"Accumulated loss is non-finite at optimizer {step=}.\n" \
+                f"Last consumed dataloader state: {last_consumed_dataloader_metadata}.\n" \
+                "Exact consumed-batch tensors were not captured; loader buffers may have been reused.\n" \
+                f"Accumulated loss: {loss_accum}",
+                error_type=ValueError, logger=logger
+            )
+
+        if dataloader_state is not None:
+            self.state.n_epochs = dataloader_state.epoch
+
+        lrm, muon_momentum, weight_decay = self._apply_optim_hparam_scheduler(step)
+
+        self.optimizer_step(should_log_step)
+
+        self.synchronize()
+        step_end_time = time.perf_counter()
+        return (payload, dataloader_state, token_count), {
+            "loss": loss_accum,
+            "tokens": eff_global_tokens,
+            "step_time": step_end_time - step_start_time,
+            "lrm": lrm,
+            "muon_momentum": muon_momentum,
+            "weight_decay": weight_decay,
+        }
+
+    def optimizer_step(self, should_log_step: bool):
+        """Apply accumulated gradients, update the scaler, and clear gradients.
+
+        Override this method to customize the optimizer step. Hyperparameter
+        scheduling stays in train_step(); monitoring uses unscaled gradients.
+        """
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+            if self.config.comp_info.is_distributed:
+                for g in self.scaler._found_inf_per_device(self.optimizer).values():
+                    dist.all_reduce(g, op=dist.ReduceOp.MAX)
+
+        if self.config.monitor_grad_norms and should_log_step:
+            if hasattr(self.optimizer, "finish_gradient_communication"):
+                self.optimizer.finish_gradient_communication()
+            self.log_gradients()
+
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+
+        self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
+
+    def evaluate_bpb(self):
+        """Run BPB validation, log metrics, and update the best checkpoint.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        step = self.state.completed_steps
+        start_bpb_eval = time.time()
+        self.compiled_model.eval()
+        tokens_per_eval_step = (
+            self.config.device_batch_size
+            * self.model.config.max_context
+            * self.config.comp_info.world_size
+        )
+        eval_steps = max(
+            1,
+            math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
+        )
+        with self.val_context(self.compiled_model):
+            val_res = compute_bpb(
+                self.compiled_model,
+                self.val_loader(),
+                eval_steps,
+                comp_info=self.config.comp_info,
+                token_bytes=self.tokenizer.token_bytes
+            )
+        print0(f"Step {step:05d} | "\
+               f"Validation bpb: {val_res['bpb']:.6f} | "\
+            f"Validation loss: {val_res['loss']:.6f}")
+
+        dt_bpb_eval = time.time() - start_bpb_eval
+
+        if (
+            (self.ckpt_state.best_eval_value is None) or
+            (val_res['bpb'] < self.ckpt_state.best_eval_value)
+        ):
+            self.ckpt_state.best_eval_value = val_res['bpb']
+            self.ckpt_state.best_eval_step = self.state.step
+            self.ckpt_state.best_eval_completed_steps = step
+            if self.config.save_on_best:
+                self.save_checkpoint()
+
+        board_dict = {
+            "eval/loss": val_res['loss'],
+            "eval/bpb": val_res['bpb'],
+            "eval/best_bpb": self.ckpt_state.best_eval_value,
+            "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
+        }
+        self.board.log(board_dict, step=step)
+        self.eval_metrics.append(board_dict, step=step)
+        self.compiled_model.train()
+
+    def evaluate_core(self):
+        """Run CORE evaluation, log metrics, and track the best score.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        step = self.state.completed_steps
+        n_steps = self.config.n_steps
+        self.model.eval()
+        with self.val_context(self.model):
+            results = evaluate_core(
+                self.model,
+                self.tokenizer,
+                self.device,
+                max_per_task=self.config.n_core_tokens,
+            )
+        max_throughput = results.get("core/max_per_task", 0) * self.config.comp_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
+        print0(f"Step {step:05d}/{n_steps:05d} | "
+               f"CORE: {results['core/core']:.4f} | "
+               f"Accuracy: {results['core/accuracy']:.4f} | "
+               f"Max per task: {int(results['core/max_per_task'])} | "
+               f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
+               f"Max throughput: {max_throughput:,.0f} tok/s")
+        board_dict = {
+            "core/core": results["core/core"],
+            "core/accuracy": results["core/accuracy"],
+            "core/max_per_task": results["core/max_per_task"],
+            "core/step_time_ms": results.get("core/step_time_ms", 0),
+        }
+        for task_label, task_results in results.get("all_core_results", {}).items():
+            for task_metric, task_value in task_results.items():
+                board_dict[f"core/{task_label}/{task_metric}"] = task_value
+        if (
+            (self.ckpt_state.best_core_value is None) or
+            (results["core/core"] > self.ckpt_state.best_core_value)
+        ):
+            self.ckpt_state.best_core_value = results["core/core"]
+            self.ckpt_state.best_core_step = self.state.step
+            self.ckpt_state.best_core_completed_steps = step
+            if self.config.save_on_best:
+                self.save_checkpoint()
+        self.board.log(board_dict, step=step)
+        self.core_metrics.append(results, step=step)
+        self.model.train()
+
+    def evaluate_samples(self):
+        """Generate samples using the original model to avoid recompilation.
+
+        Override this method to customize evaluation. Scheduling stays in train().
+        """
+        self.model.eval()
+        prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+            "My favorite color is",
+            "If 5*x + 3 = 13, then x is",
+        ]
+        engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
+        with self.val_context(self.model):
+            samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
+        # print0(self.tokenizer.decode(samples[0]))
+        self.model.train()
+
+    def prepare_batch(self, raw_batch) -> tuple[Any, Optional[DataLoaderState], int]:
+        """Return (payload, optional loader state, local token count).
+
+        The default accepts (x, y, state) or (x, y), returning (x, y) as the
+        payload and x.numel() as the token count. Override alongside compute_loss
+        for other dataloader formats. The payload passes to compute_loss unchanged.
+
+        State must be a DataLoaderState or None.
+        Without state, checkpoints cannot restore the dataloader position.
+        Token counts are per rank and microbatch, before gradient accumulation.
+        """
+        if not isinstance(raw_batch, (tuple, list)) or len(raw_batch) not in (2, 3):
+            raise ValueError("Expected (x, y) or (x, y, state); override prepare_batch for other formats.")
+        x, y = raw_batch[:2]
+        state = raw_batch[2] if len(raw_batch) == 3 else None
+        if state is not None and not isinstance(state, DataLoaderState):
+            raise TypeError("Loader state must be a DataLoaderState or None.")
+        return (x, y), state, x.numel()
+
+    def compute_loss(self, payload: Any) -> torch.Tensor:
+        """Return a scalar loss connected to the computation graph.
+
+        Override this method to use a different training objective. The training
+        step supplies autocast, gradient accumulation scaling, and backward.
+        The payload comes from prepare_batch. By default, unpack (x, y) and use
+        the compiled scalar-loss entry point when available.
+        Otherwise use the model's loss or compute cross-entropy from logits.
+        """
+        x, y = payload
+        if self.compiled_training_loss is not None:
+            return self.compiled_training_loss(x, y)
+        output = self.compiled_model(x, y)
         if hasattr(output, "loss"):
             return output.loss
         else:
@@ -637,10 +906,14 @@ class Trainer:
         Args:
             tag: Identifier for this checkpoint (e.g., "latest", "best", "step_1000")
         """
-        if not self.config.dist_info.get("RANK", 0) == 0:
-            return # Only master process saves checkpoints
-        
-        self.ckpt_manager.save(step=self.state.step, model=self.model, optimizer=self.optimizer, scaler=self.scaler, trainer_state=self.state)
+        self.ckpt_manager.save(
+            step=self.state.step,
+            model=self.model,
+            optimizer=self.optimizer,
+            scaler=self.scaler,
+            trainer_state=self.state,
+            checkpoint_state=self.ckpt_state,
+        )
 
     @classmethod
     def from_checkpoint(
@@ -650,18 +923,21 @@ class Trainer:
         step: Union[int, str] = "latest",
         cache_dir: Optional[Union[str, Path]] = None,
         board: Optional[Board] = None,
-        dist_info: Optional[Dict] = None,
+        comp_info: Optional[ComputeContext] = None,
     ):
+        comp_info = comp_info or get_comp_info()
         ckpt_manager = CheckpointManager(
             model_name=model_name,
             model_run=model_run,
             source="base", # TODO: make this dynamic based on training type
-            dist_info=dist_info or get_dist_info(),
-            mode="shard", # TODO: make this dynamic based on how checkpoints were saved
-            cache_dir=cache_dir,
+            comp_info=comp_info,
+            optimizer_state_layout="sharded" if comp_info.is_distributed else "full",
+            model_cachedir=cache_dir,
         )
         model, tokenizer, ckpt_data, trainer_config = ckpt_manager.load(step=step, phase="train")
         opt = model.build_optimizer(trainer_config)
+        if ckpt_data.optimizer_state is not None:
+            opt.load_state_dict(ckpt_data.optimizer_state)
 
         trainer = cls(
             model=model,
@@ -675,9 +951,17 @@ class Trainer:
             muon_momentum_schedule=None, 
             weight_decay_schedule=None,
             resume_state=ckpt_data.trainer_state,
+            best_state=ckpt_data.checkpoint_state,
             checkpoint_manager=ckpt_manager,
         )
-        log0(f"Resumed trainer from checkpoint at step {trainer.state.step} with best eval bpb {trainer.ckpt_state.best_eval_value:.6f} at step {trainer.ckpt_state.best_eval_step}.", logger=logger)
+        if ckpt_data.scaler_state is not None:
+            if trainer.scaler is None:
+                raise ValueError(
+                    "Checkpoint contains GradScaler state but the resumed "
+                    "trainer did not create a scaler."
+                )
+            trainer.scaler.load_state_dict(ckpt_data.scaler_state)
+        log0(f"Resumed trainer from checkpoint at step {trainer.state.step} with best eval bpb {trainer.ckpt_state.best_eval_value} at step {trainer.ckpt_state.best_eval_step}.", logger=logger)
         log0(f"Trainer instance created has no 'train_loader' or 'val_loader'. Please set these manually before calling 'trainer.train()'. Maybe consider using 'trainer.state.dataloader_state'", level="warning", logger=logger)
 
         return trainer

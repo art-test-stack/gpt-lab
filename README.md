@@ -63,6 +63,16 @@
 
 ## About The Project
 
+<div align="center">
+  <img
+    src="assets/a100x4_d12_ic1.svg"
+    width="600"
+    alt="d12 model training on 4 A100 GPUs"
+  />
+  <p><em>422M-parameter model (depth 12) training loss on 4 A100 GPUs.</em></p>
+</div>
+
+
 ### Purpose
 
 This project is primarily educational*. It implements transformer-based language models from scratch to expose and understand their core mechanisms.
@@ -144,7 +154,18 @@ I recommend to check out the corresponding [deepwiki](https://deepwiki.com/art-t
 
 ### Scripts
 
-The library includes some scripts for training, evaluation, and inference. They are located in the `scripts/` folder. The main ones are the following:
+The installed `gpt-lab` command groups tokenizer training, base training/resume,
+data preparation, cache management, and chat. Start with `gpt-lab --help`
+(or `uv run gpt-lab --help`).
+See the [CLI docstring](src/gpt_lab/cli/main.py) for commands, defaults, distributed launch,
+checkpoint resume, and extension points. Existing `scripts/` entry points remain
+compatibility wrappers.
+Standalone dataloader benchmarks and tokenizer scaling live in
+[experiments/](experiments/README.md).
+
+For a lightweight recap of runs, curves, evaluation results, and configurations,
+see the [results dashboard guide](docs/results_dashboard.md). The viewer in
+[`spaces/results/`](spaces/results/) can be deployed as a static Hugging Face Space.
 
 ### Data
 
@@ -217,7 +238,9 @@ The critical point regarding model training, is that we must make sure to have a
 
 The library provides a minimalistic automatic configuration system that computes optimal model architecture, tokenizer settings, and training hyperparameters using scaling laws.
 
-The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used in [`scripts/train_base.py`](./scripts/train_base.py) via the --auto flag.
+Subclass `AutoGPTConfig` to override individual scaling rules; see its [class docstring](./src/gpt_lab/model/auto.py) for the methods and an example.
+
+The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used by `gpt-lab train`; [`scripts/train_base.py`](./scripts/train_base.py) delegates to the same command.
 
 It automatically determines:
 - model depth scaling
@@ -242,6 +265,22 @@ meta_config = cfg.generate_gpt_config(device="cuda")
 > Setting `vocab_size = -1` enables automatic scaling-law vocabulary selection. \
 > Setting `training_time`, `n_steps`, `target_flops`, or `target_param_data_ratio` controls training horizon priority. \
 > The system automatically builds a reference model (12-layer baseline) to normalize scaling-law computations.
+
+`--num-steps` sets the complete scheduling horizon. To stop execution earlier
+without shortening LR, momentum, or weight-decay schedules, use
+`--num-steps 2317 --stop-after-step 945`. The cap counts completed optimizer
+steps since training began, including steps before a resume. It defaults
+to unset; resume retains a saved cap unless explicitly overridden. A capped
+run uses normal final checkpointing. See [the PR35 comparison](docs/pr35-execution-cap.md)
+for the pinned Modal adapter and verification results.
+
+Training raw loss and its smoothed value use the mean across ranks (equal
+token counts per rank). The default momentum schedule keeps each optimizer
+group's configured momentum fixed, independently of LR warmup and warmdown;
+an explicit `Trainer(muon_momentum_schedule=...)` still overrides the multiplier.
+This corrects the previous LR-shaped momentum multiplier and changes resumed
+training trajectories under the default schedule. Checkpoint formats are unchanged.
+Old checkpoints' loss EMA retains its previous rank-local history until it decays.
 
 Next sections detail the different generated components.
 
@@ -325,7 +364,7 @@ Expects the directory structure:
 <TOKENIZERS_FOLDER>/my_tokenizer/
 ├── tokenizer_config.json       # includes SHA-256 fingerprint
 ├── mergeable_ranks.msgpack
-└── token_bytes.pt
+└── token_bytes.safetensors
 ```
 
 #### Automatic tokenizer resolution
@@ -367,12 +406,12 @@ Training time benchmarks for different implementations and configurations. All t
 
 #### Scaling laws for tokenizer training
 
-In [docs/tokenizer_scaling.md](./docs/tokenizer_scaling.md), we analyze how ByteLevel BPE tokenization scales with different corpus sizes, vocabulary sizes, and split patterns. The goal is to understand the trade-offs between these factors and their impact on tokenization quality and efficiency.
+The tokenizer scaling experiment compares ByteLevel BPE tokenizers across corpus sizes, vocabulary sizes, and split patterns to explore their impact on tokenization quality and efficiency.
 
 To experiment yourself tokenizer scaling, you can run the following command from the root directory of the repo:
 
 ```bash
-uv run python -m scripts.benchmark.tokenizer_corpus_size \
+uv run --extra cpu python -m experiments.tokenizer_scaling \
     --seed 42 \
     --num-procs 16 \
     --vocab-sizes 20000,50000,100000 \
@@ -381,10 +420,10 @@ uv run python -m scripts.benchmark.tokenizer_corpus_size \
     --corpus-sizes-gb 10,50,100,500,1000,5000,10000 
 ```
 
-More details on the arguments are given in [tokenizer_corpus_size.py](./scripts/benchmark/tokenizer_corpus_size.py) or using `--help`:
+More details are in the [experiment guide](experiments/README.md) or `--help`:
 
 ```bash
-uv run python -m scripts.benchmark.tokenizer_corpus_size --help
+uv run --extra cpu python -m experiments.tokenizer_scaling --help
 ```
 
 ### Model architecture
@@ -414,8 +453,6 @@ model = DenseTransformer(cfg)
 
 The optimizer system uses a **registry-based, strategy-pattern architecture** that decouples optimizer logic from execution mode (single-GPU vs. distributed). Optimizers are built and configured by calling `DenseTransformer.build_optimizer` in the `Trainer` class (available in [`gpt_lab.train.trainer`](./src/gpt_lab/train/trainer.py)) using the optimizer configuration from [`configs/optim.yaml`](./configs/optim.yaml), which can specify mixed optimizer groups.
 
-> [!WARNING]
-> This is maybe the most critical part of the library, regarding model training, and it is also the part that I have less implemented myself. I used a lot of external repositories for code baseline, and used LLMs back and fourth to enhance it. My goal was to make it work, while being more modular. However, my comprehension of optimization algorithms, coupled with `torch.compile` and distributed training is quite limited. So, I encourage you to check the code in [`gpt_lab.optim.factory`](./src/gpt_lab/optim/factory.py) and the corresponding subfolders for the different optimizers.
 
 #### Optimizer Architecture
 
@@ -427,6 +464,29 @@ The system is organized around three key components:
 - **Factory** ([`gpt_lab.optim.factory`](./src/gpt_lab/optim/factory.py)): Single entry point that automatically selects single-GPU or distributed backend and delegates to the appropriate strategies.
 
 #### Configuration Example
+
+`opt: muon` retains the existing variant: Polar Express orthogonalization,
+shape-dependent factored normalization, and cautious weight decay.
+`opt: normuon` follows the [official NorMuon reference update](https://github.com/zichongli5/NorMuon/blob/main/normuon.py):
+BF16 fixed-coefficient Newton–Schulz iterations, row-wise second-moment
+normalization, and standard decoupled weight decay. Both use the existing
+whole-matrix optimizer sharding and require same-shaped 2D parameters per group.
+The configuration key `beta` is NorMuon's `beta2`; `momentum` is its first-moment
+coefficient. The existing Muon momentum schedule also applies to NorMuon.
+NorMuon uses a compiled update kernel; fusion may change intermediate BF16
+rounding relative to the eager reference implementation.
+
+Use `--optim-config-path configs/normuon.yaml` for a NorMuon override profile.
+Explicit preserved Muon/NorMuon/spectral-only ANVIL experiment profiles are in
+[optimizer comparison](experiments/optimizer_comparison/README.md).
+Its hyperparameters are starting values, not calibrated replacements for the
+current Muon profile. Existing defaults and Muon checkpoints retain their behavior.
+Choose NorMuon for a fresh run; changing a saved group's optimizer name is not a
+checkpoint conversion because normalization state layouts can differ.
+
+The isolated [communication experiment](experiments/communication_buckets/README.md) compares
+the original transport, fixed buckets, a packing pipeline, and backward hooks.
+It preserves NCCL checks and measured negative results; baseline communication remains recommended.
 
 ```yaml
 default:
@@ -466,7 +526,7 @@ optimizer = OptimizerFactory(param_groups)
 
 The factory automatically:
 - Validates all required keys for each optimizer at construction (fails fast on config errors)
-- Detects DDP mode and selects single-GPU or distributed backend
+- Selects local or distributed optimizer execution
 - Manages a reusable scalar cache for torch.compile stability
 - Routes parameter groups to the correct strategy at each step
 
@@ -480,7 +540,7 @@ To add a new optimizer (e.g., Aurora), you only need to edit **one place**:
    
    class AuroraStrategy(OptimizerStrategy):
        def local_step(self, group: dict) -> None:
-           # Single-GPU update logic
+           # Single-GPU step logic
            pass
        
        def dist_reduce(self, group: dict, world_size: int) -> dict:
@@ -525,10 +585,191 @@ Both support single-GPU and multi-GPU distributed training with async communicat
 
 #### Pre training
 
-The pre-training script is located in `scripts/train_base.py`. It allows you to pre-train a GPT model from scratch on a defined corpus, using different configurations (model architecture, training hyperparameters, optimizer, etc.). You can also choose to write the corpus from sources (e.g., Wikipedia, OpenWebText) or load an existing corpus.
+Use `gpt-lab train` to train from scratch on prepared local Parquet shards, or `gpt-lab train resume` to restore a saved run. Training automatically configures the model and training parameters from depth and scaling laws; `--train-tokenizer` trains a new tokenizer. The existing `scripts/train_base.py` entry point remains a compatibility wrapper.
 
-> [!WARNING]
-> There are two sub-arguments for this script `auto` and `custom`. For now, only `auto` is implemented, which allows you to automatically load a configuration based on main (`depth`, `aspect_ratio`, `n_heads`, etc.) arguments and compute optimal training parameters, as optimal `vocab_size` if not provided. The script can then train a new tokenizer with `--train-tokenizer` flag. The `custom` argument is intended to allow you to directly pass the configuration as command-line arguments, without the need for a YAML file. This feature is under development and will be implemented in the future.
+Explicit batch, vocabulary, and horizon options override automatic values. Optimizer base values come from YAML and are scaled once; use `--optim-config-path` to override them through a file. Resume restores the saved architecture and rejects architecture options.
+
+The same workflow accepts Python keyword arguments:
+
+```python
+from gpt_lab.utils.schemas import OptimizerConfig
+from gpt_lab.workflows.train_base import train_base
+
+optim_config = OptimizerConfig.from_file("configs/optim.yaml")
+train_base(depth=12, total_batch_size=524288, optim_config=optim_config)
+```
+
+```bash
+# Single-device training
+uv run gpt-lab train --model-name ic1 --run-name baseline --depth 12
+
+# Eight GPUs on one node
+uv run torchrun --standalone --nproc-per-node=8 --no-python \
+  gpt-lab train --model-name ic1 --run-name baseline --depth 12
+```
+
+Distributed utilities return a frozen `ComputeContext` through the
+`init_dist_groups()` and `get_comp_info()` functions. Pass it as `comp_info` and
+use attributes such as `.rank`, `.world_size`, `.device`, and `.compute_dtype`.
+For CPU runs, `.device_type` and `.device_name` both return `"cpu"`;
+`.gpu_peak_flops` remains unknown (`float("inf")`).
+Distributed runs use a one-dimensional PyTorch `DeviceMesh` named `"dp"`, exposed
+as `.dp_mesh`; single-device runs have no mesh or process group. CPU runs use
+Gloo and CUDA runs use NCCL. Distributed AdamW and Muon wait on async `Work`
+handles; Gloo gradients use SUM followed by averaging, while NCCL retains AVG.
+Trainer configs exclude this runtime object when saved; loading a checkpoint
+attaches the current launch context, including for older dictionary metadata.
+Sharded optimizer resumes still require the original world size.
+Checkpoint APIs use `optimizer_state_layout="full"` or `"sharded"`, independently
+of local or distributed optimizer execution. The current distributed optimizer
+shards its state, so its checkpoints use `"sharded"`; local runs use `"full"`.
+Readers accept legacy `mode="ddp"` / `"shard"` metadata. One-worker sharded
+checkpoints contain full optimizer state and can resume locally: loaders read
+the rank-0 files, while subsequent local checkpoints use `"full"`.
+
+`--no-python` tells torchrun to execute the installed `gpt-lab` command directly.
+With an activated environment, omit `uv run`. See the [CLI docstring](src/gpt_lab/cli/main.py)
+for module-mode launches and checkpoint selection.
+
+#### Explicit CUDA capture (experimental)
+
+`--cuda-graph-mode forward_backward` opts into fixed-shape forward/backward
+capture around compiled kernels. `disabled` preserves existing compiled execution.
+The captured path disables compiler-managed CUDA graphs to avoid nested capture.
+It requires CUDA, FP32 or BF16, the default `compute_loss`, and a fixed pair of
+input/label tensors. FP16/scaler and FP8 capture are currently rejected.
+
+One graph replay consumes one microbatch. Inputs and gradients use persistent
+storage; gradient accumulation, dataloader work, finite-loss checks, scheduler,
+optimizer and communication remain outside capture. Gradients are cleared in
+place after the update. Warmup restores parameters, model buffers, gradients and
+CPU/CUDA RNG state. Python forward side effects and changing parameter usage
+are unsupported. Evaluation uses the uncaptured evaluation path; resuming
+rebuilds the graph over restored state. Omit the mode to retain a saved mode on
+resume, or explicitly pass `disabled` when resuming without capture.
+
+`train/capture_startup_seconds` reports compilation/warmup/capture separately
+from step timing. Small-model real-CUDA equivalence checks passed on eight A100
+SXM4 GPUs. See the [experiment README](docs/cuda-graphs/README.md) for measured
+results and limits. Optimizer-update and communication capture are pending.
+
+The standalone [`scripts/modal_cuda_graphs.py`](scripts/modal_cuda_graphs.py)
+launcher follows the existing local `runs/modal_trainbase.py`. It requires a
+clean branch whose HEAD matches its live origin tip, Modal 1.6.2 authentication,
+the `gpt-lab` secret (`HF_TOKEN`, `WANDB_API_KEY`), and existing `gpt-lab-cache`
+and `gpt-lab-runs` volumes. It clones the exact selected SHA; it never uploads
+local source or starts a GPU for `--dry-run`.
+
+Every GPU job first runs the small real-CUDA equivalence check in
+[`scripts/benchmark/cuda_graph_equivalence.py`](scripts/benchmark/cuda_graph_equivalence.py).
+It uses a two-layer production transformer, the explicitly selected optimizer
+profile, and six updates with changing production LR/momentum/decay schedules.
+Both paths use compiled kernels with compiler-managed graphs disabled. It
+compares accumulated loss, pre-update accumulated gradients, parameters, and
+all optimizer state after each update. It also checks in-place gradient clearing,
+fixed gradient addresses, warmup restoration of model/buffers/optimizer/RNG,
+and replicated parameters across ranks. Distributed checks use the actual NCCL
+reduce/scatter/gather backend outside capture. Checks collect every rank's
+result before allowing timing. A skipped or failed check cannot authorize a run.
+
+The small check uses batch 2 and sequence 16, with the requested run's accumulation
+count. If the timed run uses one microstep, the gate checks both one and two
+microsteps from matching seeded states. Floating-point comparisons use rtol/atol
+`1e-3/1e-6` for BF16 and `1e-5/1e-6` for FP32; Python counters and state keys
+must match exactly. It saves observed maximum absolute errors and all failures.
+These tolerances are explicit acceptance criteria; the experiment README records
+the completed user-launched CUDA checks. No optimizer or communication capture
+is added.
+
+Run these commands from the `exp/cuda-graphs` worktree after pushing. They
+allocate paid GPUs only when the user executes them. First run the small check:
+
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 1 --mode verify --require-sxm --run-name cg-check-1-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy
+```
+
+The optional matched eight-GPU comparison verifies distributed equivalence again
+on its own allocation before either timed run. The eight-GPU preflight enforces
+microbatch 16 or 32, sequence 2048, global batch 524288,
+horizon 2317, warmup 300 and cap 150. Microbatch 16 uses two accumulation
+microsteps; microbatch 32 uses one. Both modes retain BF16, seed 42, depth 12,
+width 768, fused attention, and the same explicit optimizer profile. Evaluation,
+generation and all model/optimizer checkpoint saves are disabled.
+
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 8 --mode paired --require-sxm --run-name cg-8-matched-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy --n-acc-steps 2
+```
+
+For device batch 32, use `--device-batch-size 32 --n-acc-steps 1` after the
+`--` separator in both the paired timing and separate profile commands. Use
+distinct run names such as `cg-8-b32-matched-v1` and `cg-8-b32-profile-v1`.
+The global batch and scheduler remain unchanged.
+
+Paired runs execute sequentially within one GPU worker, keeping the allocation
+and topology fixed. Each mode reconstructs initial state in a fresh process from
+the same seed and restarts the deterministic dataloader at its initial position.
+Before capture starts, the second process must match the first process's model,
+optimizer, RNG, first-input hashes and initial data position. Final data positions
+and execution settings must also match before a paired comparison is accepted.
+This is a verified fresh-process reset, not a continuation from the first run.
+Each timed process has a fresh compiler cache. Compiler build threads are fixed
+to one per rank to bound concurrent compilation on eight ranks.
+
+Collect the separate short profile with the same model/data settings:
+
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.2 python scripts/modal_cuda_graphs.py \
+  --gpus 8 --mode paired --profile --require-sxm --run-name cg-8-profile-v1 \
+  -- --optim-config-path configs/normuon.yaml --board dummy --n-acc-steps 2
+```
+
+Profile jobs preserve the 2317/300 scheduler and use a separate 14-update
+execution cap. PyTorch CPU/CUDA profiling waits ten updates, warms up one, then
+records three. Open `trace_rank_N.json` in Perfetto or a Chrome trace viewer to
+inspect host gaps, CUDA launches and kernel activities. `kernels_rank_N.txt`
+contains the top 40 entries by self device time. Regions label batch preparation,
+accumulated updates and optimizer/communication. Profiling overhead is excluded
+from all throughput comparisons by using separate jobs and profile-only summaries.
+
+The runs volume stores `/runs/<run-name>/comparison.json`, `equivalence.log`,
+per-rank equivalence JSON, `gpus.csv` (all GPU names/UUIDs/bus IDs/memory/driver),
+and `topology.txt` (`nvidia-smi topo -m`).
+The status of each hardware query is recorded in `hardware_metadata.json`
+and the root comparison, with stdout/stderr saved separately. If an NVML query
+fails, execution continues with explicitly partial hardware metadata and attempts
+`cuda_connectivity.json` for GPU names/memory and CUDA peer-access capability.
+This fallback does not identify physical NVLink/PCIe links or their bandwidth.
+GPU validation and the all-rank equivalence gate remain mandatory before timing.
+Execution-mode directories `disabled/`
+and `forward_backward/` contain launch settings, logs, per-rank metrics and
+`summary.json`. Timed summaries report global tokens/s over updates 11–150,
+per-rank startup/steady peak allocated and reserved memory, trainer elapsed time
+including capture setup, and complete subprocess elapsed time including model
+initialization, compilation, data setup and shutdown. The root comparison also
+reports equivalence time and total worker elapsed time. Modal image build and
+provisioning remain outside worker timers and appear in Modal logs.
+
+Use new run names for retries. `--require-sxm` rejects allocations other than
+`NVIDIA A100-SXM4-80GB` before checking/training; it cannot force Modal placement.
+`--mode disabled` and `--mode forward_backward` remain available for individual
+runs, and `--gpus` accepts 1, 4 or 8. `--mode verify` needs no cached dataset.
+`--detach` submits one worker in the background. These diagnostics do not measure
+convergence quality; timing and profile claims await real user-launched results.
+
+#### Customizing the trainer
+
+Subclass [`Trainer`](src/gpt_lab/train/trainer.py) and override `train_step` for a
+complete optimizer step, or `prepare_batch`, `compute_loss`, and `optimizer_step` for
+smaller changes. `update_metrics` updates per-step state; `log_metrics` handles
+reporting. Override `evaluate_bpb`, `evaluate_core`, and `evaluate_samples`
+independently; the main loop schedules evaluations. Use `self.compiled_model`
+for training forwards.
+See the class docstring for contracts and
+[`DistillationTrainer`](src/gpt_lab/train/distillation.py) for an example.
 
 <!-- Main arguments: 
 Argument | Description
@@ -606,23 +847,26 @@ The framework provides a simple checkpointing system that is integrated with the
 ```
 <CACHE_DIR>/
 └── models/
-    └── <model_name>/                          # e.g., "ic1", "gpt2-small", "llama2"
+    └── <model_name>/                               # e.g., "ic1", "gpt2-small", "llama2"
         └── <run_name>/
-            ├── meta.pskl                      # immutable (model, tokenizer, git)
-            └── <source>/                      # base / sft / rl
-                ├── training_config.pkl        # per-phase config
-                ├── checkpoint_state.pkl       # best bpb/core steps and values
+            ├── meta.pskl                           # immutable (model, tokenizer, git)
+            └── <source>/                           # base / sft / rl
+                ├── training_config.safetensors     # per-phase config
+                ├── checkpoint_state.safetensors    # best bpb/core steps and values
                 ├── checkpoint_step_000000/
-                │   ├── model.pt
-                │   ├── optim_rank0.pt         # optimizer state dict (optim_rank{rank}.pt if sharded, otherwise optim.pt)
-                │   ├── optim_rank1.pt
-                │   ├── ...                    # more optimizer shards if needed
-                │   ├── trainer_state.pkl      # training state, rng state, data state, best bpb/core steps
+                │   ├── model.safetensors
+                │   ├── optim_rank0.safetensors     # optimizer state (otherwise optim.safetensors)
+                │   ├── optim_rank1.safetensors
+                │   ├── ...                         # more optimizer shards if needed
+                │   ├── trainer_state_rank0.json
+                │   ├── rng_state_rank0.safetensors
                 │   └── metrics.pkl
                 ├── checkpoint_step_000100/
                 │   └── ...
                 └── ...
 ```
+
+Model, optimizer, RNG, scaler, and trainer configuration files use safetensors. Nested state is described by JSON metadata inside each file; model weights keep their original state-dict keys. Tokenizer tensor caches and diagnostic batches also use safetensors. On first load, legacy `.pt`, `.pth`, and checkpoint `.pkl` files are converted to safetensors beside the originals, then loaded through the new format. Conversion requires a writable directory; originals are retained, and existing safetensors files take precedence.
 
 ### Board 
 
@@ -632,19 +876,20 @@ Vizualize the training progress in the board of your choice (Tensorboard, Weight
 
 ### Chat with the model
 
-In this section, you will find instructions to run the chat interface with different models.
+Use a saved local checkpoint in the console:
 
-Under development environment (`DEVELOPMENT='1'` in `.env`), you can run the chat interface with auto-reloading, use the following command:
 ```sh
-uv run gradio scripts/chat_app.py --demo-name=app
+uv run gpt-lab chat console --model-name ic1 --run-name baseline
 ```
 
-Otherwise, if you don't want auto-reloading, use:
+The existing experimental web interface is available through:
+
 ```sh
-uv run python -m scripts.chat_app
+uv run gpt-lab chat app
 ```
 
-Then, open your browser and go to [`http://127.0.0.1:7860/`](http://127.0.0.1:7860/). It is quite straightforward to use. You can select different models (local or remote), choose some hyperparameters for inference, and chat with the model.
+See the [CLI docstring](src/gpt_lab/cli/main.py) for UI dependency requirements,
+remote-completion configuration, and the existing Gradio compatibility limitation.
 
 ## Development Notes
 
@@ -771,7 +1016,7 @@ Here a non-exhaustive list of features that I aim to implement. Stars correspond
 <!-- LICENSE -->
 ## License
 
-Distributed under the MIT License. See `LICENSE.txt` for more information.
+GPT-Lab's original code is distributed under the [MIT License](LICENSE). Third-party components remain under their original licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
 
 <!-- CONTACT -->
 ## Contact

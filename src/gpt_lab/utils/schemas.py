@@ -2,11 +2,12 @@ import math
 import json
 import torch
 
-from pydantic import BaseModel, Field, ConfigDict, PrivateAttr
-from typing import Any, Dict, List, Literal, Optional, Union
+from pydantic import BaseModel, Field, ConfigDict, PrivateAttr, field_validator, BeforeValidator
+from typing import Any, Dict, List, Literal, Optional, Union, Annotated
 from pathlib import Path
 import os, time
 import json, pickle
+from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.common import print0
 from gpt_lab.utils.logging import log0, log_all
 from gpt_lab.utils.default import (
@@ -39,7 +40,6 @@ from gpt_lab.utils.types import (
     TpModes,
 )
 from gpt_lab.utils.special_tokens import SpecialTokens
-from gpt_lab.utils.import_utils import is_flash_attn3_available_from_kernel
 import logging
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ class TokenizerConfig(BaseModel):
     name: str = "ic1_tok"
     dirname: Union[str, Path] = TOKENIZERS_FOLDER
     vocab_size: int = VOCAB_SIZE
-    pat_str: str = "gpt4"
+    pat_str: Optional[str] = "gpt4"
     special_tokens: Optional[SpecialTokens] = Field(default_factory=SpecialTokens)
     source: TokenizerSources = "tiktoken"
 
@@ -119,7 +119,14 @@ class TokenizerConfig(BaseModel):
     trainer: Optional[TokenizerTrainerConfig] = None
 
     def model_post_init(self, context: Any) -> None:
-        if self.pat_str in PAT_STR.keys():
+        if self.pat_str is None:
+            if self.source not in ("huggingface", "dummy"):
+                log0(
+                    f"Tokenizer source {self.source!r} has no split pattern.",
+                    level="warning",
+                    logger=logger,
+                )
+        elif self.pat_str in PAT_STR.keys():
             self.pat_str = PAT_STR.get(self.pat_str)  # Use predefined pattern if pat_str is a key in PAT_STR
         elif self.pat_str in PAT_STR.values():
             pass  # pat_str is already a valid pattern
@@ -137,16 +144,44 @@ class TokenizerConfig(BaseModel):
     def get_mergeable_ranks(self) -> dict:
         if not self.dirname.exists():
             raise FileNotFoundError(f"Tokenizer directory {self.dirname} does not exist.")
+
+        msgpack_path = self.dirname / "mergeable_ranks.msgpack"
         mergeable_ranks_path = self.dirname / "vocab.pkl"
-        if not mergeable_ranks_path.exists():
-            raise FileNotFoundError(f"Mergeable ranks file {mergeable_ranks_path} does not exist.")
-        with open(mergeable_ranks_path, "rb") as f:
-            mergeable_ranks = pickle.load(f)
-        logger.info(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
-        print0(f"Loaded mergeable ranks from {mergeable_ranks_path}. Size: {len(mergeable_ranks)}")
+
+        if msgpack_path.exists():
+            # Local import avoids making schemas depend on tokenizer modules at
+            # import time.
+            from gpt_lab.tokenizer.serialization import load_mergeable_ranks
+
+            mergeable_ranks = load_mergeable_ranks(msgpack_path)
+            loaded_path = msgpack_path
+        elif mergeable_ranks_path.exists():
+            with open(mergeable_ranks_path, "rb") as f:
+                mergeable_ranks = pickle.load(f)
+            loaded_path = mergeable_ranks_path
+        else:
+            raise FileNotFoundError(
+                f"No tokenizer vocabulary found in {self.dirname}; expected "
+                f"{msgpack_path.name} or {mergeable_ranks_path.name}."
+            )
+
+        logger.info(
+            "Loaded mergeable ranks from %s. Size: %d",
+            loaded_path,
+            len(mergeable_ranks),
+        )
+        print0(
+            f"Loaded mergeable ranks from {loaded_path}. "
+            f"Size: {len(mergeable_ranks)}"
+        )
         if self.vocab_size == -1:
             self.vocab_size = len(mergeable_ranks) + len(self.special_tokens)
-        assert len(mergeable_ranks) + len(self.special_tokens) == self.vocab_size , "Mergeable ranks size does not match vocab size."
+        if len(mergeable_ranks) + len(self.special_tokens) != self.vocab_size:
+            raise ValueError(
+                "Mergeable ranks size plus special-token count does not match "
+                f"vocab_size: {len(mergeable_ranks)} + "
+                f"{len(self.special_tokens)} != {self.vocab_size}."
+            )
         return mergeable_ranks
     
     @classmethod
@@ -180,7 +215,7 @@ class TokenizerConfig(BaseModel):
 class DatasetConfig(BaseModel):
     name: str
     hfkwargs: dict = Field(default_factory=dict)
-    output_dir: str = "dataset"
+    output_dir: str = "data"
     column_name: str = "text"
     postprocess: Optional[str] = None
     upload_name: Optional[str] = None
@@ -214,8 +249,37 @@ class DownloadConfig(BaseConfig):
     num_workers: int = 4
     max_shards: int = 1000
 
+def parse_embedding_groups(value: str) -> list[tuple[str, ...]]:
+    """Return shared groups; a standalone bare value_embs leaves values separate."""
+    groups = []
+    seen = set()
+    for part in value.split(";"):
+        if not part.strip():
+            continue
+        tokens = [token.strip() for token in part.split(",")]
+        names = [token.removesuffix(":") for token in tokens]
+        for token, name in zip(tokens, names):
+            if token not in ("embs", "head", "value_embs", "value_embs:"):
+                raise ValueError(f"Unknown embedding name {token!r}; use embs, head, value_embs or value_embs:")
+            if name in seen:
+                raise ValueError(f"Duplicate embedding name {name!r}")
+            seen.add(name)
+        if len(names) > 1 or tokens == ["value_embs:"]:
+            groups.append(tuple(names))
+    return groups
+
+
+def _normalize_act_func(value):
+    if value is None:
+        return "swiglu"
+    return "relu_squared" if value == "relu_squarred" else value
+
+
+FFNActivation = Annotated[Literal["swiglu", "relu_squared"], BeforeValidator(_normalize_act_func)]
+
+
 class TransformerConfig(BaseModel):
-    # model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True)
     tf_type: TfTypes = "dense"
 
     vocab_size: int = VOCAB_SIZE
@@ -233,7 +297,7 @@ class TransformerConfig(BaseModel):
     n_kv_heads: Optional[int] = None # GQA
     n_layers: int = NUM_LAYERS
     d_head: int = DIM_HEAD  # dim_model // num_heads
-    tie_word_embeddings: bool = True # TODO: implement it in model
+    tie_embeddings: str = "embs;value_embs;head"
 
     dropout: float = .0 # DROPOUT
     attention_dropout: Optional[float] = None
@@ -241,10 +305,10 @@ class TransformerConfig(BaseModel):
     norm_before_attn: bool = True
     normalization: NormalizationTypes = "rms"  # Options: "rms", "layer"
     norm_eps: float = 1e-5
-    act_func: str = "swiglu" # TODO: make it compatible with model.DenseTransformer implementation
+    act_func: FFNActivation = "relu_squared"
 
     # TODO: padged attention implementation
-    attn_impl: AttnImplTypes = "sdpa"  # Options: "sdpa", "flash_attention", "impl". Not recommended : "impl" if return_weights=False.
+    attn_impl: AttnImplTypes = "sdpa"  # Kernel: sdpa, fa2, fa3; fused is legacy-only.
     # TODO: # layer_types: Optional[List[TParams]] = None  # e.g., ["standard", "standard", "moe", ...] length must be n_layers
     use_gqa: bool = False
     
@@ -267,15 +331,24 @@ class TransformerConfig(BaseModel):
             log0(f"d_head ({self.d_head}) is not equal to d_model/n_heads ({self.d_model // self.n_heads}). "
                  "This may lead to unexpected behavior in attention mechanisms.", level="warning", logger=logger)
         
-        self.n_kv_heads = self.n_kv_heads or self.n_heads
+        object.__setattr__(self, "n_kv_heads", self.n_kv_heads or self.n_heads)
+        groups = parse_embedding_groups(self.tie_embeddings)
+        if any("value_embs" in group and len(group) > 1 for group in groups) and self.n_kv_heads * self.d_head != self.d_model:
+            raise ValueError(
+                "Tying value_embs to embs or head requires n_kv_heads * d_head == d_model; "
+                "value and input embedding widths must match"
+            )
         if self.n_kv_heads != self.n_heads:
-            self.use_gqa = True
-        if self.use_gqa and self.attn_impl == "fused" and is_flash_attn3_available_from_kernel():
+            object.__setattr__(self, "use_gqa", True)
+        if self.use_gqa and self.attn_impl == "fused":
             log0("Fused attention implementation does not support GQA. "
                  "Falling back to standard attention. ",
                     level="warning", logger=logger)
-            self.attn_impl = "sdpa"
-        self.attention_dropout = self.attention_dropout if self.attention_dropout is not None else self.dropout
+            object.__setattr__(self, "attn_impl", "sdpa")
+        object.__setattr__(
+            self, "attention_dropout",
+            self.attention_dropout if self.attention_dropout is not None else self.dropout,
+        )
 
         if not self.norm_before_attn:
             log0("Using post-attention normalization (norm_before_attn=False) may lead to training instability.", level="warning", logger=logger)
@@ -293,11 +366,9 @@ class TransformerConfig(BaseModel):
         # if self.attn_impl == "impl":
         #     warnings.warn("Using 'impl' attention type is not recommended for production use. Only use for experimentation or retrieve attention weights.")
         if self.window_pattern is None:
-            self.window_pattern = "L"
-        self.window_size = self.window_size or (self.max_context // 4)  # Default short window size is 1/4 of max context
+            object.__setattr__(self, "window_pattern", "L")
+        object.__setattr__(self, "window_size", self.window_size or (self.max_context // 4))
         self._window_sizes = self._compute_window()
-        # freeze model_config manually to prevent issues with nested models
-        self.model_config["frozen"] = True
         
 
     def _compute_window(self) -> str:
@@ -354,23 +425,112 @@ class GenerationConfig(BaseModel):
         if self.seed is None or self.seed < 0:
             self.seed = 42  # Ensure seed is within valid range for torch.manual_seed
 
+class OptimizerConfig(BaseModel):
+    """Base optimizer groups loaded before batch/width/decay scaling.
+
+    ``from_file()`` loads the bundled profile; a supplied YAML file overrides
+    its groups. Pass the loaded object to ``train_base(optim_config=...)``.
+    Training horizons and schedules belong to TrainerConfig, not this profile.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    groups: Dict[str, Dict[str, Any]]
+
+    def model_post_init(self, context):
+        from gpt_lab.optim.registry import OPTIMIZER_REGISTRY, _validate_group
+
+        def clean(value):
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    return value
+            if isinstance(value, (list, tuple)):
+                return tuple(clean(item) for item in value)
+            return value
+
+        self.groups = {
+            name: {key: clean(value) for key, value in group.items()}
+            for name, group in self.groups.items()
+        }
+        expected = {"embeddings", "head", "value_embeds", "residual_hiddens", "residual_inputs", "transformer"}
+        if set(self.groups) - {"default"} != expected:
+            raise ValueError(f"Optimizer groups must be {sorted(expected)} (plus optional default)")
+        allowed = set().union(*(spec.required_keys for spec in OPTIMIZER_REGISTRY.values()))
+        for index, (name, group) in enumerate(self.group_configs().items()):
+            _validate_group(group, index)
+            group_allowed = allowed | ({"anvil_spectral"} if group["opt"] == "normuon" else set())
+            if set(group) - group_allowed:
+                raise ValueError(f"Unsupported optimizer parameters in {name}: {sorted(set(group) - group_allowed)}")
+            for key in ("lr", "weight_decay"):
+                if not isinstance(group[key], (int, float)) or not math.isfinite(group[key]) or group[key] < 0:
+                    raise ValueError(f"{name}.{key} must be finite and non-negative")
+
+    def group_configs(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            name: self.groups.get("default", {}) | group
+            for name, group in self.groups.items() if name != "default"
+        }
+
+    @classmethod
+    def from_file(cls, path: str | Path | None = None) -> "OptimizerConfig":
+        import yaml
+
+        def read(filename):
+            filename = Path(filename)
+            if filename.suffix not in (".yaml", ".yml"):
+                raise ValueError("Optimizer configuration must be a YAML file")
+            try:
+                with filename.open() as file:
+                    groups = yaml.safe_load(file)
+            except yaml.YAMLError as error:
+                raise ValueError(f"Invalid optimizer YAML: {filename}") from error
+            if not isinstance(groups, dict) or any(not isinstance(group, dict) for group in groups.values()):
+                raise ValueError("Optimizer YAML must map group names to parameter mappings")
+            return groups
+
+        base = read(Path(__file__).resolve().parents[1] / "optim" / "base.yaml")
+        if path is None:
+            return cls(groups=base)
+        overrides = read(path)
+        if set(overrides) - set(base):
+            raise ValueError(f"Unknown optimizer groups: {sorted(set(overrides) - set(base))}")
+        groups = {
+            name: base.get("default", {}) | group | overrides.get("default", {}) | overrides.get(name, {})
+            for name, group in base.items() if name != "default"
+        }
+        return cls(groups=groups)
+
+
 class TrainerConfig(BaseModel):
     # model_config = ConfigDict(frozen=True)
 
     # Training settings
-    dist_info: dict = Field(default_factory=dict) # Used for distributed training, populated by get_dist_info()
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    comp_info: ComputeContext = Field(default_factory=get_comp_info, exclude=True)
+
+    @field_validator("comp_info", mode="before")
+    @classmethod
+    def restore_runtime_context(cls, value):
+        # Older checkpoints stored a dictionary describing the previous launch.
+        return get_comp_info() if isinstance(value, dict) else value
 
     # Training hparams
-    n_steps: int = 1 # TODO: decide whether step = #forward pass or #tokens seen by model
+    n_steps: int = 1 # Scheduling horizon in optimizer steps.
+    stop_after_step: Optional[int] = Field(default=None, ge=0)
+    cuda_graph_mode: Literal["disabled", "forward_backward"] = "disabled"
     n_acc_steps: int = 100
     target_time: float = -1.0 # in seconds, overrides n_steps if > 0
     total_batch_size: int = -1 # Overrides device_batch_size if > 0
     n_total_tokens: int = -1 # Overrides n_steps if > 0, calculated as total_batch_size * n_steps
     
     device_batch_size: int = 1 
+    packing_strategy: PackingStrategy = "stream"
+    best_fit_buffer_docs: int = Field(default=1000, ge=1)
 
-    # Optimization hyperparameters
-    optim_config_path: Optional[str] = None # Path to optimizer config file. If not set, will use default config based on model size.
+    optim_config: Optional[OptimizerConfig] = None
+    # Legacy fields retained for loading older trainer checkpoints.
+    optim_config_path: Optional[str] = None
     lr_embeddings: float = .3 
     lr_transformer: float = .02
     lr_head: float = .008
@@ -393,6 +553,7 @@ class TrainerConfig(BaseModel):
     
     # Dtype settings
     fp8: bool = False
+    fp8_ffn_forward: bool = False
 
     # Evaluatement settings
     eval_bpb_every: int = 250 # Evaluate val bpb every N steps (-1 = disable)
@@ -428,19 +589,29 @@ class TrainerConfig(BaseModel):
             return progress * 1.0 + (1 - progress) * self.final_lr_ratio
     
     def muon_momentum_schedule(self, step: int) -> float:
-        n_steps = self.n_steps
-        warmup_iters = self.lr_warmup_steps
-        warmdown_iters = round(self.lr_warmdown_ratio * n_steps)
-        if step < warmup_iters:
-            return (step + 1) / warmup_iters
-        elif step <= n_steps - warmdown_iters:
-            return 1.0
+        """Nanochat Muon momentum schedule, relative to the configured base momentum."""
+        warmdown_iters = round(self.lr_warmdown_ratio * self.n_steps)
+        warmdown_start = self.n_steps - warmdown_iters
+        if step < 400:
+            frac = step / 400
+            target_momentum = (1 - frac) * 0.85 + frac * 0.97
+        elif step >= warmdown_start:
+            progress = (step - warmdown_start) / warmdown_iters
+            target_momentum = 0.97 * (1 - progress) + 0.90 * progress
         else:
-            progress = (n_steps - step) / warmdown_iters
-            return progress * 1.0 + (1 - progress) * self.final_lr_ratio
+            target_momentum = 0.97
+
+        # OptimizerFactory multiplies each group's initial_momentum by this value.
+        # Preserve the existing config contract, where momentum is normally 0.95.
+        base_momentum = 0.95
+        if self.optim_config is not None:
+            base_momentum = self.optim_config.group_configs()["transformer"]["momentum"]
+        return target_momentum / base_momentum
     
     def weight_decay_schedule(self, step: int) -> float:
-        return self.weight_decay_scale * 0.5 * (1 + math.cos(math.pi * step / self.n_steps))
+        # New profiles apply decay scaling when building the optimizer.
+        scale = self.weight_decay_scale if getattr(self, "optim_config", None) is None else 1.0
+        return scale * 0.5 * (1 + math.cos(math.pi * step / self.n_steps))
     
     @classmethod
     def from_disk(self, path: Union[str, Path]) -> "TrainerConfig":
@@ -449,6 +620,9 @@ class TrainerConfig(BaseModel):
         
         if not path.exists():
             raise FileNotFoundError(f"No such file: {path}")
+        if path.suffix == ".safetensors":
+            from gpt_lab.utils.tensor_io import load_tensor_state
+            return self.model_validate(load_tensor_state(path))
         with open(str(path), "rb") as f:
             data = pickle.load(f)
         return data
@@ -627,17 +801,22 @@ class DataLoaderState(BaseModel):
 
 class TrainerState(BaseModel):
     step: int = 0
+    completed_steps: Optional[int] = Field(default=None, ge=0)
     n_tokens: int = 0
     n_epochs: float = 0.0
     total_training_time: float = 0.0
     smooth_train_loss: float = 0.0
-    train_loader_state: Union[DataLoaderState, Dict] = Field(default_factory=DataLoaderState)
+    # None explicitly records that the dataloader position cannot be resumed.
+    train_loader_state: Optional[DataLoaderState] = Field(default_factory=DataLoaderState)
 
 class CheckpointState(BaseModel):
     # Evaluation tracking
     version: int = 1
     best_eval_step: int = 0
     best_core_step: int = 0
+    # Directory indices stay zero-based; these record evaluated update counts.
+    best_eval_completed_steps: Optional[int] = None
+    best_core_completed_steps: Optional[int] = None
     best_eval_value: Optional[float] = None  # lower is better
     best_core_value: Optional[float] = None  # higher is better
 

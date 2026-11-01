@@ -14,8 +14,10 @@ from gpt_lab.model.utils import (
 from gpt_lab.tokenizer.tokenizer import build_tokenizer
 from gpt_lab.optim.factory import OptimizerFactory
 from gpt_lab.utils.schemas import (
+    parse_embedding_groups,
     ModelOutput, 
     TrainerConfig,
+    OptimizerConfig,
     TransformerConfig
 )
 from gpt_lab.utils.common import print0, print0_dict
@@ -93,20 +95,20 @@ class DenseTransformer(BaseTransformer):
 
         kv_dim = config.n_kv_heads * config.d_head
 
-        # TODO: same as karpathy
         # Value embeddings (ResFormer-style): alternating layers, last layer always include
+        shared_value_embedding = None
+        if any("value_embs" in group for group in parse_embedding_groups(config.tie_embeddings)):
+            shared_value_embedding = nn.Embedding(padded_vocab_size, kv_dim)
         self.value_embeds = nn.ModuleDict({
-            str(layer_idx): nn.Embedding(padded_vocab_size, kv_dim)
+            str(layer_idx): (
+                shared_value_embedding if shared_value_embedding is not None
+                else nn.Embedding(padded_vocab_size, kv_dim)
+            )
             for layer_idx in range(config.n_layers) if has_ve(layer_idx, config.n_layers)
         })
 
         self.lm_head = Linear(config.d_model, padded_vocab_size, bias=False)
-
-        if config.tie_word_embeddings:
-            # not sure if this works / maybe have to check dtype - at least
-            # self.lm_head.weight = self.blocks .emb.weight.T # E -> V
-            # TODO: solve this naive solution
-            pass
+        self._tie_embedding_weights()
 
         self.res_x0 = torch.nn.Parameter(torch.ones(self.config.n_layers), requires_grad=True)
         self.res_h = torch.nn.Parameter(torch.zeros(self.config.n_layers), requires_grad=True)
@@ -116,12 +118,59 @@ class DenseTransformer(BaseTransformer):
 
         # default loss_fn, can be overridden by trainer or by passing a different loss_fn to the model if needed
         self.loss_fn = build_loss() 
+        self._enforce_precision()
 
+    def _enforce_precision(self, compute_dtype=None):
+        dtype = self.pe_cache.dtype if compute_dtype is None else (
+            torch.bfloat16 if compute_dtype in (torch.bfloat16, "bfloat16") else torch.float32
+        )
+        embedding_weights = {id(self.embeds.weight), *(id(ve.weight) for ve in self.value_embeds.values())}
+        for parameter in self.parameters():
+            parameter_dtype = dtype
+            # A tied head keeps one FP32 parameter; lookup outputs are cast instead.
+            if dtype == torch.bfloat16:
+                parameter_dtype = (torch.bfloat16 if id(parameter) in embedding_weights and parameter is not self.lm_head.weight
+                                   else torch.float32)
+            parameter.data = parameter.data.to(parameter_dtype)
+            if parameter.grad is not None:
+                parameter.grad.data = parameter.grad.data.to(parameter_dtype)
+        self.pe_cache = self.pe_cache.to(dtype)
+
+    def _tie_embedding_weights(self):
+        for group in parse_embedding_groups(self.config.tie_embeddings):
+            if "embs" in group:
+                source = self.embeds
+            elif "head" in group:
+                source = self.lm_head
+            else:
+                source = next(iter(self.value_embeds.values()))
+            if "head" in group:
+                self.lm_head.weight = source.weight
+            if "value_embs" in group:
+                for ve in self.value_embeds.values():
+                    ve.weight = source.weight
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        # Device/dtype moves can replace the shared Parameter objects.
+        self._tie_embedding_weights()
+        self._enforce_precision()
+        return result
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        self._tie_embedding_weights()
+        self._enforce_precision()
+        return result
 
     @torch.no_grad()
     def init_weights(self):
-        torch.nn.init.normal_(self.embeds.weight, mean=0.0, std=0.8)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        embedding = torch.empty_like(self.embeds.weight, dtype=torch.float32)
+        torch.nn.init.normal_(embedding, mean=0.0, std=0.8)
+        self.embeds.weight.copy_(embedding)
+        del embedding
+        if self.lm_head.weight is not self.embeds.weight:
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         d_model = self.config.d_model
         s = 3**0.5 * d_model**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
@@ -144,8 +193,12 @@ class DenseTransformer(BaseTransformer):
             self.res_x0.data[i] = 0.20 - (0.15 * i / max(n_layers - 1, 1))
 
         # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+        for ve in self.value_embeds.children():
+            if ve.weight is not self.embeds.weight and ve.weight is not self.lm_head.weight:
+                embedding = torch.empty_like(ve.weight, dtype=torch.float32)
+                torch.nn.init.uniform_(embedding, -s, s)
+                ve.weight.copy_(embedding)
+                del embedding
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.blocks:
@@ -193,93 +246,75 @@ class DenseTransformer(BaseTransformer):
         else:
             raise ValueError(f"Unknown positional encoding: {self.config.positional_encoding}")
 
-        return pe_cache
+        return pe_cache.to(self.pe_cache.dtype) if hasattr(self, "pe_cache") else pe_cache
     
     @property
     def n_params(self) -> int:
         return self.n_params_per_layer()["total"]
-    
+
+    def n_non_vocab_params(self) -> int:
+        """Return parameters whose size does not depend on the vocabulary.
+
+        Input embeddings, the output head, and ResFormer value embeddings all
+        grow with the vocabulary and are excluded from ``N_nv`` used by
+        vocabulary scaling laws.
+        """
+        counts = self.n_params_per_layer()
+        vocab_parameter_groups = ("embeds", "lm_head", "value_embeds")
+        return counts["total"] - sum(
+            counts[group] for group in vocab_parameter_groups
+        )
+
     def n_params_per_layer(self) -> Dict[str, int]:
         nb_of_params = dict(
             embeds=sum(p.numel() for p in self.embeds.parameters()),
             blocks=sum(p.numel() for p in self.blocks.parameters()),
-            lm_head=sum(p.numel() for p in self.lm_head.parameters()),
+            lm_head=sum(p.numel() for p in self.lm_head.parameters() if p is not self.embeds.weight),
             residuals=self.res_x0.numel() + self.res_h.numel(),
-            value_embeds=sum(p.numel() for p in self.value_embeds.parameters()),
+            value_embeds=sum(p.numel() for p in self.value_embeds.parameters() if p is not self.embeds.weight and p is not self.lm_head.weight),
         )
         nb_of_params["total"] = sum(nb_of_params.values())
         return nb_of_params
 
     def n_scaling_params(self) -> int:
+        """Count blocks and the output table, including a tied output table once."""
         nb_of_params = self.n_params_per_layer()
-        return sum(nb_of_params[tab] for tab in ["blocks", "lm_head"])
+        return nb_of_params["blocks"] + self.lm_head.weight.numel()
     
     def estimate_flops(self) -> float:
-        """Estimate FLOPs per token based on model configuration.
+        """Estimate useful forward/backward FLOPs per token (2 FLOPs/FMA).
 
-        Adapted from: karpathy/nanochat
+        Count dense projections and inclusive causal attention pairs; exclude
+        elementwise operations, optimizer work, conversion and recomputation.
+        Projection accounting adapted from karpathy/nanochat.
         """
         n_params_per_layer = self.n_params_per_layer()
-        nparams = n_params_per_layer["total"]
-        # Exclude non-matmul params: embeddings and per-layer scalars
-        nparams_exclude = sum([
-            _nparams for layer, _nparams in n_params_per_layer.items() 
-            if layer in ("embeds", "residuals", "value_embeds")])
+        # Tying saves storage, but the output projection still does the same work.
+        matmul_params = n_params_per_layer["blocks"] + self.lm_head.weight.numel()
         
         h, q, t = self.config.n_heads, self.config.d_model // self.config.n_heads, self.config.max_context
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
         for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+            span = t if window < 0 else min(window + 1, t)
+            pairs = span * (span + 1) // 2 + (t - span) * span
+            attn_flops += 12 * h * q * pairs / t
+        num_flops_per_token = 6 * matmul_params + attn_flops
         return num_flops_per_token
     
-    def build_optimizer(self, config: TrainerConfig, optim_config_path: Optional[str] = None) -> torch.optim.Optimizer:
-        # default config, overriden by optim_config_path if provided
-        optim_config = {
-            "embeddings":       dict(opt='adamw', lr=config.lr_embeddings,       betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            "head":             dict(opt='adamw', lr=config.lr_head,             betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
-            "residual_hiddens": dict(opt='adamw', lr=config.lr_residuals * 0.01, betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
-            "residual_inputs":  dict(opt='adamw', lr=config.lr_residuals,        betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            "value_embeds":     dict(opt='adamw', lr=config.lr_embeddings * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),                    
-            "transformer":      dict(opt='muon',  lr=config.lr_transformer,      momentum=0.95, ns_steps=5, beta=.9, weight_decay=config.weight_decay),
-        }
-        optim_config_path = optim_config_path or config.optim_config_path # one or another; idc for now
-        
-        if optim_config_path is not None:
-            optim_config_path = Path(optim_config_path)
-            if optim_config_path.is_file() and optim_config_path.suffix in (".yaml", ".yml"):
-                import yaml
-                with open(optim_config_path, "r") as f:
-                    _opt_cfg = yaml.safe_load(f)
-                def clean_value(value):
-                    if isinstance(value, str):
-                        try:
-                            return float(value)
-                        except (ValueError, TypeError):
-                            return value
-                    elif isinstance(value, list):
-                        return tuple(clean_value(v) for v in value)
-                    else:
-                        return value
-                
-                # clean yaml values (e.g. '1e-2' -> 1e-2, [0.8, 0.995] -> (0.8, 0.995))
-                _opt_cfg = {name: {key: clean_value(value) for key, value in group.items()} for name, group in _opt_cfg.items()}
+    def build_optimizer(
+        self, config: TrainerConfig, optim_config: Optional[OptimizerConfig] = None,
+    ) -> torch.optim.Optimizer:
+        profile = optim_config or getattr(config, "optim_config", None) or OptimizerConfig.from_file()
+        optim_config = profile.group_configs()
 
-                # update config with values from file -> override defaults from file -> override defaults from code (and keeps defaults for any missing values in the file)
-                optim_config = {name: optim_config[name] | _opt_cfg.get("default", {}) | _opt_cfg.get(name, {}) for name in optim_config.keys()}
-
-            else:
-                raise FileNotFoundError(f"Optimizer configuration file not found at {optim_config_path}. Please provide a valid path to the optimizer configuration YAML file (ending in .yaml or .yml), or remove the --optim-config-path argument to use the default configuration.")
-            
         d_model = self.config.d_model
         # Separate out all parameters into groups
         embedding_params = list(self.embeds.parameters())
         blocks_params = list(self.blocks.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        value_embeds_params = [p for p in self.value_embeds.parameters() if p is not self.embeds.weight and p is not self.lm_head.weight]
+        lm_head_params = [p for p in self.lm_head.parameters() if p is not self.embeds.weight]
         residual_h_params = [self.res_h]
         residual_x0_params = [self.res_x0]
 
@@ -291,6 +326,7 @@ class DenseTransformer(BaseTransformer):
 
         # Scaling hparams
         for name, group in optim_config.items():
+            group["lr"] *= config.batch_lr_scale
             if name in ("embeddings", "head", "value_embeds"):
                 optim_config[name]["lr"] = group["lr"] * dmodel_lr_scale
         optim_config["transformer"]["weight_decay"] *= config.weight_decay_scale
@@ -311,7 +347,7 @@ class DenseTransformer(BaseTransformer):
             param_groups.append(dict(
                 name=f"block.{shape}", params=group_params, **optim_config["transformer"]
             ))
-        optimizer = OptimizerFactory(param_groups, dist_info=config.dist_info)
+        optimizer = OptimizerFactory(param_groups, comp_info=config.comp_info)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -326,6 +362,28 @@ class DenseTransformer(BaseTransformer):
             return_hidden_states: bool = False,
             reduction: str = "mean",
         ) -> ModelOutput:
+        return self._forward(
+            input_ids, labels, attn_mask, past_key_values,
+            return_attentions, return_hidden_states, reduction,
+        )
+
+    def training_loss(self, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Mean-loss training entry point; bypasses top-level forward hooks."""
+        assert self.training, "training_loss requires training mode"
+        assert labels is not None, "training_loss requires labels"
+        return self._forward(input_ids, labels, loss_only=True)
+
+    def _forward(
+            self,
+            input_ids: torch.Tensor,
+            labels: Optional[torch.Tensor] = None,
+            attn_mask: torch.Tensor | None = None,
+            past_key_values: Any = None,
+            return_attentions: bool = False,
+            return_hidden_states: bool = False,
+            reduction: str = "mean",
+            loss_only: bool = False,
+        ) -> ModelOutput | torch.Tensor:
         assert (past_key_values is None) or (not self.training), "KV cache can not be used during training."
         # assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
@@ -350,7 +408,12 @@ class DenseTransformer(BaseTransformer):
                 T0 = past_key_values.shape[3] # assuming shape is (L, 2, B, T, H, D)
             else:
                 pass
+        device_type = input_ids.device.type
+        compute_dtype = (torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type)
+                         else self.pe_cache.dtype)
         x = self.embeds(input_ids)
+        if compute_dtype == torch.bfloat16:
+            x = x.to(torch.bfloat16)
 
         if self.config.positional_encoding == "positional_encoding":
             x = x + self.pe_cache[:x.size(2)]
@@ -391,8 +454,15 @@ class DenseTransformer(BaseTransformer):
 
         logits = logits[..., :self.config.vocab_size] 
 
-        logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
+
+        # Keep the full training/evaluation logits in the autocast dtype. A
+        # float32 copy of (batch, sequence, vocabulary) can consume several
+        # additional GiB for large vocabularies. Generation only materializes
+        # the final-token logits, so retaining its historical float32 output is
+        # inexpensive and convenient for sampling.
+        if labels is None:
+            logits = logits.float()
         
         # logits = torch.clamp(logits, min=-softcap, max=softcap)
         temperature = 1.0 # TODO: add temperature support to forward method and generation method
@@ -403,7 +473,10 @@ class DenseTransformer(BaseTransformer):
         loss = None
         if labels is not None:
             assert labels.is_contiguous(), "Labels should be contiguous for efficient loss computation"
-            loss = self.loss_fn(logits, labels, reduction=reduction)
+            loss = self.loss_fn(logits.float(), labels, reduction=reduction)
+
+        if loss_only:
+            return loss
 
         output = ModelOutput(
             logits=logits,
@@ -417,4 +490,3 @@ class DenseTransformer(BaseTransformer):
         )
         
         return output
-    

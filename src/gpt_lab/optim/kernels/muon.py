@@ -42,6 +42,9 @@ def _newton_schulz_batch(X: torch.Tensor, steps: int) -> torch.Tensor:
 """
 Muon optimizer adapted and simplified from modded-nanogpt.
 https://github.com/KellerJordan/modded-nanogpt
+Copyright (c) 2024 Keller Jordan
+Licensed under the MIT License; see LICENSES/modded-nanogpt-MIT.txt.
+Modified for GPT-Lab by Arthur Testard.
 
 Background:
 Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -116,7 +119,7 @@ def muon_step_fused(
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
-    g = X
+    g = X.to(stacked_params.dtype)
 
     # Variance reduction
     beta2 = beta2_t.to(g.dtype)

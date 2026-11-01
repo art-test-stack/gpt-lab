@@ -1,8 +1,10 @@
 [project]
 name = "gpt-lab"
-version = "0.1.0"
+version = "0.1.1"
 description = "Library for training and serving LLMs from scratch, with local and Hugging Face interfaces."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "LICENSES/*", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12,<3.13"
 authors = [
     {name = "art-test-stack"}
@@ -19,6 +21,7 @@ dependencies = [
     "pydantic==2.12.5",
     "requests==2.32.5",
     "rich==14.2.0",
+    "safetensors==0.7.0",
     "tiktoken==0.12.0",
     "tokenizers==0.22.1",
     "torch==2.9.1",
@@ -33,12 +36,18 @@ dependencies = [
 homepage = "https://github.com/art-test-stack/gpt-lab"
 repository = "https://github.com/art-test-stack/gpt-lab"
 
+[project.scripts]
+gpt-lab = "gpt_lab.cli:main"
+
 [project.optional-dependencies]
 cpu = [
     "torch==2.9.1",
 ]
 gpu = [
     "torch==2.9.1",
+]
+fp8 = [
+    "torchao==0.15.0",
 ]
 
 [dependency-groups]
@@ -66,6 +75,9 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"gpt_lab.optim" = ["*.yaml"]
 
 [tool.uv]
 managed = true

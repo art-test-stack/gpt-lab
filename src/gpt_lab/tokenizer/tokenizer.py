@@ -185,7 +185,6 @@ class Tokenizer(_BaseTokenizer):
             # tiktoken-specific exception if it can be discovered at runtime.
             EXPECTED_MISSING = (FileNotFoundError, KeyError)
             try:
-                import tiktoken
                 try:
                     # probe tiktoken for its missing-encoding exception type
                     tiktoken.get_encoding("__NONEXISTENT_ENCODING__")
@@ -222,9 +221,15 @@ class Tokenizer(_BaseTokenizer):
             )
             return cls(mergeable_ranks, special_tokens.list(), config)
         elif source == "huggingface":
-            return HuggingFaceTokenizerWrapper.from_pretrained(name)
+            return HuggingFaceTokenizerWrapper.from_pretrained(
+                name,
+                special_tokens=special_tokens,
+            )
         elif source == "local":
-            return HuggingFaceTokenizerWrapper.from_directory(name)
+            return HuggingFaceTokenizerWrapper.from_directory(
+                name,
+                special_tokens=special_tokens,
+            )
 
     @classmethod
     def from_config(cls, config: TokenizerConfig):
@@ -240,7 +245,10 @@ class Tokenizer(_BaseTokenizer):
             # -> creating a new tiktoken encoding with those merges and vocab
             # -> need to handle special tokens 
             # -> need to extract hgf pretokenizer + string pattern
-            return HuggingFaceTokenizerWrapper.from_pretrained(config.name)
+            return HuggingFaceTokenizerWrapper.from_pretrained(
+                config.name,
+                special_tokens=config.special_tokens,
+            )
         elif config.source == "local":
             mergeable_ranks = config.get_mergeable_ranks()
             special_tokens = config.special_tokens.list()
@@ -397,8 +405,9 @@ class Tokenizer(_BaseTokenizer):
         self._token_bytes = new_token_bytes
         log0(f"Updated token bytes after truncation from {old_vocab_size:,} to {self.vocab_size:,}", logger=logger)
         # Save token_bytes to disk
-        token_bytes_path = Path(self.config.dirname) / "token_bytes.pt"
-        torch.save(self.token_bytes, token_bytes_path)
+        from gpt_lab.utils.tensor_io import save_tensor_state
+        token_bytes_path = Path(self.config.dirname) / "token_bytes.safetensors"
+        save_tensor_state({"token_bytes": self.token_bytes}, token_bytes_path)
         # Persist tokenizer config/metadata
         try:
             self.config.save_to_directory()
@@ -423,8 +432,9 @@ class Tokenizer(_BaseTokenizer):
         fingerprint = save_mergeable_ranks(msgpack_path, self.mergeable_ranks)
 
         # Save token bytes tensor
-        token_bytes_path = directory / "token_bytes.pt"
-        torch.save(self.token_bytes, token_bytes_path)
+        from gpt_lab.utils.tensor_io import save_tensor_state
+        token_bytes_path = directory / "token_bytes.safetensors"
+        save_tensor_state({"token_bytes": self.token_bytes}, token_bytes_path)
         
         # Write a lightweight JSON descriptor alongside the pickle config for readability
         config_json = {

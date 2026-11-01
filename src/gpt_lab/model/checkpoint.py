@@ -5,18 +5,19 @@ Utilities for saving and loading model checkpoints, including the model state di
 Models should be saved in the following directory structure:
 <CACHE_DIR>/
 └── models/
-    └── <model_name>/                          # e.g., "ic1", "gpt2-small", "llama2"
+    └── <model_name>/                               # e.g., "ic1", "gpt2-small", "llama2"
         └── <run_name>/
-            ├── meta.pskl                      # immutable (model, tokenizer, git)
-            └── <source>/                      # base / sft / rl
-                ├── training_config.pkl        # per-phase config
-                ├── checkpoint_state.pkl       # best bpb/core steps and values
+            ├── meta.pskl                           # immutable (model, tokenizer, git)
+            └── <source>/                           # base / sft / rl
+                ├── training_config.safetensors     # per-phase config
+                ├── checkpoint_state.safetensors    # best bpb/core steps and values
                 ├── checkpoint_step_000000/
-                │   ├── model.pt
-                │   ├── optim_rank0.pt         # optimizer state dict (optim_rank{rank}.pt if sharded, otherwise optim.pt)
-                │   ├── optim_rank1.pt
-                │   ├── ...                    # more optimizer shards if needed
-                │   ├── trainer_state.pkl      # training state, rng state, data state, best bpb/core steps
+                │   ├── model.safetensors
+                │   ├── optim_rank0.safetensors     # optimizer state (otherwise optim.safetensors)
+                │   ├── optim_rank1.safetensors
+                │   ├── ...                         # more optimizer shards if needed
+                │   ├── trainer_state_rank0.json
+                │   ├── rng_state_rank0.safetensors
                 │   └── metrics.pkl
                 ├── checkpoint_step_000100/
                 │   └── ...
@@ -34,13 +35,14 @@ import re
 import random, numpy as np
 import torch
 import json
-from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, Union, Tuple, Dict, Literal, Mapping, Callable, List
 from pathlib import Path
+from packaging.version import Version
 from gpt_lab.utils.logging import log0, log_error
+from gpt_lab.utils.common import slugify
 from gpt_lab.utils.default import MODELS_FOLDER
-from gpt_lab.utils.distributed import get_dist_info
+from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import (
     CheckpointState, 
     MetaConfig,
@@ -50,6 +52,7 @@ from gpt_lab.utils.schemas import (
     TransformerConfig, 
 )
 from gpt_lab.utils.system import get_git_info
+from gpt_lab.utils.tensor_io import load_tensor_state, migrate_legacy_tensor_state, save_tensor_state
 from gpt_lab.tokenizer import build_tokenizer, Tokenizer, TokenizerConfig
 from gpt_lab.model.gpt import DenseTransformer
 
@@ -58,25 +61,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 _MODEL_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "model.pt",
-    shard=lambda x: f"model.pt",
-    # fully_sharded=lambda x: f"model.pt",
-) # dict[mode, (rank: int) -> (filename: str)]
+    full=lambda x: "model.safetensors",
+    sharded=lambda x: "model.safetensors",
+) # dict[optimizer_state_layout, (rank: int) -> (filename: str)]
 _OPT_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
-    ddp=lambda x: "optim.pt",
-    shard=lambda x: f"optim_rank{x:d}.pt",
-    # fully_sharded=lambda x: f"optim.pt", 
-) # dict[mode, (rank: int) -> (filename: str)]
+    full=lambda x: "optim.safetensors",
+    sharded=lambda x: f"optim_rank{x:d}.safetensors",
+) # dict[optimizer_state_layout, (rank: int) -> (filename: str)]
+_TRAINER_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
+    full=lambda x: "trainer_state.json",
+    sharded=lambda x: f"trainer_state_rank{x:d}.json",
+)
+_RNG_DEFAULT_FILENAME: Dict[str, Callable[[int], str]] = dict(
+    full=lambda x: "rng_state.safetensors",
+    sharded=lambda x: f"rng_state_rank{x:d}.safetensors",
+)
 _STEP_GLOB_PATTERN = "checkpoint_step_*"
 _STEP_DIRNAME = lambda step: f"checkpoint_step_{step:06d}"
 _ModelSources = Literal[("base")] # TODO: Add here "sft", "grpo" when implemented
-_Mode = Literal["ddp", "shard"]
+_OptimizerStateLayout = Literal["full", "sharded"]
 _Step = Union[int, str]  # int, "latest", "best", or "-k" / negative int
-
-class CheckpointMode(str, Enum):
-    FULL = "full"                    # rank0 only (DDP)
-    SHARDED = "sharded"              # optim state sharded across ranks (FSDP / ZeRO)
-    FULLY_SHARDED = "fully_sharded"  # FSDP / ZeRO with full sharding (including optimizer state)
 
 @dataclass
 class CheckpointConfig:
@@ -84,8 +88,8 @@ class CheckpointConfig:
     run_name: Optional[Union[str, int]] = None
     model_cachedir: Optional[Union[str, Path]] = None
     source: _ModelSources = "base"
-    dist_info: Optional[Dict] = None
-    mode: _Mode = "ddp"
+    comp_info: Optional[ComputeContext] = None
+    optimizer_state_layout: _OptimizerStateLayout = "full"
     model_config: Optional[TransformerConfig] = None
     tokenizer_config: Optional[TokenizerConfig] = None
     trainer_config: Optional[TrainerConfig] = None
@@ -95,8 +99,9 @@ class CheckpointData:
     model_state: Optional[Mapping[str, torch.Tensor]] = None
     optimizer_state: Optional[Dict] = None
     trainer_state: Optional[TrainerState] = None
+    checkpoint_state: Optional[CheckpointState] = None
     scaler_state: Optional[Dict] = None
-    rng_state: Optional[Dict[str, Union[bytes, Tuple, None]]] = None
+    rng_state: Optional[Dict[str, Union[torch.Tensor, Tuple, List, None]]] = None
 
 # private utilities
 def _solve_path(path: Optional[Union[str, Path]], default: Optional[Path] = None) -> Path:
@@ -140,10 +145,10 @@ def _solve_run_name(model_dir: Path, run_name: Optional[Union[str, int]] = None,
         best_bpb = float('inf')
         best_run = None
         for _run_name in run_names:
-            ckpt_state_path = model_dir / _run_name / source / "checkpoint_state.pkl"
+            ckpt_state_path = _resolve_state_path(model_dir / _run_name / source / "checkpoint_state.safetensors")
             if ckpt_state_path.exists():
                 raw_ckpt_state = _load_state_dict(ckpt_state_path, map_location="cpu", weight_only=False)
-                ckpt_state = CheckpointState.model_validate_json(raw_ckpt_state)
+                ckpt_state = CheckpointState.model_validate(raw_ckpt_state)
                 if ckpt_state.best_eval_step is None:
                     log0(f"Checkpoint state in {ckpt_state_path} does not contain a best step for 'best' checkpoint selection. Skipping this checkpoint for best selection.", logger=logger, level="warning")
                 if ckpt_state.best_eval_step is not None and ckpt_state.best_eval_value < best_bpb:
@@ -160,10 +165,24 @@ def _solve_run_name(model_dir: Path, run_name: Optional[Union[str, int]] = None,
             f"Found tags: {[run_name.name for run_name in run_names]}. Please specify a valid checkpoint run name or index (e.g., '-1' for the most recent tag).", 
             logger=logger, error_type=ValueError)
 
+def _resolve_state_path(path: Path) -> Path:
+    if not path.exists() and path.suffix == ".safetensors":
+        for suffix in (".pt", ".pth", ".pkl"):
+            legacy_path = path.with_suffix(suffix)
+            if legacy_path.exists():
+                return legacy_path
+    return path
+
+
 def _save_state_dict(state_dict, ckpt_dir, filename=None):
     if filename is not None:
         ckpt_dir = ckpt_dir / filename
-    torch.save(state_dict, ckpt_dir)
+    if ckpt_dir.suffix == ".safetensors":
+        if isinstance(state_dict, TrainerConfig):
+            state_dict = state_dict.model_dump()
+        save_tensor_state(state_dict, ckpt_dir)
+    else:
+        raise ValueError("New tensor states must use a .safetensors file")
     log0(f"Saved {filename} to {ckpt_dir}", logger=logger)
 
 def _save_json(data, ckpt_dir, filename=None):
@@ -186,9 +205,12 @@ def _load_json(ckpt_dir, filename):
 def _load_state_dict(ckpt_dir, filename=None, map_location=None, weight_only=True):
     if filename is not None:
         ckpt_dir = ckpt_dir / filename
+    ckpt_dir = _resolve_state_path(ckpt_dir)
     if not ckpt_dir.exists():
         log_error(f"Checkpoint file {ckpt_dir} does not exist.", logger=logger, error_type=FileNotFoundError)
-    state_dict = torch.load(ckpt_dir, map_location=map_location, weights_only=weight_only)
+    if ckpt_dir.suffix != ".safetensors":
+        ckpt_dir = migrate_legacy_tensor_state(ckpt_dir, weights_only=weight_only)
+    state_dict = load_tensor_state(ckpt_dir, device=map_location or "cpu")
     log0(f"Loaded {filename} from {ckpt_dir}.", logger=logger)
     return state_dict
 
@@ -213,9 +235,9 @@ def _get_checkpoint_step(checkpoint_dir, step: Optional[Union[int, str]] = None)
         step = int(checkpoint_files[index].stem.split("_")[-1])
     elif step == "best":
         # TODO: look at step = -1 checkpoint_state and find the best step from there -> pb: best may not be saved under .../checkpoint_step_*/
-        raw = _load_state_dict(checkpoint_dir, "checkpoint_state.pkl", map_location="cpu", weight_only=False)
-        checkpoint_state = CheckpointState.model_validate_json(raw)
-        if not checkpoint_state.best_eval_step:
+        raw = _load_state_dict(checkpoint_dir, "checkpoint_state.safetensors", map_location="cpu", weight_only=False)
+        checkpoint_state = CheckpointState.model_validate(raw)
+        if checkpoint_state.best_eval_value is None:
             log_error(f"Checkpoint state in {checkpoint_dir} does not contain a best step for 'best' checkpoint selection.", logger=logger, error_type=ValueError)
         step = checkpoint_state.best_eval_step
     else:
@@ -235,31 +257,54 @@ def _get_model_run_date_from_name(run_name) -> int:
 def capture_rng_state():
     return {
         "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        # Each torchrun process owns one current CUDA device. Capturing every
+        # visible device here can initialize peer-device contexts on every rank.
+        "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         "numpy": np.random.get_state(),
         "python": random.getstate(),
     }
 
-def set_rng_state(rng_state: Dict[str, Union[bytes, Tuple, None]]):
+def set_rng_state(
+    rng_state: Dict[str, Union[torch.Tensor, Tuple, List, None]],
+):
     torch.random.set_rng_state(rng_state["torch"])
     if torch.cuda.is_available() and rng_state["cuda"] is not None:
-        torch.cuda.set_rng_state_all(rng_state["cuda"])
+        if isinstance(rng_state["cuda"], (list, tuple)):
+            # Backward compatibility for checkpoints that stored all devices.
+            torch.cuda.set_rng_state_all(rng_state["cuda"])
+        else:
+            torch.cuda.set_rng_state(rng_state["cuda"])
     np.random.set_state(rng_state["numpy"])
     random.setstate(rng_state["python"])
 
 # api functions
-def make_default_run_name(depth, name, dist_info):
-    if dist_info is None:
-        dist_info = get_dist_info()
-    from gpt_lab.utils.system import run_command
-    git_commit = run_command("git rev-parse --short HEAD") or "unkcommit"
-    from datetime import datetime
-    date = datetime.now().strftime("%Y%m%d_%H-%M-%S")
-    device_name = (str(dist_info.get("DEVICE_NAME", "unkdevice"))
-        .lower().split(" ")[-1].replace(" ", "_").replace("/", "_").replace("-", "_"))
-    if name is None:
-        name = "model"
-    return f"{device_name}_{name}_d{depth}_cmt_{git_commit}_dt_{date}"
+def make_default_run_name(depth, name, comp_info):
+    if comp_info is None:
+        comp_info = get_comp_info()
+    is_distributed = comp_info.is_distributed
+    rank = comp_info.rank
+    run_name = None
+
+    if not is_distributed or rank == 0:
+        from gpt_lab.utils.system import run_command
+        git_commit = run_command("git rev-parse --short HEAD") or "unkcommit"
+        from datetime import datetime
+        date = datetime.now().strftime("%Y%m%d_%H-%M-%S")
+        device_name = str(comp_info.device_name).lower()
+        if device_name.startswith("apple "):
+            device_name = slugify(device_name.split(" (", 1)[0])
+        else:
+            device_name = device_name.split(" ")[-1].replace(" ", "_").replace("/", "_").replace("-", "_")
+        if name is None:
+            name = "model"
+        run_name = f"{device_name}_{name}_d{depth}_cmt_{git_commit}_dt_{date}"
+
+    if is_distributed:
+        names = [run_name]
+        torch.distributed.broadcast_object_list(names, src=0)
+        run_name = names[0]
+
+    return run_name
 
 def build_meta_model(config: TransformerConfig) -> "DenseTransformer":
     with torch.device("meta"):
@@ -287,6 +332,33 @@ def save_meta_config(
 
     log0(f"Saved meta config in {str(run_dir)}.", logger=logger)
 
+def _migrate_model_config(model_cfg: Dict, version: Optional[str]) -> None:
+    """Migrate using the saved project version before metadata validation.
+
+    Functional embedding tying starts at 0.1.1. For ambiguous 0.1.0 or
+    unversioned metadata, missing tying fields identify the old no-op flag.
+    """
+    if model_cfg.get("act_func") is None:
+        model_cfg["act_func"] = "swiglu"
+    if "tie_embeddings" in model_cfg:
+        return
+    saved_version = Version(version) if version is not None else None
+    legacy_noop = (
+        saved_version is None or saved_version < Version("0.1.1")
+    ) and (
+        (saved_version is not None and saved_version < Version("0.1.0"))
+        or ("tie_value_embeddings" not in model_cfg and "tie_all_embeddings" not in model_cfg)
+    )
+    tie_values = model_cfg.pop("tie_value_embeddings", False)
+    tie_word = model_cfg.pop("tie_word_embeddings", False) and not legacy_noop
+    tie_all = model_cfg.pop("tie_all_embeddings", False) and not legacy_noop
+    if tie_all:
+        model_cfg["tie_embeddings"] = "embs,head,value_embs:"
+    else:
+        word_group = "embs,head" if tie_word else "embs;head"
+        value_group = "value_embs:" if tie_values and not legacy_noop else "value_embs"
+        model_cfg["tie_embeddings"] = f"{word_group};{value_group}"
+
 def load_meta_config(
         name: str, 
         run_name: Optional[Union[str, int]] = None, 
@@ -310,7 +382,9 @@ def load_meta_config(
         log_error(f"Checkpoint path {run_dir} is not a directory.", logger=logger, error_type=ValueError)
 
     _meta_cfg = _load_json(run_dir, "meta.json")
-    meta_cfg = MetaConfig.model_validate_json(_meta_cfg)
+    metadata = json.loads(_meta_cfg)
+    _migrate_model_config(metadata["model_cfg"], metadata.get("version"))
+    meta_cfg = MetaConfig.model_validate(metadata)
     
     log0(f"Loaded meta config from {run_dir / 'meta.json'}", logger=logger)
     
@@ -331,6 +405,12 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+
+def _migrate_trainer_config(raw):
+    if "stop_after_updates" in raw:
+        raw.setdefault("stop_after_step", raw["stop_after_updates"])
+        raw.pop("stop_after_updates")
+    return raw
 
 def find_potential_run_name(model_dir: Union[str, Path], git_info: Optional[Dict] = None) -> str:
     model_dir = _solve_path(model_dir)
@@ -365,7 +445,7 @@ def find_potential_run_name(model_dir: Union[str, Path], git_info: Optional[Dict
     return run_names[0].name
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
+    # Find the checkpoint directory with the highest step.
     checkpoint_dir = _solve_path(checkpoint_dir)
 
     checkpoint_files = [f for f in checkpoint_dir.glob(_STEP_GLOB_PATTERN) if f.is_dir()]
@@ -395,37 +475,82 @@ def save_checkpoint(
         checkpoint_state: CheckpointState,
         optimizer: Optional[torch.optim.Optimizer] = None, # should be the state dict
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
-        mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[Dict] = None,
+        optimizer_state_layout: Literal["full", "sharded"] = "full",
+        comp_info: Optional[ComputeContext] = None,
     ):
-    if mode == "shard":
-        # TODO: implement sharded checkpointing for FSDP / ZeRO optimizers
-        log_error("Shard mode is not implemented yet. Please use ddp mode for now.", logger=logger, error_type=NotImplementedError)
+    if optimizer_state_layout not in _OPT_DEFAULT_FILENAME:
+        raise ValueError(f"Unsupported optimizer state layout: {optimizer_state_layout!r}")
     checkpoint_dir = _solve_path(checkpoint_dir)
 
     step_dir = checkpoint_dir.joinpath(_STEP_DIRNAME(step))
 
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info["RANK"]
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
+    world_size = comp_info.world_size
+
+    # All ranks may enter concurrently. mkdir(exist_ok=True) is safe on the
+    # shared filesystem, and the barriers make a checkpoint visible only after
+    # every optimizer/RNG/data-loader shard has completed.
+    step_dir.mkdir(parents=True, exist_ok=True)
+    if comp_info.is_distributed:
+        torch.distributed.barrier()
 
     if rank == 0:
-        step_dir.mkdir(parents=True, exist_ok=True)
         # Save the model state parameters
-        _save_state_dict(model.state_dict(), step_dir, "model.pt")
-        # Save the training state
+        _save_state_dict(model.state_dict(), step_dir, _MODEL_DEFAULT_FILENAME[optimizer_state_layout](rank))
+        # Shared copies support evaluation and old single-rank readers. Shard
+        # layout also writes rank-specific training and RNG state below.
         _save_json(trainer_state.model_dump(), step_dir, filename="trainer_state.json")
-        # Save rng state for reproducibility
-        _save_state_dict(capture_rng_state(), step_dir, "rng_state.pt")
+        _save_state_dict(capture_rng_state(), step_dir, "rng_state.safetensors")
         # Save the checkpoint state (best bpb/core steps and values)
-        _save_state_dict(checkpoint_state.model_dump(), step_dir, "checkpoint_state.pkl")
+        _save_state_dict(checkpoint_state.model_dump(), step_dir, "checkpoint_state.safetensors")
+        _save_json(
+            {"optimizer_state_layout": optimizer_state_layout, "world_size": world_size},
+            step_dir,
+            filename="checkpoint_meta.json",
+        )
         # Save scaler state if using mixed precision
         if scaler is not None:
-            _save_state_dict(scaler.state_dict(), step_dir, "scaler.pt")
+            _save_state_dict(scaler.state_dict(), step_dir, "scaler.safetensors")
 
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
-    if (optimizer is not None) and ((mode == "shard") or (mode == "ddp" and rank == 0)):
-        _save_state_dict(optimizer.state_dict(), step_dir, _OPT_DEFAULT_FILENAME[mode](rank))
+    if optimizer_state_layout == "sharded":
+        _save_json(
+            trainer_state.model_dump(),
+            step_dir,
+            filename=_TRAINER_DEFAULT_FILENAME[optimizer_state_layout](rank),
+        )
+        _save_state_dict(
+            capture_rng_state(),
+            step_dir,
+            _RNG_DEFAULT_FILENAME[optimizer_state_layout](rank),
+        )
+
+    # The custom distributed optimizer keeps state shards on every rank.
+    if optimizer is not None and (optimizer_state_layout == "sharded" or rank == 0):
+        _save_state_dict(optimizer.state_dict(), step_dir, _OPT_DEFAULT_FILENAME[optimizer_state_layout](rank))
+
+    if comp_info.is_distributed:
+        torch.distributed.barrier()
+
+def _load_checkpoint_metadata(step_dir: Path) -> dict:
+    metadata = _load_json(step_dir, "checkpoint_meta.json")
+    layout = metadata.get("optimizer_state_layout", metadata.get("mode"))
+    metadata["optimizer_state_layout"] = {"ddp": "full", "shard": "sharded"}.get(layout, layout)
+    return metadata
+
+
+def _checkpoint_read_layout(optimizer_state_layout: _OptimizerStateLayout, metadata: dict, world_size: int) -> _OptimizerStateLayout:
+    # A one-worker shard contains the full optimizer state and can resume locally.
+    if (
+        optimizer_state_layout == "full"
+        and world_size == 1
+        and metadata.get("optimizer_state_layout") == "sharded"
+        and metadata.get("world_size") == 1
+    ):
+        return "sharded"
+    return optimizer_state_layout
+
 
 def load_checkpoint(
         checkpoint_dir: Union[str, Path], # should be <model_dir>/<model_name>/<run_name>/<source>/<checkpoint_dir>
@@ -435,50 +560,97 @@ def load_checkpoint(
         load_trainer: bool = True,
         load_scaler: bool = True,
         load_rng: bool = True,
-        mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[Dict] = None,
+        optimizer_state_layout: Literal["full", "sharded"] = "full",
+        comp_info: Optional[ComputeContext] = None,
     ) -> CheckpointData:
     # Load the model state
     checkpoint_dir = _solve_path(checkpoint_dir)
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info["RANK"]
-    device = dist_info["DEVICE"]
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
+    device = comp_info.device
 
     step = _get_checkpoint_step(checkpoint_dir, step)
     step_dir = checkpoint_dir / _STEP_DIRNAME(step)
     if not step_dir.exists():
         log_error(f"Checkpoint directory {step_dir} does not exist for step {step}.", logger=logger, error_type=FileNotFoundError)
+    metadata_path = step_dir / "checkpoint_meta.json"
+    if metadata_path.exists():
+        metadata = _load_checkpoint_metadata(step_dir)
+        optimizer_state_layout = _checkpoint_read_layout(optimizer_state_layout, metadata, comp_info.world_size)
+        if load_optim and metadata.get("optimizer_state_layout") != optimizer_state_layout:
+            raise ValueError(
+                "Checkpoint optimizer state layout does not match the requested layout: "
+                f"saved {metadata.get('optimizer_state_layout')!r}, requested {optimizer_state_layout!r}"
+            )
+        if (
+            load_optim
+            and optimizer_state_layout == "sharded"
+            and metadata.get("world_size") != comp_info.world_size
+        ):
+            raise ValueError(
+                "Sharded optimizer checkpoints must be resumed with the same "
+                f"world size: saved {metadata.get('world_size')}, current "
+                f"{comp_info.world_size}"
+            )
+
     # Load the model state parameters
     model_data = None
     if load_model:
-        model_data = _load_state_dict(step_dir, f"model.pt", map_location=device)
+        model_data = _load_state_dict(step_dir, _MODEL_DEFAULT_FILENAME[optimizer_state_layout](rank), map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optim:
-        optimizer_data = _load_state_dict(step_dir, _OPT_DEFAULT_FILENAME[mode](rank), map_location=device)
+        optimizer_data = _load_state_dict(step_dir, _OPT_DEFAULT_FILENAME[optimizer_state_layout](rank), map_location=device)
     # Load the trainer state
     trainer_state = None
     if load_trainer:
-        trainer_state = TrainerState.model_validate(_load_json(step_dir, "trainer_state.json"))
+        trainer_filename = _TRAINER_DEFAULT_FILENAME[optimizer_state_layout](rank)
+        if not (step_dir / trainer_filename).exists():
+            trainer_filename = "trainer_state.json"
+        raw_trainer_state = _load_json(step_dir, trainer_filename)
+        if "completed_updates" in raw_trainer_state:
+            raw_trainer_state.setdefault("completed_steps", raw_trainer_state["completed_updates"])
+            raw_trainer_state.pop("completed_updates")
+        trainer_state = TrainerState.model_validate(raw_trainer_state)
+    checkpoint_state = None
+    checkpoint_state_path = _resolve_state_path(step_dir / "checkpoint_state.safetensors")
+    if checkpoint_state_path.exists():
+        checkpoint_state = CheckpointState.model_validate(
+            _load_state_dict(
+                step_dir,
+                checkpoint_state_path.name,
+                map_location="cpu",
+                weight_only=False,
+            )
+        )
     # Load the scaler state if requested
     # TODO: this is a bit hacky, we should probably have a more general way to specify scaler state
     # as it is device-specific and may not always be needed 
     # => we should probably also have a more general way to specify additional states to load/save in the future.
     scaler_state = None
     if load_scaler:
-        if not (step_dir / "scaler.pt").exists():
-            log0("Scaler state file scaler.pt not found in step directory. Skipping loading scaler state.", logger=logger, level="warning")
+        if not _resolve_state_path(step_dir / "scaler.safetensors").exists():
+            log0("Scaler state file not found in step directory. Skipping loading scaler state.", logger=logger, level="warning")
         else:
-            scaler_state = _load_state_dict(step_dir, "scaler.pt", map_location="cpu", weight_only=False)
+            scaler_state = _load_state_dict(step_dir, "scaler.safetensors", map_location="cpu", weight_only=False)
     # Load the RNG state if requested
     rng_state = None
     if load_rng:
-        rng_state = _load_state_dict(step_dir, "rng_state.pt", map_location="cpu", weight_only=False)
+        rng_filename = _RNG_DEFAULT_FILENAME[optimizer_state_layout](rank)
+        if not _resolve_state_path(step_dir / rng_filename).exists():
+            rng_filename = "rng_state.safetensors"
+        rng_state = _load_state_dict(
+            step_dir,
+            rng_filename,
+            map_location="cpu",
+            weight_only=False,
+        )
     return CheckpointData(
         model_state=model_data,
         optimizer_state=optimizer_data,
         trainer_state=trainer_state,
+        checkpoint_state=checkpoint_state,
         scaler_state=scaler_state,
         rng_state=rng_state
     )
@@ -490,12 +662,15 @@ def build_model(
         step: Union[int, str] = -1, 
         phase: str = "train",
         source: _ModelSources = "base",
-        dist_info: Optional[Dict] = None,
+        comp_info: Optional[ComputeContext] = None,
+        optimizer_state_layout: Optional[_OptimizerStateLayout] = None,
      ) -> tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
-    if dist_info is None:
-        dist_info = get_dist_info()
-    device: torch.device = dist_info["DEVICE"]
+    if comp_info is None:
+        comp_info = get_comp_info()
+    if optimizer_state_layout is None:
+        optimizer_state_layout = "sharded" if comp_info.is_distributed else "full"
+    device: torch.device = comp_info.device
     model_cachedir = _solve_model_cache_dir(model_cachedir)
     run_name = _solve_run_name(model_cachedir / model_name, run_name=run_name)
     # get metaconfig
@@ -504,15 +679,23 @@ def build_model(
     # get checkpoint data
     ckpt_dir = model_cachedir / model_name / run_name / source
     if phase == "train":
-        trainer_config = TrainerConfig.model_validate(_load_state_dict(ckpt_dir, "training_config.pkl", map_location="cpu", weight_only=False))
-    load_scaler = (dist_info.get("dtype", False) == torch.float16) and (device.type == "cuda")
-    checkpoint_data = load_checkpoint(ckpt_dir, step, dist_info=dist_info, load_model=True, load_optim=True, load_trainer=True, load_scaler=load_scaler, load_rng=True)
-    if device.type in {"cpu", "mps"}:
-        # Convert bfloat16 tensors to float for CPU inference
-        checkpoint_data.model_state = {
-            k: v.float() if v.dtype == torch.bfloat16 else v
-            for k, v in checkpoint_data.model_state.items()
-        }
+        raw = _load_state_dict(ckpt_dir, "training_config.safetensors", map_location="cpu", weight_only=False)
+        trainer_config = TrainerConfig.model_validate(_migrate_trainer_config(raw) | {"comp_info": comp_info})
+    load_scaler = (
+        comp_info.compute_dtype == torch.float16
+        and device.type == "cuda"
+    )
+    checkpoint_data = load_checkpoint(
+        ckpt_dir,
+        step,
+        comp_info=comp_info,
+        load_model=True,
+        load_optim=phase == "train",
+        load_trainer=True,
+        load_scaler=load_scaler,
+        load_rng=True,
+        optimizer_state_layout=optimizer_state_layout,
+    )
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in checkpoint_data.model_state.items()}
     model_config_kwargs = meta_config.model_cfg.model_dump()
@@ -526,6 +709,7 @@ def build_model(
     # Load the model state
     model.to_empty(device=device)
     model.precompute_pos_enc()
+    model._enforce_precision(comp_info.compute_dtype)
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
@@ -547,11 +731,11 @@ def load_model_from_dir(
         phase: Literal["train", "eval"] = "train",
         model_cachedir: Optional[Union[str, Path]] = None,
         source: _ModelSources = "base",
-        dist_info: Optional[Dict] = None,
+        comp_info: Optional[ComputeContext] = None,
     ) -> Tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
-    if dist_info is None:
-        dist_info = get_dist_info()
-    device = dist_info["DEVICE"]
+    if comp_info is None:
+        comp_info = get_comp_info()
+    device = comp_info.device
     model_cachedir = _solve_model_cache_dir(model_cachedir)
     model_dir = model_cachedir / model_name
     if run_name is None:
@@ -564,7 +748,7 @@ def load_model_from_dir(
         step = find_last_step(ckpt_dir)
     assert step is not None, f"No checkpoints found in {ckpt_dir}"
     # build the model
-    model, tokenizer, ckpt_data, trainer_config = build_model(model_name=model_name, run_name=run_name, model_cachedir=model_cachedir, step=step, phase=phase, source=source, dist_info=dist_info)
+    model, tokenizer, ckpt_data, trainer_config = build_model(model_name=model_name, run_name=run_name, model_cachedir=model_cachedir, step=step, phase=phase, source=source, comp_info=comp_info)
     log0(f"Loaded model from {ckpt_dir} with step {step}", logger=logger)
     return model, tokenizer, ckpt_data, trainer_config
 
@@ -574,15 +758,13 @@ def load_optimizer_state(
         run_name: Optional[Union[str, int]] = None, 
         model_cachedir: Optional[Union[str, Path]] = None, # should not be needed -> this should be CACHE_DIR / models
         step: Optional[int] = None,
-        mode: Literal["ddp", "shard"] = "ddp",
-        dist_info: Optional[Dict] = None,
+        optimizer_state_layout: Literal["full", "sharded"] = "full",
+        comp_info: Optional[ComputeContext] = None,
     ) -> Optional[Dict]:
     """Load just the optimizer shard for a given rank, without re-loading the model."""
-    if dist_info is None:
-        dist_info = get_dist_info()
-    rank = dist_info["RANK"]
-    if mode == "shard":
-        log_error("Shard mode is not implemented yet. Please use ddp mode for now.", logger=logger, error_type=NotImplementedError)
+    if comp_info is None:
+        comp_info = get_comp_info()
+    rank = comp_info.rank
     # resolve general checkpoint path
     model_dir = _solve_model_cache_dir(model_cachedir).joinpath(model_name)
 
@@ -593,15 +775,18 @@ def load_optimizer_state(
     if step is None:
         step = find_last_step(checkpoints_dir)
     
-    optimizer_path = (checkpoints_dir
-        .joinpath(_STEP_DIRNAME(step))
-        .joinpath(_OPT_DEFAULT_FILENAME[mode](rank)))
+    step_dir = checkpoints_dir / _STEP_DIRNAME(step)
+    if (step_dir / "checkpoint_meta.json").exists():
+        metadata = _load_checkpoint_metadata(step_dir)
+        optimizer_state_layout = _checkpoint_read_layout(optimizer_state_layout, metadata, comp_info.world_size)
+    optimizer_path = step_dir / _OPT_DEFAULT_FILENAME[optimizer_state_layout](rank)
     
+    optimizer_path = _resolve_state_path(optimizer_path)
     if not optimizer_path.exists():
         log0(f"Optimizer checkpoint not found: {optimizer_path}")
         return None
     log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = torch.load(optimizer_path, map_location=dist_info["DEVICE"])
+    optimizer_data = _load_state_dict(optimizer_path, map_location=comp_info.device)
     return optimizer_data
 
 # general class api to simply checkpoint management 
@@ -617,8 +802,8 @@ class CheckpointManager:
         model_run: Optional[Union[str, int]] = None,
         model_cachedir: Optional[Union[str, Path]] = None,
         source: _ModelSources = "base",
-        dist_info: Optional[Dict] = None,
-        mode: _Mode = "ddp",
+        comp_info: Optional[ComputeContext] = None,
+        optimizer_state_layout: _OptimizerStateLayout = "full",
     ) -> None:
         self.model_name = model_name
         self.model_run = model_run
@@ -626,10 +811,10 @@ class CheckpointManager:
         self.run_name = _solve_run_name(self.model_cachedir / self.model_name, run_name=model_run)
         self.source_dir = self.model_cachedir / self.model_name / self.run_name / source
         
-        self.dist_info = dist_info or get_dist_info()
-        self.mode = mode
-        self._rank = self.dist_info["RANK"]
-        self._device = self.dist_info["DEVICE"]
+        self.comp_info = comp_info or get_comp_info()
+        self.optimizer_state_layout = optimizer_state_layout
+        self._rank = self.comp_info.rank
+        self._device = self.comp_info.device
  
         self._ckpt_state: Optional[CheckpointState] = self._load_checkpoint_state()
     
@@ -637,16 +822,16 @@ class CheckpointManager:
         if self._rank != 0:
             return
         self.source_dir.mkdir(parents=True, exist_ok=True)
-        _save_state_dict(trainer_config, self.source_dir, "training_config.pkl")
-        log0(f"Saved training config to {self.source_dir / 'training_config.pkl'}", logger=logger)
+        _save_state_dict(trainer_config, self.source_dir, "training_config.safetensors")
+        log0(f"Saved training config to {self.source_dir / 'training_config.safetensors'}", logger=logger)
 
     def load_training_config(self) -> Optional[TrainerConfig]:
-        path = self.source_dir / "training_config.pkl"
+        path = _resolve_state_path(self.source_dir / "training_config.safetensors")
         if not path.exists():
             log0(f"No training config found at {path}.", logger=logger, level="warning")
             return None
-        raw = _load_state_dict(self.source_dir, "training_config.pkl")
-        return TrainerConfig.model_validate(raw)
+        raw = _load_state_dict(path, map_location="cpu", weight_only=False)
+        return TrainerConfig.model_validate(_migrate_trainer_config(raw) | {"comp_info": self.comp_info})
     
     def save(
         self,
@@ -655,10 +840,15 @@ class CheckpointManager:
         optimizer: Optional[torch.optim.Optimizer] = None,
         trainer_state: Optional[TrainerState] = None,
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
+        checkpoint_state: Optional[CheckpointState] = None,
     ) -> Path:
         step = _get_checkpoint_step(self.source_dir, step)
         step_dir = self.source_dir / _STEP_DIRNAME(step)
-        if self._ckpt_state is None:
+        if trainer_state is None:
+            trainer_state = TrainerState()
+        if checkpoint_state is not None:
+            self._ckpt_state = checkpoint_state
+        elif self._ckpt_state is None:
             self._ckpt_state = CheckpointState(best_eval_step=step, best_eval_value=float('inf'))
         save_checkpoint(
             model=model,
@@ -668,9 +858,11 @@ class CheckpointManager:
             optimizer=optimizer,
             checkpoint_state=self._ckpt_state,
             scaler=scaler,
-            mode=self.mode,
-            dist_info=self.dist_info,
+            optimizer_state_layout=self.optimizer_state_layout,
+            comp_info=self.comp_info,
         )
+        if self._rank == 0:
+            self._save_checkpoint_state()
         return step_dir
  
     def load_states(
@@ -682,8 +874,9 @@ class CheckpointManager:
         load_scaler: bool = True,
     ) -> CheckpointData:
         step = _get_checkpoint_step(self.source_dir, step)
-        ckpt_data = load_checkpoint(self.source_dir, step=step, dist_info=self.dist_info,
-            load_model=load_model, load_optim=load_optim, load_rng=load_rng, load_scaler=load_scaler)
+        ckpt_data = load_checkpoint(self.source_dir, step=step, comp_info=self.comp_info,
+            load_model=load_model, load_optim=load_optim, load_rng=load_rng,
+            load_scaler=load_scaler, optimizer_state_layout=self.optimizer_state_layout)
         return ckpt_data 
     
     def load(self, step: _Step = "latest", phase: Literal["train", "eval"] = "train") -> Tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
@@ -695,7 +888,8 @@ class CheckpointManager:
             step=step,
             phase=phase,
             source=self.source_dir.name,
-            dist_info=self.dist_info,
+            comp_info=self.comp_info,
+            optimizer_state_layout=self.optimizer_state_layout,
         )
         return model, tokenizer, ckpt_data, trainer_config
  
@@ -737,8 +931,8 @@ class CheckpointManager:
             model_name=meta_config.name,
             run_name=meta_config.run_name,
             model_cachedir=meta_config.dirname,
-            dist_info=self.dist_info,
-            mode=self.mode,
+            comp_info=self.comp_info,
+            optimizer_state_layout=self.optimizer_state_layout,
             model_config=meta_config.model_cfg,
             tokenizer_config=meta_config.tokenizer_cfg,
             trainer_config=trainer_config
@@ -764,14 +958,14 @@ class CheckpointManager:
  
     @property
     def _ckpt_state_path(self) -> Path:
-        return self.source_dir / "checkpoint_state.pkl"
+        return _resolve_state_path(self.source_dir / "checkpoint_state.safetensors")
  
     def _save_checkpoint_state(self) -> None:
         self.source_dir.mkdir(parents=True, exist_ok=True)
-        _save_state_dict(self._ckpt_state.model_dump(), self.source_dir, "checkpoint_state.pkl")
+        _save_state_dict(self._ckpt_state.model_dump(), self.source_dir, "checkpoint_state.safetensors")
  
     def _load_checkpoint_state(self) -> Optional[CheckpointState]:
         if not self._ckpt_state_path.exists():
             return None
         raw_ckpt_state = _load_state_dict(self._ckpt_state_path, map_location="cpu", weight_only=False)
-        return CheckpointState.model_validate_json(raw_ckpt_state)
+        return CheckpointState.model_validate(raw_ckpt_state)

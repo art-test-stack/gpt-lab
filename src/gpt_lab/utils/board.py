@@ -24,6 +24,8 @@ class DummyBoard:
         pass
     def finish(self, *args, **kwargs):
         pass
+    def close(self):
+        pass
 
 class Board:
     def __init__(
@@ -48,7 +50,7 @@ class Board:
                 id=run,
                 dir=board_dir, # TODO
                 config=config,
-                resume="must" if resume else "auto",
+                resume="must" if resume else None,
             )
             
         elif self.board_type == "trackio":
@@ -88,4 +90,3 @@ class Board:
             self.main.close()
         elif self.board_type == "wandb":
             wandb.finish()
-        

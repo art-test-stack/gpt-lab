@@ -1,9 +1,37 @@
-from .board import Board
-from .common import get_banner, print0, print0_dict, is_rank0, get_rank
-from .distributed import init_dist_groups, cleanup_dist_groups, get_device_type, get_dist_info
-from .logging import init_logger, log0, log_dict
-from .special_tokens import SpecialTokens
-from .system import get_git_info, get_gpu_info, get_system_info, estimate_cost
+"""Utility exports loaded only when accessed."""
+
+from importlib import import_module
+
+
+_EXPORTS = {
+    "Board": "board",
+    "get_banner": "common",
+    "print0": "common",
+    "print0_dict": "common",
+    "is_rank0": "common",
+    "get_rank": "common",
+    "init_dist_groups": "distributed",
+    "cleanup_dist_groups": "distributed",
+    "get_device_type": "distributed",
+    "get_comp_info": "distributed",
+    "ComputeContext": "distributed",
+    "init_logger": "logging",
+    "log0": "logging",
+    "log_dict": "logging",
+    "SpecialTokens": "special_tokens",
+    "get_git_info": "system",
+    "get_gpu_info": "system",
+    "get_system_info": "system",
+    "estimate_cost": "system",
+}
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f".{_EXPORTS[name]}", __name__), name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "Board",
@@ -14,7 +42,8 @@ __all__ = [
     "cleanup_dist_groups",
     "is_rank0",
     "get_device_type",
-    "get_dist_info",
+    "get_comp_info",
+    "ComputeContext",
     "init_logger",
     "log0",
     "log_dict",

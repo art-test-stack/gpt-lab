@@ -550,17 +550,19 @@ def token_rows(raw, tokens, tokenizer, on_the_fly):
 def build_specs(raw, tokens, tokenizer, on_the_fly, raw_path, token_path, policy, selected, args):
     group, specs = (STREAM_GROUP if policy == STREAM else BEST_FIT_GROUP), []
     rows = lambda: token_rows(raw, tokens, tokenizer, on_the_fly)
-    if policy == STREAM and "gpt_lab_stream" in selected:
+    gpt_id = "gpt_lab_stream" if policy == STREAM else "gpt_lab_best_fit"
+    if gpt_id in selected:
         def gpt_lab():
             stats = PackingStats()
             loader = DistDataLoader(
                 CorpusDocuments(raw, tokens, tokenizer, on_the_fly),
                 args.batch_size, args.seq_len, device=args.device,
-                packing_strategy="stream", bos_token_id=tokenizer.get_bos_token_id(),
+                packing_strategy="stream" if policy == STREAM else "bos_bestfit_crop",
+                best_fit_buffer_docs=args.best_fit_buffer_docs, bos_token_id=tokenizer.get_bos_token_id(),
                 packing_stats=stats,
             )
             return StatsAdapter(loader, stats)
-        specs.append(LoaderSpec("GPT-Lab DistDataLoader", "gpt_lab_stream", policy, group, "gpt_lab.data.loader.DistDataLoader", gpt_lab))
+        specs.append(LoaderSpec("GPT-Lab DistDataLoader", gpt_id, policy, group, "gpt_lab.data.loader.DistDataLoader", gpt_lab))
     if "custom_pytorch" in selected:
         def custom():
             dataset = TorchPackedDataset(None, None, args.batch_size, args.seq_len, True, "stream" if policy == STREAM else "bestfit", args.best_fit_buffer_docs)
@@ -712,7 +714,7 @@ def aggregate(spec, trials, alignment, mode, tokenizer_name, pretokenization_sec
     return ComparisonResult(
         spec.comparison_group, spec.implementation, spec.implementation_id,
         spec.packing_policy, spec.provenance, mode, tokenizer_name, str(args.device),
-        "pinned CPU + non-blocking CUDA copy; regular copy otherwise",
+        "blocking copy for GPT-Lab reused staging buffers; adapters may use non-blocking copies",
         args.batch_size, args.seq_len, args.trials, args.batches, args.trials * args.batches,
         statistics.median(throughputs), percentile(throughputs, .5), percentile(throughputs, .95),
         statistics.mean(throughputs), statistics.stdev(throughputs) if len(throughputs) > 1 else 0.0,
@@ -818,7 +820,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark-results") / datetime.now().strftime("dataloaders-%Y%m%d-%H%M%S"))
     parser.add_argument("--tokenizers", default="gpt2"); parser.add_argument("--tokenization", choices=("on-the-fly", "pretokenized", "both"), default="both")
     parser.add_argument("--groups", default=f"{STREAM_GROUP},{BEST_FIT_GROUP}")
-    parser.add_argument("--implementations", default="gpt_lab_stream,custom_pytorch,nanochat_stream,nanochat_best_fit")
+    parser.add_argument("--implementations", default="gpt_lab_stream,gpt_lab_best_fit,custom_pytorch,nanochat_stream,nanochat_best_fit")
     parser.add_argument("--device", type=torch.device, default=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--batch-size", type=int, default=4); parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--batches", type=int, default=300); parser.add_argument("--trials", type=int, default=5)
@@ -883,8 +885,7 @@ def main() -> None:
         "corpus": {"path": str(dataset), "documents": len(raw), "order": "sorted shards/row groups/rows, repeated exactly"},
         "config": {"batch_size": args.batch_size, "sequence_length": args.seq_len, "trials": args.trials, "batches_per_trial": args.batches, "warmup_batches": args.warmup_batches, "correctness_batches": args.correctness_batches, "best_fit_buffer_documents": args.best_fit_buffer_docs, "tokenization": args.tokenization, "tokenizers": args.tokenizers},
         "pretokenization": pretokenization,
-        "matched_groups": {STREAM_GROUP: ["GPT-Lab", "Custom PyTorch", "nanochat adapted"], BEST_FIT_GROUP: ["Custom PyTorch", "nanochat adapted"]},
-        "gpt_lab_best_fit": "Unavailable: GPT-Lab bos_aligned retains suffixes and is not destructive best-fit, so it is excluded.",
+        "matched_groups": {STREAM_GROUP: ["GPT-Lab", "Custom PyTorch", "nanochat adapted"], BEST_FIT_GROUP: ["GPT-Lab", "Custom PyTorch", "nanochat adapted"]},
         "invalid_previous_comparisons": ["stream versus destructive BOS-best-fit", "B*(T+1) row stream versus flat B*T+1 carry stream", "loader timing obscured by model execution"],
         "timing": {"scope": "loader-only next() and device transfer", "excluded": ["construction", "correctness", "warmup", "pretokenization", "model execution"], "accelerator_sync": "before/after each measured batch", "rotated_orders": execution_orders},
         "memory": {
