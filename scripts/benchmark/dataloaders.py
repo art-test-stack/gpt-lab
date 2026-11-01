@@ -475,7 +475,8 @@ class StatsAdapter:
         values = {field: getattr(self.stats, field) - before[field] for field in self.FIELDS}
         values["buffered_source_tokens_delta"] = self.stats.buffered_source_tokens - buffered_before
         values["actual_buffered_tokens"] = self.stats.buffered_source_tokens
-        values["actual_buffered_documents"] = None
+        values["actual_buffered_documents"] = (len(self.iterator.doc_buffer)
+                                                 if isinstance(self.iterator, DistDataLoader) else None)
         return inputs, targets, values
 
 
@@ -851,7 +852,7 @@ def main() -> None:
     args = parse_args(); args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset = find_dataset(args.dataset_path); raw = read_documents(dataset, args.column, args.max_docs)
     selected, groups = set(filter(None, args.implementations.split(","))), set(filter(None, args.groups.split(",")))
-    known = {"gpt_lab_stream", "custom_pytorch", "nanochat_stream", "nanochat_best_fit"}
+    known = {"gpt_lab_stream", "gpt_lab_best_fit", "custom_pytorch", "nanochat_stream", "nanochat_best_fit"}
     if selected - known: raise ValueError(f"Unknown implementations: {sorted(selected - known)}")
     if groups - {STREAM_GROUP, BEST_FIT_GROUP}: raise ValueError(f"Unknown groups: {sorted(groups)}")
     modes = ("on-the-fly", "pretokenized") if args.tokenization == "both" else (args.tokenization,)

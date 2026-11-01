@@ -2,6 +2,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple, Union
+import warnings
 
 import torch
 
@@ -180,6 +181,8 @@ class DistDataLoader:
         self.doc_buffer: list[torch.Tensor] = []
 
         state = resume_state or getattr(dataset, "start_state", None)
+        if state is not None and state.packing_strategy is None:
+            warnings.warn("Legacy checkpoint lacks buffered packing state; exact token continuation is unavailable", stacklevel=2)
         if state is not None and state.packing_strategy is not None:
             if state.packing_strategy != packing_strategy:
                 raise ValueError(
@@ -632,8 +635,8 @@ def build_dataloader(
     if comp_info is None:
         comp_info = get_comp_info()
     if use_nanochat:
-        if packing_strategy != "stream":
-            raise ValueError("Use packing_strategy instead of combining it with use_nanochat")
+        if packing_strategy not in ("stream", "bos_bestfit_crop"):
+            raise ValueError("use_nanochat conflicts with packing_strategy")
         packing_strategy = "bos_bestfit_crop"
     if packing_strategy in ("stream", "bos_aligned", "bos_bestfit_crop"):
         if bos_token_id is None and tokenizer is not None and hasattr(tokenizer, "get_bos_token_id"):
@@ -646,7 +649,7 @@ def build_dataloader(
             base_url=base_url,
             shard_limit=shard_limit,
             max_shards=max_shards,
-            cachedir=cachedir or DATA_DIR,
+            cachedir=cachedir or datadir or DATA_DIR,
             start_state=resume_state,
             comp_info=comp_info,
             tokenizer_threads=tokenizer_threads,

@@ -237,3 +237,17 @@ def test_benchmark_trial_reports_memory_pressure():
     assert memory["accelerator_peak_delta_mib"] is None
     assert result.host_rss_peak_mib == memory["host_rss_peak_mib"]
     assert result.accelerator_peak_allocated_mib is None
+
+
+@pytest.mark.parametrize("policy,implementation", [("flat_stream", "gpt_lab_stream"), ("bos_aligned_best_fit", "gpt_lab_best_fit")])
+def test_shared_loader_passes_policy_matched_benchmark_gate(policy, implementation):
+    from scripts.benchmark.dataloaders import build_specs, correctness_gate
+    docs = [[99, *range(1, size)] for size in (3, 9, 23, 65)]
+    args = Namespace(batch_size=2, seq_len=4, best_fit_buffer_docs=3,
+                     device=torch.device("cpu"), correctness_batches=5)
+    specs = build_specs(["unused"] * len(docs), docs, IdentityTokenizer(99, 100), False,
+                        None, None, policy, {implementation, "custom_pytorch"}, args)
+    assert len(specs) == 2
+    alignment = correctness_gate(specs, docs, 99, args)
+    if policy == "bos_aligned_best_fit":
+        assert alignment[implementation] == 1.0

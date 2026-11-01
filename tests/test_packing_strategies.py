@@ -222,3 +222,12 @@ def test_output_storage_is_reused_after_consumption():
     assert x.data_ptr() == x2.data_ptr()
     assert y.data_ptr() == y2.data_ptr()
     assert not torch.equal(first, x2)
+
+
+
+def test_legacy_state_warns_and_versionless_draft_packing_is_rejected():
+    docs = [[BOS, *range(20)]]
+    with pytest.warns(UserWarning, match="exact token continuation is unavailable"):
+        make_loader(docs, strategy="stream", state=DataLoaderState())
+    with pytest.raises(ValueError, match="versioned state"):
+        make_loader(docs, strategy="stream", state=DataLoaderState(packing_strategy="stream"))
