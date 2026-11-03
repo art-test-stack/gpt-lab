@@ -1,13 +1,57 @@
 from collections import deque
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Optional, Tuple, Union, Literal
+from typing import Callable, Iterator, Optional, Tuple, Union
+import warnings
 
 import torch
 
 from gpt_lab.utils.default import DATA_DIR
 from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import DataLoaderState
+from gpt_lab.utils.types import PackingStrategy
 from gpt_lab.data.sharder import ShardManager
+
+
+@dataclass
+class PackingStats:
+    """Aggregate source-token and packing counters.
+
+    ``source_tokens_read`` counts tokenized source tokens entering the packer,
+    including document BOS tokens. ``new_source_tokens_advanced`` counts unique
+    source-stream tokens permanently advanced, excluding a retained FIFO carry.
+    Cropped tokens are source tokens advanced without being emitted. Skipped
+    transitions include destructive suffix loss and deliberate row segmentation
+    at an original BOS. Synthetic BOS tokens are never source tokens.
+    """
+
+    destructive_cropped_tokens: int = 0
+    source_tokens_read: int = 0
+    new_source_tokens_advanced: int = 0
+    skipped_adjacent_transitions: int = 0
+    synthetic_bos_tokens_inserted: int = 0
+    intentional_bos_boundaries: int = 0
+    buffered_source_tokens: int = 0
+    source_tokens_emitted: int = 0
+    source_bos_tokens_emitted: int = 0
+    rows: int = 0
+    batches: int = 0
+    debug_discarded_suffixes: Optional[list[tuple[int, ...]]] = None
+
+    def reset(self) -> None:
+        self.destructive_cropped_tokens = 0
+        self.source_tokens_read = 0
+        self.new_source_tokens_advanced = 0
+        self.skipped_adjacent_transitions = 0
+        self.synthetic_bos_tokens_inserted = 0
+        self.intentional_bos_boundaries = 0
+        self.buffered_source_tokens = 0
+        self.source_tokens_emitted = 0
+        self.source_bos_tokens_emitted = 0
+        self.rows = 0
+        self.batches = 0
+        if self.debug_discarded_suffixes is not None:
+            self.debug_discarded_suffixes.clear()
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -57,7 +101,9 @@ class ShardedDataset:
         self.tokenizer_threads = tokenizer_threads
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, DataLoaderState]]:
-        for texts, state in self.sm.iterate(start_state=self.start_state):
+        # One document per source state makes checkpoint resume exact: no
+        # untracked documents remain suspended inside this generator.
+        for texts, state in self.sm.iterate(start_state=self.start_state, batch_size=1):
             for txt in texts:
                 tokens = (
                     self.tokenizer(txt, prepend_bos=True, threads=self.tokenizer_threads)
@@ -80,29 +126,15 @@ class DistDataLoader:
     """
     Packs tokenized documents into fixed-shape (B, T) input/target tensors.
 
-    Design notes
-    ------------
-    * Buffer is a deque of (Tensor, state) pairs — O(1) popleft and head
-      update, versus O(n) for list.pop(0).
+    ``stream`` (the default) is a corrected flat B*T+1 stream with one-token
+    carry between batches. ``bos_aligned`` starts every row with BOS and keeps
+    every continuation suffix, inserting a synthetic BOS before it.
+    ``bos_bestfit_crop`` selects whole documents from a bounded lookahead and
+    discards suffixes when no document fits; rows start at a real document BOS.
 
-    * Buffer is sized in **tokens**, not in documents.  The old heuristic
-      `buffer_size = B * T * 16` was meant to be a token budget but was
-      interpreted as a document count, which could queue hundreds of
-      thousands of documents and consume gigabytes of memory before the
-      first batch.
-
-    * Documents are separated by an explicit BOS token so the model always
-      sees clean boundaries: …doc_N_last [BOS] doc_N+1_first…
-      Without this, cross-document targets are silently trained on,
-      which is especially harmful for value-embedding architectures where
-      BOS is the per-document anchor.
-
-    * Partial-document tail is kept as a tensor *view* (tokens[take:]),
-      not a Python list slice, so no allocation occurs when a document
-      spans multiple batches.
-
-    * Output tensors (self.inputs, self.targets) are pre-allocated once
-      and reused every step.
+    BOS alignment does not isolate documents in attention. Documents packed in
+    the same row can attend to earlier documents unless the model is separately
+    given a segment-aware attention mask.
     """
 
     def __init__(
@@ -112,32 +144,87 @@ class DistDataLoader:
         seq_len: int,
         device: str = "cuda",
         buffer_size: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
+        packing_strategy: PackingStrategy = "stream",
+        bos_token_id: Optional[int] = None,
+        resume_state: Optional[DataLoaderState] = None,
+        packing_stats: Optional[PackingStats] = None,
+        best_fit_buffer_docs: int = 1000,
     ):
+        if packing_strategy not in ("stream", "bos_aligned", "bos_bestfit_crop"):
+            raise ValueError(f"DistDataLoader does not implement {packing_strategy!r}")
+        if batch_size < 1 or seq_len < 1:
+            raise ValueError("batch_size and seq_len must be positive")
+        if packing_strategy != "stream" and bos_token_id is None:
+            raise ValueError("BOS packing requires bos_token_id")
+        if best_fit_buffer_docs < 1:
+            raise ValueError("best_fit_buffer_docs must be positive")
         self.dataset = dataset
         self.B = batch_size
         self.T = seq_len
         self.device = torch.device(device)
-        self.eos_token_id = eos_token_id
+        self.packing_strategy = packing_strategy
+        self.bos_token_id = bos_token_id
+        self.best_fit_buffer_docs = best_fit_buffer_docs
+        self.packing_stats = packing_stats or PackingStats()
+        self.last_batch_stats = PackingStats()
 
-        # Token budget for the pre-fetch buffer.
-        # Default: ~16 full batches so the GPU is never starved.
+        # Retained for API compatibility. On-demand reads make a checkpoint
+        # exact without serializing a multi-batch prefetch queue.
         self.token_buffer_size = buffer_size or (batch_size * seq_len * 16)
 
         self.iterator = iter(dataset)
-        self.buffer: deque[Tuple[torch.Tensor, DataLoaderState]] = deque()
-        self._buffered_tokens: int = 0
+        self.buffer: deque[Tuple[torch.Tensor, Optional[DataLoaderState], bool]] = deque()
         self.last_state: Optional[DataLoaderState] = None
+        self._carry_token: Optional[int] = None
+        self._continuation_pending = False
+        self._finished = False
+        self.doc_buffer: list[torch.Tensor] = []
+
+        state = resume_state or getattr(dataset, "start_state", None)
+        if state is not None and state.packing_strategy is None:
+            warnings.warn("Legacy checkpoint lacks buffered packing state; exact token continuation is unavailable", stacklevel=2)
+        if state is not None and state.packing_strategy is not None:
+            if state.packing_strategy != packing_strategy:
+                raise ValueError(
+                    f"Cannot resume {state.packing_strategy!r} state with {packing_strategy!r} packing"
+                )
+            if state.packing_state_version != 1:
+                raise ValueError("Packing checkpoint lacks supported versioned state; exact resume is unavailable")
+            expected = dict(
+                packing_batch_size=self.B, packing_seq_len=self.T,
+                packing_bos_token_id=self.bos_token_id,
+                packing_buffer_size=self.best_fit_buffer_docs,
+            )
+            sm = getattr(dataset, "sm", None)
+            if sm is not None:
+                expected.update(packing_rank=sm.ddp_rank, packing_world_size=sm.world_size)
+            for key, value in expected.items():
+                if getattr(state, key) != value:
+                    raise ValueError(f"Cannot resume with incompatible {key}: saved {getattr(state, key)!r}, requested {value!r}")
+            self.last_state = state
+            self.doc_buffer = [torch.tensor(doc, dtype=torch.long) for doc in state.packing_doc_buffer]
+            if state.pending_tokens:
+                self.buffer.append((
+                    torch.tensor(state.pending_tokens, dtype=torch.long),
+                    state,
+                    state.pending_is_document_start,
+                ))
+            self._carry_token = state.carry_token
+            self._continuation_pending = state.continuation_pending
+            saved = {
+                key: value for key, value in state.packing_stats.items()
+                if key in PackingStats.__dataclass_fields__
+            }
+            self.packing_stats = packing_stats or PackingStats(**saved)
 
         total = batch_size * (seq_len + 1)
 
-        # Pinned CPU staging buffer → non-blocking async copy to GPU.
+        # Reused pinned staging storage requires a completed host-to-device copy.
         self.cpu = torch.empty(
             total, dtype=torch.long,
             pin_memory=(self.device.type == "cuda"),
         )
         self.gpu = torch.empty(total, dtype=torch.long, device=self.device)
-
         # Single contiguous allocation; inputs and targets are non-overlapping
         # views into it.  Avoids two separate allocations per forward pass.
         _out = torch.empty(
@@ -146,88 +233,203 @@ class DistDataLoader:
         self.inputs  = _out[:batch_size * seq_len].view(batch_size, seq_len)
         self.targets = _out[batch_size * seq_len:].view(batch_size, seq_len)
 
-    def _refill(self) -> None:
-        """Pull documents from the dataset until the token budget is met."""
-        while self._buffered_tokens < self.token_buffer_size:
-            try:
-                tokens, state = next(self.iterator)
-            except StopIteration:
-                if getattr(self.dataset, "split", None) == "val":
-                    # Validation set is finite — wrap around silently.
-                    self.iterator = iter(self.dataset)
-                    continue
-                # Training iterator (ShardManager.iterate) is infinite;
-                # reaching here means something went wrong upstream.
-                break
+    def _pull_document(self) -> bool:
+        if self.buffer:
+            return True
+        return self._read_document()
 
-            self.buffer.append((tokens, state))
-            self._buffered_tokens += len(tokens)
+    def _read_document(self) -> bool:
+        try:
+            tokens, state = next(self.iterator)
+        except StopIteration:
+            return False
+        if not isinstance(tokens, torch.Tensor):
+            tokens = torch.tensor(tokens, dtype=torch.long)
+        if tokens.ndim != 1 or not len(tokens):
+            raise ValueError("Source documents must be nonempty 1-D token tensors")
+        if self.packing_strategy != "stream" and int(tokens[0]) != self.bos_token_id:
+            raise ValueError("BOS packing requires every source document to begin with a real BOS")
+        self.last_state = state
+        self.buffer.append((tokens, state, True))
+        self.packing_stats.source_tokens_read += len(tokens)
+        self.packing_stats.buffered_source_tokens += len(tokens)
+        self.last_batch_stats.source_tokens_read += len(tokens)
+        return True
+
+    def _copy_source(self, destination: torch.Tensor, limit: int) -> int:
+        if not self._pull_document():
+            return 0
+        tokens, state, is_start = self.buffer[0]
+        take = min(len(tokens), limit)
+        destination[:take].copy_(tokens[:take])
+        for stats in (self.packing_stats, self.last_batch_stats):
+            stats.source_tokens_emitted += take
+            stats.new_source_tokens_advanced += take
+            if is_start and take:
+                stats.source_bos_tokens_emitted += 1
+        self.packing_stats.buffered_source_tokens -= take
+        if take == len(tokens):
+            self.buffer.popleft()
+        else:
+            self.buffer[0] = (tokens[take:], state, False)
+        return take
 
     def __iter__(self):
         return self
 
     def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
-        self._refill()
-        B, T = self.B, self.T
-        total = B * (T + 1)
+        if self._finished:
+            raise StopIteration
+        self.last_batch_stats = PackingStats()
+        if self.packing_strategy == "stream":
+            self._next_stream()
+        elif self.packing_strategy == "bos_aligned":
+            self._next_bos_aligned()
+        else:
+            self._next_bestfit_crop()
+        for stats in (self.packing_stats, self.last_batch_stats):
+            stats.batches += 1
+            stats.rows += self.B
+        return self.inputs, self.targets, self._state()
+
+    def _next_stream(self) -> None:
+        total = self.B * self.T + 1
         pos = 0
-
+        had_carry = self._carry_token is not None
+        if had_carry:
+            self.packing_stats.buffered_source_tokens -= 1
+            self.cpu[0] = self._carry_token
+            pos = 1
         while pos < total:
-            if not self.buffer:
-                # Mid-batch top-up (rare: only if a single doc > token_buffer_size).
-                self._refill()
-                if not self.buffer:
-                    raise RuntimeError(
-                        "DistDataLoader buffer is empty mid-batch. "
-                        "The training ShardManager iterator should be infinite — "
-                        "check shard availability and ShardManager.iterate()."
-                    )
-
-            # O(1) peek at deque head — no pop yet.
-            tokens, state = self.buffer[0]
-            self.last_state = state
-
-            remaining = total - pos
-            take = min(len(tokens), remaining)
-
-            # Zero-copy write into the pinned CPU buffer.
-            # tokens[:take] is a tensor view (no new allocation).
-            self.cpu[pos : pos + take].copy_(tokens[:take])
+            take = self._copy_source(self.cpu[pos:total], total - pos)
+            if not take:
+                break
             pos += take
-            self._buffered_tokens -= take
+        if pos < total:
+            self._finished = True
+            raise StopIteration
+        if not had_carry:
+            # The first source token seeds the flat window; only the following
+            # B*T tokens advance the stream and contribute target positions.
+            for stats in (self.packing_stats, self.last_batch_stats):
+                stats.new_source_tokens_advanced -= 1
+        self.gpu[:total].copy_(self.cpu[:total], non_blocking=False)
+        self.inputs.copy_(self.gpu[:total - 1].view(self.B, self.T))
+        self.targets.copy_(self.gpu[1:total].view(self.B, self.T))
+        self._carry_token = int(self.cpu[total - 1])
+        self.packing_stats.buffered_source_tokens += 1
 
-            if take < len(tokens):
-                # Document spans into the next batch.
-                # Update the head in place with a view of the remainder —
-                # deque[0] access and assignment are both O(1).
-                self.buffer[0] = (tokens[take:], state)
-            else:
-                # Document fully consumed — O(1) removal.
-                self.buffer.popleft()
-
-        # Blocking host-to-device transfer.
+    def _next_bos_aligned(self) -> None:
+        B, capacity = self.B, self.T + 1
+        rows = self.cpu[:B * capacity].view(B, capacity)
+        for row_index in range(B):
+            pos = 0
+            if self._continuation_pending:
+                rows[row_index, 0] = self.bos_token_id
+                for stats in (self.packing_stats, self.last_batch_stats):
+                    stats.synthetic_bos_tokens_inserted += 1
+                    stats.skipped_adjacent_transitions += 1
+                self._continuation_pending = False
+                pos = 1
+            while pos < capacity:
+                if not self._pull_document():
+                    self._finished = True
+                    raise StopIteration
+                tokens, _, is_start = self.buffer[0]
+                if is_start and (not len(tokens) or int(tokens[0]) != self.bos_token_id):
+                    raise ValueError("bos_aligned requires every source document to begin with BOS")
+                if pos == 0 and is_start:
+                    for stats in (self.packing_stats, self.last_batch_stats):
+                        stats.intentional_bos_boundaries += 1
+                        stats.skipped_adjacent_transitions += 1
+                take = self._copy_source(rows[row_index, pos:capacity], capacity - pos)
+                pos += take
+                if self.buffer and pos == capacity:
+                    self._continuation_pending = True
         self.gpu.copy_(self.cpu, non_blocking=False)
-
-        data = self.gpu.view(B, T + 1)
+        data = self.gpu.view(B, capacity)
         self.inputs.copy_(data[:, :-1])
         self.targets.copy_(data[:, 1:])
 
-        return self.inputs, self.targets, self.last_state
+    def _next_bestfit_crop(self) -> None:
+        rows = self.cpu.view(self.B, self.T + 1)
+        for row in rows:
+            pos = 0
+            while pos < self.T + 1:
+                while len(self.doc_buffer) < self.best_fit_buffer_docs:
+                    if not self._read_document():
+                        break
+                    self.doc_buffer.append(self.buffer.popleft()[0])
+                if not self.doc_buffer:
+                    self._finished = True
+                    raise StopIteration
+                remaining = self.T + 1 - pos
+                fits = [i for i, doc in enumerate(self.doc_buffer) if len(doc) <= remaining]
+                index = (max(fits, key=lambda i: len(self.doc_buffer[i])) if fits
+                         else min(range(len(self.doc_buffer)), key=lambda i: len(self.doc_buffer[i])))
+                doc = self.doc_buffer.pop(index)
+                take = min(len(doc), remaining)
+                row[pos:pos + take].copy_(doc[:take])
+                cropped = len(doc) - take
+                for stats in (self.packing_stats, self.last_batch_stats):
+                    stats.source_tokens_emitted += take
+                    stats.source_bos_tokens_emitted += 1
+                    stats.new_source_tokens_advanced += len(doc)
+                    stats.destructive_cropped_tokens += cropped
+                    stats.skipped_adjacent_transitions += cropped + (pos == 0)
+                    stats.intentional_bos_boundaries += pos == 0
+                    if cropped and stats.debug_discarded_suffixes is not None:
+                        stats.debug_discarded_suffixes.append(tuple(doc[take:].tolist()))
+                self.packing_stats.buffered_source_tokens -= len(doc)
+                pos += take
+        self.gpu.copy_(self.cpu, non_blocking=False)
+        data = self.gpu.view(self.B, self.T + 1)
+        self.inputs.copy_(data[:, :-1])
+        self.targets.copy_(data[:, 1:])
+
+    def _state(self) -> DataLoaderState:
+        base = self.last_state or DataLoaderState()
+        values = base.model_dump(include={
+            "shard_idx", "global_shard_idx", "row_group_idx", "offset_in_row_group", "epoch",
+        })
+        pending_is_start = False
+        pending_tokens = []
+        if self.buffer:
+            tokens, _, pending_is_start = self.buffer[0]
+            pending_tokens = tokens.tolist()
+        sm = getattr(self.dataset, "sm", None)
+        return DataLoaderState(
+            **values,
+            cursor_version=1,
+            packing_state_version=1,
+            packing_batch_size=self.B,
+            packing_seq_len=self.T,
+            packing_bos_token_id=self.bos_token_id,
+            packing_buffer_size=self.best_fit_buffer_docs,
+            packing_rank=sm.ddp_rank if sm is not None else None,
+            packing_world_size=sm.world_size if sm is not None else None,
+            packing_doc_buffer=[doc.tolist() for doc in self.doc_buffer],
+            packing_strategy=self.packing_strategy,
+            pending_tokens=pending_tokens,
+            pending_is_document_start=pending_is_start,
+            carry_token=self._carry_token,
+            continuation_pending=self._continuation_pending,
+            packing_stats=asdict(self.packing_stats),
+        )
 
 # just to compare
 """
 Distributed dataloaders for pretraining.
 
-BOS-aligned bestfit:
+BOS-aligned destructive best-fit:
    - Every row starts with BOS token
    - Documents packed using best-fit algorithm to minimize cropping
    - When no document fits remaining space, crops a document to fill exactly
-   - 100% utilization (no padding), ~35% tokens cropped at T=2048
+   - Full rows without padding; suffix waste depends on corpus and configuration
 
-Compared to the original tokenizing_distributed_data_loader:
-BOS-aligned loses ~35% of tokens to cropping, but ensures that
-there are fewer "confusing" tokens in the train/val batches as every token can
-now attend back to the BOS token and sees the full context of the document.
+This legacy strategy may lose substantial source content to cropping. Starting
+a row with BOS does not isolate documents packed later in that row: causal
+attention still crosses document boundaries without segment-aware masks.
 
 Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
@@ -295,6 +497,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
     buffer_size=1000, base_path=None,
+    packing_stats: Optional[PackingStats] = None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -310,7 +513,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     Key properties:
     - Every row starts with BOS
     - 100% utilization (no padding, every token is trained on)
-    - Approximately 35% of all tokens are discarded due to cropping
+    - Discarded suffix tokens are counted; the rate depends on the corpus
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
@@ -326,10 +529,13 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
         for tokens in token_lists:
             doc_buffer.append(tokens)
+            if packing_stats is not None:
+                packing_stats.source_tokens_read += len(tokens)
+                packing_stats.buffered_source_tokens += len(tokens)
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
-    use_cuda = device == "cuda"
+    use_cuda = torch.device(device).type == "cuda"
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
@@ -340,6 +546,11 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     while True:
         for row_idx in range(B):
+            if packing_stats is not None:
+                # The transition into this row's original BOS is deliberately
+                # segmented, rather than lost accidentally or made synthetic.
+                packing_stats.intentional_bos_boundaries += 1
+                packing_stats.skipped_adjacent_transitions += 1
             pos = 0
             while pos < row_capacity:
                 # Ensure buffer has documents
@@ -366,8 +577,19 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     # No doc fits - crop shortest in buffer to fill remaining and minimize waste
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+                    take = min(len(doc), remaining)
+                    row_buffer[row_idx, pos:pos + take] = torch.tensor(doc[:take], dtype=torch.long)
+                    if packing_stats is not None:
+                        discarded = len(doc) - take
+                        packing_stats.destructive_cropped_tokens += discarded
+                        packing_stats.skipped_adjacent_transitions += discarded
+                        if packing_stats.debug_discarded_suffixes is not None and discarded:
+                            packing_stats.debug_discarded_suffixes.append(tuple(doc[take:]))
+                    pos += take
+
+                if packing_stats is not None:
+                    packing_stats.new_source_tokens_advanced += len(doc)
+                    packing_stats.buffered_source_tokens -= len(doc)
 
         # Copy to pinned CPU buffer, then single HtoD transfer
         cpu_inputs.copy_(row_buffer[:, :-1])
@@ -379,7 +601,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         state_dict = DataLoaderState(shard_idx=pq_idx, row_group_idx=rg_idx, epoch=epoch)
 
         # Single HtoD copy into persistent GPU buffer and yield
-        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        gpu_buffer.copy_(cpu_buffer, non_blocking=False)
         yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
@@ -404,34 +626,21 @@ def build_dataloader(
     resume_state: Optional[DataLoaderState] = None,
     comp_info: Optional[ComputeContext] = None,
     tokenizer_threads: int = 4,
-    use_nanochat: bool = False,
+    packing_strategy: PackingStrategy = "stream",
+    bos_token_id: Optional[int] = None,
+    use_nanochat: Optional[bool] = None,
+    packing_stats: Optional[PackingStats] = None,
+    best_fit_buffer_docs: int = 1000,
 ) -> DistDataLoader:
     if comp_info is None:
         comp_info = get_comp_info()
     if use_nanochat:
-        # This is the original dataloader from nanochat, from which I derived the pipeline for gpt-lab.
-        # So it is based on the same underlying data loading and on-the-fly tokenization
-        if resume_state is not None:
-            resume_state_dict = dict(
-                pq_idx=resume_state.shard_idx,
-                rg_idx=resume_state.row_group_idx,
-                epoch=resume_state.epoch
-            )
-        else:
-            resume_state_dict = None
-        dataloader = lambda: tokenizing_distributed_data_loader_with_state_bos_bestfit(
-            tokenizer=tokenizer,
-            B=batch_size,
-            T=seq_len,
-            split=split,
-            tokenizer_threads=tokenizer_threads,
-            tokenizer_batch_size=128,
-            device=comp_info.device,
-            resume_state_dict=resume_state_dict,
-            buffer_size=buffer_size or (batch_size * seq_len * 16),
-            base_path=datadir / name
-        )
-    else:
+        if packing_strategy not in ("stream", "bos_bestfit_crop"):
+            raise ValueError("use_nanochat conflicts with packing_strategy")
+        packing_strategy = "bos_bestfit_crop"
+    if packing_strategy in ("stream", "bos_aligned", "bos_bestfit_crop"):
+        if bos_token_id is None and tokenizer is not None and hasattr(tokenizer, "get_bos_token_id"):
+            bos_token_id = tokenizer.get_bos_token_id()
         ds = ShardedDataset(
             name=name,
             tokenizer=tokenizer,
@@ -440,9 +649,10 @@ def build_dataloader(
             base_url=base_url,
             shard_limit=shard_limit,
             max_shards=max_shards,
-            cachedir=cachedir,
+            cachedir=cachedir or datadir or DATA_DIR,
             start_state=resume_state,
             comp_info=comp_info,
+            tokenizer_threads=tokenizer_threads,
         )
         dataloader = lambda: DistDataLoader(
             ds,
@@ -450,7 +660,14 @@ def build_dataloader(
             seq_len=seq_len,
             device=comp_info.device,
             buffer_size=buffer_size,
+            packing_strategy=packing_strategy,
+            bos_token_id=bos_token_id,
+            resume_state=resume_state,
+            packing_stats=packing_stats,
+            best_fit_buffer_docs=best_fit_buffer_docs,
         )
+    else:
+        raise ValueError(f"Unknown packing strategy: {packing_strategy!r}")
     if split == "val":
         return dataloader
     else:

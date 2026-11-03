@@ -57,7 +57,9 @@ def train_base(
     log_every=250,
     monitor_grad_norms=False,
     device_batch_size=32,
-    use_nanochat_dataloader=False,
+    use_nanochat_dataloader=None,
+    packing_strategy=None,
+    best_fit_buffer_docs=None,
     max_seq_len=2048,
     tokenizer_model=None,
     vocab_size=-1,
@@ -216,12 +218,16 @@ def train_base(
 
         resume_state = None
         if is_resumed:
-            print("ckpt_data.trainer_state", ckpt_data.trainer_state)
             if ckpt_data and hasattr(ckpt_data.trainer_state, "train_loader_state") and ckpt_data.trainer_state.train_loader_state is not None:
                 resume_state = ckpt_data.trainer_state.train_loader_state
             else:
                 log0("No dataloader state found in checkpoint data. Resuming without dataloader state.", logger=logger, level="warning")
 
+        packing_strategy, best_fit_buffer_docs = resolve_packing_options(
+            packing_strategy, best_fit_buffer_docs, use_nanochat_dataloader,
+            trainer_config if is_resumed else None,
+        )
+        parameters.update(packing_strategy=packing_strategy, best_fit_buffer_docs=best_fit_buffer_docs)
         loader_common_kwargs = dict(
             name=ds_name,
             tokenizer=tokenizer,
@@ -232,9 +238,9 @@ def train_base(
             max_shards=None, # TODO: configured based on configs/data.yaml
             batch_size=base_training_config.get("device_batch_size", device_batch_size),
             comp_info=comp_info,
-            use_nanochat=use_nanochat_dataloader,
+            packing_strategy=packing_strategy,
+            best_fit_buffer_docs=best_fit_buffer_docs,
         )
-        # TODO: add option to configure buffer size
         train_loader = build_dataloader(split="train", resume_state=resume_state, **loader_common_kwargs)
         val_loader = build_dataloader(split="val", **loader_common_kwargs)
 
@@ -386,6 +392,8 @@ def build_trainer_config(parameters: dict, comp_info: ComputeContext, base_train
         fp8_ffn_forward=parameters.get("fp8_ffn_forward", False),
         stop_after_step=parameters.get("stop_after_step"),
         cuda_graph_mode=parameters.get("cuda_graph_mode") or "disabled",
+        packing_strategy=parameters.get("packing_strategy") or "stream",
+        best_fit_buffer_docs=parameters.get("best_fit_buffer_docs") or 1000,
         optim_config=parameters["optim_config"],
         lr_warmup_steps=parameters["warmup_steps"],
         lr_warmdown_ratio=parameters["warmdown_ratio"],
@@ -404,3 +412,24 @@ def build_trainer_config(parameters: dict, comp_info: ComputeContext, base_train
         # training horizon args from meta config
         **base_training_config
     )
+
+
+def resolve_packing_options(packing_strategy, best_fit_buffer_docs, use_nanochat, saved_config=None):
+    """Resolve fresh defaults or enforce the saved packing contract on resume."""
+    if use_nanochat:
+        if packing_strategy not in (None, "bos_bestfit_crop"):
+            raise ValueError("--use-nanochat-dataloader conflicts with --packing-strategy")
+        packing_strategy = "bos_bestfit_crop"
+    if packing_strategy not in (None, "stream", "bos_aligned", "bos_bestfit_crop"):
+        raise ValueError(f"Unknown packing strategy: {packing_strategy!r}")
+    if best_fit_buffer_docs is not None and (not isinstance(best_fit_buffer_docs, int) or best_fit_buffer_docs < 1):
+        raise ValueError("best_fit_buffer_docs must be a positive integer")
+    if saved_config is not None:
+        saved_policy = getattr(saved_config, "packing_strategy", "stream")
+        saved_buffer = getattr(saved_config, "best_fit_buffer_docs", 1000)
+        if packing_strategy is not None and packing_strategy != saved_policy:
+            raise ValueError("packing_strategy conflicts with saved training configuration")
+        if best_fit_buffer_docs is not None and best_fit_buffer_docs != saved_buffer:
+            raise ValueError("best_fit_buffer_docs conflicts with saved training configuration")
+        return saved_policy, saved_buffer
+    return packing_strategy or "stream", best_fit_buffer_docs if best_fit_buffer_docs is not None else 1000

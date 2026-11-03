@@ -1,6 +1,6 @@
 from argparse import ArgumentParser, Namespace
 
-from gpt_lab.cli.options import cache_dir, checkpoint_step
+from gpt_lab.cli.options import cache_dir, checkpoint_step, positive_int
 
 
 def add_common_arguments(parser: ArgumentParser) -> None:
@@ -24,7 +24,9 @@ def add_common_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--log-every', type=int, default=250, help='Log metrics every N zero-based update indices (-1 = final only, 0 = disable).')
     parser.add_argument('--monitor-grad-norms', action='store_true', help='Whether to monitor gradient norms during training. If set, will log the norm of the gradients of each parameter to the board at each training step.')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Batch size for each device during training. Batch size define further effective batch size as device_batch_size * max_seq_len * n_acc_steps.')
-    parser.add_argument('--use-nanochat-dataloader', action='store_true', help='Whether to use the nanochat dataloader instead of the default dataloader.')
+    parser.add_argument('--packing-strategy', choices=('stream', 'bos_aligned', 'bos_bestfit_crop'), default=None, help='Packing policy; fresh runs default to stream. Resume restores the saved policy and rejects changes. bos_aligned inserts synthetic BOS before continuations; crop starts at real document BOS.')
+    parser.add_argument('--best-fit-buffer-docs', type=positive_int, default=None, help='Best-fit lookahead in documents (default: 1000); saved and restored on resume.')
+    parser.add_argument('--use-nanochat-dataloader', action='store_true', default=None, help='Deprecated alias for --packing-strategy bos_bestfit_crop.')
     parser.add_argument('--stop-after-step', type=int, default=None, help='Absolute cap on completed optimizer steps, including before resume; >=0. Leaves the scheduling horizon unchanged. Unset retains the saved cap on resume.')
     parser.add_argument('--cuda-graph-mode', choices=('disabled', 'forward_backward'), default=None, help='Opt-in fixed-shape compiled forward/backward CUDA capture (FP32/BF16). Unset retains the saved mode on resume.')
 

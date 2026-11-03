@@ -27,6 +27,7 @@ OptimizerNames = Literal[ "adam", "adamw", "muon", "shampoo", "adahessian"]
 LossTypes = Literal["cross_entropy", "kl_divergence"]
 LossReductionTypes = Literal["none", "mean", "sum"]
 TpModes = Literal["row", "column"]
+PackingStrategy = Literal["stream", "bos_aligned", "bos_bestfit_crop"]
 
 # str_to_torch_dtype = {
 #     "bool": torch.bool,
