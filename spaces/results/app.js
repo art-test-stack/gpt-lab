@@ -6,7 +6,7 @@ const fmt = (n, digits = 3) => finite(n) ? n.toLocaleString('en-US', {maximumFra
 const compact = n => new Intl.NumberFormat('en-US', {notation:'compact', maximumFractionDigits:1}).format(n);
 const duration = n => !finite(n) ? '—' : n >= 3600 ? `${fmt(n / 3600, 1)} h` : n >= 60 ? `${fmt(n / 60, 1)} min` : `${fmt(n, 1)} s`;
 const title = run => String(run.label || run.id);
-let snapshot = {schema_version: 1, runs: []}, realSnapshot = snapshot, selected = new Set(), synthetic = false, tab = 'evidence';
+let snapshot = {schema_version: 1, runs: []}, realSnapshot = snapshot, selected = new Set(), synthetic = false, tab = 'overview';
 const inExperiment = run => !$('experiment').value || JSON.stringify(run.group || '') === $('experiment').value;
 const chosen = () => snapshot.runs.filter(run => inExperiment(run) && selected.has(run.id));
 const visibleRuns = () => snapshot.runs.filter(run => inExperiment(run) && `${title(run)} ${run.group || ''} ${run.status || ''}`.toLowerCase().includes($('search').value.toLowerCase()));
@@ -139,7 +139,7 @@ function render() {
   if (tab === 'evaluation') { chart('core-chart','core/core'); chart('eval-chart','core/step_time_ms',{factor:0.001}); }
 }
 function showTab(next, updateHash = true) {
-  tab = ['overview', 'evaluation', 'configuration', 'evidence'].includes(next) ? next : 'evidence';
+  tab = ['overview', 'evaluation', 'configuration', 'evidence'].includes(next) ? next : 'overview';
   for (const node of document.querySelectorAll('[data-tab]')) { node.classList.toggle('active',node.dataset.tab === tab); node.setAttribute('aria-pressed', node.dataset.tab === tab); }
   for (const node of document.querySelectorAll('.tab-panel')) node.hidden = node.id !== tab;
   for (const node of document.querySelectorAll('[data-training-action]')) node.hidden = tab === 'evidence';
