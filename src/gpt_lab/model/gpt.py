@@ -492,4 +492,3 @@ class DenseTransformer(BaseTransformer):
         )
         
         return output
-
