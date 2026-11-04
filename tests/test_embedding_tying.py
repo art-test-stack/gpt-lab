@@ -136,6 +136,25 @@ def test_embedding_tying_lifecycle(mode, compute_dtype, tmp_path):
     _assert_sharing(restored)
 
 
+@pytest.mark.parametrize("mode", ["embs;value_embs;head", "embs,head,value_embs:"])
+@pytest.mark.parametrize("context,pattern,window,expected_attention_flops", [
+    (4, "L", 1, 3072),       # Four full 4x4 attention squares.
+    (4, "S", 1, 1344),       # Three width-1 rectangles; the final layer is full.
+    (4, "SL", 2, 2304),      # Widths 2, 4, 2, 4; no causal/prefix discount.
+    (4, "S", 4, 3072),       # A window equal to context counts the full square.
+    (4, "S", 8, 3072),       # Windows longer than context are capped.
+    (1, "SSSL", 1, 768),     # Single-token sequences still count every layer.
+])
+def test_flops_follow_nanochat_convention(mode, context, pattern, window, expected_attention_flops):
+    model = build_meta_model(_config(
+        tie_embeddings=mode, max_context=context,
+        window_pattern=pattern, window_size=window,
+    ))
+    # Head tying changes storage, but not its dense output projection work.
+    projection_flops = 6 * model.n_scaling_params()
+    assert model.estimate_flops() == projection_flops + expected_attention_flops
+
+
 def test_full_tying_rejects_incompatible_value_width():
     with pytest.raises(ValueError, match="value and input embedding widths must match"):
         _config(n_kv_heads=1, tie_embeddings="embs,head,value_embs:")
@@ -271,3 +290,4 @@ def test_checkpoint_migrates_boolean_tying(flags, expected):
     saved = dict(flags)
     _migrate_model_config(saved, "0.1.1")
     assert saved == {"tie_embeddings": expected, "act_func": "swiglu"}
+

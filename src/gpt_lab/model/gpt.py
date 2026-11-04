@@ -282,11 +282,14 @@ class DenseTransformer(BaseTransformer):
         return nb_of_params["blocks"] + self.lm_head.weight.numel()
     
     def estimate_flops(self) -> float:
-        """Estimate useful forward/backward FLOPs per token (2 FLOPs/FMA).
+        """Estimate forward/backward FLOPs per token using nanochat's convention.
 
-        Count dense projections and inclusive causal attention pairs; exclude
-        elementwise operations, optimizer work, conversion and recomputation.
-        Projection accounting adapted from karpathy/nanochat.
+        Count 6 FLOPs per dense projection parameter and rectangular attention
+        (2 FLOPs/FMA), without discounting causal masks or short prefixes. Cap
+        each layer's attention length by its left window, matching nanochat.
+        This is an MFU accounting convention, not executed kernel FLOPs; exclude
+        lookups, elementwise operations, optimizer work, casts and recomputation.
+        Projection and attention accounting adapted from karpathy/nanochat.
         """
         n_params_per_layer = self.n_params_per_layer()
         # Tying saves storage, but the output projection still does the same work.
@@ -297,9 +300,8 @@ class DenseTransformer(BaseTransformer):
         attn_flops = 0
         for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left
-            span = t if window < 0 else min(window + 1, t)
-            pairs = span * (span + 1) // 2 + (t - span) * span
-            attn_flops += 12 * h * q * pairs / t
+            effective_seq = t if window < 0 else min(window, t)
+            attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * matmul_params + attn_flops
         return num_flops_per_token
     

@@ -275,6 +275,15 @@ This corrects the previous LR-shaped momentum multiplier and changes resumed
 training trajectories under the default schedule. Checkpoint formats are unchanged.
 Old checkpoints' loss EMA retains its previous rank-local history until it decays.
 
+Training FLOPs and MFU use the PaLM convention adapted in [nanochat](https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py): `6 * (block parameters + output-head parameters)` plus
+`12 * d_model * effective_seq` per attention layer, where `effective_seq` is
+the context length for full attention or `min(left_window, context_length)`
+for sliding attention. This rectangular estimate does not discount causal masks
+or short prefixes. It excludes input/value embedding lookups, elementwise and
+optimizer work, casts, and recomputation; it does not measure executed kernel
+FLOPs. The output head is counted even when tied. MFU is estimated FLOPs/token
+times global tokens/second divided by the aggregate GPU peak FLOPs/second.
+
 Next sections detail the different generated components.
 
 ### Tokenization
@@ -825,7 +834,7 @@ class CustomGPT(nn.Module):
       "Return the number of scaling parameters of the model. This method is used to compute the optimal training parameters based on the model size."
 
     def estimate_flops(self) -> float:
-      "Return the estimated number of FLOPs for a forward pass of the model. This method is used to compute the optimal training parameters based on the model size."
+      "Return estimated forward/backward FLOPs per token using the nanochat convention, for training budgets and MFU."
 
     def build_optimizer(self, training_config) -> gpt_lab.optim.OptimizerFactory:
       "Return the optimizer for the model based on the provided configuration. This method is used to build the optimizer for training."
