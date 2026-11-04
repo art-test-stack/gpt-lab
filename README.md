@@ -275,8 +275,7 @@ This corrects the previous LR-shaped momentum multiplier and changes resumed
 training trajectories under the default schedule. Checkpoint formats are unchanged.
 Old checkpoints' loss EMA retains its previous rank-local history until it decays.
 
-Training FLOPs and MFU use the [nanochat](https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py)
-convention: `6 * (block parameters + output-head parameters)` plus
+Training FLOPs and MFU use the PaLM convention adapted in [nanochat](https://github.com/karpathy/nanochat/blob/master/nanochat/gpt.py): `6 * (block parameters + output-head parameters)` plus
 `12 * d_model * effective_seq` per attention layer, where `effective_seq` is
 the context length for full attention or `min(left_window, context_length)`
 for sliding attention. This rectangular estimate does not discount causal masks
@@ -284,10 +283,6 @@ or short prefixes. It excludes input/value embedding lookups, elementwise and
 optimizer work, casts, and recomputation; it does not measure executed kernel
 FLOPs. The output head is counted even when tied. MFU is estimated FLOPs/token
 times global tokens/second divided by the aggregate GPU peak FLOPs/second.
-This restores the previous attention convention for comparisons with nanochat;
-historical logs are not rewritten automatically. Fresh FLOP-budgeted training
-horizons use the restored estimate; resumed runs retain their saved training
-configuration.
 
 Next sections detail the different generated components.
 
