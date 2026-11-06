@@ -320,13 +320,11 @@ class SwigLUFeedForward(Module):
         if self.training and self.dropout_rate > 0.0:
             h = F.dropout(h, p=self.dropout_rate, training=True)
                 
-        output = h + x
-        # output = apply_rms_norm(h)
-        return output
+        return h
     
     
 class SquaredReLUFeedForward(Module):
-    '''Squared-ReLU FFN with the inner residual preserved (architecture C).'''
+    '''Squared-ReLU FFN branch; DecoderLayer applies the residual addition.'''
     def __init__(self, d_in: int, d_latent: int, dropout: float, device=DEVICE) -> None:
         super().__init__()
         self.w_1 = Linear(d_in, d_latent, device=device)
@@ -337,7 +335,7 @@ class SquaredReLUFeedForward(Module):
         h = self.w_2(F.relu(self.w_1(x)).square())
         if self.training and self.dropout_rate > 0.0:
             h = F.dropout(h, p=self.dropout_rate, training=True)
-        return h + x
+        return h
 
 
 class DecoderLayer(Module):
