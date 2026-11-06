@@ -366,11 +366,11 @@ class DecoderLayer(Module):
             value_embeds=value_embeds, rope_cache=rope_cache, window_size=window_size, 
             kv_cache=kv_cache, attn_mask=attn_mask, return_attn_weights=return_attn_weights)
         
+        if self.training and self.dropout_rate > 0.0:
+            h = F.dropout(h, p=self.dropout_rate, training=True)
+
         h = x + h
         h = h + self.ffn(self.norm(h))
-
-        if self.training:
-            h = F.dropout(h, p=self.dropout_rate, training=True)
         
         return h, attn_weights
     
