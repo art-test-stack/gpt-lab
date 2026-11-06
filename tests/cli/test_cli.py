@@ -82,6 +82,12 @@ def test_handlers_forward_to_packaged_workflow(prefix, module, handler, workflow
         execute.assert_called_once_with(args)
 
 
+def test_cli_rejects_legacy_fused_attention():
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(["train", "--attn-impl", "fused"])
+    assert error.value.code == 2
+
+
 def test_important_training_defaults():
     args = build_parser().parse_args(['train'])
     expected = dict(model_init='auto', model_name='ic1', run_name=None, max_seq_len=2048,

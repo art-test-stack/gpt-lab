@@ -44,6 +44,12 @@ def _auto_config(tmp_path: Path, **overrides) -> AutoGPTConfig:
     return AutoGPTConfig(**values)
 
 
+@pytest.mark.parametrize("config_class", [TransformerConfig, AutoGPTConfig])
+def test_legacy_fused_attention_is_rejected(config_class):
+    with pytest.raises(ValueError, match="attn_impl"):
+        config_class.model_validate({"attn_impl": "fused"})
+
+
 @pytest.mark.fast
 def test_non_vocab_parameter_count_is_vocab_independent():
     common = {

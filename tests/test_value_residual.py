@@ -1,34 +1,31 @@
-import copy
-from importlib import import_module
-
 import torch
 
 from gpt_lab.model.layers import CausalSelfAttention
 from gpt_lab.utils.schemas import TransformerConfig
 
 
-def test_fused_value_residual_matches_sdpa_outputs_and_gradients(monkeypatch):
-    # Exercise real packed attention through its CPU fallback, without a GPU kernel.
-    monkeypatch.setattr(import_module("gpt_lab.model.flash_attn"), "flash_attention_is_installed", False)
-    torch.manual_seed(42)
+def test_sdpa_value_residual_without_rope_or_qk_norm():
     config = TransformerConfig(
         d_model=16, d_ffn=32, n_heads=2, d_head=8, n_layers=1,
         norm_before_attn=False, attn_impl="sdpa", dropout=0.0,
     )
-    reference = CausalSelfAttention(config).to("cpu").eval()
-    packed = copy.deepcopy(reference)
-    packed.attn_impl = "fused"
-    x = torch.randn(2, 4, config.d_model)
-    values = torch.randn_like(x, requires_grad=True)
-    reference_values = values.detach().clone().requires_grad_()
+    attention = CausalSelfAttention(config).to("cpu").eval()
+    with torch.no_grad():
+        attention.qkv_proj.weight.zero_()
+        attention.o_proj.weight.copy_(torch.eye(config.d_model))
+        attention.ve_gate.weight.zero_()
+    x = torch.ones(2, 4, config.d_model)
+    positions = torch.arange(1, 5, dtype=x.dtype).view(1, 4, 1)
+    values = positions.expand_as(x).clone().requires_grad_()
 
-    output, _ = packed(x, value_embeds=values)
-    expected, _ = reference(x, value_embeds=reference_values)
+    output, _ = attention(x, value_embeds=values)
 
+    # Zero Q/K gives causal prefix means; a zero gate projection gives 3/2.
+    expected = 1.5 * values.cumsum(dim=1) / positions
     torch.testing.assert_close(output, expected)
-    output.square().sum().backward()
-    expected.square().sum().backward()
-    assert values.grad is not None and values.grad.abs().sum() > 0
-    assert packed.ve_gate.weight.grad is not None and packed.ve_gate.weight.grad.abs().sum() > 0
-    torch.testing.assert_close(values.grad, reference_values.grad)
-    torch.testing.assert_close(packed.ve_gate.weight.grad, reference.ve_gate.weight.grad)
+    output.sum().backward()
+    expected_value_grad = (1.5 / positions).flip(1).cumsum(dim=1).flip(1).expand_as(values)
+    torch.testing.assert_close(values.grad, expected_value_grad)
+    # Each gate weight sees 2 batches * 8 channels * (1 + 1.5 + 2 + 2.5) * 3/4.
+    torch.testing.assert_close(attention.ve_gate.weight.grad,
+                               torch.full_like(attention.ve_gate.weight, 84.0))
