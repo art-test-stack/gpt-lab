@@ -212,7 +212,10 @@ class CausalSelfAttention(Module):
             q = self.norm(q)
             k = self.norm(k)
 
-        if self.attn_impl == "fused" and ((rope_cache is not None) or self.norm_before_attn):
+        # Adding value embeddings replaces v rather than updating the packed view.
+        if self.attn_impl == "fused" and (
+            rope_cache is not None or self.norm_before_attn or value_embeds is not None
+        ):
             qkv = torch.cat([q, k, v], dim=-2)
 
         attn_weights = None
