@@ -432,6 +432,11 @@ uv run --extra cpu python -m experiments.tokenizer_scaling --help
 
 The library provides a modular implementation of a GPT-style DenseTransformer, where architectural components (attention, feedforward blocks, normalization, and positional encoding) are fully decoupled and configurable. The core model is defined in [`gpt_lab.model.gpt`](./src/gpt_lab/model/gpt.py), while reusable layer primitives are implemented in [`gpt_lab.model.layers`](./src/gpt_lab/model/layers.py). Model behavior is controlled via a Pydantic configuration class (`TransformerConfig`) defined in `gpt_lab.utils.schemas` (but also accessible under `gpt_lab.model.gpt`), enabling structured extension of architectural variants and hyperparameters.
 
+Each decoder block applies the attention and FFN residual additions. SwiGLU and
+squared-ReLU FFNs return only their transformed branch. Older checkpoints trained
+with the additional inner FFN skip still load with the same parameter keys, but
+their outputs and resumed training trajectories change under this architecture.
+
 Here a simple example to produce a Llama-like architecture:
 ```python
 from gpt_lab.model.gpt import TransformerConfig, DenseTransformer
