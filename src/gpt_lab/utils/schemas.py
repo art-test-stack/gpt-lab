@@ -306,7 +306,7 @@ class TransformerConfig(BaseModel):
     act_func: FFNActivation = "relu_squared"
 
     # TODO: padged attention implementation
-    attn_impl: AttnImplTypes = "sdpa"  # Kernel: sdpa, fa2, fa3; fused is legacy-only.
+    attn_impl: AttnImplTypes = "sdpa"  # Kernel: sdpa, fa2, fa3.
     # TODO: # layer_types: Optional[List[TParams]] = None  # e.g., ["standard", "standard", "moe", ...] length must be n_layers
     use_gqa: bool = False
     
@@ -338,11 +338,6 @@ class TransformerConfig(BaseModel):
             )
         if self.n_kv_heads != self.n_heads:
             object.__setattr__(self, "use_gqa", True)
-        if self.use_gqa and self.attn_impl == "fused":
-            log0("Fused attention implementation does not support GQA. "
-                 "Falling back to standard attention. ",
-                    level="warning", logger=logger)
-            object.__setattr__(self, "attn_impl", "sdpa")
         object.__setattr__(
             self, "attention_dropout",
             self.attention_dropout if self.attention_dropout is not None else self.dropout,

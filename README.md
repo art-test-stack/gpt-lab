@@ -444,7 +444,8 @@ cfg = TransformerConfig(
     n_kv_heads=8,
     n_layers=6,
     d_ffn=2048,
-    attn_impl="flash_attention",
+    # Kernel: "sdpa", "fa2", or "fa3"; legacy "fused" configs are rejected.
+    attn_impl="sdpa",
     act_func="swiglu",
     normalization="rms",
 )

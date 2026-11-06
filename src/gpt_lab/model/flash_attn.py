@@ -35,7 +35,7 @@ if is_torch_cuda_available():
     except Exception as error:
         _flash_attn_load_error = error
         warnings.warn(
-            "Fused attention backend initialization failed; explicit fused requests on Hopper require FA3.\n"
+            "FlashAttention 3 backend initialization failed.\n"
             + traceback.format_exc(),
             RuntimeWarning, stacklevel=2,
         )
