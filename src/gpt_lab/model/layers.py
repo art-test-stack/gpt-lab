@@ -145,9 +145,6 @@ class CausalSelfAttention(Module):
         super().__init__()
         assert config.d_model == config.d_head * config.n_heads, f'Dimensions are not correct. dim_model must be equal to d_head * n_heads. Got dim_model={config.d_model}, d_head={config.d_head}, n_heads={config.n_heads}'
         assert config.attn_impl in get_args(AttnImplTypes), f'Attention implementation {config.attn_impl} is not supported. Supported attention implementations are in {get_args(AttnImplTypes)}.'
-        if (config.attn_impl == "fused" and torch.cuda.is_available()
-                and torch.cuda.get_device_capability()[0] >= 9):
-            require_flash_attn3()
         if config.attn_impl == "fa3":
             require_flash_attn3()
             if config.dropout != 0.0 or config.attention_dropout != 0.0:
@@ -212,9 +209,6 @@ class CausalSelfAttention(Module):
             q = self.norm(q)
             k = self.norm(k)
 
-        if self.attn_impl == "fused" and ((rope_cache is not None) or self.norm_before_attn):
-            qkv = torch.cat([q, k, v], dim=-2)
-
         attn_weights = None
         # interpretability mode - not optimized for memory efficiency
         if return_attn_weights:
@@ -238,18 +232,7 @@ class CausalSelfAttention(Module):
                 cache_seqlens=kv_cache.seqlens,
                 causal=True,
                 window_size=window_size if window_size is not None else (-1, -1),
-                backend=None if self.attn_impl == "fused" else self.attn_impl,
-            )
-
-        # qkv-fused training mode
-        elif self.attn_impl == 'fused':
-            assert Hq == Hk, f'Fused attention implementation does not support GQA. Please set attn_impl to "sdpa" if you want to use GQA. Got Hq={Hq}, Hk={Hk}.'
-            qkv = qkv.view(B, Tq, 3, Hq, D).contiguous()  
-            x = flash_attn.flash_attn_qkvpacked_func(
-                qkv,
-                dropout_p=self.dropout_rate if self.training else 0.0,
-                window_size=window_size,
-                causal=True
+                backend=self.attn_impl,
             )
 
         # Kernel choice is independent of the packed projection.
