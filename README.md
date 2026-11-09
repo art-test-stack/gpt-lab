@@ -451,6 +451,9 @@ cfg = TransformerConfig(
 model = DenseTransformer(cfg)
 ```
 
+During training, dropout masks the attention output and FFN branch before their
+residual additions, preserving the skip path. Evaluation disables dropout.
+
 ### Optimization
 
 The optimizer system uses a **registry-based, strategy-pattern architecture** that decouples optimizer logic from execution mode (single-GPU vs. distributed). Optimizers are built and configured by calling `DenseTransformer.build_optimizer` in the `Trainer` class (available in [`gpt_lab.train.trainer`](./src/gpt_lab/train/trainer.py)) using the optimizer configuration from [`configs/optim.yaml`](./configs/optim.yaml), which can specify mixed optimizer groups.
