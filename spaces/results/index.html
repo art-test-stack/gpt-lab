@@ -58,7 +58,7 @@
       <section id="configuration" class="tab-panel" hidden><article class="panel"><div class="panel-title"><h2>Configuration comparison</h2><label class="small"><input id="differences" type="checkbox"> Only differences</label></div><p class="table-note">Nested settings stay together. Expand JSON to inspect, or download a run’s complete configuration.</p><div id="config-downloads" class="config-downloads" aria-label="Configuration JSON downloads"></div><div id="config-table" class="table-wrap"></div></article></section>
 
       <article class="panel runs-panel"><div class="panel-title"><h2>Run recap</h2><span>LAST RECORDED VALUES</span></div><div id="recap-table" class="table-wrap"></div></article>
-      <p class="footnote">Training time excludes evaluation in gpt-lab. Logged elapsed time includes intervals between metric logs; neither is a Modal billing measurement. MFU is an estimate based on model FLOPs and configured peak compute. Missing axis values are omitted, not interpolated. Scores are not automatically ranked as comparable experiments.</p>
+      <p class="footnote">Training time excludes evaluation in gpt-lab. Logged elapsed time includes intervals between metric logs; neither is a Modal billing measurement. MFU uses nanochat-compatible rectangular attention and each run’s original peak-compute denominator. <a href="archive/accounting-v1/per-run.md">Accounting audit and correction provenance</a>. Missing axis values are omitted, not interpolated. Scores are not automatically ranked as comparable experiments.</p>
     </div>
     <section id="evidence" class="tab-panel archive-panel" hidden>
       <div id="archive-summary" class="archive-summary"></div>
