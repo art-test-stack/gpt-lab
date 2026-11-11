@@ -35,7 +35,7 @@ if is_torch_cuda_available():
     except Exception as error:
         _flash_attn_load_error = error
         warnings.warn(
-            "Fused attention backend initialization failed; explicit fused requests on Hopper require FA3.\n"
+            "FlashAttention 3 backend initialization failed.\n"
             + traceback.format_exc(),
             RuntimeWarning, stacklevel=2,
         )
@@ -261,6 +261,8 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
                 window_size=(-1, -1), alibi_slopes=None, deterministic=False, backend=None):
     """
+    Prefer a kernel's packed entrypoint for matching Q/K/V shapes.
+
     Args:
         q: (B, Tq, H, D)
         k: (B, Tk, H, D)
@@ -284,6 +286,9 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
             kwargs.update(dropout_p=dropout_p, alibi_slopes=alibi_slopes)
         elif dropout_p != 0.0 or alibi_slopes is not None:
             raise ValueError("FA3 does not support attention dropout or ALiBi in this integration")
+        packed = getattr(kernel, "flash_attn_qkvpacked_func", None)
+        if callable(packed) and q.shape == k.shape == v.shape:
+            return packed(torch.stack((q, k, v), dim=2), **kwargs)
         return kernel.flash_attn_func(q, k, v, **kwargs)
     if backend is not None:
         raise ValueError(f"Unknown attention kernel: {backend}")

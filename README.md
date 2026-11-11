@@ -449,7 +449,9 @@ cfg = TransformerConfig(
     n_kv_heads=8,
     n_layers=6,
     d_ffn=2048,
-    attn_impl="flash_attention",
+    # Select "sdpa", "fa2", or "fa3". Packed attention is chosen automatically;
+    # GQA and kernels without a packed entrypoint use separate Q/K/V.
+    attn_impl="sdpa",
     act_func="swiglu",
     normalization="rms",
 )
