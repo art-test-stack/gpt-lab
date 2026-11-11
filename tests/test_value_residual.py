@@ -1,13 +1,28 @@
+from importlib import import_module
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from gpt_lab.model.layers import CausalSelfAttention
 from gpt_lab.utils.schemas import TransformerConfig
 
 
-def test_sdpa_value_residual_without_rope_or_qk_norm():
+@pytest.mark.parametrize("backend", ["sdpa", "fa2", "fa3"])
+def test_value_residual_without_rope_or_qk_norm(monkeypatch, backend):
+    dispatch = import_module("gpt_lab.model.flash_attn")
+
+    def packed(qkv, **kwargs):
+        return dispatch._sdpa_fallback(*qkv.unbind(dim=2), **kwargs)
+
+    if backend != "sdpa":
+        kernel = SimpleNamespace(flash_attn_qkvpacked_func=packed)
+        loader = "require_flash_attn2" if backend == "fa2" else "require_flash_attn3"
+        monkeypatch.setattr(dispatch, loader, lambda: kernel)
+        monkeypatch.setattr(import_module("gpt_lab.model.layers"), loader, lambda: kernel)
     config = TransformerConfig(
         d_model=16, d_ffn=32, n_heads=2, d_head=8, n_layers=1,
-        norm_before_attn=False, attn_impl="sdpa", dropout=0.0,
+        norm_before_attn=False, attn_impl=backend, dropout=0.0,
     )
     attention = CausalSelfAttention(config).to("cpu").eval()
     with torch.no_grad():
