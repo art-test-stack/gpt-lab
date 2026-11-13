@@ -344,10 +344,30 @@ class DenseTransformer(BaseTransformer):
             dict(name="residual_inputs", params=residual_x0_params, **optim_config["residual_inputs"]),
         ]
 
-        for shape in sorted({p.shape for p in blocks_params}):
-            group_params = [p for p in blocks_params if p.shape == shape]
+        transformer_opts = optim_config["transformer"]
+        qkv_mode = transformer_opts.pop("muon_qkv", "joint")
+        qkv_params = set()
+        qkv_splits = ()
+        if qkv_mode != "joint":
+            qkv_params = {block.attention.qkv_proj.weight for block in self.blocks}
+            d_head = self.config.d_head
+            n_heads, n_kv_heads = self.config.n_heads, self.config.n_kv_heads
+            if qkv_mode == "projection":
+                qkv_splits = (n_heads * d_head, n_kv_heads * d_head, n_kv_heads * d_head)
+            else:
+                qkv_splits = (d_head,) * (n_heads + 2 * n_kv_heads)
+
+        block_groups = {}
+        for param in blocks_params:
+            splits = qkv_splits if param in qkv_params else ()
+            block_groups.setdefault((param.shape, splits), []).append(param)
+        for (shape, splits), group_params in sorted(block_groups.items()):
+            group_options = dict(transformer_opts)
+            if splits:
+                group_options["qkv_split_sizes"] = splits
             param_groups.append(dict(
-                name=f"block.{shape}", params=group_params, **optim_config["transformer"]
+                name=f"qkv.{shape}" if splits else f"block.{shape}",
+                params=group_params, **group_options,
             ))
         optimizer = OptimizerFactory(param_groups, comp_info=config.comp_info)
         for group in optimizer.param_groups:

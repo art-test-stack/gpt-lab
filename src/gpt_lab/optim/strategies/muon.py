@@ -1,6 +1,7 @@
 """Muon optimizer strategy (MomentUm Orthogonalized by Newton-Schulz)."""
 from __future__ import annotations
 
+from itertools import groupby
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,41 +30,59 @@ class MuonStrategy(OptimizerStrategy):
     def _kernel_kwargs(self, group: dict) -> dict:
         return {}
     
-    def local_step(self, group: dict) -> None:
-        params: list[torch.Tensor] = group["params"]
-        if not params:
-            return
-        
-        p = params[0]
-        state = self.opt.state[p]
-        shape, device, dtype = p.shape, p.device, p.dtype
-        red_dim = self._normalization_dim(shape)
-        
+    def _update(self, group: dict, grads: torch.Tensor, weights: torch.Tensor, state_size: int) -> None:
+        state = self.opt.state[group["params"][0]]
+        shape = weights.shape[-2:]
         if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(len(params), *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (
-                (len(params), shape[-2], 1) if red_dim == -1
-                else (len(params), 1, shape[-1])
-            )
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
-        
+            state["momentum_buffer"] = weights.new_zeros((state_size, *shape))
+        momentum = state["momentum_buffer"][:len(weights)]
+
         self.opt.scalars.muon_momentum_t.fill_(group["momentum"])
         self.opt.scalars.muon_beta2_t.fill_(group.get("beta") or 0.0)
-        self.opt.scalars.muon_lr_t.fill_(self._learning_rate(group, shape))
         self.opt.scalars.muon_wd_t.fill_(group["weight_decay"])
-        
+
+        splits = group.get("qkv_split_sizes")
+        if not splits:
+            self._update_matrices(group, grads, weights, momentum, state, state_size, "second_momentum_buffer")
+            return
+
+        # The leading block axis batches independent matrices. Unflatten keeps
+        # writable views into the original parameter and momentum buffers.
+        start = 0
+        for rows, run in groupby(splits):
+            count = len(list(run))
+            end = start + count * rows
+            blocks = tuple(t[:, start:end].unflatten(-2, (count, rows)) for t in (grads, weights, momentum))
+            self._update_matrices(group, *blocks, state, state_size, f"second_momentum_buffer_{start}")
+            start = end
+
+    def _update_matrices(self, group, grads, weights, momentum, state, state_size, variance_key):
+        rows, cols = weights.shape[-2:]
+        red_dim = self._normalization_dim((rows, cols))
+        if variance_key not in state:
+            variance_shape = (rows, 1) if red_dim == -1 else (1, cols)
+            state[variance_key] = weights.new_zeros((state_size, *weights.shape[1:-2], *variance_shape))
+        if len(weights) == 0:
+            return
+
+        self.opt.scalars.muon_lr_t.fill_(self._learning_rate(group, (rows, cols)))
         self.step_kernel(
-            stacked_grads, stacked_params, state["momentum_buffer"],
-            state["second_momentum_buffer"], self.opt.scalars.muon_momentum_t,
+            grads, weights, momentum,
+            state[variance_key][:len(weights)], self.opt.scalars.muon_momentum_t,
             self.opt.scalars.muon_lr_t, self.opt.scalars.muon_wd_t,
             self.opt.scalars.muon_beta2_t, group["ns_steps"], red_dim,
             self.opt.comp_info.compute_dtype,
             **self._kernel_kwargs(group),
         )
+
+    def local_step(self, group: dict) -> None:
+        params: list[torch.Tensor] = group["params"]
+        if not params:
+            return
+
+        stacked_grads = torch.stack([p.grad for p in params])
+        stacked_params = torch.stack(params)
+        self._update(group, stacked_grads, stacked_params, len(params))
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
     
     def dist_reduce(self, group: dict, world_size: int) -> dict:
@@ -146,8 +165,6 @@ class MuonStrategy(OptimizerStrategy):
         chunk_size = (len(params) + world_size - 1) // world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
-        red_dim = self._normalization_dim(shape)
-        
         start_idx = rank * chunk_size
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
 
@@ -163,41 +180,14 @@ class MuonStrategy(OptimizerStrategy):
                 for slot, position in enumerate(bucket["owner_positions"]):
                     owned_grads[position].copy_(bucket["grad_chunk"][slot])
         
-        state = self.opt.state[p]
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (
-                (chunk_size, shape[-2], 1) if red_dim == -1
-                else (chunk_size, 1, shape[-1])
-            )
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        
         updated_params = info.get("updated_params")
         if updated_params is None:
             updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         
-        if num_owned > 0:
-            owned_params = [params[start_idx + i] for i in range(num_owned)]
-            stacked_owned = torch.stack(owned_params)
-            
-            self.opt.scalars.muon_momentum_t.fill_(group["momentum"])
-            self.opt.scalars.muon_beta2_t.fill_(group["beta"])
-            self.opt.scalars.muon_lr_t.fill_(
-                self._learning_rate(group, shape)
-            )
-            self.opt.scalars.muon_wd_t.fill_(group["weight_decay"])
-            
-            self.step_kernel(
-                owned_grads[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned],
-                state["second_momentum_buffer"][:num_owned],
-                self.opt.scalars.muon_momentum_t, self.opt.scalars.muon_lr_t,
-                self.opt.scalars.muon_wd_t, self.opt.scalars.muon_beta2_t,
-                group["ns_steps"], red_dim, self.opt.comp_info.compute_dtype,
-                **self._kernel_kwargs(group),
-            )
-            updated_params[:num_owned].copy_(stacked_owned)
+        owned_grads = owned_grads[:num_owned]
+        stacked_owned = torch.stack(params[start_idx:start_idx + num_owned]) if num_owned else owned_grads
+        self._update(group, owned_grads, stacked_owned, chunk_size)
+        updated_params[:num_owned].copy_(stacked_owned)
         
         if num_owned < chunk_size:
             updated_params[num_owned:].zero_()

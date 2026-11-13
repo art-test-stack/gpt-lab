@@ -54,6 +54,35 @@ def test_normuon_override_profile():
     assert groups["embeddings"]["opt"] == groups["head"]["opt"] == "adamw"
 
 
+@pytest.mark.parametrize("mode,splits", [
+    ("joint", ()), ("projection", (16, 8, 8)), ("head", (8, 8, 8, 8)),
+])
+def test_qkv_optimizer_profile_keeps_one_projection_per_layer(tmp_path, mode, splits):
+    path = tmp_path / "optimizer.yaml"
+    path.write_text(f"transformer:\n  muon_qkv: {mode}\n")
+    profile = OptimizerConfig.from_file(path)
+    config = TrainerConfig(optim_config=profile, comp_info=ComputeContext(device=torch.device("cpu")))
+    model = build_meta_model(TransformerConfig(
+        vocab_size=300, max_context=4, d_model=16, d_ffn=32,
+        n_heads=2, n_kv_heads=1, n_layers=2, d_head=8, window_pattern="L",
+    )).to_empty(device="cpu")
+    optimizer = model.build_optimizer(config)
+    qkv_params = {block.attention.qkv_proj.weight for block in model.blocks}
+    assert all(param.shape == (32, 16) for param in qkv_params)
+    for group in optimizer.param_groups:
+        params = set(group["params"])
+        if params & qkv_params:
+            assert group.get("qkv_split_sizes", ()) == splits
+            if splits:
+                assert params == qkv_params
+            else:
+                # The FFN up weights share the packed QKV weight's shape.
+                assert model.blocks[0].ffn.w_1.weight in params
+        else:
+            assert "qkv_split_sizes" not in group
+    assert profile.group_configs()["transformer"]["muon_qkv"] == mode
+
+
 @pytest.mark.parametrize('contents', [
     'batch_size: 64',
     'transformer:\n  n_steps: 8',
@@ -61,6 +90,8 @@ def test_normuon_override_profile():
     'head:\n  lr: bad',
     'head:\n  weight_decay: .nan',
     'head:\n  opt: unknown',
+    'head:\n  muon_qkv: head',
+    'transformer:\n  muon_qkv: fused',
 ])
 def test_optimizer_file_rejects_conflicting_or_invalid_parameters(tmp_path, contents):
     path = tmp_path / 'invalid.yaml'

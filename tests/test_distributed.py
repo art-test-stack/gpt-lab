@@ -157,7 +157,7 @@ def test_two_process_cpu_mesh(tmp_path, adopt_existing):
     mp.spawn(_mesh_worker, args=(port, tmp_path, adopt_existing), nprocs=2, join=True)
 
 
-def _optimizer_worker(rank, port):
+def _optimizer_worker(rank, port, communication_mode):
     from gpt_lab.optim.factory import OptimizerFactory
 
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2",
@@ -167,6 +167,7 @@ def _optimizer_worker(rank, port):
     context = init_dist_groups("cpu")
     try:
         shapes = [(8,), (32, 32), (2, 3), (2, 3), (2, 3), (3, 2), (3, 2), (3, 2)]
+        shapes.extend([(8, 4)] * 3 + [(6, 4)])
         parameters = [torch.nn.Parameter(torch.linspace(-0.3, 0.7, torch.Size(shape).numel()).reshape(shape))
                       for shape in shapes]
         reference = [torch.nn.Parameter(parameter.detach().clone()) for parameter in parameters]
@@ -175,10 +176,15 @@ def _optimizer_worker(rank, port):
             return [
                 dict(params=params[:2], opt="adamw", lr=0.01, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1),
                 dict(params=params[2:5], opt="muon", lr=0.01, momentum=0.95, beta=0.9, ns_steps=2, weight_decay=0.1),
-                dict(params=params[5:], opt="normuon", lr=0.01, momentum=0.95, beta=0.95, ns_steps=5, weight_decay=0.1),
+                dict(params=params[5:8], opt="normuon", lr=0.01, momentum=0.95, beta=0.95, ns_steps=5, weight_decay=0.1),
+                dict(params=params[8:11], opt="muon", lr=0.01, momentum=0.95, beta=0.9,
+                     ns_steps=2, weight_decay=0.1, qkv_split_sizes=(4, 2, 2)),
+                dict(params=params[11:], opt="normuon", lr=0.01, momentum=0.95, beta=0.95,
+                     ns_steps=5, weight_decay=0.1, qkv_split_sizes=(2, 2, 2)),
             ]
 
         optimizer = OptimizerFactory(groups(parameters), comp_info=context)
+        optimizer.configure_communication(communication_mode, bucket_bytes=128)
         local = OptimizerFactory(groups(reference), comp_info=ComputeContext(device=torch.device("cpu")))
         # Exercise real optimizer kernels without testing the compiler toolchain.
         with torch.compiler.set_stance("force_eager"):
@@ -201,17 +207,23 @@ def _optimizer_worker(rank, port):
                         if index == 1:
                             expected = expected.chunk(2)[rank]
                         torch.testing.assert_close(actual_state[key], expected)
-                owned = 2 if rank == 0 else 1
-                for start in (2, 5):
-                    for key in ("momentum_buffer", "second_momentum_buffer"):
-                        expected = local.state[reference[start]][key][rank * 2:rank * 2 + owned]
-                        torch.testing.assert_close(optimizer.state[parameters[start]][key][:owned], expected)
+                for start, size in ((2, 3), (5, 3), (8, 3), (11, 1)):
+                    slots = (size + 1) // 2
+                    owned = min(slots, size - rank * slots)
+                    local_state = local.state[reference[start]]
+                    distributed_state = optimizer.state[parameters[start]]
+                    assert distributed_state.keys() == local_state.keys()
+                    for key, expected in local_state.items():
+                        assert distributed_state[key].shape[0] == slots
+                        expected = expected[rank * slots:rank * slots + owned]
+                        torch.testing.assert_close(distributed_state[key][:owned], expected)
     finally:
         cleanup_dist_groups()
 
 
-def test_two_process_gloo_optimizer_matches_averaged_local_updates():
+@pytest.mark.parametrize("communication_mode", ["baseline", "pipeline"])
+def test_two_process_gloo_optimizer_matches_averaged_local_updates(communication_mode):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_optimizer_worker, args=(port,), nprocs=2, join=True)
+    mp.spawn(_optimizer_worker, args=(port, communication_mode), nprocs=2, join=True)

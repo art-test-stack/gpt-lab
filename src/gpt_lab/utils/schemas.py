@@ -453,6 +453,10 @@ class OptimizerConfig(BaseModel):
         for index, (name, group) in enumerate(self.group_configs().items()):
             _validate_group(group, index)
             group_allowed = allowed | ({"anvil_spectral"} if group["opt"] == "normuon" else set())
+            if name == "transformer" and group["opt"] in ("muon", "normuon"):
+                group_allowed.add("muon_qkv")
+                if group["muon_qkv"] not in ("joint", "projection", "head"):
+                    raise ValueError("transformer.muon_qkv must be joint, projection, or head")
             if set(group) - group_allowed:
                 raise ValueError(f"Unsupported optimizer parameters in {name}: {sorted(set(group) - group_allowed)}")
             for key in ("lr", "weight_decay"):
@@ -460,10 +464,13 @@ class OptimizerConfig(BaseModel):
                     raise ValueError(f"{name}.{key} must be finite and non-negative")
 
     def group_configs(self) -> Dict[str, Dict[str, Any]]:
-        return {
+        groups = {
             name: self.groups.get("default", {}) | group
             for name, group in self.groups.items() if name != "default"
         }
+        if groups["transformer"].get("opt") in ("muon", "normuon"):
+            groups["transformer"].setdefault("muon_qkv", "joint")
+        return groups
 
     @classmethod
     def from_file(cls, path: str | Path | None = None) -> "OptimizerConfig":
