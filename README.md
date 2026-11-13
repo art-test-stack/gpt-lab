@@ -481,6 +481,22 @@ NorMuon uses a compiled update kernel; fusion may change intermediate BF16
 rounding relative to the eager reference implementation.
 
 Use `--optim-config-path configs/normuon.yaml` for a NorMuon override profile.
+For Muon or NorMuon, an optimizer YAML override can select the QKV update granularity.
+
+```yaml
+transformer:
+  muon_qkv: projection
+```
+
+- `joint` (default) updates the entire QKV matrix together.
+- `projection` updates Q, K, and V independently, including unequal row counts in GQA.
+- `head` updates each Q, K, and V head independently.
+
+All modes use one fused QKV linear projection and the same automatic FlashAttention dispatch.
+The split modes reuse the compiled optimizer step on batches of equal-sized blocks, with normalization
+and learning-rate scaling based on the logical matrix shapes. Resume with the same setting to
+restore the optimizer's momentum and variance state.
+
 Explicit preserved Muon/NorMuon/spectral-only ANVIL experiment profiles are in
 [optimizer comparison](experiments/optimizer_comparison/README.md).
 Its hyperparameters are starting values, not calibrated replacements for the

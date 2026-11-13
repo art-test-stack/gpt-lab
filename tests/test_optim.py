@@ -94,6 +94,38 @@ def test_legacy_checkpoint_gets_schedule_baselines(opt_name):
     assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.07)
 
 
+@pytest.mark.parametrize("opt_name", ["muon", "normuon"])
+@pytest.mark.parametrize("splits", [(4, 4, 4), (4, 2, 2), (2,) * 4])
+def test_split_qkv_matches_independent_matrices_after_resume(tmp_path, opt_name, splits):
+    generator = torch.Generator().manual_seed(35)
+    packed = torch.nn.Parameter(torch.randn(sum(splits), 4, generator=generator))
+    parts = [torch.nn.Parameter(block.clone()) for block in packed.detach().split(splits)]
+    settings = dict(opt=opt_name, lr=0.02, momentum=0.95, beta=0.9, ns_steps=5, weight_decay=0.1)
+    context = ComputeContext(device=torch.device("cpu"))
+    group = dict(params=[packed], qkv_split_sizes=splits, **settings)
+    optimizer = OptimizerFactory([group], comp_info=context)
+    reference = OptimizerFactory([dict(params=[p], **settings) for p in parts], comp_info=context)
+
+    with torch.compiler.set_stance("force_eager"):
+        for step in range(3):
+            packed.grad = torch.randn(packed.shape, generator=generator)
+            for part, grad in zip(parts, packed.grad.split(splits)):
+                part.grad = grad.clone()
+            optimizer.step()
+            reference.step()
+            torch.testing.assert_close(packed, torch.cat(parts))
+
+            if step == 0:
+                path = tmp_path / "optimizer.safetensors"
+                save_tensor_state(optimizer.state_dict(), path)
+                saved = load_tensor_state(path)
+                optimizer = OptimizerFactory([group], comp_info=context)
+                optimizer.load_state_dict(saved)
+                joint = OptimizerFactory([dict(params=[packed], **settings)], comp_info=context)
+                with pytest.raises(ValueError, match="different Muon QKV split layout"):
+                    joint.load_state_dict(saved)
+
+
 def _reference_normuon_update(grad, momentum, second_moment, beta, beta2, steps):
     # Unbatched official reference; MIT (c) 2025 zichongli5, LICENSES/NorMuon-MIT.txt.
     momentum.lerp_(grad, 1 - beta)
