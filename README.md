@@ -186,7 +186,8 @@ data_loader: DistDataLoader = build_dataloader(
     seq_len=model.config.max_context,
     batch_size=32,
     base_url="karpathy/climbmix-400b-shuffle", # for starting point
-    max_shards=6542 # last shard id for the given dataset (if not provided, it will be computed by probing the server, which can take a while)
+    max_shards=6542, # last shard id for the given dataset (if not provided, it will be computed by probing the server, which can take a while)
+    packing_strategy="stream", # default
 ) 
 ```
 
@@ -222,9 +223,30 @@ The data pipeline basically works with for any dataset available on internet tha
 ![sequence packing](./assets/sequence_packing.png)
 Sequence packing strategy. From [The Smol Training Playbook](https://huggingface.co/spaces/HuggingFaceTB/smol-training-playbook).
 
-The `build_dataloader` function the data loader, which is accessible from [`gpt_lab.data.DistDataLoader`](./src/gpt_lab/data/loader.py). It employs a distributed streaming data pipeline over Parquet shards with on-the-fly tokenization and greedy document packing into fixed-length sequences. It creates cpu and gpu buffers to pre-load the data in contiguous memory, stream the data from local shards downloaded from the given dataset, and feed the model with the data with a packing strategy, to maximize the throughput of the training loop by avoiding the use of padding tokens. It also supports distributed training setups, and can be used with DDP or other distributed training frameworks.
+The `build_dataloader` function, accessible through [`gpt_lab.data.DistDataLoader`](./src/gpt_lab/data/loader.py), exposes three explicit packing strategies:
 
-The critical point regarding model training, is that we must make sure to have a good balance between loader time and model forward/backward time to avoid bottlenecks from the data loading process. Given that constraint, the implementated data loader is satisfying. 
+- `stream` (default) treats documents as one flat stream. It builds each batch from exactly `B*T+1` tokens and carries the final token into the next batch, so no source token or adjacent transition is silently lost. Rows are arbitrary views of that stream and need not start with BOS.
+- `bos_aligned` retains source continuation tokens and is deterministic. A suffix crossing a row is retained on the next row after a **synthetic** BOS. This is not a real document boundary and does not preserve every original adjacent transition. `PackingStats` reports synthetic-BOS overhead. Finite sources emit complete batches only.
+- `bos_bestfit_crop` uses nanochat-style packing in the shared loader. From a document lookahead it selects the largest whole document that fits; if none fits, it takes a prefix of the shortest document and discards its suffix. Every row starts at an **actual document BOS**. Original BOS markers between documents inside a row are retained. `PackingStats.destructive_cropped_tokens` counts discarded suffix tokens; the rate depends on corpus, row length and buffer size.
+
+Select both settings through the current CLI:
+
+```sh
+gpt-lab train --packing-strategy bos_bestfit_crop --best-fit-buffer-docs 1000
+gpt-lab train resume --model-name ic1 --run-name baseline
+```
+
+Fresh training still defaults to `stream`; the best-fit buffer defaults to 1000 **documents**, separate from the legacy token-buffer argument. Both settings are saved in `TrainerConfig`. Resume restores them and rejects incompatible explicit overrides. `--use-nanochat-dataloader` remains a deprecated alias for `--packing-strategy bos_bestfit_crop`, now using the shared source/packer rather than the legacy generator. The Python API accepts `comp_info=ComputeContext(...)`.
+
+New checkpoints use cursor version 1: the offset names the next unread document in the named row group. Packing-state version 1 saves source tails, stream carry, synthetic-BOS continuation state, ordered best-fit lookahead documents, counters, shape, BOS ID, buffer size, and rank/world size. Serialized reload reproduces subsequent inputs, targets and source positions with unchanged source files/order, tokenizer, packing settings, batch/sequence shape and rank topology. A document-count buffer does not bound token memory for very long documents; its buffered tokens also enlarge checkpoints.
+
+Legacy cursor version 0 retains its old approximate row-group resume semantics. Old checkpoints without buffered packing state cannot reproduce exact token continuation and emit a warning. Versionless packing states from the old draft are rejected because their cursor semantics are ambiguous. The standalone legacy nanochat generator retained for benchmark comparisons still has approximate resume and is not used for training.
+
+Staging and output tensors are reused. The host-to-device transfer is blocking so staging storage is safe to overwrite on the next call; the trainer's existing model/data overlap is retained. Returned batch views must be consumed or cloned before requesting the next batch. Small CPU examples and their limits are recorded in [the packing experiment](experiments/20261101-packing-policies/README.md); no GPU performance claim is made.
+
+These are context-layout policies, not document-isolation policies. A BOS token does **not** prevent causal attention from crossing document boundaries within the same row; GPT-Lab does not currently pass segment-aware attention masks to the model.
+
+Loader-only CPU timings do not establish training throughput or accelerator utilization; keep the existing default until a representative packing comparison is measured.
 
 
 ### Automatic configuration
