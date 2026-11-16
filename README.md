@@ -458,7 +458,7 @@ model = DenseTransformer(cfg)
 `"fa2"` loads `kernels-community/flash-attn2` version 4. Explicit requests fail
 if the selected kernel cannot load; they do not switch to SDPA.
 
-FA3 training preprocesses the adjacent Q/K heads together (RoPE and per-head
+The single packed QKV projection is split into Q, K, and V head views. Q and K
 normalization), applies the gated value residual, and concatenates the results
 into `[B, T, Hq + 2*Hkv, D]` for upstream packed FA3, including GQA. Inference
 uses separate Q/K/V inputs. Kernels without a packed entrypoint retain their
