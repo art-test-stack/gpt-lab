@@ -468,7 +468,7 @@ each pass through RoPE, then the configured per-head normalization, in PyTorch;
 Attention uses separate Q/K/V inputs by default. To opt into packed attention
 during training, set `use_packed_attn_kernel=True` or pass
 `--use-packed-attn-kernel` with `--attn-impl fa3` (or another compatible kernel).
-separate-input call; FA2 training can use its supported five-dimensional layout.
+FA3 then concatenates the results into `[B, T, Hq + 2*Hkv, D]`, including GQA.
 
 A name containing `/`, such as `attn_impl="kernels-community/flash-attn3"`
 or `--attn-impl owner/kernel`, selects that Hub kernel's `main` revision.
