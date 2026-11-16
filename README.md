@@ -445,7 +445,7 @@ cfg = TransformerConfig(
     n_layers=6,
     d_ffn=2048,
     # Select "sdpa", "fa2", "fa3", or a Hub "owner/kernel" name.
-    # Packed attention is chosen automatically;
+    # Packed attention is chosen automatically when supported;
     # GQA and kernels without a packed entrypoint use separate Q/K/V.
     attn_impl="sdpa",
     act_func="swiglu",
