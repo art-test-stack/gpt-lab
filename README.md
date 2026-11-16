@@ -478,7 +478,7 @@ A name containing `/`, such as `attn_impl="kernels-community/flash-attn3"`
 or `--attn-impl owner/kernel`, selects that Hub kernel's `main` revision.
 This explicitly permits loading code from the named repository. The kernel
 must export a FlashAttention-compatible `flash_attn_func`; an optional
-`flash_attn_qkvpacked_func` enables automatic packed dispatch, and
+`flash_attn_qkvpacked_func` enables opt-in packed dispatch, and
 `flash_attn_with_kvcache` is required for KV-cache decoding. Dropout and ALiBi
 are forwarded only when the selected entrypoint supports them; requesting an
 unsupported option raises an error. Attention weights and arbitrary masks
