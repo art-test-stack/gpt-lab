@@ -278,7 +278,7 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
                 window_size=(-1, -1), alibi_slopes=None, deterministic=False, backend=None,
                 use_packed=False):
     """
-    Prefer a kernel's packed entrypoint for matching Q/K/V shapes.
+    Use separate inputs unless packing is requested for matching Q/K/V shapes.
 
     Args:
         q: (B, Tq, H, D)
