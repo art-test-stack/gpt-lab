@@ -307,6 +307,7 @@ class TransformerConfig(BaseModel):
 
     # TODO: padged attention implementation
     attn_impl: AttnImplTypes = "sdpa"  # sdpa, fa2, fa3, or a Hub owner/kernel name.
+    use_packed_attn_kernel: bool = False
     # TODO: # layer_types: Optional[List[TParams]] = None  # e.g., ["standard", "standard", "moe", ...] length must be n_layers
     use_gqa: bool = False
     
