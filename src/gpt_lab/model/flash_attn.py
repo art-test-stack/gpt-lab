@@ -1,4 +1,4 @@
-from gpt_lab.utils.import_utils import is_torch_cuda_available
+from gpt_lab.utils.import_utils import get_attention_kernel, is_torch_cuda_available
 
 import torch
 import torch.nn.functional as F
@@ -19,15 +19,10 @@ if is_torch_cuda_available():
         major, _ = torch.cuda.get_device_capability()
         if major >= 9:
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-            import kernels
-            _flash_attn = kernels.get_kernel('varunneal/flash-attention-3').flash_attn_interface
+            _flash_attn = get_attention_kernel("fa3")
         elif major == 8:
             try:
-                import kernels
-                _flash_attn2 = kernels.get_kernel(
-                    'kernels-community/flash-attn2',
-                    revision='c3f3c93a4a39e3d2cf49c13eac49229bc726ea13',
-                )
+                _flash_attn2 = get_attention_kernel("fa2")
             except Exception as error:
                 _flash_attn2_load_error = error
                 warnings.warn(f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}',
@@ -56,11 +51,7 @@ def require_flash_attn2():
     if (_flash_attn2 is None and _flash_attn2_load_error is None
             and is_torch_cuda_available() and torch.cuda.get_device_capability()[0] >= 8):
         try:
-            import kernels
-            _flash_attn2 = kernels.get_kernel(
-                'kernels-community/flash-attn2',
-                revision='c3f3c93a4a39e3d2cf49c13eac49229bc726ea13',
-            )
+            _flash_attn2 = get_attention_kernel("fa2")
         except Exception as error:
             _flash_attn2_load_error = error
     if _flash_attn2 is None:
@@ -68,6 +59,17 @@ def require_flash_attn2():
             "FlashAttention 2 was requested but failed to load; refusing SDPA fallback."
         ) from _flash_attn2_load_error
     return _flash_attn2
+
+
+def require_attention_kernel(backend):
+    if backend == "fa3":
+        return require_flash_attn3()
+    if backend == "fa2":
+        return require_flash_attn2()
+    try:
+        return get_attention_kernel(backend)
+    except Exception as error:
+        raise RuntimeError(f"Attention kernel {backend!r} was requested but failed to load") from error
 
 
 def scaled_dot_product_attention(
@@ -191,7 +193,8 @@ def _sdpa_fallback(q, k, v,
 
 
 def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
-                          window_size=(-1, -1), alibi_slopes=None, deterministic=False):
+                          window_size=(-1, -1), alibi_slopes=None, deterministic=False,
+                          num_heads_q=None, backend=None):
     """
     flash_attn_qkvpacked_func
 
@@ -204,7 +207,8 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
     If window_size != (-1, -1), implements sliding window local attention. Query at position i
     will only attend to keys between [i - window_size[0], i + window_size[1]] inclusive.
     Arguments:
-        'qkv': (batch_size, seqlen, 3, nheads, headdim)
+        'qkv': (batch_size, seqlen, 3, nheads, headdim), or the FA3 layout
+            (batch_size, seqlen, num_heads_q + 2 * num_heads_kv, headdim).
         'dropout_p': float. Dropout probability.
         'softmax_scale': float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
@@ -221,6 +225,18 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
     dropout when the pinned Hub kernel is available; other cases retain the
     existing backend dispatch.
     """
+    if backend == "fa3":
+        if dropout_p != 0.0 or alibi_slopes is not None:
+            raise ValueError("FA3 does not support attention dropout or ALiBi in this integration")
+        kernel = require_flash_attn3()
+        dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else qkv.dtype
+        return kernel.flash_attn_qkvpacked_func(
+            qkv.to(dtype=dtype), num_heads_q=num_heads_q,
+            softmax_scale=softmax_scale, causal=causal,
+            window_size=window_size or (-1, -1), deterministic=deterministic,
+        )
+    if backend is not None:
+        raise ValueError(f"Unsupported packed attention backend: {backend}")
     attention_dtype = (torch.get_autocast_dtype('cuda')
                        if torch.is_autocast_enabled('cuda') else qkv.dtype)
     if (_flash_attn2 is not None and qkv.is_cuda and causal
@@ -236,14 +252,14 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
             deterministic=deterministic,
         )
     if flash_attention_is_installed:
+        if dropout_p != 0.0 or alibi_slopes is not None:
+            raise ValueError("FA3 does not support attention dropout or ALiBi in this integration")
         return _flash_attn.flash_attn_qkvpacked_func(
-            qkv,
-            dropout_p=dropout_p,
+            qkv.to(dtype=attention_dtype),
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
-            # alibi_slopes=alibi_slopes,
-            # deterministic=deterministic
+            deterministic=deterministic,
         )
     assert alibi_slopes is None, "Alibi slopes are not supported when FlashAttention is not installed."
 
@@ -259,7 +275,8 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
     )
 
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
-                window_size=(-1, -1), alibi_slopes=None, deterministic=False, backend=None):
+                window_size=(-1, -1), alibi_slopes=None, deterministic=False, backend=None,
+                use_packed=True):
     """
     Prefer a kernel's packed entrypoint for matching Q/K/V shapes.
 
@@ -276,32 +293,37 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
                               softmax_scale=softmax_scale, causal=causal,
                               window_size=window_size, alibi_slopes=alibi_slopes,
                               deterministic=deterministic, use_gqa=q.size(-2) != k.size(-2))
-    if backend in ("fa2", "fa3"):
-        kernel = require_flash_attn2() if backend == "fa2" else require_flash_attn3()
+    if backend is None and flash_attention_is_installed:
+        backend = "fa3"
+    if backend in ("fa2", "fa3") or (backend is not None and "/" in backend):
+        kernel = require_attention_kernel(backend)
         dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else q.dtype
         q, k, v = (tensor.to(dtype=dtype) for tensor in (q, k, v))
+        packed = getattr(kernel, "flash_attn_qkvpacked_func", None)
+        use_packed = use_packed and callable(packed) and q.shape == k.shape == v.shape
         kwargs = dict(softmax_scale=softmax_scale, causal=causal,
                       window_size=window_size or (-1, -1), deterministic=deterministic)
         if backend == "fa2":
             kwargs.update(dropout_p=dropout_p, alibi_slopes=alibi_slopes)
-        elif dropout_p != 0.0 or alibi_slopes is not None:
-            raise ValueError("FA3 does not support attention dropout or ALiBi in this integration")
-        packed = getattr(kernel, "flash_attn_qkvpacked_func", None)
-        if callable(packed) and q.shape == k.shape == v.shape:
+        elif backend == "fa3":
+            if dropout_p != 0.0 or alibi_slopes is not None:
+                raise ValueError("FA3 does not support attention dropout or ALiBi in this integration")
+        else:
+            entrypoint = "flash_attn_qkvpacked_func" if use_packed else "flash_attn_func"
+            options = kernel._gpt_lab_attention_options[entrypoint]
+            if "dropout_p" in options:
+                kwargs["dropout_p"] = dropout_p
+            elif dropout_p != 0.0:
+                raise ValueError(f"Attention kernel {backend!r} does not support dropout_p")
+            if "alibi_slopes" in options:
+                kwargs["alibi_slopes"] = alibi_slopes
+            elif alibi_slopes is not None:
+                raise ValueError(f"Attention kernel {backend!r} does not support alibi_slopes")
+        if use_packed:
             return packed(torch.stack((q, k, v), dim=2), **kwargs)
         return kernel.flash_attn_func(q, k, v, **kwargs)
     if backend is not None:
         raise ValueError(f"Unknown attention kernel: {backend}")
-    if flash_attention_is_installed:
-        return _flash_attn.flash_attn_func(
-            q, k,v,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic
-        )
     use_gqa = (k.size(-2) != q.size(-2)) # GQA if Hq != Hkv
     return _sdpa_fallback(
         q, k, v,
@@ -416,10 +438,13 @@ def flash_attn_with_kvcache(
     if (k is not None) and (v is not None):
         assert q.device == k.device == v.device, "q, k and v are expected to be on the same device"
     assert q.device == k_cache.device == v_cache.device, "q, k_cache and v_cache are expected to be on the same device"
-    if backend in ("fa2", "fa3") or (backend is None and flash_attention_is_installed):
-        kernel = (require_flash_attn2() if backend == "fa2" else
-                  require_flash_attn3())
-        return kernel.flash_attn_with_kvcache(
+    if (backend in ("fa2", "fa3") or (backend is not None and "/" in backend)
+            or (backend is None and flash_attention_is_installed)):
+        kernel = require_attention_kernel(backend or "fa3")
+        function = getattr(kernel, "flash_attn_with_kvcache", None)
+        if not callable(function):
+            raise RuntimeError(f"Attention kernel {backend!r} does not support KV-cache decoding")
+        return function(
             q, k_cache, v_cache,
             k=k,
             v=v,
