@@ -212,7 +212,7 @@ class CausalSelfAttention(Module):
         qkv = qkv.view(B, Tq, Hq + 2 * Hk, D)
         q, k, v = self._prepare_qkv(qkv, x, value_embeds, rope_cache)
 
-        if self._packed_fa3 and self.training and kv_cache is None:
+        if self.use_packed_attn_kernel and self._packed_fa3 and self.training and kv_cache is None:
             qkv_ready = torch.cat((q, k, v), dim=-2)
             output = flash_attn.flash_attn_qkvpacked_func(
                 qkv_ready, num_heads_q=Hq, causal=True,
