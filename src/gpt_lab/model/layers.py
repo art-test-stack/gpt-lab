@@ -189,6 +189,7 @@ class CausalSelfAttention(Module):
             k = apply_rope(k, rope_cache)
         if self.norm_before_attn:
             q = self.norm(q)
+            k = self.norm(k)
         if value_embeds is not None:
             value_embeds = value_embeds.view_as(v)
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
