@@ -91,6 +91,7 @@ class AutoGPTConfig(BaseModel):
     attn_softcap: Optional[float] = None # not supported yet
     softcap: Optional[float] = 18.0
     attn_impl: AttnImplTypes = "sdpa" 
+    use_packed_attn_kernel: bool = False
     quantization: Optional[str] = None # not supported yet
 
     # Training 
