@@ -462,6 +462,7 @@ The single packed QKV projection is split into Q, K, and V head views. Q and K
 each pass through RoPE, then the configured per-head normalization, in PyTorch;
 `torch.compile` can fuse this preprocessing. The gated value residual is preserved.
 FA3 training concatenates the results into `[B, T, Hq + 2*Hkv, D]` for upstream
+packed FA3, including GQA. Inference
 uses separate Q/K/V inputs. Kernels without a packed entrypoint retain their
 separate-input call; FA2 training can use its supported five-dimensional layout.
 
