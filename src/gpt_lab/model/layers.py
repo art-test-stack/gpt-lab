@@ -194,7 +194,7 @@ class CausalSelfAttention(Module):
             value_embeds = value_embeds.view_as(v)
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * value_embeds
-        return qk, v
+        return q, k, v
 
     def forward(self, x: torch.Tensor, value_embeds=None, rope_cache=None,  window_size=None, 
                 kv_cache=None, attn_mask=None, return_attn_weights: bool = False
