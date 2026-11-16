@@ -1,9 +1,16 @@
 """Shared, standard-library-only parser helpers."""
 
 import argparse
+import re
 import sys
 
 from gpt_lab.utils.paths import get_cache_dir as cache_dir
+
+
+def attention_impl(value: str) -> str:
+    if value in ("sdpa", "fa2", "fa3") or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
+        return value
+    raise argparse.ArgumentTypeError("expected sdpa, fa2, fa3, or a kernel repository name (owner/name)")
 
 
 class ArgumentParser(argparse.ArgumentParser):
