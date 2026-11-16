@@ -451,6 +451,7 @@ cfg = TransformerConfig(
     d_ffn=2048,
     # Select "sdpa", "fa2", "fa3", or a Hub "owner/kernel" name.
     attn_impl="sdpa",
+    use_packed_attn_kernel=False,  # Opt in only when useful for your workload.
     act_func="swiglu",
     normalization="rms",
 )
