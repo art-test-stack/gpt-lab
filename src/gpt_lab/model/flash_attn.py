@@ -276,7 +276,7 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
 
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
                 window_size=(-1, -1), alibi_slopes=None, deterministic=False, backend=None,
-                use_packed=True):
+                use_packed=False):
     """
     Prefer a kernel's packed entrypoint for matching Q/K/V shapes.
 
