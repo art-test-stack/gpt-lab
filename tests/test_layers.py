@@ -1,5 +1,6 @@
 import pytest
 from gpt_lab.model.layers import (
+    DecoderLayer,
     apply_rms_norm,
     scaled_dot_product_attention,
 )
@@ -8,7 +9,7 @@ from gpt_lab.model.utils import (
     apply_rope,
     precompute_rope, 
 )
-from gpt_lab.utils.schemas import GPTConfig
+from gpt_lab.utils.schemas import GPTConfig, TransformerConfig
 import torch
 import torch.nn.functional as F
 import time
@@ -19,6 +20,41 @@ from gpt_lab.model.flash_attn import (
     _sdpa_fallback,
     flash_attn_qkvpacked_func,
 )
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "relu_squared"])
+def test_decoder_zero_projection_branches_preserve_input(activation):
+    config = TransformerConfig(
+        d_model=16, d_ffn=32, n_heads=2, d_head=8, n_layers=2,
+        act_func=activation, attn_impl="sdpa", dropout=0.0,
+    )
+    block = DecoderLayer(config).to("cpu").eval()
+    with torch.no_grad():
+        block.attention.o_proj.weight.zero_()
+        block.ffn.w_2.weight.zero_()
+    x = torch.randn(2, 3, 16, requires_grad=True)
+
+    output, _ = block(x)
+
+    torch.testing.assert_close(output, x, rtol=0, atol=0)
+    output.sum().backward()
+    torch.testing.assert_close(x.grad, torch.ones_like(x), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "relu_squared"])
+def test_ffn_returns_only_projection_branch(activation):
+    config = TransformerConfig(
+        d_model=16, d_ffn=32, n_heads=2, d_head=8, n_layers=2,
+        act_func=activation, attn_impl="sdpa", dropout=0.0,
+    )
+    ffn = DecoderLayer(config).ffn.to("cpu").eval()
+    with torch.no_grad():
+        ffn.w_1.weight.fill_(1 / config.d_model)
+        ffn.w_2.weight.fill_(1 / config.d_ffn)
+    x = torch.ones(2, 3, config.d_model)
+    expected = 1.0 if activation == "relu_squared" else torch.sigmoid(torch.tensor(1.0)).item()
+
+    torch.testing.assert_close(ffn(x), torch.full_like(x, expected))
 
 
 @pytest.mark.fast

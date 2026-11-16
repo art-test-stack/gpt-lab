@@ -14,6 +14,7 @@ archive/
 dumas.py 
 draft.md
 _dumas.py
+docs/
 
 # C extensions
 *.so
