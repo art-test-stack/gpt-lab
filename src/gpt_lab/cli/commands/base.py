@@ -46,7 +46,7 @@ def add_auto_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--window-size', type=str, default=None, help='Window size for pattern smalls (S).')
     parser.add_argument('--softcap', type=float, default=18.0, help='Soft cap for model logits to prevent overflow.')
     parser.add_argument('--attn-softcap', type=float, default=None, help='Soft cap for attention scores to prevent overflow.')
-    parser.add_argument('--attn-impl', type=attention_impl, default='sdpa', help="Attention: sdpa, fa2, fa3 (community FA3 v2), or owner/kernel (Hub main revision, FlashAttention-compatible API). Explicit kernels fail if unavailable. Packed attention is automatic; FA3 training also packs GQA.")
+    parser.add_argument('--attn-impl', type=attention_impl, default='sdpa', help="Attention: sdpa, fa2, fa3 (community FA3 v2), or owner/kernel (Hub main revision, FlashAttention-compatible API). Explicit kernels fail if unavailable. Separate-input attention is the default.")
     parser.add_argument('--num-steps', type=int, default=-1, help='Complete scheduling horizon; -1 infers it. Use --stop-after-step to limit execution without shortening schedules.')
     parser.add_argument('--target-flops', type=float, default=-1.0, help='Target FLOPS for auto-configured models.')
     parser.add_argument('--target-param-data-ratio', type=float, default=11.0, help='Target parameter-to-data ratio for auto-configured models.')
