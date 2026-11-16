@@ -444,7 +444,8 @@ cfg = TransformerConfig(
     n_kv_heads=8,
     n_layers=6,
     d_ffn=2048,
-    # Select "sdpa", "fa2", or "fa3". Packed attention is chosen automatically;
+    # Select "sdpa", "fa2", "fa3", or a Hub "owner/kernel" name.
+    # Packed attention is chosen automatically;
     # GQA and kernels without a packed entrypoint use separate Q/K/V.
     attn_impl="sdpa",
     act_func="swiglu",
@@ -452,6 +453,33 @@ cfg = TransformerConfig(
 )
 model = DenseTransformer(cfg)
 ```
+
+`attn_impl="fa3"` loads `kernels-community/flash-attn3` version 2;
+`"fa2"` loads `kernels-community/flash-attn2` version 4. Explicit requests fail
+if the selected kernel cannot load; they do not switch to SDPA.
+
+FA3 training preprocesses the adjacent Q/K heads together (RoPE and per-head
+normalization), applies the gated value residual, and concatenates the results
+into `[B, T, Hq + 2*Hkv, D]` for upstream packed FA3, including GQA. Inference
+uses separate Q/K/V inputs. Kernels without a packed entrypoint retain their
+separate-input call; FA2 training can use its supported five-dimensional layout.
+
+A name containing `/`, such as `attn_impl="kernels-community/flash-attn3"`
+or `--attn-impl owner/kernel`, selects that Hub kernel's `main` revision.
+This explicitly permits loading code from the named repository. The kernel
+must export a FlashAttention-compatible `flash_attn_func`; an optional
+`flash_attn_qkvpacked_func` enables automatic packed dispatch, and
+`flash_attn_with_kvcache` is required for KV-cache decoding. Dropout and ALiBi
+are forwarded only when the selected entrypoint supports them; requesting an
+unsupported option raises an error. Attention weights and arbitrary masks
+require SDPA. Bare custom names follow `main`, so their code may change
+between downloads; the built-in `fa3` alias selects version 2 instead.
+
+The kernel loader uses `kernels==0.18.3` and PyTorch `2.11.0+cu128`
+for the GPU extra. The optional `fp8` extra pins `torchao==0.17.0`.
+Models saved with an older PyTorch/kernel combination
+retain their architecture, but matching their previous numerical results
+requires the original software environment.
 
 ### Optimization
 
