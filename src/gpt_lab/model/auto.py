@@ -91,6 +91,7 @@ class AutoGPTConfig(BaseModel):
     attn_softcap: Optional[float] = None # not supported yet
     softcap: Optional[float] = 18.0
     attn_impl: AttnImplTypes = "sdpa" 
+    use_packed_attn_kernel: bool = False
     quantization: Optional[str] = None # not supported yet
 
     # Training 
@@ -198,6 +199,7 @@ class AutoGPTConfig(BaseModel):
             window_pattern=self.window_pattern or "SSSL",
             window_size=self.window_size,
             attn_impl=self.attn_impl,
+            use_packed_attn_kernel=self.use_packed_attn_kernel,
             softcap=self.softcap if self.softcap is not None else 18.0,
             quantization=self.quantization,
         )

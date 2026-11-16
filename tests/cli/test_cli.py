@@ -82,13 +82,24 @@ def test_handlers_forward_to_packaged_workflow(prefix, module, handler, workflow
         execute.assert_called_once_with(args)
 
 
+def test_cli_rejects_legacy_fused_attention():
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(["train", "--attn-impl", "fused"])
+    assert error.value.code == 2
+
+
+def test_cli_accepts_custom_attention_kernel():
+    args = build_parser().parse_args(["train", "--attn-impl", "example/attention"])
+    assert args.attn_impl == "example/attention"
+
+
 def test_important_training_defaults():
     args = build_parser().parse_args(['train'])
     expected = dict(model_init='auto', model_name='ic1', run_name=None, max_seq_len=2048,
                     random_seed=42, board='wandb', ds_name='climbmix-base', depth=12,
                     aspect_ratio=64, d_head=128, n_kv_heads=None, softcap=18.0,
                     tie_embeddings="embs;value_embs;head",
-                    attn_softcap=None, attn_impl='sdpa', device_batch_size=32,
+                    attn_softcap=None, attn_impl='sdpa', use_packed_attn_kernel=False, device_batch_size=32,
                     vocab_size=-1, num_steps=-1, target_param_data_ratio=11.0,
                     n_acc_steps=-1, total_batch_size=-1, warmup_steps=40,
                     warmdown_ratio=.65, final_lr_frac=.05,

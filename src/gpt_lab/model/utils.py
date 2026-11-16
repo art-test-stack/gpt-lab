@@ -58,10 +58,7 @@ def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor, pairwise_split: bool =
     _x1 = x1 * cos - x2 * sin
     _x2 = x1 * sin + x2 * cos
 
-    x_out = torch.empty_like(x)
-    x_out[..., ::2] = _x1
-    x_out[..., 1::2] = _x2
-    return x_out
+    return torch.stack((_x1, _x2), dim=-1).flatten(-2).to(x.dtype)
 
 
 def apply_positional_encoding(x: torch.Tensor, pos_enc: torch.Tensor) -> torch.Tensor:

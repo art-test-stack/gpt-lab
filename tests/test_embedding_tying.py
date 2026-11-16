@@ -162,7 +162,7 @@ def test_full_tying_rejects_incompatible_value_width():
 
 def test_frozen_configs_still_initialize_derived_fields():
     _config()
-    config = _config(n_kv_heads=1, attn_impl="fused", window_pattern=None)
+    config = _config(n_kv_heads=1, attn_impl="sdpa", window_pattern=None)
     assert config.use_gqa
     assert config.attn_impl == "sdpa"
     assert config.window_pattern == "L"

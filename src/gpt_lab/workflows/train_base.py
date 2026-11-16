@@ -75,6 +75,7 @@ def train_base(
     softcap=18.0,
     attn_softcap=None,
     attn_impl='sdpa',
+    use_packed_attn_kernel=False,
     num_steps=-1,
     stop_after_step=None,
     cuda_graph_mode=None,
@@ -367,6 +368,7 @@ def build_auto_config(parameters: dict, device, comp_info: ComputeContext):
         softcap=parameters["softcap"],
         attn_softcap=parameters["attn_softcap"],
         attn_impl=parameters["attn_impl"],
+        use_packed_attn_kernel=parameters.get("use_packed_attn_kernel", False),
         # training horizon targets
         n_steps=parameters["num_steps"],
         target_flops=parameters["target_flops"],

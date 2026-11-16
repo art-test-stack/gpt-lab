@@ -42,7 +42,7 @@ def enable_fp8_ffn_forward(model, compute_dtype):
 
 @cache
 def _float8_linear_class():
-    """Load the torchao 0.15.0 adapter only for explicit FP8 conversion."""
+    """Load the torchao adapter only for explicit FP8 conversion."""
     from dataclasses import replace
 
     from torchao.float8 import Float8LinearConfig

@@ -449,12 +449,47 @@ cfg = TransformerConfig(
     n_kv_heads=8,
     n_layers=6,
     d_ffn=2048,
-    attn_impl="flash_attention",
+    # Select "sdpa", "fa2", "fa3", or a Hub "owner/kernel" name.
+    attn_impl="sdpa",
+    use_packed_attn_kernel=False,  # Opt in only when useful for your workload.
     act_func="swiglu",
     normalization="rms",
 )
 model = DenseTransformer(cfg)
 ```
+
+`attn_impl="fa3"` loads `kernels-community/flash-attn3` version 2;
+`"fa2"` loads `kernels-community/flash-attn2` version 4. Explicit requests fail
+if the selected kernel cannot load; they do not switch to SDPA.
+
+The single packed QKV projection is split into Q, K, and V head views. Q and K
+each pass through RoPE, then the configured per-head normalization, in PyTorch;
+`torch.compile` can fuse this preprocessing. The gated value residual is preserved.
+Attention uses separate Q/K/V inputs by default. To opt into packed attention
+during training, set `use_packed_attn_kernel=True` or pass
+`--use-packed-attn-kernel` with `--attn-impl fa3` (or another compatible kernel).
+FA3 then concatenates the results into `[B, T, Hq + 2*Hkv, D]`, including GQA.
+FA2 and custom kernels can use their five-dimensional packed layout for MHA.
+Unsupported layouts or kernels without a packed entrypoint keep separate inputs;
+SDPA and inference also keep their existing paths. The flag is saved in the model
+config and restored on resume; configs without the field default to separate inputs.
+
+A name containing `/`, such as `attn_impl="kernels-community/flash-attn3"`
+or `--attn-impl owner/kernel`, selects that Hub kernel's `main` revision.
+This explicitly permits loading code from the named repository. The kernel
+must export a FlashAttention-compatible `flash_attn_func`; an optional
+`flash_attn_qkvpacked_func` enables opt-in packed dispatch, and
+`flash_attn_with_kvcache` is required for KV-cache decoding. Dropout and ALiBi
+are forwarded only when the selected entrypoint supports them; requesting an
+unsupported option raises an error. Attention weights and arbitrary masks
+require SDPA. Bare custom names follow `main`, so their code may change
+between downloads; the built-in `fa3` alias selects version 2 instead.
+
+The kernel loader uses `kernels==0.18.3` and PyTorch `2.11.0+cu128`
+for the GPU extra. The optional `fp8` extra pins `torchao==0.17.0`.
+Models saved with an older PyTorch/kernel combination
+retain their architecture, but matching their previous numerical results
+requires the original software environment.
 
 During training, dropout masks the attention output and FFN branch before their
 residual additions, preserving the skip path. Evaluation disables dropout.

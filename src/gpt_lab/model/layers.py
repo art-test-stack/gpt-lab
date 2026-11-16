@@ -1,7 +1,7 @@
 from gpt_lab.utils.schemas import TransformerConfig
-from gpt_lab.model.flash_attn import flash_attn, scaled_dot_product_attention, require_flash_attn3, require_flash_attn2
+from gpt_lab.model.flash_attn import flash_attn, scaled_dot_product_attention, require_flash_attn3, require_flash_attn2, require_attention_kernel
 from gpt_lab.model.utils import apply_rope, has_ve
-from gpt_lab.utils.types import AttnImplTypes, NormalizationTypes
+from gpt_lab.utils.types import NormalizationTypes
 from gpt_lab.utils.default import DEVICE
 from gpt_lab.utils.logging import log0
 import numpy as np
@@ -144,16 +144,17 @@ class CausalSelfAttention(Module):
     def __init__(self, config: TransformerConfig, layer_idx: int = 0) -> None:
         super().__init__()
         assert config.d_model == config.d_head * config.n_heads, f'Dimensions are not correct. dim_model must be equal to d_head * n_heads. Got dim_model={config.d_model}, d_head={config.d_head}, n_heads={config.n_heads}'
-        assert config.attn_impl in get_args(AttnImplTypes), f'Attention implementation {config.attn_impl} is not supported. Supported attention implementations are in {get_args(AttnImplTypes)}.'
-        if (config.attn_impl == "fused" and torch.cuda.is_available()
-                and torch.cuda.get_device_capability()[0] >= 9):
-            require_flash_attn3()
+        assert config.attn_impl in ("sdpa", "fa2", "fa3", "torch", "raw") or "/" in config.attn_impl, f'Attention implementation {config.attn_impl} is not supported.'
+        self._packed_fa3 = False
         if config.attn_impl == "fa3":
-            require_flash_attn3()
+            kernel = require_flash_attn3()
+            self._packed_fa3 = callable(getattr(kernel, "flash_attn_qkvpacked_func", None))
             if config.dropout != 0.0 or config.attention_dropout != 0.0:
                 raise ValueError("FA3 does not support attention dropout in this integration")
         elif config.attn_impl == "fa2":
             require_flash_attn2()
+        elif "/" in config.attn_impl:
+            require_attention_kernel(config.attn_impl)
         assert config.normalization in get_args(NormalizationTypes), f'Normalization {config.normalization} is not supported. Supported normalizations are in {get_args(NormalizationTypes)}.'
         assert config.n_heads % config.n_kv_heads == 0, f'Number of heads must be divisible by number of key-value heads. Got n_heads={config.n_heads}, n_kv_heads={config.n_kv_heads}.'
         
@@ -167,6 +168,7 @@ class CausalSelfAttention(Module):
 
         self.norm = build_norm(config.normalization, eps=config.norm_eps, torch_impl=True)
         self.attn_impl = config.attn_impl
+        self.use_packed_attn_kernel = config.use_packed_attn_kernel
         self.qkv_proj = Linear(config.d_model, (config.n_heads + 2 * config.n_kv_heads) * config.d_head, bias=False)
         self.o_proj = Linear(config.d_model, config.d_model, bias=False)
 
@@ -180,12 +182,27 @@ class CausalSelfAttention(Module):
         torch.nn.init.uniform_(self.qkv_proj.weight, -std, std) # weights use Uniform to avoid outliers
         torch.nn.init.zeros_(self.o_proj.weight) # projections are zero
 
+    def _prepare_qkv(self, qkv, x, value_embeds=None, rope_cache=None):
+        """Preprocess Q and K separately so Inductor can fuse their arithmetic."""
+        q, k, v = qkv.split((self.n_heads, self.n_kv_heads, self.n_kv_heads), dim=-2)
+        if rope_cache is not None:
+            q = apply_rope(q, rope_cache)
+            k = apply_rope(k, rope_cache)
+        if self.norm_before_attn:
+            q = self.norm(q)
+            k = self.norm(k)
+        if value_embeds is not None:
+            value_embeds = value_embeds.view_as(v)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            v = v + gate.unsqueeze(-1) * value_embeds
+        return q, k, v
+
     def forward(self, x: torch.Tensor, value_embeds=None, rope_cache=None,  window_size=None, 
                 kv_cache=None, attn_mask=None, return_attn_weights: bool = False
         ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         B, Tq, E = x.size()
-        if self.attn_impl in ("fa2", "fa3") and (return_attn_weights or attn_mask is not None):
-            raise ValueError("Explicit FA2/FA3 requests do not support attention weights or arbitrary masks; use sdpa")
+        if (self.attn_impl in ("fa2", "fa3") or "/" in self.attn_impl) and (return_attn_weights or attn_mask is not None):
+            raise ValueError("Explicit attention kernels do not support attention weights or arbitrary masks; use sdpa")
         if kv_cache is not None:
             kv_cache.check_sizes(B, Tq, x.device, x.dtype)
 
@@ -193,27 +210,15 @@ class CausalSelfAttention(Module):
         qkv = self.qkv_proj(x)
 
         qkv = qkv.view(B, Tq, Hq + 2 * Hk, D)
-        
-        q = qkv[:, :, :Hq, :]
-        k = qkv[:, :, Hq:Hq+Hk, :]
-        v = qkv[:, :, Hq+Hk:, :]
-        
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if value_embeds is not None:
-            value_embeds = value_embeds.view(B, Tq, self.n_kv_heads, self.d_head)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, Tq, Hk)
-            v = v + gate.unsqueeze(-1) * value_embeds
+        q, k, v = self._prepare_qkv(qkv, x, value_embeds, rope_cache)
 
-        if rope_cache is not None:
-            q = apply_rope(q, rope_cache)
-            k = apply_rope(k, rope_cache)
-
-        if self.norm_before_attn:
-            q = self.norm(q)
-            k = self.norm(k)
-
-        if self.attn_impl == "fused" and ((rope_cache is not None) or self.norm_before_attn):
-            qkv = torch.cat([q, k, v], dim=-2)
+        if self.use_packed_attn_kernel and self._packed_fa3 and self.training and kv_cache is None:
+            qkv_ready = torch.cat((q, k, v), dim=-2)
+            output = flash_attn.flash_attn_qkvpacked_func(
+                qkv_ready, num_heads_q=Hq, causal=True,
+                window_size=window_size, backend='fa3',
+            )
+            return self.o_proj(output.contiguous().view(B, Tq, E)), None
 
         attn_weights = None
         # interpretability mode - not optimized for memory efficiency
@@ -238,31 +243,21 @@ class CausalSelfAttention(Module):
                 cache_seqlens=kv_cache.seqlens,
                 causal=True,
                 window_size=window_size if window_size is not None else (-1, -1),
-                backend=None if self.attn_impl == "fused" else self.attn_impl,
-            )
-
-        # qkv-fused training mode
-        elif self.attn_impl == 'fused':
-            assert Hq == Hk, f'Fused attention implementation does not support GQA. Please set attn_impl to "sdpa" if you want to use GQA. Got Hq={Hq}, Hk={Hk}.'
-            qkv = qkv.view(B, Tq, 3, Hq, D).contiguous()  
-            x = flash_attn.flash_attn_qkvpacked_func(
-                qkv,
-                dropout_p=self.dropout_rate if self.training else 0.0,
-                window_size=window_size,
-                causal=True
+                backend=self.attn_impl,
             )
 
         # Kernel choice is independent of the packed projection.
-        elif self.attn_impl in ('sdpa', 'fa2', 'fa3'):
+        elif self.attn_impl in ('sdpa', 'fa2', 'fa3') or "/" in self.attn_impl:
             x = flash_attn.flash_attn_func(
                 q, k, v,
                 dropout_p=self.dropout_rate if self.training else 0.0,
                 window_size=window_size,
                 causal=True,
                 backend=self.attn_impl,
+                use_packed=self.use_packed_attn_kernel and self.training,
             )
         else:
-            raise ValueError(f'Attention implementation {self.attn_impl} is not supported. Supported attention implementations are in {get_args(AttnImplTypes)}.')
+            raise ValueError(f'Attention implementation {self.attn_impl} is not supported; use sdpa, fa2, fa3, or owner/kernel.')
         
         # x: (B, Tq, Hq, D) -> (B, Tq, E)
         x = x.contiguous().view(B, Tq, -1)

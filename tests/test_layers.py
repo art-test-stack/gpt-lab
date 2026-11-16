@@ -255,7 +255,7 @@ def test_missing_flash_kernel_does_not_recurse(monkeypatch):
 
     calls = 0
 
-    def fail_get_kernel(_name):
+    def fail_get_kernel(_name, **kwargs):
         nonlocal calls
         calls += 1
         raise RuntimeError("missing kernel")
