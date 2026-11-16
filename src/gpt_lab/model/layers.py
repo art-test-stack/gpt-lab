@@ -168,6 +168,7 @@ class CausalSelfAttention(Module):
 
         self.norm = build_norm(config.normalization, eps=config.norm_eps, torch_impl=True)
         self.attn_impl = config.attn_impl
+        self.use_packed_attn_kernel = config.use_packed_attn_kernel
         self.qkv_proj = Linear(config.d_model, (config.n_heads + 2 * config.n_kv_heads) * config.d_head, bias=False)
         self.o_proj = Linear(config.d_model, config.d_model, bias=False)
 
