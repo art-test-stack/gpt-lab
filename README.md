@@ -467,7 +467,7 @@ each pass through RoPE, then the configured per-head normalization, in PyTorch;
 `torch.compile` can fuse this preprocessing. The gated value residual is preserved.
 Attention uses separate Q/K/V inputs by default. To opt into packed attention
 during training, set `use_packed_attn_kernel=True` or pass
-uses separate Q/K/V inputs. Kernels without a packed entrypoint retain their
+`--use-packed-attn-kernel` with `--attn-impl fa3` (or another compatible kernel).
 separate-input call; FA2 training can use its supported five-dimensional layout.
 
 A name containing `/`, such as `attn_impl="kernels-community/flash-attn3"`
