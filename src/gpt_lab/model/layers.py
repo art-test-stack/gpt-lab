@@ -218,7 +218,6 @@ class CausalSelfAttention(Module):
                 window_size=window_size, backend='fa3',
             )
             return self.o_proj(output.contiguous().view(B, Tq, E)), None
-
         q, k = qk.split((Hq, Hk), dim=-2)
 
         attn_weights = None
