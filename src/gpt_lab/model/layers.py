@@ -254,7 +254,7 @@ class CausalSelfAttention(Module):
                 window_size=window_size,
                 causal=True,
                 backend=self.attn_impl,
-                use_packed=self.training,
+                use_packed=self.use_packed_attn_kernel and self.training,
             )
         else:
             raise ValueError(f'Attention implementation {self.attn_impl} is not supported; use sdpa, fa2, fa3, or owner/kernel.')
