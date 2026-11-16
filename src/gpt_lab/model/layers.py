@@ -209,7 +209,7 @@ class CausalSelfAttention(Module):
         qkv = self.qkv_proj(x)
 
         qkv = qkv.view(B, Tq, Hq + 2 * Hk, D)
-        qk, v = self._prepare_qkv(qkv, x, value_embeds, rope_cache)
+        q, k, v = self._prepare_qkv(qkv, x, value_embeds, rope_cache)
 
         if self._packed_fa3 and self.training and kv_cache is None:
             qkv_ready = torch.cat((qk, v), dim=-2)
