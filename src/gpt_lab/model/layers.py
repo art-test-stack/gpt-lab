@@ -183,7 +183,7 @@ class CausalSelfAttention(Module):
 
     def _prepare_qkv(self, qkv, x, value_embeds=None, rope_cache=None):
         """Preprocess Q and K separately so Inductor can fuse their arithmetic."""
-        qk, v = qkv.split((self.n_heads + self.n_kv_heads, self.n_kv_heads), dim=-2)
+        q, k, v = qkv.split((self.n_heads, self.n_kv_heads, self.n_kv_heads), dim=-2)
         if rope_cache is not None:
             qk = apply_rope(qk, rope_cache)
         if self.norm_before_attn:
