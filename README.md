@@ -466,7 +466,7 @@ The single packed QKV projection is split into Q, K, and V head views. Q and K
 each pass through RoPE, then the configured per-head normalization, in PyTorch;
 `torch.compile` can fuse this preprocessing. The gated value residual is preserved.
 Attention uses separate Q/K/V inputs by default. To opt into packed attention
-packed FA3, including GQA. Inference
+during training, set `use_packed_attn_kernel=True` or pass
 uses separate Q/K/V inputs. Kernels without a packed entrypoint retain their
 separate-input call; FA2 training can use its supported five-dimensional layout.
 
