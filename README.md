@@ -470,6 +470,7 @@ during training, set `use_packed_attn_kernel=True` or pass
 `--use-packed-attn-kernel` with `--attn-impl fa3` (or another compatible kernel).
 FA3 then concatenates the results into `[B, T, Hq + 2*Hkv, D]`, including GQA.
 FA2 and custom kernels can use their five-dimensional packed layout for MHA.
+Unsupported layouts or kernels without a packed entrypoint keep separate inputs;
 
 A name containing `/`, such as `attn_impl="kernels-community/flash-attn3"`
 or `--attn-impl owner/kernel`, selects that Hub kernel's `main` revision.
