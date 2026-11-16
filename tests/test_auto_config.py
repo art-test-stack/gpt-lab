@@ -44,6 +44,35 @@ def _auto_config(tmp_path: Path, **overrides) -> AutoGPTConfig:
     return AutoGPTConfig(**values)
 
 
+@pytest.mark.parametrize("config_class", [TransformerConfig, AutoGPTConfig])
+def test_legacy_fused_attention_is_rejected(config_class):
+    with pytest.raises(ValueError, match="attn_impl"):
+        config_class.model_validate({"attn_impl": "fused"})
+
+
+@pytest.mark.parametrize("config_class", [TransformerConfig, AutoGPTConfig])
+def test_custom_attention_kernel_config_roundtrip(config_class, tmp_path):
+    config = (_auto_config(tmp_path, attn_impl="example/attention") if config_class is AutoGPTConfig
+              else config_class(attn_impl="example/attention"))
+    assert config_class.model_validate_json(config.model_dump_json()).attn_impl == "example/attention"
+
+
+@pytest.mark.parametrize("config_class", [TransformerConfig, AutoGPTConfig])
+def test_packed_attention_config_defaults_and_roundtrip(config_class, tmp_path):
+    config = _auto_config(tmp_path) if config_class is AutoGPTConfig else config_class()
+    assert config.use_packed_attn_kernel is False
+    config = config_class.model_validate(config.model_dump() | {"use_packed_attn_kernel": True})
+    assert config_class.model_validate_json(config.model_dump_json()).use_packed_attn_kernel is True
+    data = config.model_dump(exclude={"use_packed_attn_kernel"})
+    assert config_class.model_validate(data).use_packed_attn_kernel is False
+
+
+@pytest.mark.parametrize("name", ["typo", "owner/", "/kernel", "owner/kernel@v2"])
+def test_invalid_attention_kernel_config(name):
+    with pytest.raises(ValueError, match="attn_impl"):
+        TransformerConfig(attn_impl=name)
+
+
 @pytest.mark.fast
 def test_non_vocab_parameter_count_is_vocab_independent():
     common = {
@@ -198,7 +227,8 @@ def test_auto_config_forwards_embedding_tying(tmp_path, mode):
         assert model_cfg.model_dump()["tie_embeddings"] == mode
 
 
-def test_cli_batch_and_horizon_override_automatic_sizing(monkeypatch, tmp_path):
+@pytest.mark.parametrize("use_packed", [False, True])
+def test_cli_batch_and_horizon_override_automatic_sizing(monkeypatch, tmp_path, use_packed):
     from gpt_lab.cli.parser import build_parser
     from gpt_lab.workflows.train_base import build_auto_config
 
@@ -207,7 +237,7 @@ def test_cli_batch_and_horizon_override_automatic_sizing(monkeypatch, tmp_path):
         '--model-dir', str(tmp_path), '--depth', '3', '--aspect-ratio', '64',
         '--d-head', '64', '--vocab-size', '4096', '--max-seq-len', '8',
         '--device-batch-size', '1', '--total-batch-size', '64', '--num-steps', '7',
-    ])
+    ] + (['--use-packed-attn-kernel'] if use_packed else []))
     def reject_automatic_sizing(*_args):
         pytest.fail('Explicit CLI value must bypass automatic sizing')
 
@@ -220,6 +250,7 @@ def test_cli_batch_and_horizon_override_automatic_sizing(monkeypatch, tmp_path):
     )
     generated = build_auto_config(vars(args), 'cpu', ComputeContext(device=torch.device("cpu")))
     assert generated.model_cfg.n_layers == 3
+    assert generated.model_cfg.use_packed_attn_kernel is use_packed
     assert generated.model_cfg.vocab_size == 4096
     assert generated.base_train['total_batch_size'] == 64
     assert generated.base_train['n_steps'] == 7
