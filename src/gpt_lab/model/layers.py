@@ -186,6 +186,7 @@ class CausalSelfAttention(Module):
         q, k, v = qkv.split((self.n_heads, self.n_kv_heads, self.n_kv_heads), dim=-2)
         if rope_cache is not None:
             q = apply_rope(q, rope_cache)
+            k = apply_rope(k, rope_cache)
         if self.norm_before_attn:
             qk = self.norm(qk)
         if value_embeds is not None:
