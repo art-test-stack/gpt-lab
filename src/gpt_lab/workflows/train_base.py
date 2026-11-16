@@ -75,6 +75,7 @@ def train_base(
     softcap=18.0,
     attn_softcap=None,
     attn_impl='sdpa',
+    use_packed_attn_kernel=False,
     num_steps=-1,
     stop_after_step=None,
     cuda_graph_mode=None,
