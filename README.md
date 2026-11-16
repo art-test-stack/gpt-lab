@@ -446,7 +446,7 @@ cfg = TransformerConfig(
     d_ffn=2048,
     # Select "sdpa", "fa2", "fa3", or a Hub "owner/kernel" name.
     # Packed attention is chosen automatically when supported;
-    # GQA and kernels without a packed entrypoint use separate Q/K/V.
+    # FA3 training's four-dimensional layout also supports GQA.
     attn_impl="sdpa",
     act_func="swiglu",
     normalization="rms",
