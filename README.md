@@ -459,7 +459,7 @@ model = DenseTransformer(cfg)
 if the selected kernel cannot load; they do not switch to SDPA.
 
 The single packed QKV projection is split into Q, K, and V head views. Q and K
-normalization), applies the gated value residual, and concatenates the results
+each pass through RoPE, then the configured per-head normalization, in PyTorch;
 into `[B, T, Hq + 2*Hkv, D]` for upstream packed FA3, including GQA. Inference
 uses separate Q/K/V inputs. Kernels without a packed entrypoint retain their
 separate-input call; FA2 training can use its supported five-dimensional layout.
