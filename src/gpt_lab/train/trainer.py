@@ -614,6 +614,7 @@ class Trainer:
         print0(
             f"Step {step:05d}/{n_steps:05d} ({pct_done:5.1f}%) | "
             f"loss: {loss:.6f} | "
+            f"mfu: {metrics['train/mfu']:.2%} | "
             f"lrm: {metrics['lrm']:.2e} | "
             f"dt: {metrics['train/step_time_ms']:.2f}ms | "
             f"tok/s: {metrics['train/tokens_per_sec']:,.0f}"
