@@ -615,6 +615,9 @@ transformer:
   muon_qkv: projection
 ```
 
+Fresh runs can also pass `--muon-qkv joint|projection|head` to `gpt-lab train auto`;
+an explicit CLI value overrides the loaded optimizer YAML profile.
+
 - `joint` (default) updates the entire QKV matrix together.
 - `projection` updates Q, K, and V independently, including unequal row counts in GQA.
 - `head` updates each Q, K, and V head independently.
