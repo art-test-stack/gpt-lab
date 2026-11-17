@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace, ModuleType
 import copy
+import logging
 import subprocess
 import sys
 import textwrap
@@ -260,7 +261,15 @@ def test_custom_kernel_kvcache_dispatch(monkeypatch):
 def test_loader_logs_warning_and_preserves_strict_error(monkeypatch, caplog, backend, capability, warning):
     attention = import_module("gpt_lab.model.flash_attn")
     calls = []
+    availability = []
     failure = OSError("missing build")
+
+    class AvailabilityHandler(logging.Handler):
+        def emit(self, record):
+            assert attention._flash_attn_initialized
+            assert not attention._flash_attn_init_lock.locked()
+            availability.append((attention.flash_attention_is_installed,
+                                 attention.flash_attn.flash_attention_is_installed))
 
     def fail(name):
         calls.append(name)
@@ -272,14 +281,20 @@ def test_loader_logs_warning_and_preserves_strict_error(monkeypatch, caplog, bac
     monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (capability, 0))
     monkeypatch.setattr(attention, "get_attention_kernel", fail)
-    with caplog.at_level("WARNING", logger=attention.__name__):
-        with pytest.raises(RuntimeError, match="refusing SDPA fallback") as error:
-            attention.load_flash_attn(backend)
+    handler = AvailabilityHandler()
+    attention.logger.addHandler(handler)
+    try:
+        with caplog.at_level("WARNING", logger=attention.__name__):
+            with pytest.raises(RuntimeError, match="refusing SDPA fallback") as error:
+                attention.load_flash_attn(backend)
+    finally:
+        attention.logger.removeHandler(handler)
     assert len(caplog.records) == 1
     assert caplog.records[0].levelname == "WARNING"
     assert warning in caplog.records[0].message
     assert error.value.__cause__ is failure
     assert calls == [backend]
+    assert availability == [(False, False)]
 
 
 def test_loader_returns_bound_namespace_and_initializes_once(monkeypatch):

@@ -29,6 +29,7 @@ def _initialize_flash_attention():
     global _flash_attn_initialized
     if _flash_attn_initialized:
         return
+    warning_message = None
     with _flash_attn_init_lock:
         if _flash_attn_initialized:
             return
@@ -43,16 +44,17 @@ def _initialize_flash_attention():
                         _flash_attn2 = get_attention_kernel("fa2")
                     except Exception as error:
                         _flash_attn2_load_error = error
-                        log_all(f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}',
-                                level="warning", logger=logger)
+                        warning_message = f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}'
             except Exception as error:
                 _flash_attn_load_error = error
-                log_all(
+                warning_message = (
                     "FlashAttention 3 backend initialization failed.\n"
-                    + traceback.format_exc(),
-                    level="warning", logger=logger,
+                    + traceback.format_exc()
                 )
         _flash_attn_initialized = True
+    if warning_message is not None:
+        # Log handlers may read availability and re-enter initialization.
+        log_all(warning_message, level="warning", logger=logger)
 
 
 def require_flash_attn3():
