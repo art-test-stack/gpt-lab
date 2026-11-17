@@ -1,5 +1,6 @@
 """Separate Q/K preprocessing against the previous joint arithmetic on CPU."""
 import copy
+import sys
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -36,9 +37,11 @@ def stub_kernel(monkeypatch, calls, packed=True, backend="fa3"):
     kernel = SimpleNamespace(flash_attn_func=separate, flash_attn_with_kvcache=kvcache)
     if packed:
         kernel.flash_attn_qkvpacked_func = qkvpacked
-    loader = "require_flash_attn3" if backend == "fa3" else "require_flash_attn2"
-    monkeypatch.setattr(dispatch, loader, lambda: kernel)
-    monkeypatch.setattr(import_module("gpt_lab.model.layers"), loader, lambda: kernel)
+    if "/" in backend:
+        monkeypatch.setattr(import_module("gpt_lab.utils.import_utils"), "_attention_kernels", {})
+        monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=lambda *args, **kw: kernel))
+    else:
+        monkeypatch.setattr(dispatch, "require_flash_attn3" if backend == "fa3" else "require_flash_attn2", lambda: kernel)
 
 
 def joint_reference(attention, x, values, rope, window):
@@ -53,6 +56,10 @@ def joint_reference(attention, x, values, rope, window):
         gate = 3 * torch.sigmoid(attention.ve_gate(x[..., :attention.ve_gate_channels]))
         v = v + gate.unsqueeze(-1) * values.view_as(v)
     q, k = qk.split((attention.n_heads, attention.n_kv_heads), -2)
+    # The legacy 4-D packed call keeps cat's promoted dtype without CUDA AMP.
+    dtype = torch.promote_types(q.dtype, v.dtype) if (attention.training and
+        attention.use_packed_attn_kernel and attention._packed_fa3) else q.dtype
+    q, k, v = (tensor.to(dtype) for tensor in (q, k, v))
     dispatch = import_module("gpt_lab.model.flash_attn")
     out = dispatch._sdpa_fallback(q, k, v, causal=True, window_size=window,
                                   use_gqa=attention.n_heads != attention.n_kv_heads)
@@ -86,6 +93,7 @@ def test_qk_preprocessing_uses_head_views_and_rope_before_norm(monkeypatch):
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2])
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "example/attention"])
 @pytest.mark.parametrize("use_packed", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("normalization,rope_enabled,norm_enabled,values_enabled", [
@@ -95,24 +103,25 @@ def test_qk_preprocessing_uses_head_views_and_rope_before_norm(monkeypatch):
     ("rms", True, False, False),
     ("rms", False, True, False),
 ])
-def test_separate_qk_outputs_and_gradients(monkeypatch, kv_heads, use_packed, dtype, normalization,
+def test_separate_qk_outputs_and_gradients(monkeypatch, kv_heads, backend, use_packed, dtype, normalization,
                                       rope_enabled, norm_enabled, values_enabled):
     calls = []
-    stub_kernel(monkeypatch, calls)
+    stub_kernel(monkeypatch, calls, backend=backend)
     torch.manual_seed(42)
     config = TransformerConfig(d_model=16, d_ffn=32, n_heads=2, n_kv_heads=kv_heads,
-        d_head=8, n_layers=1, attn_impl="fa3", normalization=normalization,
+        d_head=8, n_layers=1, attn_impl=backend, normalization=normalization,
         norm_before_attn=norm_enabled, norm_eps=3e-4, use_packed_attn_kernel=use_packed)
     attention = CausalSelfAttention(config).to(device="cpu", dtype=dtype).train()
     reference = copy.deepcopy(attention)
     x = torch.randn(2, 7, 16, dtype=dtype, requires_grad=True)
-    values = torch.randn(2, 7, kv_heads * 8, dtype=dtype, requires_grad=True) if values_enabled else None
+    values = torch.randn(2, 7, kv_heads * 8, dtype=torch.float32, requires_grad=True) if values_enabled else None
     rx = x.detach().clone().requires_grad_()
     rv = values.detach().clone().requires_grad_() if values_enabled else None
     rope = precompute_rope(7, 8, device=torch.device("cpu")) if rope_enabled else None
     output, _ = attention(x, value_embeds=values, rope_cache=rope, window_size=(2, 0))
     expected = joint_reference(reference, rx, rv, rope, (2, 0))
-    assert calls == ["packed4d" if use_packed else "separate"]
+    expected_call = "packed4d" if backend == "fa3" else "packed5d" if kv_heads == 2 else "separate"
+    assert calls == [expected_call if use_packed else "separate"]
     torch.testing.assert_close(output, expected)
     dy = torch.randn_like(output)
     output.backward(dy)
@@ -133,6 +142,7 @@ def test_separate_qk_outputs_and_gradients(monkeypatch, kv_heads, use_packed, dt
     ("fa3", False, True, False, "separate"),
     ("fa3", False, True, True, "kvcache"),
     ("fa3", True, False, False, "separate"),
+    ("fa3", True, True, True, "packed5d"),
     ("fa2", True, True, False, "packed5d"),
     ("fa2", True, False, False, "separate"),
 ])
@@ -169,3 +179,60 @@ def test_separate_preprocessing_compiles_as_one_graph(monkeypatch, use_packed):
     compiled = torch.compile(attention, backend="eager", fullgraph=True)
     output = compiled(x, value_embeds=values, rope_cache=rope)[0]
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "example/attention"])
+@pytest.mark.parametrize("use_packed", [False, True])
+def test_model_resolves_dispatch_before_forward(monkeypatch, backend, use_packed):
+    calls = []
+    stub_kernel(monkeypatch, calls, backend=backend)
+    cfg = TransformerConfig(d_model=16, d_ffn=32, n_heads=2, d_head=8, n_layers=1,
+                            attn_impl=backend, use_packed_attn_kernel=use_packed)
+    attention = CausalSelfAttention(cfg).cpu()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Regular forwards must use the bound attention callable")
+
+    dispatch = import_module("gpt_lab.model.flash_attn")
+    monkeypatch.setattr(dispatch, "_initialize_flash_attention", unexpected)
+    monkeypatch.setattr(dispatch, "require_attention_kernel", unexpected)
+    monkeypatch.setattr(dispatch, "require_flash_attn3", unexpected)
+    monkeypatch.setattr(dispatch, "require_flash_attn2", unexpected)
+    monkeypatch.setattr(dispatch, "_load_flash_attn_functions", unexpected)
+    monkeypatch.setattr(dispatch, "flash_attn_func", unexpected)
+    monkeypatch.setattr(dispatch, "flash_attn_qkvpacked_func", unexpected)
+    monkeypatch.setattr(dispatch, "flash_attn_with_kvcache", unexpected)
+    x = torch.randn(2, 7, 16)
+    first = attention(x)[0]
+    attention.eval()
+    torch.testing.assert_close(attention(x)[0], first)
+    attention.train()
+    torch.testing.assert_close(attention(x)[0], first)
+    attention.eval()
+    cache = SimpleNamespace(check_sizes=lambda *args: None,
+        layer=lambda index: (torch.zeros(2, 8, 2, 8), torch.zeros(2, 8, 2, 8)),
+        seqlens=torch.zeros(2, dtype=torch.int32))
+    torch.testing.assert_close(attention(x, kv_cache=cache)[0], first)
+    training_call = ("packed4d" if backend == "fa3" else "packed5d") if use_packed else "separate"
+    assert calls == [training_call, "separate", training_call, "kvcache"]
+
+
+def test_sdpa_and_cache_are_selected_before_forward(monkeypatch):
+    cfg = TransformerConfig(d_model=16, d_ffn=32, n_heads=2, n_kv_heads=1,
+                            d_head=8, n_layers=1, attn_impl="sdpa")
+    attention = CausalSelfAttention(cfg).cpu().eval()
+    x = torch.randn(2, 7, 16)
+    expected = attention(x)[0]
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("SDPA execution must not select or load a backend")
+
+    dispatch = import_module("gpt_lab.model.flash_attn")
+    monkeypatch.setattr(dispatch, "_load_flash_attn_functions", unexpected)
+    monkeypatch.setattr(dispatch, "_initialize_flash_attention", unexpected)
+    monkeypatch.setattr(dispatch, "require_attention_kernel", unexpected)
+    torch.testing.assert_close(attention(x)[0], expected)
+    cache = SimpleNamespace(check_sizes=lambda *args: None,
+        layer=lambda index: (torch.zeros(2, 8, 1, 8), torch.zeros(2, 8, 1, 8)),
+        seqlens=torch.zeros(2, dtype=torch.int32))
+    torch.testing.assert_close(attention(x, kv_cache=cache)[0], expected)
