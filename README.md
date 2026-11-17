@@ -623,6 +623,16 @@ All modes retain one fused QKV linear projection. Attention dispatch and the pac
 opt-in are independent of this setting. Split modes reuse the compiled optimizer step on
 batches of equal-sized blocks, with normalization and learning-rate scaling based on each
 logical matrix shape. Resume with the same split layout to restore momentum and variance state.
+The default `joint` mode retains the existing optimizer checkpoint layout; incompatible split
+layouts are rejected on load.
+
+Splitting uses writable views of the existing stacked optimizer buffers. MHA projection and
+head modes each use one batched step; unequal-width GQA projections use two (Q, then K/V).
+Muon head splitting can increase factored variance storage: wide heads keep one value per input
+column per head, while the joint tall matrix keeps one per output row. NorMuon keeps row-wise
+variance in every mode. On CPU, noncontiguous Muon blocks use the existing eager kernel to avoid
+a PyTorch 2.11 Inductor fusion failure; contiguous CPU batches and CUDA keep the compiled path.
+Throughput and peak memory for these modes have not been benchmarked.
 
 Explicit preserved Muon/NorMuon/spectral-only ANVIL experiment profiles are in
 [optimizer comparison](experiments/optimizer_comparison/README.md).
