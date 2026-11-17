@@ -519,7 +519,10 @@ class AutoGPTConfig(BaseModel):
             dist.barrier()
         # Display the generated configuration for verification
         print0_dict("AutoGPTConfig generated the following tokenizer configuration", tokenizer.config.model_dump())
-        print0_dict("AutoGPTConfig generated the following model configuration", model.config.model_dump())
+        print0_dict("AutoGPTConfig generated the following model configuration", model.config.model_dump() | {
+            "depth": model.config.n_layers,
+            "aspect_ratio": model.config.d_model / model.config.n_layers,
+        })
         
         print0_dict("Model Parameter counts", model.n_params_per_layer())
         print0(f"Estimated FLOPS per token: {training_config['n_flops_per_token']:.2e}")
