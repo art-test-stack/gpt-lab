@@ -162,6 +162,46 @@ def test_public_packed_helper_rejects_unsupported_backends_before_loading(monkey
         attention.flash_attn_qkvpacked_func(qkv, backend=backend)
 
 
+@pytest.mark.parametrize("entrypoint", ["public", "bound"])
+@pytest.mark.parametrize("backend,fa3_loaded,window,expected", [
+    (None, True, (512, 0), "fa2"),
+    (None, True, (1, 0), "fa3"),
+    (None, False, (512, 0), "fa2"),
+    (None, False, (1, 0), "sdpa"),
+    ("fa3", True, (512, 0), "fa3"),
+])
+def test_implicit_packed_dispatch_preserves_fa2_priority(monkeypatch, entrypoint, backend,
+                                                        fa3_loaded, window, expected):
+    attention = import_module("gpt_lab.model.flash_attn")
+    calls = []
+    output = torch.empty(1, 4, 2, 8, dtype=torch.bfloat16)
+
+    def record(name):
+        def packed(*args, **kwargs):
+            calls.append(name)
+            return output
+        return packed
+
+    fa2 = SimpleNamespace(flash_attn_qkvpacked_func=record("fa2"))
+    fa3 = SimpleNamespace(flash_attn_func=lambda *args, **kwargs: output,
+                          flash_attn_qkvpacked_func=record("fa3"))
+    monkeypatch.setattr(attention, "_flash_attn_initialized", True)
+    monkeypatch.setattr(attention, "_flash_attn", fa3 if fa3_loaded else None)
+    monkeypatch.setattr(attention, "_flash_attn2", fa2)
+    monkeypatch.setattr(attention, "_sdpa_qkvpacked_func", record("sdpa"))
+    tensor = torch.empty(1, 4, 3, 2, 8, dtype=torch.bfloat16)
+    # Simulate CUDA metadata while keeping dtype conversions on CPU.
+    qkv = SimpleNamespace(is_cuda=True, dtype=tensor.dtype, size=tensor.size, to=tensor.to)
+    options = dict(causal=True, window_size=window, softmax_scale=0.25, deterministic=True)
+
+    if entrypoint == "public":
+        actual = attention.flash_attn_qkvpacked_func(qkv, backend=backend, **options)
+    else:
+        actual = attention.load_flash_attn(backend).flash_attn_qkvpacked_func(qkv, **options)
+    assert actual is output
+    assert calls == [expected]
+
+
 def test_custom_kernel_kvcache_dispatch(monkeypatch):
     attention = import_module("gpt_lab.model.flash_attn")
     q = torch.randn(1, 1, 2, 8)

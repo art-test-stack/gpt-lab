@@ -340,9 +340,9 @@ def _unsupported_attention(*args, _backend, **kwargs):
     raise ValueError(f"Attention implementation {_backend} is not supported; use sdpa, fa2, fa3, or owner/kernel.")
 
 
-def _automatic_ampere_qkvpacked(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
-                               window_size=(-1, -1), alibi_slopes=None, deterministic=False,
-                               num_heads_q=None, *, _function):
+def _automatic_qkvpacked(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
+                         window_size=(-1, -1), alibi_slopes=None, deterministic=False,
+                         num_heads_q=None, *, _function, _fallback):
     """Retain the legacy implicit FA2 fast path; named model backends never use this."""
     dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else qkv.dtype
     if (qkv.is_cuda and causal and window_size is not None and tuple(window_size) == (512, 0)
@@ -350,8 +350,8 @@ def _automatic_ampere_qkvpacked(qkv, dropout_p=0.0, softmax_scale=None, causal=F
             and qkv.dtype in (torch.float32, torch.bfloat16) and dtype == torch.bfloat16):
         return _fa2_qkvpacked_func(qkv, dropout_p, softmax_scale, causal, window_size,
                                    alibi_slopes, deterministic, _function=_function)
-    return _sdpa_qkvpacked_func(qkv, dropout_p, softmax_scale, causal, window_size,
-                                alibi_slopes, deterministic, num_heads_q)
+    return _fallback(qkv, dropout_p, softmax_scale, causal, window_size,
+                     alibi_slopes, deterministic, num_heads_q)
 
 
 def _load_flash_attn_functions(backend):
@@ -365,7 +365,8 @@ def _load_flash_attn_functions(backend):
         separate = _sdpa_func if backend == 'sdpa' else partial(_unsupported_attention, _backend=backend)
         packed = _sdpa_qkvpacked_func if automatic else partial(_unsupported_packed, _backend=backend)
         if automatic and _flash_attn2 is not None:
-            packed = partial(_automatic_ampere_qkvpacked, _function=_flash_attn2.flash_attn_qkvpacked_func)
+            packed = partial(_automatic_qkvpacked, _function=_flash_attn2.flash_attn_qkvpacked_func,
+                             _fallback=packed)
         return dict(
             flash_attn_func=separate, flash_attn_qkvpacked_func=packed,
             flash_attn_with_kvcache=_sdpa_with_kvcache, flash_attention_is_installed=flash_attention_is_installed,
@@ -388,6 +389,9 @@ def _load_flash_attn_functions(backend):
         if callable(packed):
             packed = partial(_hub_call, _function=packed, _options=options['flash_attn_qkvpacked_func'], _backend=backend)
         separate = partial(_hub_func, _function=function, _packed=packed)
+    if automatic and _flash_attn2 is not None:
+        packed_call = partial(_automatic_qkvpacked, _function=_flash_attn2.flash_attn_qkvpacked_func,
+                              _fallback=packed_call)
     cache = getattr(kernel, 'flash_attn_with_kvcache', None)
     cache_call = (partial(_native_with_kvcache, _function=cache) if callable(cache)
                   else partial(_missing_kvcache, _backend=backend))
@@ -476,7 +480,8 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
         num_heads_q: Number of query heads for FA3's four-dimensional layout;
             ignored by the implicit SDPA/FA2 paths.
         backend: "fa3" for an explicit packed call. None retains implicit
-            FA3/SDPA selection and the legacy Ampere FA2 fast path. Other
+            dispatch: already-loaded FA2 takes priority for eligible BF16 causal
+            (512, 0) calls, followed by FA3 when loaded, otherwise SDPA. Other
             explicit backends raise ValueError before backend loading.
 
     Returns:
