@@ -149,6 +149,19 @@ def test_custom_kernel_load_failure_has_no_sdpa_fallback(monkeypatch):
     assert isinstance(error.value.__cause__, OSError)
 
 
+@pytest.mark.parametrize("backend", ["fa2", "sdpa", "torch", "raw", "owner/kernel", "unknown"])
+def test_public_packed_helper_rejects_unsupported_backends_before_loading(monkeypatch, backend):
+    attention = import_module("gpt_lab.model.flash_attn")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Unsupported packed backends must be rejected before loading")
+
+    monkeypatch.setattr(attention, "_load_flash_attn_functions", unexpected)
+    qkv = torch.randn(1, 4, 3, 2, 8)
+    with pytest.raises(ValueError, match=f"Unsupported packed attention backend: {backend}"):
+        attention.flash_attn_qkvpacked_func(qkv, backend=backend)
+
+
 def test_custom_kernel_kvcache_dispatch(monkeypatch):
     attention = import_module("gpt_lab.model.flash_attn")
     q = torch.randn(1, 1, 2, 8)
@@ -315,3 +328,53 @@ def test_backend_loading_waits_for_the_helper(monkeypatch):
             assert not calls
     finally:
         reload(attention)
+
+
+@pytest.mark.parametrize("backend", ["torch", "raw"])
+@torch.no_grad()
+def test_legacy_attention_configs_support_cached_model_evaluation(backend):
+    from gpt_lab.model.gpt import DenseTransformer
+    from gpt_lab.model.utils import KVCache
+    from gpt_lab.utils.schemas import TransformerConfig
+
+    config = TransformerConfig(vocab_size=64, max_context=4, d_model=16, d_ffn=32,
+        n_heads=2, d_head=8, n_layers=1, attn_impl=backend, window_pattern="L")
+    model = DenseTransformer(config).cpu().eval()
+    model.init_weights()
+    # Keep attention's contribution nonzero so incorrect cache contents affect logits.
+    torch.nn.init.normal_(model.blocks[0].attention.o_proj.weight, std=0.1)
+    reference = DenseTransformer(config.model_copy(update={"attn_impl": "sdpa"})).cpu().eval()
+    reference.load_state_dict(model.state_dict())
+    cache = KVCache(config=config)
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+
+    for chunk in (slice(0, 3), slice(3, 4)):
+        actual = model(input_ids[:, chunk], past_key_values=cache)
+        expected = reference(input_ids[:, :chunk.stop])
+        torch.testing.assert_close(actual.logits, expected.logits)
+        cache.advance()
+        assert cache.cur_pos == chunk.stop
+
+
+@pytest.mark.parametrize("backend", ["torch", "raw"])
+@torch.no_grad()
+def test_legacy_attention_configs_support_layer_weight_inspection(backend):
+    from gpt_lab.model.layers import CausalSelfAttention
+    from gpt_lab.utils.schemas import TransformerConfig
+
+    config = TransformerConfig(d_model=16, d_ffn=32, n_heads=2, d_head=8,
+                              n_layers=1, attn_impl=backend)
+    attention = CausalSelfAttention(config).cpu().eval()
+    reference = CausalSelfAttention(config.model_copy(update={"attn_impl": "sdpa"})).cpu().eval()
+    reference.load_state_dict(attention.state_dict())
+    x = torch.randn(2, 3, 16)
+
+    output, weights = attention(x, return_attn_weights=True)
+    expected_output, expected_weights = reference(x, return_attn_weights=True)
+    assert weights is not None and torch.isfinite(weights).all()
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(weights, expected_weights)
+    for training in (True, False):
+        attention.train(training)
+        with pytest.raises(ValueError, match=f"Attention implementation {backend} is not supported"):
+            attention(x)

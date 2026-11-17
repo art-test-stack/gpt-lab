@@ -339,6 +339,10 @@ def _unsupported_packed(*args, _backend, **kwargs):
     raise ValueError(f"Unsupported packed attention backend: {_backend}")
 
 
+def _unsupported_attention(*args, _backend, **kwargs):
+    raise ValueError(f"Attention implementation {_backend} is not supported; use sdpa, fa2, fa3, or owner/kernel.")
+
+
 def _automatic_ampere_qkvpacked(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
                                window_size=(-1, -1), alibi_slopes=None, deterministic=False,
                                num_heads_q=None, *, _function):
@@ -359,12 +363,13 @@ def _load_flash_attn_functions(backend):
     automatic = backend is None
     if automatic:
         backend = 'fa3' if flash_attention_is_installed else 'sdpa'
-    if backend == 'sdpa':
+    if backend in ('sdpa', 'torch', 'raw'):
+        separate = _sdpa_func if backend == 'sdpa' else partial(_unsupported_attention, _backend=backend)
         packed = _sdpa_qkvpacked_func if automatic else partial(_unsupported_packed, _backend=backend)
         if automatic and _flash_attn2 is not None:
             packed = partial(_automatic_ampere_qkvpacked, _function=_flash_attn2.flash_attn_qkvpacked_func)
         return dict(
-            flash_attn_func=_sdpa_func, flash_attn_qkvpacked_func=packed,
+            flash_attn_func=separate, flash_attn_qkvpacked_func=packed,
             flash_attn_with_kvcache=_sdpa_with_kvcache, flash_attention_is_installed=flash_attention_is_installed,
             packed_fa3=False, supports_attn_weights=True,
         )
@@ -402,6 +407,8 @@ def load_flash_attn(backend):
         backend: "sdpa", "fa2", "fa3", or a Hub repository ("owner/name").
             None retains the implicit default: FA3 when available, otherwise SDPA.
             Explicit kernel requests raise if loading fails.
+            Legacy "torch" and "raw" configs retain SDPA cached evaluation and
+            layer-level attention-weight inspection; ordinary forwards raise.
 
     Returns:
         Namespace exposing flash_attn_func, flash_attn_qkvpacked_func, and
@@ -472,13 +479,15 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
             ignored by the implicit SDPA/FA2 paths.
         backend: "fa3" for an explicit packed call. None retains implicit
             FA3/SDPA selection and the legacy Ampere FA2 fast path. Other
-            explicit backends are unsupported by this entrypoint.
+            explicit backends raise ValueError before backend loading.
 
     Returns:
         Attention output of shape (batch_size, seqlen, nheads_q, headdim).
 
     Models use the corresponding function bound by load_flash_attn.
     """
+    if backend not in (None, "fa3"):
+        raise ValueError(f"Unsupported packed attention backend: {backend}")
     return _load_flash_attn_functions(backend)['flash_attn_qkvpacked_func'](
         qkv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, deterministic, num_heads_q)
 
