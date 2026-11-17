@@ -66,7 +66,11 @@ class MuonStrategy(OptimizerStrategy):
             return
 
         self.opt.scalars.muon_lr_t.fill_(self._learning_rate(group, (rows, cols)))
-        self.step_kernel(
+        step_kernel = self.step_kernel
+        if group["opt"] == "muon" and weights.device.type == "cpu" and not weights.is_contiguous():
+            # shortcut: PyTorch 2.11 CPU fusion fails on strided Muon views; remove when Inductor supports them.
+            step_kernel = step_kernel.__wrapped__
+        step_kernel(
             grads, weights, momentum,
             state[variance_key][:len(weights)], self.opt.scalars.muon_momentum_t,
             self.opt.scalars.muon_lr_t, self.opt.scalars.muon_wd_t,
