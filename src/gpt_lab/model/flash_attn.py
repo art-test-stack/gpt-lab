@@ -449,6 +449,7 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
             ignored by the SDPA wrapper.
         backend: Selection described in load_flash_attn. Hub kernels must
             support any requested non-default dropout or ALiBi options.
+            Explicit "sdpa" calls bypass native backend initialization.
         use_packed: Use a kernel's packed entrypoint when available and Q/K/V
             shapes match; otherwise retain separate inputs. Ignored by SDPA.
 
@@ -457,6 +458,9 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
 
     Compatibility entrypoint; models bind functions once with load_flash_attn.
     """
+    if backend == "sdpa":
+        return _sdpa_func(q, k, v, dropout_p, softmax_scale, causal, window_size,
+                          alibi_slopes, deterministic, use_packed)
     return _load_flash_attn_functions(backend)['flash_attn_func'](
         q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes,
         deterministic, use_packed)

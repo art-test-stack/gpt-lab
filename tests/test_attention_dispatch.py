@@ -3,7 +3,9 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace, ModuleType
 import copy
+import subprocess
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -15,6 +17,34 @@ def clear_kernel_cache():
     _attention_kernels.clear()
     yield
     _attention_kernels.clear()
+
+
+def test_public_sdpa_compiles_before_any_eager_call():
+    code = """
+        from importlib import import_module
+        import torch
+        import torch.nn.functional as F
+
+        attention = import_module("gpt_lab.model.flash_attn")
+        assert not attention._flash_attn_initialized
+        torch.manual_seed(42)
+        q, k, v = torch.randn(3, 1, 4, 2, 8).unbind(0)
+        compiled = torch.compile(
+            lambda q, k, v: attention.flash_attn_func(
+                q, k, v, backend="sdpa", causal=True, softmax_scale=0.25),
+            backend="eager", fullgraph=True,
+        )
+        output = compiled(q, k, v)
+        assert not attention._flash_attn_initialized
+        expected = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            is_causal=True, scale=0.25,
+        ).transpose(1, 2)
+        torch.testing.assert_close(output, expected)
+    """
+    process = subprocess.run([sys.executable, "-c", textwrap.dedent(code)],
+                             capture_output=True, text=True, timeout=60)
+    assert process.returncode == 0, process.stdout + process.stderr
 
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3", "example/attention"])
