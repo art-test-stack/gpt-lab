@@ -1,5 +1,5 @@
 from gpt_lab.utils.schemas import TransformerConfig
-from gpt_lab.model.flash_attn import flash_attn, scaled_dot_product_attention, require_flash_attn3, require_flash_attn2, require_attention_kernel
+from gpt_lab.model.flash_attn import scaled_dot_product_attention, load_flash_attn
 from gpt_lab.model.utils import apply_rope, has_ve
 from gpt_lab.utils.types import NormalizationTypes
 from gpt_lab.utils.default import DEVICE
@@ -145,16 +145,11 @@ class CausalSelfAttention(Module):
         super().__init__()
         assert config.d_model == config.d_head * config.n_heads, f'Dimensions are not correct. dim_model must be equal to d_head * n_heads. Got dim_model={config.d_model}, d_head={config.d_head}, n_heads={config.n_heads}'
         assert config.attn_impl in ("sdpa", "fa2", "fa3", "torch", "raw") or "/" in config.attn_impl, f'Attention implementation {config.attn_impl} is not supported.'
-        self._packed_fa3 = False
+        self.flash_attn = load_flash_attn(config.attn_impl)
+        self._packed_fa3 = self.flash_attn.packed_fa3
         if config.attn_impl == "fa3":
-            kernel = require_flash_attn3()
-            self._packed_fa3 = callable(getattr(kernel, "flash_attn_qkvpacked_func", None))
             if config.dropout != 0.0 or config.attention_dropout != 0.0:
                 raise ValueError("FA3 does not support attention dropout in this integration")
-        elif config.attn_impl == "fa2":
-            require_flash_attn2()
-        elif "/" in config.attn_impl:
-            require_attention_kernel(config.attn_impl)
         assert config.normalization in get_args(NormalizationTypes), f'Normalization {config.normalization} is not supported. Supported normalizations are in {get_args(NormalizationTypes)}.'
         assert config.n_heads % config.n_kv_heads == 0, f'Number of heads must be divisible by number of key-value heads. Got n_heads={config.n_heads}, n_kv_heads={config.n_kv_heads}.'
         
@@ -201,7 +196,7 @@ class CausalSelfAttention(Module):
                 kv_cache=None, attn_mask=None, return_attn_weights: bool = False
         ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         B, Tq, E = x.size()
-        if (self.attn_impl in ("fa2", "fa3") or "/" in self.attn_impl) and (return_attn_weights or attn_mask is not None):
+        if not self.flash_attn.supports_attn_weights and (return_attn_weights or attn_mask is not None):
             raise ValueError("Explicit attention kernels do not support attention weights or arbitrary masks; use sdpa")
         if kv_cache is not None:
             kv_cache.check_sizes(B, Tq, x.device, x.dtype)
@@ -214,9 +209,9 @@ class CausalSelfAttention(Module):
 
         if self.use_packed_attn_kernel and self._packed_fa3 and self.training and kv_cache is None:
             qkv_ready = torch.cat((q, k, v), dim=-2)
-            output = flash_attn.flash_attn_qkvpacked_func(
+            output = self.flash_attn.flash_attn_qkvpacked_func(
                 qkv_ready, num_heads_q=Hq, causal=True,
-                window_size=window_size, backend='fa3',
+                window_size=window_size,
             )
             return self.o_proj(output.contiguous().view(B, Tq, E)), None
 
@@ -238,26 +233,22 @@ class CausalSelfAttention(Module):
             k_cache, v_cache = kv_cache.layer(self.layer_idx)
             k_cache, v_cache = k_cache.to(q.device, dtype=q.dtype), v_cache.to(v.device, dtype=q.dtype)
             
-            x = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache,
+            x = self.flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache,
                 k, v,
                 cache_seqlens=kv_cache.seqlens,
                 causal=True,
                 window_size=window_size if window_size is not None else (-1, -1),
-                backend=self.attn_impl,
             )
 
         # Kernel choice is independent of the packed projection.
-        elif self.attn_impl in ('sdpa', 'fa2', 'fa3') or "/" in self.attn_impl:
-            x = flash_attn.flash_attn_func(
+        else:
+            x = self.flash_attn.flash_attn_func(
                 q, k, v,
                 dropout_p=self.dropout_rate if self.training else 0.0,
                 window_size=window_size,
                 causal=True,
-                backend=self.attn_impl,
                 use_packed=self.use_packed_attn_kernel and self.training,
             )
-        else:
-            raise ValueError(f'Attention implementation {self.attn_impl} is not supported; use sdpa, fa2, fa3, or owner/kernel.')
         
         # x: (B, Tq, Hq, D) -> (B, Tq, E)
         x = x.contiguous().view(B, Tq, -1)

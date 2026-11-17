@@ -1,9 +1,12 @@
 from packaging import version
 from functools import lru_cache
-import warnings
+from gpt_lab.utils.logging import log_all
+import logging
 import traceback
 import inspect
 import re
+
+logger = logging.getLogger(__name__)
 
 
 def validate_attn_impl(value: str) -> str:
@@ -104,10 +107,9 @@ def is_flash_attn3_available_from_kernel() -> bool:
         get_attention_kernel("fa3")
         return True
     except Exception:
-        warnings.warn(
+        log_all(
             "FlashAttention 3 is not available. Falling back to PyTorch SDPA.\n"
             + traceback.format_exc(),
-            UserWarning,
-            stacklevel=2,
+            level="warning", logger=logger,
         )
         return False

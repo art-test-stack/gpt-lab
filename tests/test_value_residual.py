@@ -29,9 +29,7 @@ def test_value_residual_without_rope_or_qk_norm(monkeypatch, backend):
         if "/" in backend:
             monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=lambda *args, **kw: kernel))
         else:
-            loader = "require_flash_attn2" if backend == "fa2" else "require_flash_attn3"
-            monkeypatch.setattr(dispatch, loader, lambda: kernel)
-            monkeypatch.setattr(import_module("gpt_lab.model.layers"), loader, lambda: kernel)
+            monkeypatch.setattr(dispatch, "require_flash_attn3" if backend == "fa3" else "require_flash_attn2", lambda: kernel)
     config = TransformerConfig(
         d_model=16, d_ffn=32, n_heads=2, d_head=8, n_layers=1,
         norm_before_attn=False, attn_impl=backend, dropout=0.0,
