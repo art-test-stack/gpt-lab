@@ -157,7 +157,7 @@ def test_two_process_cpu_mesh(tmp_path, adopt_existing):
     mp.spawn(_mesh_worker, args=(port, tmp_path, adopt_existing), nprocs=2, join=True)
 
 
-def _optimizer_worker(rank, port, communication_mode):
+def _optimizer_worker(rank, port, communication_mode, checkpoint_dir):
     from gpt_lab.optim.factory import OptimizerFactory
 
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2",
@@ -167,7 +167,7 @@ def _optimizer_worker(rank, port, communication_mode):
     context = init_dist_groups("cpu")
     try:
         shapes = [(8,), (32, 32), (2, 3), (2, 3), (2, 3), (3, 2), (3, 2), (3, 2)]
-        shapes.extend([(8, 4)] * 3 + [(6, 4)])
+        shapes.extend([(8, 4)] * 7 + [(12, 4)])
         parameters = [torch.nn.Parameter(torch.linspace(-0.3, 0.7, torch.Size(shape).numel()).reshape(shape))
                       for shape in shapes]
         reference = [torch.nn.Parameter(parameter.detach().clone()) for parameter in parameters]
@@ -179,8 +179,12 @@ def _optimizer_worker(rank, port, communication_mode):
                 dict(params=params[5:8], opt="normuon", lr=0.01, momentum=0.95, beta=0.95, ns_steps=5, weight_decay=0.1),
                 dict(params=params[8:11], opt="muon", lr=0.01, momentum=0.95, beta=0.9,
                      ns_steps=2, weight_decay=0.1, qkv_split_sizes=(4, 2, 2)),
-                dict(params=params[11:], opt="normuon", lr=0.01, momentum=0.95, beta=0.95,
-                     ns_steps=5, weight_decay=0.1, qkv_split_sizes=(2, 2, 2)),
+                dict(params=params[11:12], opt="normuon", lr=0.01, momentum=0.95, beta=0.95,
+                     ns_steps=5, weight_decay=0.1, qkv_split_sizes=(4, 2, 2)),
+                dict(params=params[12:15], opt="muon", lr=0.01, momentum=0.95, beta=0.9,
+                     ns_steps=2, weight_decay=0.1, qkv_split_sizes=(2,) * 4),
+                dict(params=params[15:], opt="normuon", lr=0.01, momentum=0.95, beta=0.95,
+                     ns_steps=5, weight_decay=0.1, qkv_split_sizes=(2,) * 6),
             ]
 
         optimizer = OptimizerFactory(groups(parameters), comp_info=context)
@@ -207,7 +211,7 @@ def _optimizer_worker(rank, port, communication_mode):
                         if index == 1:
                             expected = expected.chunk(2)[rank]
                         torch.testing.assert_close(actual_state[key], expected)
-                for start, size in ((2, 3), (5, 3), (8, 3), (11, 1)):
+                for start, size in ((2, 3), (5, 3), (8, 3), (11, 1), (12, 3), (15, 1)):
                     slots = (size + 1) // 2
                     owned = min(slots, size - rank * slots)
                     local_state = local.state[reference[start]]
@@ -217,13 +221,17 @@ def _optimizer_worker(rank, port, communication_mode):
                         assert distributed_state[key].shape[0] == slots
                         expected = expected[rank * slots:rank * slots + owned]
                         torch.testing.assert_close(distributed_state[key][:owned], expected)
+                if step == 0:
+                    path = checkpoint_dir / f"optimizer-rank{rank}.safetensors"
+                    save_tensor_state(optimizer.state_dict(), path)
+                    optimizer.load_state_dict(load_tensor_state(path))
     finally:
         cleanup_dist_groups()
 
 
 @pytest.mark.parametrize("communication_mode", ["baseline", "pipeline"])
-def test_two_process_gloo_optimizer_matches_averaged_local_updates(communication_mode):
+def test_two_process_gloo_optimizer_matches_averaged_local_updates(tmp_path, communication_mode):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    mp.spawn(_optimizer_worker, args=(port, communication_mode), nprocs=2, join=True)
+    mp.spawn(_optimizer_worker, args=(port, communication_mode, tmp_path), nprocs=2, join=True)
