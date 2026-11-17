@@ -244,6 +244,9 @@ file when loaded again.
 
 The CLI accepts the same file with `--architecture-config <path>`. Omitted
 architecture options use the file, while explicit options override it.
+The generated model log and board configuration include the resolved `depth`
+and effective `aspect_ratio` (`d_model / n_layers`), after rounding width to whole
+attention heads. The effective ratio can differ from the requested sizing ratio.
 `--disable-value-embeds` removes value embedding tables and gates; `value_embs`
 must then be absent from `--tie-embeddings` (for example, use `'embs;head'`).
 `--freeze-res-connections` makes the residual mixing parameters non-trainable
