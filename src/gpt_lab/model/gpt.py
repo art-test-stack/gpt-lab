@@ -353,20 +353,20 @@ class DenseTransformer(BaseTransformer):
 
         transformer_opts = optim_config["transformer"]
         qkv_mode = transformer_opts.pop("muon_qkv", "joint")
-        qkv_params = set()
-        qkv_splits = ()
+        qkv_splits = {}
         if qkv_mode != "joint":
-            qkv_params = {block.attention.qkv_proj.weight for block in self.blocks}
-            d_head = self.config.d_head
-            n_heads, n_kv_heads = self.config.n_heads, self.config.n_kv_heads
-            if qkv_mode == "projection":
-                qkv_splits = (n_heads * d_head, n_kv_heads * d_head, n_kv_heads * d_head)
-            else:
-                qkv_splits = (d_head,) * (n_heads + 2 * n_kv_heads)
+            for block in self.blocks:
+                attention = block.attention
+                d_head = attention.d_head
+                n_heads, n_kv_heads = attention.n_heads, attention.n_kv_heads
+                qkv_splits[attention.qkv_proj.weight] = (
+                    (n_heads * d_head, n_kv_heads * d_head, n_kv_heads * d_head)
+                    if qkv_mode == "projection" else (d_head,) * (n_heads + 2 * n_kv_heads)
+                )
 
         block_groups = {}
         for param in blocks_params:
-            splits = qkv_splits if param in qkv_params else ()
+            splits = qkv_splits.get(param, ())
             block_groups.setdefault((param.shape, splits), []).append(param)
         for (shape, splits), group_params in sorted(block_groups.items()):
             group_options = dict(transformer_opts)
