@@ -1,5 +1,6 @@
-from importlib import import_module
-from types import SimpleNamespace
+from importlib import import_module, reload
+from types import SimpleNamespace, ModuleType
+import copy
 import sys
 
 import pytest
@@ -165,3 +166,96 @@ def test_custom_kernel_kvcache_dispatch(monkeypatch):
     del kernel.flash_attn_with_kvcache
     with pytest.raises(RuntimeError, match="does not support KV-cache decoding"):
         attention.flash_attn_with_kvcache(q, cache, cache, backend="example/cache")
+
+
+@pytest.mark.parametrize("backend,capability,warning", [
+    ("fa3", 9, "FlashAttention 3 backend initialization failed"),
+    ("fa2", 8, "FlashAttention 2 unavailable"),
+])
+def test_loader_preserves_warning_and_strict_error(monkeypatch, backend, capability, warning):
+    attention = import_module("gpt_lab.model.flash_attn")
+    calls = []
+    failure = OSError("missing build")
+
+    def fail(name):
+        calls.append(name)
+        raise failure
+
+    for name in ("_flash_attn", "_flash_attn2", "_flash_attn_load_error", "_flash_attn2_load_error"):
+        monkeypatch.setattr(attention, name, None)
+    monkeypatch.setattr(attention, "_flash_attn_initialized", False)
+    monkeypatch.setattr(attention, "flash_attention_is_installed", False)
+    monkeypatch.setattr(attention.flash_attn, "flash_attention_is_installed", False)
+    monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (capability, 0))
+    monkeypatch.setattr(attention, "get_attention_kernel", fail)
+    with pytest.warns(RuntimeWarning, match=warning):
+        with pytest.raises(RuntimeError, match="refusing SDPA fallback") as error:
+            attention.load_flash_attn(backend)
+    assert error.value.__cause__ is failure
+    assert calls == [backend]
+
+
+def test_loader_returns_bound_namespace_and_initializes_once(monkeypatch):
+    attention = import_module("gpt_lab.model.flash_attn")
+    loads = []
+    kernel = ModuleType("native_attention")
+    kernel.flash_attn_func = lambda q, k, v, **kwargs: q
+
+    def load(name):
+        loads.append(name)
+        return kernel
+
+    monkeypatch.setattr(attention, "_flash_attn", None)
+    monkeypatch.setattr(attention, "_flash_attn_initialized", False)
+    monkeypatch.setattr(attention, "flash_attention_is_installed", False)
+    monkeypatch.setattr(attention.flash_attn, "flash_attention_is_installed", False)
+    monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(attention, "get_attention_kernel", load)
+    bound = attention.load_flash_attn("fa3")
+    assert isinstance(bound, SimpleNamespace)
+    assert bound.flash_attention_is_installed and attention.flash_attn.flash_attention_is_installed
+    q = torch.randn(1, 4, 2, 8)
+    assert bound.flash_attn_func(q, q, q) is q
+    assert copy.deepcopy(bound).flash_attn_func(q, q, q) is q
+    attention.load_flash_attn("fa3")
+    assert loads == ["fa3"]
+
+
+def test_kvcache_retains_implicit_fa3_selection(monkeypatch):
+    attention = import_module("gpt_lab.model.flash_attn")
+    q = torch.randn(1, 1, 2, 8)
+    cache = torch.zeros(1, 4, 2, 8)
+    calls = []
+
+    def native(*args, **kwargs):
+        calls.append(args)
+        return q
+
+    monkeypatch.setattr(attention, "_flash_attn_initialized", True)
+    monkeypatch.setattr(attention, "flash_attention_is_installed", True)
+    monkeypatch.setattr(attention, "_flash_attn", SimpleNamespace(
+        flash_attn_func=lambda *args, **kwargs: q, flash_attn_with_kvcache=native))
+    assert attention.flash_attn_with_kvcache(q, cache, cache) is q
+    assert len(calls) == 1
+
+
+def test_backend_loading_waits_for_the_helper(monkeypatch):
+    attention = import_module("gpt_lab.model.flash_attn")
+    imports = import_module("gpt_lab.utils.import_utils")
+    calls = []
+
+    def load(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace()
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(imports, "get_attention_kernel", load)
+            patch.setattr(imports, "is_torch_cuda_available", lambda: True)
+            patch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+            reload(attention)
+            assert not calls
+    finally:
+        reload(attention)
