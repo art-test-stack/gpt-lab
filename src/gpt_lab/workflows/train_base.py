@@ -284,6 +284,10 @@ def train_base(
 
         if is_master_process:
             board_args["dirname"] = ckpt_manager.source_dir
+            board_args.update(
+                depth=model.config.n_layers,
+                aspect_ratio=model.config.d_model / model.config.n_layers,
+            )
             board_instance = Board(
                 board_type=board,
                 # entity_name=None, # TODO: add option for wandb entity
