@@ -1,9 +1,10 @@
 from gpt_lab.utils.import_utils import get_attention_kernel, is_torch_cuda_available
+from gpt_lab.utils.logging import log_all
 
 import torch
 import torch.nn.functional as F
 import os
-import warnings
+import logging
 import traceback
 from typing import Optional, Union
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ from functools import partial
 from threading import Lock
 
 import math
+
+logger = logging.getLogger(__name__)
 
 _flash_attn = None
 _flash_attn2 = None
@@ -40,14 +43,14 @@ def _initialize_flash_attention():
                         _flash_attn2 = get_attention_kernel("fa2")
                     except Exception as error:
                         _flash_attn2_load_error = error
-                        warnings.warn(f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}',
-                                      RuntimeWarning, stacklevel=2)
+                        log_all(f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}',
+                                level="warning", logger=logger)
             except Exception as error:
                 _flash_attn_load_error = error
-                warnings.warn(
+                log_all(
                     "FlashAttention 3 backend initialization failed.\n"
                     + traceback.format_exc(),
-                    RuntimeWarning, stacklevel=2,
+                    level="warning", logger=logger,
                 )
         _flash_attn_initialized = True
 

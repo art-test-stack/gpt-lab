@@ -227,7 +227,7 @@ def test_custom_kernel_kvcache_dispatch(monkeypatch):
     ("fa3", 9, "FlashAttention 3 backend initialization failed"),
     ("fa2", 8, "FlashAttention 2 unavailable"),
 ])
-def test_loader_preserves_warning_and_strict_error(monkeypatch, backend, capability, warning):
+def test_loader_logs_warning_and_preserves_strict_error(monkeypatch, caplog, backend, capability, warning):
     attention = import_module("gpt_lab.model.flash_attn")
     calls = []
     failure = OSError("missing build")
@@ -242,9 +242,12 @@ def test_loader_preserves_warning_and_strict_error(monkeypatch, backend, capabil
     monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (capability, 0))
     monkeypatch.setattr(attention, "get_attention_kernel", fail)
-    with pytest.warns(RuntimeWarning, match=warning):
+    with caplog.at_level("WARNING", logger=attention.__name__):
         with pytest.raises(RuntimeError, match="refusing SDPA fallback") as error:
             attention.load_flash_attn(backend)
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "WARNING"
+    assert warning in caplog.records[0].message
     assert error.value.__cause__ is failure
     assert calls == [backend]
 
@@ -370,7 +373,7 @@ def test_backend_loading_waits_for_the_helper(monkeypatch):
 
 @pytest.mark.parametrize("surface", ["namespace", "module"])
 @pytest.mark.parametrize("outcome", ["available", "missing", "cpu"])
-def test_public_availability_flag_initializes_on_first_read(monkeypatch, surface, outcome):
+def test_public_availability_flag_initializes_on_first_read(monkeypatch, caplog, surface, outcome):
     attention = import_module("gpt_lab.model.flash_attn")
     public = attention.flash_attn if surface == "namespace" else attention
     loads = []
@@ -391,10 +394,7 @@ def test_public_availability_flag_initializes_on_first_read(monkeypatch, surface
     monkeypatch.setenv("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     assert not loads
 
-    if outcome == "missing":
-        with pytest.warns(RuntimeWarning, match="FlashAttention 3 backend initialization failed"):
-            installed = public.flash_attention_is_installed
-    else:
+    with caplog.at_level("WARNING", logger=attention.__name__):
         installed = public.flash_attention_is_installed
     expected = outcome == "available"
     assert installed is expected
@@ -405,6 +405,10 @@ def test_public_availability_flag_initializes_on_first_read(monkeypatch, surface
     if installed:
         assert attention.require_flash_attn3() is kernel
     assert loads == ([] if outcome == "cpu" else ["fa3"])
+    assert len(caplog.records) == int(outcome == "missing")
+    if outcome == "missing":
+        assert caplog.records[0].levelname == "WARNING"
+        assert "FlashAttention 3 backend initialization failed" in caplog.records[0].message
 
 
 @pytest.mark.parametrize("backend", ["torch", "raw"])

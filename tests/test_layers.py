@@ -250,7 +250,7 @@ def test_flash_fallback_aligns_cached_queries_to_bottom_right():
 
 
 @pytest.mark.fast
-def test_missing_flash_kernel_does_not_recurse(monkeypatch):
+def test_missing_flash_kernel_does_not_recurse(monkeypatch, caplog):
     import gpt_lab.utils.import_utils as import_utils
 
     calls = 0
@@ -268,8 +268,11 @@ def test_missing_flash_kernel_does_not_recurse(monkeypatch):
     )
     import_utils.is_flash_attn3_available_from_kernel.cache_clear()
     try:
-        with pytest.warns(UserWarning, match="Falling back to PyTorch SDPA"):
+        with caplog.at_level("WARNING", logger=import_utils.__name__):
             assert not import_utils.is_flash_attn3_available_from_kernel()
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelname == "WARNING"
+        assert "Falling back to PyTorch SDPA" in caplog.records[0].message
         assert calls == 1
     finally:
         import_utils.is_flash_attn3_available_from_kernel.cache_clear()
