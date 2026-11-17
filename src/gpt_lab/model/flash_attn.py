@@ -8,6 +8,7 @@ import traceback
 from typing import Optional, Union
 from types import SimpleNamespace
 from functools import partial
+from threading import Lock
 
 import math
 
@@ -16,6 +17,7 @@ _flash_attn2 = None
 _flash_attn_load_error = None
 _flash_attn2_load_error = None
 _flash_attn_initialized = False
+_flash_attn_init_lock = Lock()
 flash_attention_is_installed = False
 
 
@@ -24,29 +26,32 @@ def _initialize_flash_attention():
     global _flash_attn_initialized, flash_attention_is_installed
     if _flash_attn_initialized:
         return
-    _flash_attn_initialized = True
-    if is_torch_cuda_available():
-        try:
-            major, _ = torch.cuda.get_device_capability()
-            if major >= 9:
-                os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-                _flash_attn = get_attention_kernel("fa3")
-            elif major == 8:
-                try:
-                    _flash_attn2 = get_attention_kernel("fa2")
-                except Exception as error:
-                    _flash_attn2_load_error = error
-                    warnings.warn(f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}',
-                                  RuntimeWarning, stacklevel=2)
-        except Exception as error:
-            _flash_attn_load_error = error
-            warnings.warn(
-                "FlashAttention 3 backend initialization failed.\n"
-                + traceback.format_exc(),
-                RuntimeWarning, stacklevel=2,
-            )
-    flash_attention_is_installed = _flash_attn is not None
-    flash_attn.flash_attention_is_installed = flash_attention_is_installed
+    with _flash_attn_init_lock:
+        if _flash_attn_initialized:
+            return
+        if is_torch_cuda_available():
+            try:
+                major, _ = torch.cuda.get_device_capability()
+                if major >= 9:
+                    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+                    _flash_attn = get_attention_kernel("fa3")
+                elif major == 8:
+                    try:
+                        _flash_attn2 = get_attention_kernel("fa2")
+                    except Exception as error:
+                        _flash_attn2_load_error = error
+                        warnings.warn(f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}',
+                                      RuntimeWarning, stacklevel=2)
+            except Exception as error:
+                _flash_attn_load_error = error
+                warnings.warn(
+                    "FlashAttention 3 backend initialization failed.\n"
+                    + traceback.format_exc(),
+                    RuntimeWarning, stacklevel=2,
+                )
+        flash_attention_is_installed = _flash_attn is not None
+        flash_attn.flash_attention_is_installed = flash_attention_is_installed
+        _flash_attn_initialized = True
 
 
 def require_flash_attn3():

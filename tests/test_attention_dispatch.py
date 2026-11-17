@@ -1,4 +1,6 @@
 from importlib import import_module, reload
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace, ModuleType
 import copy
 import sys
@@ -220,6 +222,60 @@ def test_loader_returns_bound_namespace_and_initializes_once(monkeypatch):
     assert bound.flash_attn_func(q, q, q) is q
     assert copy.deepcopy(bound).flash_attn_func(q, q, q) is q
     attention.load_flash_attn("fa3")
+    assert loads == ["fa3"]
+
+
+@pytest.mark.parametrize("implicit", [False, True])
+def test_concurrent_first_use_waits_for_fa3_initialization(monkeypatch, implicit):
+    attention = import_module("gpt_lab.model.flash_attn")
+    loading, release, caller_started = Event(), Event(), Event()
+    loads = []
+    kernel = SimpleNamespace(flash_attn_func=lambda q, k, v, **kwargs: q)
+
+    def load(name):
+        loads.append(name)
+        loading.set()
+        assert release.wait(timeout=5)
+        return kernel
+
+    def concurrent_caller():
+        caller_started.set()
+        return attention.load_flash_attn(None) if implicit else attention.require_flash_attn3()
+
+    monkeypatch.setattr(attention, "_flash_attn", None)
+    monkeypatch.setattr(attention, "_flash_attn_initialized", False)
+    monkeypatch.setattr(attention, "flash_attention_is_installed", False)
+    monkeypatch.setattr(attention.flash_attn, "flash_attention_is_installed", False)
+    monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(attention, "get_attention_kernel", load)
+    monkeypatch.setenv("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(attention.require_flash_attn3)
+        try:
+            assert loading.wait(timeout=5)
+            second = executor.submit(concurrent_caller)
+            assert caller_started.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.1)
+            assert not attention._flash_attn_initialized
+            assert not attention.flash_attention_is_installed
+            assert not attention.flash_attn.flash_attention_is_installed
+        finally:
+            release.set()
+        assert first.result(timeout=5) is kernel
+        result = second.result(timeout=5)
+
+    if implicit:
+        assert result.flash_attention_is_installed
+        q = torch.randn(1, 4, 2, 8)
+        assert result.flash_attn_func(q, q, q) is q
+    else:
+        assert result is kernel
+    assert attention._flash_attn_initialized
+    assert attention.flash_attention_is_installed
+    assert attention.flash_attn.flash_attention_is_installed
     assert loads == ["fa3"]
 
 
