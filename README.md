@@ -256,17 +256,18 @@ The switches and residual values are saved with the model configuration.
 Existing checkpoints default to enabled value embeddings and trainable residuals.
 
 Use `gpt-lab train --architecture-config configs/llama3.yaml --tokenizer-model gpt2`
-for the Llama-3-style preset with the GPT-2 tokenizer. Its `aspect_ratio: 128`
-comes from Llama 3 8B's width/depth ratio, `4096 / 32`. With `d_head: 128`, the
-default depth of 12 gives width 1536, 12 query heads, and three fixed KV heads,
-preserving four query heads per KV head at that depth. Add `--n-kv-heads 12` for
-MHA. GQA depth overrides must be divisible by three; explicit KV-head overrides
-must divide both target and reference query head counts. Width scaling keeps its
-existing rules. RMSNorm stays parameter-free;
+for the Llama-3-style preset with the GPT-2 tokenizer. Its `aspect_ratio: 96`
+is an experimental sizing choice. With `d_head: 128`, the default depth of 12
+gives width 1152 and nine query/KV heads; depth 16 gives width 1536 and twelve
+query/KV heads. YAML `n_kv_heads: null` selects MHA at both target and reference
+depths. Explicit `--n-kv-heads` overrides select GQA and must divide both target
+and reference query head counts. Width scaling keeps its existing rules.
+RMSNorm stays parameter-free;
 this preset retains the current input/Q/K normalization, logit softcap, and 4x
 FFN width, so it does not reproduce the original Llama 3 equations exactly.
 With 50,257 vocabulary entries, padded to 50,304 embedding rows, it contains
-565,051,416 parameters including 24 frozen residual scalars (counted on meta).
+370,704,408 parameters including 24 frozen residual scalars at depth 12
+(counted on meta).
 
 The width/depth ratio is a sizing choice, not a constant across the Llama family:
 
@@ -292,6 +293,18 @@ estimate and uses the loaded tokenizer's vocabulary. Explicit batch size and
 `--num-steps` can bypass automatic batch and horizon sizing; optimizer profiles
 still receive the existing batch/width/decay multipliers. No training calibration
 or hardware throughput measurement is implied by this preset.
+
+At depth 16, this preset has 758,513,696 total parameters, including 32 frozen
+residual scalars, and 681,246,720 scaling parameters (blocks plus output head).
+A 15-token/parameter target at 524,288 tokens per update gives a 19,490-update
+horizon. At sequence length 2048 with four GPUs and device batch size 16, this
+requires four accumulation microsteps per update.
+
+A 1,300-step warmup is `ceil(681246720 / 524288)`, following the one-parameter-token
+warmup heuristic from [Porian et al.](https://arxiv.org/abs/2406.19146).
+That heuristic was studied with AdamW and is uncalibrated for this Muon profile
+or its peak learning rates. A ten-update diagnostic reaches only 10/1300 of peak
+LR and cannot establish stability at peak LR.
 
 The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used by `gpt-lab train`; [`scripts/train_base.py`](./scripts/train_base.py) delegates to the same command.
 
