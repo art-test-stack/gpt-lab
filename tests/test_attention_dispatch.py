@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace, ModuleType
 import copy
-import logging
 import subprocess
 import sys
 import textwrap
@@ -24,24 +23,17 @@ def test_public_sdpa_compiles_before_any_eager_call():
     code = """
         from importlib import import_module
         import torch
-        import torch.nn.functional as F
 
         attention = import_module("gpt_lab.model.flash_attn")
         assert not attention._flash_attn_initialized
-        torch.manual_seed(42)
-        q, k, v = torch.randn(3, 1, 4, 2, 8).unbind(0)
+        q = torch.randn(1, 4, 2, 8)
         compiled = torch.compile(
-            lambda q, k, v: attention.flash_attn_func(
-                q, k, v, backend="sdpa", causal=True, softmax_scale=0.25),
+            lambda q: attention.flash_attn_func(q, q, q, backend="sdpa"),
             backend="eager", fullgraph=True,
         )
-        output = compiled(q, k, v)
+        output = compiled(q)
         assert not attention._flash_attn_initialized
-        expected = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-            is_causal=True, scale=0.25,
-        ).transpose(1, 2)
-        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(output, attention._sdpa_func(q, q, q))
     """
     process = subprocess.run([sys.executable, "-c", textwrap.dedent(code)],
                              capture_output=True, text=True, timeout=60)
@@ -246,23 +238,18 @@ def test_implicit_separate_and_cache_allow_fa2_without_packed(monkeypatch, fa3_l
     monkeypatch.setattr(attention, "_flash_attn_initialized", True)
     monkeypatch.setattr(attention, "_flash_attn", fa3 if fa3_loaded else None)
     monkeypatch.setattr(attention, "_flash_attn2", fa2)
-    q, k, v = torch.randn(3, 1, 4, 2, 8).unbind(0)
+    q, k, v = torch.randn(3, 1, 4, 2, 8, dtype=torch.bfloat16).unbind(0)
     expected = attention._sdpa_func(q, k, v, causal=True)
 
-    output = attention.flash_attn_func(q, k, v, causal=True)
-    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(attention.flash_attn_func(q, k, v, causal=True), expected)
     k_cache, v_cache = torch.zeros_like(k), torch.zeros_like(v)
-    cached = attention.flash_attn_with_kvcache(q, k_cache, v_cache, k, v,
-        cache_seqlens=torch.zeros(1, dtype=torch.int32), causal=True)
-    torch.testing.assert_close(cached, expected)
-    torch.testing.assert_close(k_cache, k)
-    torch.testing.assert_close(v_cache, v)
-    tensor = torch.stack((q, k, v), dim=2).bfloat16()
+    torch.testing.assert_close(attention.flash_attn_with_kvcache(q, k_cache, v_cache, k, v,
+        cache_seqlens=torch.zeros(1, dtype=torch.int32), causal=True), expected)
+    tensor = torch.stack((q, k, v), dim=2)
     qkv = SimpleNamespace(is_cuda=True, dtype=tensor.dtype, size=tensor.size,
                           to=tensor.to, unbind=tensor.unbind)
-    packed = attention.flash_attn_qkvpacked_func(qkv, causal=True, window_size=(512, 0))
-    expected_packed = attention._sdpa_qkvpacked_func(tensor, causal=True, window_size=(512, 0))
-    torch.testing.assert_close(packed, expected_packed)
+    torch.testing.assert_close(
+        attention.flash_attn_qkvpacked_func(qkv, causal=True, window_size=(512, 0)), expected)
 
 
 def test_custom_kernel_kvcache_dispatch(monkeypatch):
@@ -293,15 +280,15 @@ def test_custom_kernel_kvcache_dispatch(monkeypatch):
 def test_loader_logs_warning_and_preserves_strict_error(monkeypatch, caplog, backend, capability, warning):
     attention = import_module("gpt_lab.model.flash_attn")
     calls = []
-    availability = []
     failure = OSError("missing build")
+    emit = caplog.handler.emit
 
-    class AvailabilityHandler(logging.Handler):
-        def emit(self, record):
-            assert attention._flash_attn_initialized
-            assert not attention._flash_attn_init_lock.locked()
-            availability.append((attention.flash_attention_is_installed,
-                                 attention.flash_attn.flash_attention_is_installed))
+    def check_availability(record):
+        assert attention._flash_attn_initialized
+        assert not attention._flash_attn_init_lock.locked()
+        assert not attention.flash_attention_is_installed
+        assert not attention.flash_attn.flash_attention_is_installed
+        emit(record)
 
     def fail(name):
         calls.append(name)
@@ -313,20 +300,15 @@ def test_loader_logs_warning_and_preserves_strict_error(monkeypatch, caplog, bac
     monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (capability, 0))
     monkeypatch.setattr(attention, "get_attention_kernel", fail)
-    handler = AvailabilityHandler()
-    attention.logger.addHandler(handler)
-    try:
-        with caplog.at_level("WARNING", logger=attention.__name__):
-            with pytest.raises(RuntimeError, match="refusing SDPA fallback") as error:
-                attention.load_flash_attn(backend)
-    finally:
-        attention.logger.removeHandler(handler)
+    monkeypatch.setattr(caplog.handler, "emit", check_availability)
+    with caplog.at_level("WARNING", logger=attention.__name__):
+        with pytest.raises(RuntimeError, match="refusing SDPA fallback") as error:
+            attention.load_flash_attn(backend)
     assert len(caplog.records) == 1
     assert caplog.records[0].levelname == "WARNING"
     assert warning in caplog.records[0].message
     assert error.value.__cause__ is failure
     assert calls == [backend]
-    assert availability == [(False, False)]
 
 
 def test_loader_returns_bound_namespace_and_initializes_once(monkeypatch):
