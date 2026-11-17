@@ -18,13 +18,12 @@ _flash_attn_load_error = None
 _flash_attn2_load_error = None
 _flash_attn_initialized = False
 _flash_attn_init_lock = Lock()
-flash_attention_is_installed = False
 
 
 def _initialize_flash_attention():
     """Serialize first use and publish availability only after loading finishes."""
     global _flash_attn, _flash_attn2, _flash_attn_load_error, _flash_attn2_load_error
-    global _flash_attn_initialized, flash_attention_is_installed
+    global _flash_attn_initialized
     if _flash_attn_initialized:
         return
     with _flash_attn_init_lock:
@@ -50,8 +49,6 @@ def _initialize_flash_attention():
                     + traceback.format_exc(),
                     RuntimeWarning, stacklevel=2,
                 )
-        flash_attention_is_installed = _flash_attn is not None
-        flash_attn.flash_attention_is_installed = flash_attention_is_installed
         _flash_attn_initialized = True
 
 
@@ -360,6 +357,7 @@ def _automatic_ampere_qkvpacked(qkv, dropout_p=0.0, softmax_scale=None, causal=F
 def _load_flash_attn_functions(backend):
     """Select all execution functions once, after rank-local device setup."""
     _initialize_flash_attention()
+    flash_attention_is_installed = _flash_attn is not None
     automatic = backend is None
     if automatic:
         backend = 'fa3' if flash_attention_is_installed else 'sdpa'
@@ -534,9 +532,23 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, rotary_cos=None
         block_table, softmax_scale, causal, window_size, rotary_interleaved, alibi_slopes)
 
 
-flash_attn = SimpleNamespace(
+class _FlashAttention(SimpleNamespace):
+    @property
+    def flash_attention_is_installed(self):
+        """Resolve FA3 availability on first read, waiting for any in-flight load."""
+        _initialize_flash_attention()
+        return _flash_attn is not None
+
+
+flash_attn = _FlashAttention(
     flash_attn_func=flash_attn_func,
     flash_attn_qkvpacked_func=flash_attn_qkvpacked_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
-    flash_attention_is_installed=flash_attention_is_installed,
 )
+
+
+def __getattr__(name):
+    """Resolve the legacy module-level availability flag without eager imports."""
+    if name == "flash_attention_is_installed":
+        return flash_attn.flash_attention_is_installed
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -199,8 +199,6 @@ def test_loader_preserves_warning_and_strict_error(monkeypatch, backend, capabil
     for name in ("_flash_attn", "_flash_attn2", "_flash_attn_load_error", "_flash_attn2_load_error"):
         monkeypatch.setattr(attention, name, None)
     monkeypatch.setattr(attention, "_flash_attn_initialized", False)
-    monkeypatch.setattr(attention, "flash_attention_is_installed", False)
-    monkeypatch.setattr(attention.flash_attn, "flash_attention_is_installed", False)
     monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (capability, 0))
     monkeypatch.setattr(attention, "get_attention_kernel", fail)
@@ -223,8 +221,6 @@ def test_loader_returns_bound_namespace_and_initializes_once(monkeypatch):
 
     monkeypatch.setattr(attention, "_flash_attn", None)
     monkeypatch.setattr(attention, "_flash_attn_initialized", False)
-    monkeypatch.setattr(attention, "flash_attention_is_installed", False)
-    monkeypatch.setattr(attention.flash_attn, "flash_attention_is_installed", False)
     monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
     monkeypatch.setattr(attention, "get_attention_kernel", load)
@@ -238,8 +234,8 @@ def test_loader_returns_bound_namespace_and_initializes_once(monkeypatch):
     assert loads == ["fa3"]
 
 
-@pytest.mark.parametrize("implicit", [False, True])
-def test_concurrent_first_use_waits_for_fa3_initialization(monkeypatch, implicit):
+@pytest.mark.parametrize("caller", ["strict", "implicit", "namespace_flag", "module_flag"])
+def test_concurrent_first_use_waits_for_fa3_initialization(monkeypatch, caller):
     attention = import_module("gpt_lab.model.flash_attn")
     loading, release, caller_started = Event(), Event(), Event()
     loads = []
@@ -253,12 +249,14 @@ def test_concurrent_first_use_waits_for_fa3_initialization(monkeypatch, implicit
 
     def concurrent_caller():
         caller_started.set()
-        return attention.load_flash_attn(None) if implicit else attention.require_flash_attn3()
+        if caller == "namespace_flag":
+            return attention.flash_attn.flash_attention_is_installed
+        if caller == "module_flag":
+            return attention.flash_attention_is_installed
+        return attention.load_flash_attn(None) if caller == "implicit" else attention.require_flash_attn3()
 
     monkeypatch.setattr(attention, "_flash_attn", None)
     monkeypatch.setattr(attention, "_flash_attn_initialized", False)
-    monkeypatch.setattr(attention, "flash_attention_is_installed", False)
-    monkeypatch.setattr(attention.flash_attn, "flash_attention_is_installed", False)
     monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
     monkeypatch.setattr(attention, "get_attention_kernel", load)
@@ -273,14 +271,15 @@ def test_concurrent_first_use_waits_for_fa3_initialization(monkeypatch, implicit
             with pytest.raises(TimeoutError):
                 second.result(timeout=0.1)
             assert not attention._flash_attn_initialized
-            assert not attention.flash_attention_is_installed
-            assert not attention.flash_attn.flash_attention_is_installed
+            assert attention._flash_attn is None
         finally:
             release.set()
         assert first.result(timeout=5) is kernel
         result = second.result(timeout=5)
 
-    if implicit:
+    if caller.endswith("_flag"):
+        assert result is True
+    elif caller == "implicit":
         assert result.flash_attention_is_installed
         q = torch.randn(1, 4, 2, 8)
         assert result.flash_attn_func(q, q, q) is q
@@ -303,7 +302,6 @@ def test_kvcache_retains_implicit_fa3_selection(monkeypatch):
         return q
 
     monkeypatch.setattr(attention, "_flash_attn_initialized", True)
-    monkeypatch.setattr(attention, "flash_attention_is_installed", True)
     monkeypatch.setattr(attention, "_flash_attn", SimpleNamespace(
         flash_attn_func=lambda *args, **kwargs: q, flash_attn_with_kvcache=native))
     assert attention.flash_attn_with_kvcache(q, cache, cache) is q
@@ -328,6 +326,45 @@ def test_backend_loading_waits_for_the_helper(monkeypatch):
             assert not calls
     finally:
         reload(attention)
+
+
+@pytest.mark.parametrize("surface", ["namespace", "module"])
+@pytest.mark.parametrize("outcome", ["available", "missing", "cpu"])
+def test_public_availability_flag_initializes_on_first_read(monkeypatch, surface, outcome):
+    attention = import_module("gpt_lab.model.flash_attn")
+    public = attention.flash_attn if surface == "namespace" else attention
+    loads = []
+    kernel = SimpleNamespace(flash_attn_func=lambda q, k, v, **kwargs: q)
+
+    def load(name):
+        loads.append(name)
+        if outcome == "missing":
+            raise OSError("missing build")
+        return kernel
+
+    monkeypatch.setattr(attention, "_flash_attn", None)
+    monkeypatch.setattr(attention, "_flash_attn_load_error", None)
+    monkeypatch.setattr(attention, "_flash_attn_initialized", False)
+    monkeypatch.setattr(attention, "is_torch_cuda_available", lambda: outcome != "cpu")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(attention, "get_attention_kernel", load)
+    monkeypatch.setenv("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    assert not loads
+
+    if outcome == "missing":
+        with pytest.warns(RuntimeWarning, match="FlashAttention 3 backend initialization failed"):
+            installed = public.flash_attention_is_installed
+    else:
+        installed = public.flash_attention_is_installed
+    expected = outcome == "available"
+    assert installed is expected
+    assert attention._flash_attn_initialized
+    assert public.flash_attention_is_installed is expected
+    assert attention.flash_attention_is_installed is expected
+    assert attention.flash_attn.flash_attention_is_installed is expected
+    if installed:
+        assert attention.require_flash_attn3() is kernel
+    assert loads == ([] if outcome == "cpu" else ["fa3"])
 
 
 @pytest.mark.parametrize("backend", ["torch", "raw"])
