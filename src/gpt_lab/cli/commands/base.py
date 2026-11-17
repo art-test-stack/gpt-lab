@@ -30,6 +30,7 @@ def add_common_arguments(parser: ArgumentParser) -> None:
 
 
 def add_auto_arguments(parser: ArgumentParser) -> None:
+    parser.add_argument('--muon-qkv', choices=('joint', 'projection', 'head'), default=None, help='Override transformer.muon_qkv in the loaded Muon/NorMuon optimizer profile; attention execution is unchanged.')
     parser.add_argument('--architecture-config', type=str, default=None, help='Architecture defaults from a YAML file; explicit options override the file before scaling.')
     parser.add_argument('--disable-value-embeds', type=boolean, nargs='?', const=True, default=SUPPRESS, help='Disable value tables and gates. Bare flag means true; false overrides a preset. Remove value_embs from --tie-embeddings when disabled.')
     parser.add_argument('--freeze-res-connections', type=boolean, nargs='?', const=True, default=SUPPRESS, help='Freeze residual mixing parameters. Bare flag means true; false overrides a preset.')
@@ -99,9 +100,12 @@ def run(args: Namespace) -> None:
     from gpt_lab.utils.schemas import OptimizerConfig
     from gpt_lab.workflows.train_base import train_base
 
-    ignored = {"_handler", "optim_config_path", "ds_config_path", "truncate_tokenizer", "fp8"}
+    ignored = {"_handler", "optim_config_path", "muon_qkv", "ds_config_path", "truncate_tokenizer", "fp8"}
     parameters = {key: value for key, value in vars(args).items() if key not in ignored}
     profile = None
     if args.model_init == "auto" or args.optim_config_path is not None:
         profile = OptimizerConfig.from_file(args.optim_config_path)
+    if getattr(args, "muon_qkv", None) is not None:
+        profile.groups["transformer"]["muon_qkv"] = args.muon_qkv
+        profile = OptimizerConfig.model_validate(profile.model_dump())
     train_base(optim_config=profile, **parameters)
