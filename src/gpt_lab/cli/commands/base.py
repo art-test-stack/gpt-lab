@@ -1,6 +1,6 @@
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, Namespace, SUPPRESS
 
-from gpt_lab.cli.options import cache_dir, checkpoint_step
+from gpt_lab.cli.options import attention_impl, boolean, cache_dir, checkpoint_step
 
 
 def add_common_arguments(parser: ArgumentParser) -> None:
@@ -30,23 +30,29 @@ def add_common_arguments(parser: ArgumentParser) -> None:
 
 
 def add_auto_arguments(parser: ArgumentParser) -> None:
-    parser.add_argument('--max-seq-len', type=int, default=2048, help='Maximum sequence length for training.')
+    parser.add_argument('--architecture-config', type=str, default=None, help='Architecture defaults from a YAML file; explicit options override the file before scaling.')
+    parser.add_argument('--disable-value-embeds', type=boolean, nargs='?', const=True, default=SUPPRESS, help='Disable value tables and gates. Bare flag means true; false overrides a preset. Remove value_embs from --tie-embeddings when disabled.')
+    parser.add_argument('--freeze-res-connections', type=boolean, nargs='?', const=True, default=SUPPRESS, help='Freeze residual mixing parameters. Bare flag means true; false overrides a preset.')
+    parser.add_argument('--res-h', type=float, default=SUPPRESS, help='Initial hidden-state residual multiplier for every layer; omitted uses the preset or the existing per-layer schedule.')
+    parser.add_argument('--res-x0', type=float, default=SUPPRESS, help='Initial input-embedding residual multiplier for every layer; omitted uses the preset or the existing per-layer schedule.')
+    parser.add_argument('--max-seq-len', type=int, default=SUPPRESS, help='Maximum sequence length for training.')
     parser.add_argument('--tokenizer-model', type=str, default=None, help='Tokenizer model to use for auto-configured models. If not set, will use vocab size scaling law to determine tokenizer config.')
     parser.add_argument('--vocab-size', type=int, default=-1, help='Vocabulary size for auto-configured models. If not set, will be determined by vocab size scaling law based on model depth.')
     parser.add_argument('--pat-str', type=str, default=None, help="Split pattern for pre-tokenization if training a new-tokenizer. Options are 'gpt2, 'gpt4', 'cl100k_base', 'o200k_base', or directly the pattern string. If not set, will default to 'gpt2' pattern.")
     parser.add_argument('--train-tokenizer', action='store_true', help='Whether to train a new tokenizer from scratch.')
     parser.add_argument('--truncate-tokenizer', action='store_true', help='Legacy flag, retained but unused by the training pipeline.')
-    parser.add_argument('--depth', type=int, default=12, help='Number of model layers.')
-    parser.add_argument('--act-func', choices=('swiglu', 'relu_squared', 'relu_squarred'), default='relu_squared', help='FFN architecture; squared ReLU by default. Both retain the inner residual. Saved checkpoints with missing activation load as SwiGLU.')
-    parser.add_argument('--aspect-ratio', type=float, default=64, help='Aspect ratio for auto-configured models.')
-    parser.add_argument('--d-head', type=int, default=128, help='Dimension of each attention head for auto-configured models. If not set, will be determined by aspect ratio and model depth.')
-    parser.add_argument('--n-kv-heads', '--d-kv-head', dest='n_kv_heads', type=int, default=None, help='Number of key/value heads for GQA; None uses the query head count. --d-kv-head is a deprecated alias.')
-    parser.add_argument('--tie-embeddings', type=str, default='embs;value_embs;head', help='Use commas to share parameters and semicolons to separate groups. Valid examples: embs;value_embs;head (separate), embs,value_embs;head (share input/value tables; widths must match), embs;value_embs:;head (share value tables only). Input/head, value/head, and full sharing are also supported; shared table widths must match. Quote this value in the shell.')
-    parser.add_argument('--window-pattern', type=str, default=None, help="Window pattern for sliding attention window. String of 'S' and 'L'. If 'None', will be later set as 'SSSL'.")
-    parser.add_argument('--window-size', type=str, default=None, help='Window size for pattern smalls (S).')
-    parser.add_argument('--softcap', type=float, default=18.0, help='Soft cap for model logits to prevent overflow.')
-    parser.add_argument('--attn-softcap', type=float, default=None, help='Soft cap for attention scores to prevent overflow.')
-    parser.add_argument('--attn-impl', choices=('sdpa', 'fa2', 'fa3'), default='sdpa', help="Attention kernel. FA2/FA3 require their CUDA backend and fail if unavailable. QKV uses one packed projection; attention prefers the kernel's packed entrypoint and uses separate Q/K/V for GQA or when unsupported.")
+    parser.add_argument('--depth', type=int, default=SUPPRESS, help='Number of model layers.')
+    parser.add_argument('--act-func', choices=('swiglu', 'relu_squared', 'relu_squarred'), default=SUPPRESS, help='FFN architecture; squared ReLU by default. The decoder applies residual additions. Saved checkpoints with missing activation load as SwiGLU.')
+    parser.add_argument('--aspect-ratio', type=float, default=SUPPRESS, help='Aspect ratio for auto-configured models.')
+    parser.add_argument('--d-head', type=int, default=SUPPRESS, help='Dimension of each attention head for auto-configured models. If not set, will be determined by aspect ratio and model depth.')
+    parser.add_argument('--n-kv-heads', '--d-kv-head', dest='n_kv_heads', type=int, default=SUPPRESS, help='Number of key/value heads for GQA; None uses the query head count. --d-kv-head is a deprecated alias.')
+    parser.add_argument('--tie-embeddings', type=str, default=SUPPRESS, help='Use commas to share parameters and semicolons to separate groups. Valid examples: embs;value_embs;head (separate), embs,value_embs;head (share input/value tables; widths must match), embs;value_embs:;head (share value tables only). Input/head, value/head, and full sharing are also supported; shared table widths must match. Quote this value in the shell.')
+    parser.add_argument('--window-pattern', type=str, default=SUPPRESS, help="Window pattern for sliding attention window. String of 'S' and 'L'. If 'None', will be later set as 'SSSL'.")
+    parser.add_argument('--window-size', type=str, default=SUPPRESS, help='Window size for pattern smalls (S).')
+    parser.add_argument('--softcap', type=float, default=SUPPRESS, help='Soft cap for model logits to prevent overflow.')
+    parser.add_argument('--attn-softcap', type=float, default=SUPPRESS, help='Soft cap for attention scores to prevent overflow.')
+    parser.add_argument('--attn-impl', type=attention_impl, default=SUPPRESS, help="Attention: sdpa, fa2, fa3 (community FA3 v2), or owner/kernel (Hub main revision, FlashAttention-compatible API). Explicit kernels fail if unavailable. Separate-input attention is the default.")
+    parser.add_argument('--use-packed-attn-kernel', action='store_true', default=SUPPRESS, help='Opt into packed attention during training when supported by the selected kernel and layout. FA3 also supports packed GQA. Saved in the model config for resume.')
     parser.add_argument('--num-steps', type=int, default=-1, help='Complete scheduling horizon; -1 infers it. Use --stop-after-step to limit execution without shortening schedules.')
     parser.add_argument('--target-flops', type=float, default=-1.0, help='Target FLOPS for auto-configured models.')
     parser.add_argument('--target-param-data-ratio', type=float, default=11.0, help='Target parameter-to-data ratio for auto-configured models.')

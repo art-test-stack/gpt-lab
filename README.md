@@ -233,6 +233,82 @@ The library provides a minimalistic automatic configuration system that computes
 
 Subclass `AutoGPTConfig` to override individual scaling rules; see its [class docstring](./src/gpt_lab/model/auto.py) for the methods and an example.
 
+Pass `architecture_config="configs/my-architecture.yaml"` to `AutoGPTConfig`
+to load architecture defaults from a flat YAML mapping, using its field names
+(for example, `act_func: swiglu` and `d_head: 128`). Explicit constructor fields
+override the file, including `False` and `None`. The resolved architecture is
+used for the vocabulary probe, target model, and reference model before training
+scaling is computed. Training and tokenizer settings do not belong in this file.
+Saved configurations contain the resolved values and do not require the YAML
+file when loaded again.
+
+The CLI accepts the same file with `--architecture-config <path>`. Omitted
+architecture options use the file, while explicit options override it.
+The generated model log and board configuration include the resolved `depth`
+and effective `aspect_ratio` (`d_model / n_layers`), after rounding width to whole
+attention heads. The effective ratio can differ from the requested sizing ratio.
+`--disable-value-embeds` removes value embedding tables and gates; `value_embs`
+must then be absent from `--tie-embeddings` (for example, use `'embs;head'`).
+`--freeze-res-connections` makes the residual mixing parameters non-trainable
+and excludes them from the optimizer. Both flags accept an optional `true` or
+`false`; a bare flag means `true`. Explicit `false` reverses a preset setting.
+Set `--res-h 1 --res-x0 0` to preserve the hidden stream without blending the
+initial embeddings at each layer. These values can also be set as `res_h` and
+`res_x0` in YAML; omitted values retain the existing initialization schedules.
+The switches and residual values are saved with the model configuration.
+Existing checkpoints default to enabled value embeddings and trainable residuals.
+
+Use `gpt-lab train --architecture-config configs/llama3.yaml --tokenizer-model gpt2`
+for the Llama-3-style preset with the GPT-2 tokenizer. Its `aspect_ratio: 96`
+is an experimental sizing choice. With `d_head: 128`, the default depth of 12
+gives width 1152 and nine query/KV heads; depth 16 gives width 1536 and twelve
+query/KV heads. YAML `n_kv_heads: null` selects MHA at both target and reference
+depths. Explicit `--n-kv-heads` overrides select GQA and must divide both target
+and reference query head counts. Width scaling keeps its existing rules.
+RMSNorm stays parameter-free;
+this preset retains the current input/Q/K normalization, logit softcap, and 4x
+FFN width, so it does not reproduce the original Llama 3 equations exactly.
+With 50,257 vocabulary entries, padded to 50,304 embedding rows, it contains
+370,704,408 parameters including 24 frozen residual scalars at depth 12
+(counted on meta).
+
+The width/depth ratio is a sizing choice, not a constant across the Llama family:
+
+| Published model | Hidden width | Layers | Width / layers |
+| --- | ---: | ---: | ---: |
+| Llama 3 8B | 4096 | 32 | 128 |
+| Llama 3 70B | 8192 | 80 | 102.4 |
+| Llama 3.1 405B | 16384 | 126 | 130.03 |
+
+Dimensions come from [Meta's report, Table 3](https://arxiv.org/html/2407.21783v3#S3.T3).
+
+Changing the aspect ratio and model components does **not** recalibrate the
+existing scaling laws. Automatic training settings for this preset are
+experimental: the 12-layer reference model now has this architecture too, while
+the reference batch size remains 524,288 tokens. The data/parameter target
+(default 11), batch-size exponent (0.383), batch learning-rate multiplier,
+weight-decay correction, and embedding/head learning-rate width correction
+(`sqrt(768 / d_model)`) have not been validated for this variant. Parameter and
+FLOPs counts are recomputed from the resolved model; that accounting does not
+establish optimal training settings. The vocabulary-sizing rule is also
+unchanged and remains unverified here. `--tokenizer-model gpt2` bypasses that
+estimate and uses the loaded tokenizer's vocabulary. Explicit batch size and
+`--num-steps` can bypass automatic batch and horizon sizing; optimizer profiles
+still receive the existing batch/width/decay multipliers. No training calibration
+or hardware throughput measurement is implied by this preset.
+
+At depth 16, this preset has 758,513,696 total parameters, including 32 frozen
+residual scalars, and 681,246,720 scaling parameters (blocks plus output head).
+A 15-token/parameter target at 524,288 tokens per update gives a 19,490-update
+horizon. At sequence length 2048 with four GPUs and device batch size 16, this
+requires four accumulation microsteps per update.
+
+A 1,300-step warmup is `ceil(681246720 / 524288)`, following the one-parameter-token
+warmup heuristic from [Porian et al.](https://arxiv.org/abs/2406.19146).
+That heuristic was studied with AdamW and is uncalibrated for this Muon profile
+or its peak learning rates. A ten-update diagnostic reaches only 10/1300 of peak
+LR and cannot establish stability at peak LR.
+
 The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used by `gpt-lab train`; [`scripts/train_base.py`](./scripts/train_base.py) delegates to the same command.
 
 It automatically determines:
@@ -432,6 +508,11 @@ uv run --extra cpu python -m experiments.tokenizer_scaling --help
 
 The library provides a modular implementation of a GPT-style DenseTransformer, where architectural components (attention, feedforward blocks, normalization, and positional encoding) are fully decoupled and configurable. The core model is defined in [`gpt_lab.model.gpt`](./src/gpt_lab/model/gpt.py), while reusable layer primitives are implemented in [`gpt_lab.model.layers`](./src/gpt_lab/model/layers.py). Model behavior is controlled via a Pydantic configuration class (`TransformerConfig`) defined in `gpt_lab.utils.schemas` (but also accessible under `gpt_lab.model.gpt`), enabling structured extension of architectural variants and hyperparameters.
 
+Each decoder block applies the attention and FFN residual additions. SwiGLU and
+squared-ReLU FFNs return only their transformed branch. Older checkpoints trained
+with the additional inner FFN skip still load with the same parameter keys, but
+their outputs and resumed training trajectories change under this architecture.
+
 Here a simple example to produce a Llama-like architecture:
 ```python
 from gpt_lab.model.gpt import TransformerConfig, DenseTransformer
@@ -444,14 +525,60 @@ cfg = TransformerConfig(
     n_kv_heads=8,
     n_layers=6,
     d_ffn=2048,
-    # Select "sdpa", "fa2", or "fa3". Packed attention is chosen automatically;
-    # GQA and kernels without a packed entrypoint use separate Q/K/V.
+    # Select "sdpa", "fa2", "fa3", or a Hub "owner/kernel" name.
     attn_impl="sdpa",
+    use_packed_attn_kernel=False,  # Opt in only when useful for your workload.
     act_func="swiglu",
     normalization="rms",
 )
 model = DenseTransformer(cfg)
 ```
+
+`attn_impl="fa3"` loads `kernels-community/flash-attn3` version 2;
+`"fa2"` loads `kernels-community/flash-attn2` version 4. Explicit requests fail
+if the selected kernel cannot load; they do not switch to SDPA.
+
+The single packed QKV projection is split into Q, K, and V head views. Q and K
+each pass through RoPE, then the configured per-head normalization, in PyTorch;
+`torch.compile` can fuse this preprocessing. The gated value residual is preserved.
+Attention uses separate Q/K/V inputs by default. To opt into packed attention
+during training, set `use_packed_attn_kernel=True` or pass
+`--use-packed-attn-kernel` with `--attn-impl fa3` (or another compatible kernel).
+FA3 then concatenates the results into `[B, T, Hq + 2*Hkv, D]`, including GQA.
+FA2 and custom kernels can use their five-dimensional packed layout for MHA.
+Unsupported layouts or kernels without a packed entrypoint keep separate inputs;
+SDPA and inference also keep their existing paths. The flag is saved in the model
+config and restored on resume; configs without the field default to separate inputs.
+`CausalSelfAttention` loads its configured backend once through `load_flash_attn`.
+The helper selects separate SDPA, FA2, FA3 or Hub execution functions and returns
+a `SimpleNamespace`, including a fixed KV-cache function. Model forward calls
+never select or reload a backend. The existing module-level functions remain
+thin compatibility entrypoints for direct callers, retaining their arguments;
+`require_flash_attn2`/`require_flash_attn3`, availability warnings and the public
+`flash_attn` namespace remain available. Hardware initialization happens on first
+load, after rank-local device setup. The wrappers retain their dtype handling;
+the layer adds no extra V cast. Direct KV-cache calls keep their `backend=None`
+default and existing automatic selection behavior.
+
+A name containing `/`, such as `attn_impl="kernels-community/flash-attn3"`
+or `--attn-impl owner/kernel`, selects that Hub kernel's `main` revision.
+This explicitly permits loading code from the named repository. The kernel
+must export a FlashAttention-compatible `flash_attn_func`; an optional
+`flash_attn_qkvpacked_func` enables opt-in packed dispatch, and
+`flash_attn_with_kvcache` is required for KV-cache decoding. Dropout and ALiBi
+are forwarded only when the selected entrypoint supports them; requesting an
+unsupported option raises an error. Attention weights and arbitrary masks
+require SDPA. Bare custom names follow `main`, so their code may change
+between downloads; the built-in `fa3` alias selects version 2 instead.
+
+The kernel loader uses `kernels==0.18.3` and PyTorch `2.11.0+cu128`
+for the GPU extra. The optional `fp8` extra pins `torchao==0.17.0`.
+Models saved with an older PyTorch/kernel combination
+retain their architecture, but matching their previous numerical results
+requires the original software environment.
+
+During training, dropout masks the attention output and FFN branch before their
+residual additions, preserving the skip path. Evaluation disables dropout.
 
 ### Optimization
 
@@ -492,10 +619,10 @@ transformer:
 - `projection` updates Q, K, and V independently, including unequal row counts in GQA.
 - `head` updates each Q, K, and V head independently.
 
-All modes use one fused QKV linear projection and the same automatic FlashAttention dispatch.
-The split modes reuse the compiled optimizer step on batches of equal-sized blocks, with normalization
-and learning-rate scaling based on the logical matrix shapes. Resume with the same setting to
-restore the optimizer's momentum and variance state.
+All modes retain one fused QKV linear projection. Attention dispatch and the packed-attention
+opt-in are independent of this setting. Split modes reuse the compiled optimizer step on
+batches of equal-sized blocks, with normalization and learning-rate scaling based on each
+logical matrix shape. Resume with the same split layout to restore momentum and variance state.
 
 Explicit preserved Muon/NorMuon/spectral-only ANVIL experiment profiles are in
 [optimizer comparison](experiments/optimizer_comparison/README.md).

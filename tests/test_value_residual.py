@@ -1,5 +1,6 @@
 from importlib import import_module
 from types import SimpleNamespace
+import sys
 
 import pytest
 import torch
@@ -8,7 +9,15 @@ from gpt_lab.model.layers import CausalSelfAttention
 from gpt_lab.utils.schemas import TransformerConfig
 
 
-@pytest.mark.parametrize("backend", ["sdpa", "fa2", "fa3"])
+@pytest.fixture(autouse=True)
+def clear_kernel_cache():
+    from gpt_lab.utils.import_utils import _attention_kernels
+    _attention_kernels.clear()
+    yield
+    _attention_kernels.clear()
+
+
+@pytest.mark.parametrize("backend", ["sdpa", "fa2", "fa3", "example/attention"])
 def test_value_residual_without_rope_or_qk_norm(monkeypatch, backend):
     dispatch = import_module("gpt_lab.model.flash_attn")
 
@@ -16,10 +25,11 @@ def test_value_residual_without_rope_or_qk_norm(monkeypatch, backend):
         return dispatch._sdpa_fallback(*qkv.unbind(dim=2), **kwargs)
 
     if backend != "sdpa":
-        kernel = SimpleNamespace(flash_attn_qkvpacked_func=packed)
-        loader = "require_flash_attn2" if backend == "fa2" else "require_flash_attn3"
-        monkeypatch.setattr(dispatch, loader, lambda: kernel)
-        monkeypatch.setattr(import_module("gpt_lab.model.layers"), loader, lambda: kernel)
+        kernel = SimpleNamespace(flash_attn_qkvpacked_func=packed, flash_attn_func=dispatch._sdpa_fallback)
+        if "/" in backend:
+            monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=lambda *args, **kw: kernel))
+        else:
+            monkeypatch.setattr(dispatch, "require_flash_attn3" if backend == "fa3" else "require_flash_attn2", lambda: kernel)
     config = TransformerConfig(
         d_model=16, d_ffn=32, n_heads=2, d_head=8, n_layers=1,
         norm_before_attn=False, attn_impl=backend, dropout=0.0,

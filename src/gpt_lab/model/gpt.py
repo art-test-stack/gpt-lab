@@ -104,14 +104,15 @@ class DenseTransformer(BaseTransformer):
                 shared_value_embedding if shared_value_embedding is not None
                 else nn.Embedding(padded_vocab_size, kv_dim)
             )
-            for layer_idx in range(config.n_layers) if has_ve(layer_idx, config.n_layers)
+            for layer_idx in range(config.n_layers)
+            if not config.disable_value_embeds and has_ve(layer_idx, config.n_layers)
         })
 
         self.lm_head = Linear(config.d_model, padded_vocab_size, bias=False)
         self._tie_embedding_weights()
 
-        self.res_x0 = torch.nn.Parameter(torch.ones(self.config.n_layers), requires_grad=True)
-        self.res_h = torch.nn.Parameter(torch.zeros(self.config.n_layers), requires_grad=True)
+        self.res_x0 = torch.nn.Parameter(torch.ones(self.config.n_layers), requires_grad=not config.freeze_res_connections)
+        self.res_h = torch.nn.Parameter(torch.zeros(self.config.n_layers), requires_grad=not config.freeze_res_connections)
         
         _pe_cache = self._precompute_pos_enc()
         self.register_buffer("pe_cache", _pe_cache, persistent=False)
@@ -191,6 +192,10 @@ class DenseTransformer(BaseTransformer):
         # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(n_layers):
             self.res_x0.data[i] = 0.20 - (0.15 * i / max(n_layers - 1, 1))
+        if self.config.res_h is not None:
+            self.res_h.fill_(self.config.res_h)
+        if self.config.res_x0 is not None:
+            self.res_x0.fill_(self.config.res_x0)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.children():
@@ -321,6 +326,8 @@ class DenseTransformer(BaseTransformer):
         residual_x0_params = [self.res_x0]
 
         assert len(list(self.parameters())) == len(blocks_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(residual_h_params) + len(residual_x0_params), "Parameter grouping error: some parameters are missing or duplicated in the groups."
+        residual_h_params = [p for p in residual_h_params if p.requires_grad]
+        residual_x0_params = [p for p in residual_x0_params if p.requires_grad]
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = 1 / math.sqrt(d_model / 768)

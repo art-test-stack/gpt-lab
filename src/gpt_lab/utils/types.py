@@ -1,4 +1,7 @@
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union, Literal
+from typing import Annotated, Any, Callable, Dict, Iterable, Optional, Tuple, Union, Literal
+
+from pydantic import AfterValidator
+from gpt_lab.utils.import_utils import validate_attn_impl
 
 import torch
 
@@ -19,7 +22,7 @@ Devices = Literal["cpu", "cuda", "mps", "xpu", "meta"]
 TokenizerSources = Literal["tiktoken", "local", "huggingface", "dummy"]
 TokenizerTensors = Literal["pt", "np", "tf", "jax"]
 NormalizationTypes = Literal["rms", "layer"]
-AttnImplTypes = Literal["sdpa", "fa2", "fa3", "torch", "raw"]
+AttnImplTypes = Literal["torch", "raw"] | Annotated[str, AfterValidator(validate_attn_impl)]
 PositionalEncodingTypes = Literal["positional", "rope"]
 TfTypes = Literal["dense", "moe"]
 Dtypes = Literal["float32", "float16", "bfloat16"]

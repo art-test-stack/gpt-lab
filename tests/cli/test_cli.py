@@ -88,19 +88,25 @@ def test_cli_rejects_legacy_fused_attention():
     assert error.value.code == 2
 
 
+def test_cli_accepts_custom_attention_kernel():
+    args = build_parser().parse_args(["train", "--attn-impl", "example/attention"])
+    assert args.attn_impl == "example/attention"
+
+
 def test_important_training_defaults():
     args = build_parser().parse_args(['train'])
-    expected = dict(model_init='auto', model_name='ic1', run_name=None, max_seq_len=2048,
-                    random_seed=42, board='wandb', ds_name='climbmix-base', depth=12,
-                    aspect_ratio=64, d_head=128, n_kv_heads=None, softcap=18.0,
-                    tie_embeddings="embs;value_embs;head",
-                    attn_softcap=None, attn_impl='sdpa', device_batch_size=32,
+    expected = dict(model_init='auto', model_name='ic1', run_name=None,
+                    random_seed=42, board='wandb', ds_name='climbmix-base', device_batch_size=32,
                     vocab_size=-1, num_steps=-1, target_param_data_ratio=11.0,
                     n_acc_steps=-1, total_batch_size=-1, warmup_steps=40,
                     warmdown_ratio=.65, final_lr_frac=.05,
                     eval_bpb_every=250, n_bpb_tokens=80 * 524288, eval_core_every=2000,
                     sample_every=0, save_every=-1, log_every=250)
     assert vars(args) | expected == vars(args)
+    # Architecture defaults are resolved after loading the optional YAML.
+    assert 'depth' not in vars(args)
+    assert 'disable_value_embeds' not in vars(args)
+    assert 'freeze_res_connections' not in vars(args)
 
 
 def test_auto_parsing_and_deprecated_alias():

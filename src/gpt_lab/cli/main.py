@@ -31,6 +31,11 @@ values replace inference. Optimizer values come from the bundled base YAML;
 weight-decay CLI overrides are not supported. Resume accepts checkpoint/runtime
 options, not architecture flags, and rejects conflicting optimizer profiles.
 
+--architecture-config supplies architecture defaults from YAML before explicit
+options and scaling. --disable-value-embeds and --freeze-res-connections accept
+an optional true/false (bare means true). Disabling values requires removing
+value_embs from --tie-embeddings. --res-h/--res-x0 set initial residual multipliers.
+
 Python entry point (file loading stays outside the workflow):
     from gpt_lab.utils.schemas import OptimizerConfig
     from gpt_lab.workflows.train_base import train_base

@@ -1,49 +1,66 @@
-from gpt_lab.utils.import_utils import is_torch_cuda_available
+from gpt_lab.utils.import_utils import get_attention_kernel, is_torch_cuda_available
+from gpt_lab.utils.logging import log_all
 
 import torch
 import torch.nn.functional as F
 import os
-import warnings
+import logging
 import traceback
 from typing import Optional, Union
 from types import SimpleNamespace
+from functools import partial
+from threading import Lock
 
 import math
+
+logger = logging.getLogger(__name__)
 
 _flash_attn = None
 _flash_attn2 = None
 _flash_attn_load_error = None
 _flash_attn2_load_error = None
-if is_torch_cuda_available():
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        if major >= 9:
-            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-            import kernels
-            _flash_attn = kernels.get_kernel('varunneal/flash-attention-3').flash_attn_interface
-        elif major == 8:
-            try:
-                import kernels
-                _flash_attn2 = kernels.get_kernel(
-                    'kernels-community/flash-attn2',
-                    revision='c3f3c93a4a39e3d2cf49c13eac49229bc726ea13',
-                )
-            except Exception as error:
-                _flash_attn2_load_error = error
-                warnings.warn(f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}',
-                              RuntimeWarning, stacklevel=2)
-    except Exception as error:
-        _flash_attn_load_error = error
-        warnings.warn(
-            "FlashAttention 3 backend initialization failed.\n"
-            + traceback.format_exc(),
-            RuntimeWarning, stacklevel=2,
-        )
+_flash_attn_initialized = False
+_flash_attn_init_lock = Lock()
 
-flash_attention_is_installed = _flash_attn is not None
+
+# The None result is constant; initialization must run outside the tensor graph.
+@torch.compiler.assume_constant_result
+def _initialize_flash_attention():
+    """Serialize first use and publish availability only after loading finishes."""
+    global _flash_attn, _flash_attn2, _flash_attn_load_error, _flash_attn2_load_error
+    global _flash_attn_initialized
+    if _flash_attn_initialized:
+        return
+    warning_message = None
+    with _flash_attn_init_lock:
+        if _flash_attn_initialized:
+            return
+        if is_torch_cuda_available():
+            try:
+                major, _ = torch.cuda.get_device_capability()
+                if major >= 9:
+                    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+                    _flash_attn = get_attention_kernel("fa3")
+                elif major == 8:
+                    try:
+                        _flash_attn2 = get_attention_kernel("fa2")
+                    except Exception as error:
+                        _flash_attn2_load_error = error
+                        warning_message = f'FlashAttention 2 unavailable; retaining PyTorch SDPA: {error}'
+            except Exception as error:
+                _flash_attn_load_error = error
+                warning_message = (
+                    "FlashAttention 3 backend initialization failed.\n"
+                    + traceback.format_exc()
+                )
+        _flash_attn_initialized = True
+    if warning_message is not None:
+        # Log handlers may read availability and re-enter initialization.
+        log_all(warning_message, level="warning", logger=logger)
 
 
 def require_flash_attn3():
+    _initialize_flash_attention()
     if _flash_attn is None:
         raise RuntimeError(
             "FlashAttention 3 was requested but failed to load; refusing SDPA fallback."
@@ -52,15 +69,12 @@ def require_flash_attn3():
 
 
 def require_flash_attn2():
+    _initialize_flash_attention()
     global _flash_attn2, _flash_attn2_load_error
     if (_flash_attn2 is None and _flash_attn2_load_error is None
             and is_torch_cuda_available() and torch.cuda.get_device_capability()[0] >= 8):
         try:
-            import kernels
-            _flash_attn2 = kernels.get_kernel(
-                'kernels-community/flash-attn2',
-                revision='c3f3c93a4a39e3d2cf49c13eac49229bc726ea13',
-            )
+            _flash_attn2 = get_attention_kernel("fa2")
         except Exception as error:
             _flash_attn2_load_error = error
     if _flash_attn2 is None:
@@ -68,6 +82,17 @@ def require_flash_attn2():
             "FlashAttention 2 was requested but failed to load; refusing SDPA fallback."
         ) from _flash_attn2_load_error
     return _flash_attn2
+
+
+def require_attention_kernel(backend):
+    if backend == "fa3":
+        return require_flash_attn3()
+    if backend == "fa2":
+        return require_flash_attn2()
+    try:
+        return get_attention_kernel(backend)
+    except Exception as error:
+        raise RuntimeError(f"Attention kernel {backend!r} was requested but failed to load") from error
 
 
 def scaled_dot_product_attention(
@@ -190,275 +215,358 @@ def _sdpa_fallback(q, k, v,
     return output.transpose(1, 2)  # B, Tq, H, D
 
 
-def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
-                          window_size=(-1, -1), alibi_slopes=None, deterministic=False):
-    """
-    flash_attn_qkvpacked_func
+def _cast_qkv(q, k, v):
+    dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else q.dtype
+    return q.to(dtype), k.to(dtype), v.to(dtype)
 
-    This function expects same signature than @Dao-AILab/flash-attention
-    
-    'dropout_p' should be set to 0.0 during evaluation
-    If Q, K, V are already stacked into 1 tensor, this function will be faster than
-    calling flash_attn_func on Q, K, V since the backward pass avoids explicit concatenation
-    of the gradients of Q, K, V.
-    If window_size != (-1, -1), implements sliding window local attention. Query at position i
-    will only attend to keys between [i - window_size[0], i + window_size[1]] inclusive.
-    Arguments:
-        'qkv': (batch_size, seqlen, 3, nheads, headdim)
-        'dropout_p': float. Dropout probability.
-        'softmax_scale': float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        'causal': bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        'window_size': (left, right). If not (-1, -1), implements sliding window local attention.
-        'alibi_slopes': (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|) is added to
-            the attention score of query i and key j.
-        'deterministic': bool. Whether to use the deterministic implementation of the backward pass,
-            which is slightly slower and uses more memory. The forward pass is always deterministic.
-    Return:
-        out: (batch_size, seqlen, nheads, headdim).
 
-    Ampere uses FlashAttention 2 for BF16 causal (512, 0) windows with zero
-    dropout when the pinned Hub kernel is available; other cases retain the
-    existing backend dispatch.
-    """
-    attention_dtype = (torch.get_autocast_dtype('cuda')
-                       if torch.is_autocast_enabled('cuda') else qkv.dtype)
-    if (_flash_attn2 is not None and qkv.is_cuda and causal
-            and window_size is not None and tuple(window_size) == (512, 0)
-            and dropout_p == 0.0 and alibi_slopes is None
-            and qkv.size(-1) <= 256
-            and qkv.dtype in (torch.float32, torch.bfloat16)
-            and attention_dtype == torch.bfloat16):
-        # Value embeddings can promote packed Q/K/V; FA2 needs an explicit AMP cast.
-        return _flash_attn2.flash_attn_qkvpacked_func(
-            qkv.to(dtype=torch.bfloat16), dropout_p=dropout_p,
-            softmax_scale=softmax_scale, causal=causal, window_size=window_size,
-            deterministic=deterministic,
-        )
-    if flash_attention_is_installed:
-        return _flash_attn.flash_attn_qkvpacked_func(
-            qkv,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            # alibi_slopes=alibi_slopes,
-            # deterministic=deterministic
-        )
-    assert alibi_slopes is None, "Alibi slopes are not supported when FlashAttention is not installed."
+def _sdpa_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
+               window_size=(-1, -1), alibi_slopes=None, deterministic=False, use_packed=False):
+    return _sdpa_fallback(q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale,
+                          causal=causal, window_size=window_size, alibi_slopes=alibi_slopes,
+                          deterministic=deterministic, use_gqa=q.size(-2) != k.size(-2))
 
-    q, k, v = qkv.unbind(dim=2)
-    return _sdpa_fallback(
-        q, k, v,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        window_size=window_size,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        causal=causal,
-    )
 
-def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
-                window_size=(-1, -1), alibi_slopes=None, deterministic=False, backend=None):
-    """
-    Prefer a kernel's packed entrypoint for matching Q/K/V shapes.
+def _sdpa_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
+                         window_size=(-1, -1), alibi_slopes=None, deterministic=False,
+                         num_heads_q=None):
+    return _sdpa_func(*qkv.unbind(2), dropout_p=dropout_p, softmax_scale=softmax_scale,
+                      causal=causal, window_size=window_size, alibi_slopes=alibi_slopes,
+                      deterministic=deterministic)
 
-    Args:
-        q: (B, Tq, H, D)
-        k: (B, Tk, H, D)
-        v: (B, Tk, H, D)
-        ... 
-    Returns:
-        output: (B, Tq, H, D)
-    """
-    if backend == "sdpa":
-        return _sdpa_fallback(q, k, v, dropout_p=dropout_p,
-                              softmax_scale=softmax_scale, causal=causal,
-                              window_size=window_size, alibi_slopes=alibi_slopes,
-                              deterministic=deterministic, use_gqa=q.size(-2) != k.size(-2))
-    if backend in ("fa2", "fa3"):
-        kernel = require_flash_attn2() if backend == "fa2" else require_flash_attn3()
-        dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else q.dtype
-        q, k, v = (tensor.to(dtype=dtype) for tensor in (q, k, v))
-        kwargs = dict(softmax_scale=softmax_scale, causal=causal,
-                      window_size=window_size or (-1, -1), deterministic=deterministic)
-        if backend == "fa2":
-            kwargs.update(dropout_p=dropout_p, alibi_slopes=alibi_slopes)
-        elif dropout_p != 0.0 or alibi_slopes is not None:
-            raise ValueError("FA3 does not support attention dropout or ALiBi in this integration")
-        packed = getattr(kernel, "flash_attn_qkvpacked_func", None)
-        if callable(packed) and q.shape == k.shape == v.shape:
-            return packed(torch.stack((q, k, v), dim=2), **kwargs)
-        return kernel.flash_attn_func(q, k, v, **kwargs)
-    if backend is not None:
-        raise ValueError(f"Unknown attention kernel: {backend}")
-    if flash_attention_is_installed:
-        return _flash_attn.flash_attn_func(
-            q, k,v,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic
-        )
-    use_gqa = (k.size(-2) != q.size(-2)) # GQA if Hq != Hkv
-    return _sdpa_fallback(
-        q, k, v,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        window_size=window_size,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        use_gqa=use_gqa,
-        causal=causal,
-    )
 
-def flash_attn_with_kvcache(
-    q: torch.Tensor, # (B, Tq, H, D)
-    k_cache: torch.Tensor, # (Bc, Tc, Hkv, D)
-    v_cache: torch.Tensor, # (Bc, Tc, Hkv, D)
-    k: Optional[torch.Tensor] = None, # (B, Tk, Hkv, D)
-    v: Optional[torch.Tensor] = None, # (B, Tk, Hkv, D)
-    rotary_cos=None, # ignored. handled outside
-    rotary_sin=None,
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
-    cache_batch_idx: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    softmax_scale=None,
-    causal=True,
-    window_size=(-1, -1),  # -1 means 'infinite' context window
-    rotary_interleaved=True,
-    alibi_slopes=None,
-    backend=None,
-):  
-    """
-    flash_attn_qkvpacked_func
+def _fa2_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
+              window_size=(-1, -1), alibi_slopes=None, deterministic=False, use_packed=False,
+              *, _function, _packed):
+    q, k, v = _cast_qkv(q, k, v)
+    kwargs = dict(dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal,
+                  window_size=window_size or (-1, -1), alibi_slopes=alibi_slopes,
+                  deterministic=deterministic)
+    if use_packed and _packed is not None and q.shape == k.shape == v.shape:
+        return _packed(torch.stack((q, k, v), dim=2), **kwargs)
+    return _function(q, k, v, **kwargs)
 
-    This function expects same signature than @Dao-AILab/flash-attention.
 
-    If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
-    k and v. This is useful for incremental decoding: you can pass in the cached keys/values from
-    the previous step, and update them with the new keys/values from the current step, and do
-    attention with the updated cache, all in 1 kernel.
+def _fa2_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
+                        window_size=(-1, -1), alibi_slopes=None, deterministic=False,
+                        num_heads_q=None, *, _function):
+    dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else qkv.dtype
+    return _function(qkv.to(dtype), dropout_p=dropout_p, softmax_scale=softmax_scale,
+                     causal=causal, window_size=window_size, alibi_slopes=alibi_slopes,
+                     deterministic=deterministic)
 
-    If you pass in k / v, you must make sure that the cache is large enough to hold the new values.
-    For example, the KV cache could be pre-allocated with the max sequence length, and you can use
-    cache_seqlens to keep track of the current sequence lengths of each sequence in the batch.
 
-    Also apply rotary embedding if rotary_cos and rotary_sin are passed in. The key @k will be
-    rotated by rotary_cos and rotary_sin at indices cache_seqlens, cache_seqlens + 1, etc.
-    If causal or local (i.e., window_size != (-1, -1)), the query @q will be rotated by rotary_cos
-    and rotary_sin at indices cache_seqlens, cache_seqlens + 1, etc.
-    If not causal and not local, the query @q will be rotated by rotary_cos and rotary_sin at
-    indices cache_seqlens only (i.e. we consider all tokens in @q to be at position cache_seqlens).
+def _fa3_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
+              window_size=(-1, -1), alibi_slopes=None, deterministic=False, use_packed=False,
+              *, _function, _packed):
+    if dropout_p != 0.0 or alibi_slopes is not None:
+        raise ValueError("FA3 does not support attention dropout or ALiBi in this integration")
+    q, k, v = _cast_qkv(q, k, v)
+    kwargs = dict(softmax_scale=softmax_scale, causal=causal,
+                  window_size=window_size or (-1, -1), deterministic=deterministic)
+    if use_packed and _packed is not None and q.shape == k.shape == v.shape:
+        return _packed(torch.stack((q, k, v), dim=2), **kwargs)
+    return _function(q, k, v, **kwargs)
 
-    See tests/test_flash_attn.py::test_flash_attn_kvcache for examples of how to use this function.
 
-    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
-    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
-    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
-    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+def _fa3_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
+                        window_size=(-1, -1), alibi_slopes=None, deterministic=False,
+                        num_heads_q=None, *, _function):
+    if dropout_p != 0.0 or alibi_slopes is not None:
+        raise ValueError("FA3 does not support attention dropout or ALiBi in this integration")
+    dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else qkv.dtype
+    return _function(qkv.to(dtype), num_heads_q=num_heads_q, softmax_scale=softmax_scale,
+                     causal=causal, window_size=window_size or (-1, -1), deterministic=deterministic)
 
-    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
-        1 1 1 1 0
-        1 1 1 1 1
-    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-        0 0
-        0 0
-        0 0
-        1 0
-        1 1
-    If the row of the mask is all zero, the output will be zero.
 
-    If window_size != (-1, -1), implements sliding window local attention. Query at position i
-    will only attend to keys between
-    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+def _hub_call(*args, dropout_p, alibi_slopes, _function, _options, _backend, **kwargs):
+    if 'dropout_p' in _options:
+        kwargs['dropout_p'] = dropout_p
+    elif dropout_p != 0.0:
+        raise ValueError(f"Attention kernel {_backend!r} does not support dropout_p")
+    if 'alibi_slopes' in _options:
+        kwargs['alibi_slopes'] = alibi_slopes
+    elif alibi_slopes is not None:
+        raise ValueError(f"Attention kernel {_backend!r} does not support alibi_slopes")
+    return _function(*args, **kwargs)
 
-    Note: Does not support backward pass.
 
-    Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
-        k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
-            or (num_blocks, page_block_size, nheads_k, headdim) if there's a block_table (i.e. paged KV cache)
-            page_block_size must be a multiple of 256.
-        v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
-            or (num_blocks, page_block_size, nheads_k, headdim) if there's a block_table (i.e. paged KV cache)
-        k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
-            k with k_cache, starting at the indices specified by cache_seqlens.
-        v [optional]: (batch_size, seqlen_new, nheads_k, headdim). Similar to k.
-        rotary_cos [optional]: (seqlen_ro, rotary_dim / 2). If not None, we apply rotary embedding
-            to k and q. Only applicable if k and v are passed in. rotary_dim must be divisible by 16.
-        rotary_sin [optional]: (seqlen_ro, rotary_dim / 2). Similar to rotary_cos.
-        cache_seqlens: int, or (batch_size,), dtype torch.int32. The sequence lengths of the
-            KV cache.
-        block_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
-        cache_batch_idx: (batch_size,), dtype torch.int32. The indices used to index into the KV cache.
-            If None, we assume that the batch indices are [0, 1, 2, ..., batch_size - 1].
-            If the indices are not distinct, and k and v are provided, the values updated in the cache
-                 might come from any of the duplicate indices.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        rotary_interleaved: bool. Only applicable if rotary_cos and rotary_sin are passed in.
-            If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
-            rotary embedding will combine dimensions 0 & rotary_dim / 2, 1 & rotary_dim / 2 + 1
-            (i.e. GPT-NeoX style).
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
+def _hub_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
+              window_size=(-1, -1), alibi_slopes=None, deterministic=False, use_packed=False,
+              *, _function, _packed):
+    q, k, v = _cast_qkv(q, k, v)
+    kwargs = dict(dropout_p=dropout_p, softmax_scale=softmax_scale, causal=causal,
+                  window_size=window_size or (-1, -1), alibi_slopes=alibi_slopes,
+                  deterministic=deterministic)
+    if use_packed and _packed is not None and q.shape == k.shape == v.shape:
+        return _packed(torch.stack((q, k, v), dim=2), **kwargs)
+    return _function(q, k, v, **kwargs)
 
-    Return:
-        out: (batch_size, seqlen, nheads, headdim).
-    """
-    if (k is not None) and (v is not None):
+
+def _check_cache_devices(q, k_cache, v_cache, k, v):
+    if k is not None and v is not None:
         assert q.device == k.device == v.device, "q, k and v are expected to be on the same device"
     assert q.device == k_cache.device == v_cache.device, "q, k_cache and v_cache are expected to be on the same device"
-    if backend in ("fa2", "fa3") or (backend is None and flash_attention_is_installed):
-        kernel = (require_flash_attn2() if backend == "fa2" else
-                  require_flash_attn3())
-        return kernel.flash_attn_with_kvcache(
-            q, k_cache, v_cache,
-            k=k,
-            v=v,
-            # rotary_cos=rotary_cos,
-            # rotary_sin=rotary_sin,
-            cache_seqlens=cache_seqlens,
-            cache_batch_idx=cache_batch_idx,
-            # block_table=block_table,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            # rotary_interleaved=rotary_interleaved,
-            # alibi_slopes=alibi_slopes
-        )
-    Tq = q.size(1)
-    
-    cur_pos = cache_seqlens[0].item() # TODO: change for batch support -> efficiently get max cur_pos
-    end_pos = cur_pos + Tq
 
+
+def _native_with_kvcache(q, k_cache, v_cache, k=None, v=None, rotary_cos=None,
+                         rotary_sin=None, cache_seqlens=None, cache_batch_idx=None,
+                         block_table=None, softmax_scale=None, causal=True,
+                         window_size=(-1, -1), rotary_interleaved=True, alibi_slopes=None,
+                         *, _function):
+    _check_cache_devices(q, k_cache, v_cache, k, v)
+    # RoPE stays external; the other unused cache options stay ignored, as before.
+    return _function(q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
+                     cache_batch_idx=cache_batch_idx, softmax_scale=softmax_scale,
+                     causal=causal, window_size=window_size)
+
+
+def _sdpa_with_kvcache(q, k_cache, v_cache, k=None, v=None, rotary_cos=None,
+                       rotary_sin=None, cache_seqlens=None, cache_batch_idx=None,
+                       block_table=None, softmax_scale=None, causal=True,
+                       window_size=(-1, -1), rotary_interleaved=True, alibi_slopes=None):
+    _check_cache_devices(q, k_cache, v_cache, k, v)
+    cur_pos = cache_seqlens[0].item()  # Existing cache path assumes equal positions within a batch.
+    end_pos = cur_pos + q.size(1)
     if k is not None and v is not None:
-        k_cache[:,cur_pos:end_pos,:,:] = k
-        v_cache[:,cur_pos:end_pos,:,:] = v
-    
-    k = k_cache[:,:end_pos,:,:]
-    v = v_cache[:,:end_pos,:,:]
-    use_gqa = (k.size(-2) != q.size(-2)) # GQA if Hq != Hkv
-    return _sdpa_fallback(
-        q, k, v,
-        dropout_p=0.0,
-        softmax_scale=softmax_scale,
-        window_size=window_size,
-        use_gqa=use_gqa,
-        causal=causal,
-    )
-    
+        k_cache[:, cur_pos:end_pos] = k
+        v_cache[:, cur_pos:end_pos] = v
+    return _sdpa_func(q, k_cache[:, :end_pos], v_cache[:, :end_pos],
+                      softmax_scale=softmax_scale, causal=causal, window_size=window_size)
 
-flash_attn = SimpleNamespace(
+
+def _missing_kvcache(*args, _backend, **kwargs):
+    raise RuntimeError(f"Attention kernel {_backend!r} does not support KV-cache decoding")
+
+
+def _unsupported_packed(*args, _backend, **kwargs):
+    raise ValueError(f"Unsupported packed attention backend: {_backend}")
+
+
+def _unsupported_attention(*args, _backend, **kwargs):
+    raise ValueError(f"Attention implementation {_backend} is not supported; use sdpa, fa2, fa3, or owner/kernel.")
+
+
+def _automatic_qkvpacked(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
+                         window_size=(-1, -1), alibi_slopes=None, deterministic=False,
+                         num_heads_q=None, *, _function, _fallback):
+    """Retain the legacy implicit FA2 fast path; named model backends never use this."""
+    dtype = torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else qkv.dtype
+    if (qkv.is_cuda and causal and window_size is not None and tuple(window_size) == (512, 0)
+            and dropout_p == 0.0 and alibi_slopes is None and qkv.size(-1) <= 256
+            and qkv.dtype in (torch.float32, torch.bfloat16) and dtype == torch.bfloat16):
+        return _fa2_qkvpacked_func(qkv, dropout_p, softmax_scale, causal, window_size,
+                                   alibi_slopes, deterministic, _function=_function)
+    return _fallback(qkv, dropout_p, softmax_scale, causal, window_size,
+                     alibi_slopes, deterministic, num_heads_q)
+
+
+def _load_flash_attn_functions(backend):
+    """Select all execution functions once, after rank-local device setup."""
+    _initialize_flash_attention()
+    flash_attention_is_installed = _flash_attn is not None
+    automatic = backend is None
+    fa2_packed = getattr(_flash_attn2, 'flash_attn_qkvpacked_func', None) if automatic else None
+    if automatic:
+        backend = 'fa3' if flash_attention_is_installed else 'sdpa'
+    if backend in ('sdpa', 'torch', 'raw'):
+        separate = _sdpa_func if backend == 'sdpa' else partial(_unsupported_attention, _backend=backend)
+        packed = _sdpa_qkvpacked_func if automatic else partial(_unsupported_packed, _backend=backend)
+        if callable(fa2_packed):
+            packed = partial(_automatic_qkvpacked, _function=fa2_packed,
+                             _fallback=packed)
+        return dict(
+            flash_attn_func=separate, flash_attn_qkvpacked_func=packed,
+            flash_attn_with_kvcache=_sdpa_with_kvcache, flash_attention_is_installed=flash_attention_is_installed,
+            packed_fa3=False, supports_attn_weights=True,
+        )
+
+    kernel = require_attention_kernel(backend)
+    function = kernel.flash_attn_func
+    packed = getattr(kernel, 'flash_attn_qkvpacked_func', None)
+    packed = packed if callable(packed) else None
+    packed_call = partial(_unsupported_packed, _backend=backend)
+    if backend == 'fa2':
+        separate = partial(_fa2_func, _function=function, _packed=packed)
+    elif backend == 'fa3':
+        separate = partial(_fa3_func, _function=function, _packed=packed)
+        packed_call = partial(_fa3_qkvpacked_func, _function=packed)
+    else:
+        options = kernel._gpt_lab_attention_options
+        function = partial(_hub_call, _function=function, _options=options['flash_attn_func'], _backend=backend)
+        if callable(packed):
+            packed = partial(_hub_call, _function=packed, _options=options['flash_attn_qkvpacked_func'], _backend=backend)
+        separate = partial(_hub_func, _function=function, _packed=packed)
+    if callable(fa2_packed):
+        packed_call = partial(_automatic_qkvpacked, _function=fa2_packed,
+                              _fallback=packed_call)
+    cache = getattr(kernel, 'flash_attn_with_kvcache', None)
+    cache_call = (partial(_native_with_kvcache, _function=cache) if callable(cache)
+                  else partial(_missing_kvcache, _backend=backend))
+    return dict(
+        flash_attn_func=separate, flash_attn_qkvpacked_func=packed_call,
+        flash_attn_with_kvcache=cache_call, flash_attention_is_installed=flash_attention_is_installed,
+        packed_fa3=backend == 'fa3' and callable(packed), supports_attn_weights=False,
+    )
+
+
+def load_flash_attn(backend):
+    """Bind attention functions during model initialization, after device setup.
+
+    Args:
+        backend: "sdpa", "fa2", "fa3", or a Hub repository ("owner/name").
+            None retains the implicit default: FA3 when available, otherwise SDPA.
+            Explicit kernel requests raise if loading fails.
+            Legacy "torch" and "raw" configs retain SDPA cached evaluation and
+            layer-level attention-weight inspection; ordinary forwards raise.
+
+    Returns:
+        Namespace exposing flash_attn_func, flash_attn_qkvpacked_func, and
+        flash_attn_with_kvcache with the signatures documented below, excluding
+        the backend argument. Also exposes packed_fa3, supports_attn_weights,
+        and flash_attention_is_installed (whether FA3 loaded successfully).
+        Explicit packed calls support FA3; backend=None retains legacy dispatch.
+    """
+    return SimpleNamespace(**_load_flash_attn_functions(backend))
+
+
+def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
+                    window_size=(-1, -1), alibi_slopes=None, deterministic=False,
+                    backend=None, use_packed=False):
+    """Compute attention from separate Q/K/V tensors.
+
+    Args:
+        q: (batch_size, seqlen_q, nheads_q, headdim).
+        k: (batch_size, seqlen_k, nheads_kv, headdim).
+        v: Same shape as k. MQA/GQA uses fewer KV heads than query heads;
+            nheads_q must be divisible by nheads_kv.
+        dropout_p: Attention dropout probability; set to 0.0 during evaluation.
+            FA3 requires 0.0.
+        softmax_scale: Scale applied to QK^T; None uses 1 / sqrt(headdim).
+        causal: Apply a causal mask aligned to the bottom right when sequence
+            lengths differ.
+        window_size: (left, right) context limits; -1 means unlimited.
+            Query i attends within [i + seqlen_k - seqlen_q - left,
+            i + seqlen_k - seqlen_q + right], subject to the causal mask.
+        alibi_slopes: Optional fp32 slopes of shape (nheads_q,) or
+            (batch_size, nheads_q). Unsupported by FA3 and SDPA here.
+        deterministic: Request deterministic backward from native kernels;
+            ignored by the SDPA wrapper.
+        backend: Selection described in load_flash_attn. Hub kernels must
+            support any requested non-default dropout or ALiBi options.
+            Explicit "sdpa" calls bypass native backend initialization.
+        use_packed: Use a kernel's packed entrypoint when available and Q/K/V
+            shapes match; otherwise retain separate inputs. Ignored by SDPA.
+
+    Returns:
+        Attention output of shape (batch_size, seqlen_q, nheads_q, headdim).
+
+    Compatibility entrypoint; models bind functions once with load_flash_attn.
+    """
+    if backend == "sdpa":
+        return _sdpa_func(q, k, v, dropout_p, softmax_scale, causal, window_size,
+                          alibi_slopes, deterministic, use_packed)
+    return _load_flash_attn_functions(backend)['flash_attn_func'](
+        q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes,
+        deterministic, use_packed)
+
+
+def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
+                             window_size=(-1, -1), alibi_slopes=None, deterministic=False,
+                             num_heads_q=None, backend=None):
+    """Compute attention from already packed Q/K/V tensors.
+
+    Args:
+        qkv: (batch_size, seqlen, 3, nheads, headdim), or the FA3 layout
+            (batch_size, seqlen, num_heads_q + 2 * num_heads_kv, headdim).
+            The implicit SDPA/FA2 paths require the five-dimensional layout.
+        dropout_p: Attention dropout probability; use 0.0 during evaluation.
+            FA3 requires 0.0.
+        softmax_scale: Scale applied to QK^T; None uses 1 / sqrt(headdim).
+        causal: Whether to apply causal attention.
+        window_size: (left, right) context limits around each query position;
+            -1 means unlimited.
+        alibi_slopes: Optional fp32 slopes of shape (nheads,) or
+            (batch_size, nheads); unsupported by FA3 and SDPA here.
+        deterministic: Request deterministic native backward; ignored by SDPA.
+        num_heads_q: Number of query heads for FA3's four-dimensional layout;
+            ignored by the implicit SDPA/FA2 paths.
+        backend: "fa3" for an explicit packed call. None retains implicit
+            dispatch: already-loaded FA2 takes priority for eligible BF16 causal
+            (512, 0) calls when its packed entrypoint is callable, followed by
+            FA3 when loaded, otherwise SDPA. Other explicit backends raise
+            ValueError before backend loading.
+
+    Returns:
+        Attention output of shape (batch_size, seqlen, nheads_q, headdim).
+
+    Models use the corresponding function bound by load_flash_attn.
+    """
+    if backend not in (None, "fa3"):
+        raise ValueError(f"Unsupported packed attention backend: {backend}")
+    return _load_flash_attn_functions(backend)['flash_attn_qkvpacked_func'](
+        qkv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, deterministic, num_heads_q)
+
+
+def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, rotary_cos=None,
+                           rotary_sin=None, cache_seqlens=None, cache_batch_idx=None,
+                           block_table=None, softmax_scale=None, causal=True,
+                           window_size=(-1, -1), rotary_interleaved=True, alibi_slopes=None,
+                           backend=None):
+    """Attend to a KV cache, optionally appending new keys and values in place.
+
+    Args:
+        q: (batch_size, seqlen_q, nheads_q, headdim).
+        k_cache: Preallocated (batch_size_cache, seqlen_cache, nheads_kv, headdim).
+        v_cache: Same shape as k_cache. The cache must have capacity for any
+            appended tokens. MQA/GQA requires nheads_q divisible by nheads_kv.
+        k: Optional new keys (batch_size, seqlen_new, nheads_kv, headdim).
+        v: Optional new values with the same shape as k; provide both together.
+        rotary_cos, rotary_sin: Ignored; apply RoPE before calling this wrapper.
+        cache_seqlens: Existing cache lengths passed to native kernels.
+            SDPA requires an indexable tensor, reads cache_seqlens[0], and
+            assumes equal positions across the batch and seqlen_new == seqlen_q.
+            This wrapper does not advance the supplied lengths.
+        cache_batch_idx: Optional native cache row indices, typically an int32
+            tensor of shape (batch_size,). Ignored by SDPA, which uses batch
+            rows directly.
+        block_table: Ignored; paged KV caches are not supported by this wrapper.
+        softmax_scale: Scale applied to QK^T; None uses 1 / sqrt(headdim).
+        causal: Apply causal attention with bottom-right mask alignment.
+        window_size: (left, right) context limits as in flash_attn_func.
+        rotary_interleaved: Ignored; RoPE is handled externally.
+        alibi_slopes: Ignored by this cache wrapper.
+        backend: Selection described in load_flash_attn. Explicit native
+            backends must export flash_attn_with_kvcache or the call raises.
+
+    Returns:
+        Attention output of shape (batch_size, seqlen_q, nheads_q, headdim).
+        Native cache kernels are intended for inference without backward.
+
+    Models use the corresponding function bound by load_flash_attn.
+    """
+    return _load_flash_attn_functions(backend)['flash_attn_with_kvcache'](
+        q, k_cache, v_cache, k, v, rotary_cos, rotary_sin, cache_seqlens, cache_batch_idx,
+        block_table, softmax_scale, causal, window_size, rotary_interleaved, alibi_slopes)
+
+
+class _FlashAttention(SimpleNamespace):
+    @property
+    def flash_attention_is_installed(self):
+        """Resolve FA3 availability on first read, waiting for any in-flight load."""
+        _initialize_flash_attention()
+        return _flash_attn is not None
+
+
+flash_attn = _FlashAttention(
     flash_attn_func=flash_attn_func,
     flash_attn_qkvpacked_func=flash_attn_qkvpacked_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
-    flash_attention_is_installed=flash_attention_is_installed
 )
+
+
+def __getattr__(name):
+    """Resolve the legacy module-level availability flag without eager imports."""
+    if name == "flash_attention_is_installed":
+        return flash_attn.flash_attention_is_installed
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
