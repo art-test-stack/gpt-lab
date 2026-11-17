@@ -110,6 +110,8 @@ def training_dependencies(monkeypatch):
     manager.load.return_value = model, tokenizer, checkpoint, saved_config
     factory = Mock(return_value=manager)
     auto = Mock()
+    from gpt_lab.model.auto import AutoGPTConfig
+    auto.architecture_fields = AutoGPTConfig.architecture_fields
     auto.return_value.generate_gpt_config.return_value = meta
     loader = Mock(side_effect=['train-loader', 'val-loader'])
     trainer = Mock()

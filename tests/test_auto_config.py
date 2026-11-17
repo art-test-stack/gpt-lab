@@ -44,6 +44,166 @@ def _auto_config(tmp_path: Path, **overrides) -> AutoGPTConfig:
     return AutoGPTConfig(**values)
 
 
+@pytest.mark.parametrize("kv_heads, expected_parameters", [
+    (3, 565_051_416),
+    (12, 607_518_744),
+])
+def test_llama_preset_with_gpt2_and_mha_override(monkeypatch, tmp_path, kv_heads, expected_parameters):
+    from gpt_lab.cli.parser import build_parser
+    from gpt_lab.model.layers import Linear
+    from gpt_lab.workflows.train_base import build_auto_config
+
+    # Linear's explicit default device otherwise bypasses the existing meta context.
+    monkeypatch.setattr(Linear.__init__, "__defaults__", (False, torch.device("meta"), None))
+    monkeypatch.setattr(
+        AutoGPTConfig, "compute_vocab_size",
+        lambda *_args: pytest.fail("An explicit GPT-2 tokenizer must bypass vocabulary sizing"),
+    )
+    loaded = []
+
+    def load(name, *, special_tokens, tokenizer_dir):
+        loaded.append(name)
+        return _DummyTokenizer(50_257, special_tokens)
+
+    monkeypatch.setattr("gpt_lab.model.auto.load_tokenizer", load)
+    args = build_parser().parse_args([
+        "train", "--architecture-config", str(Path(__file__).resolve().parents[1] / "configs/llama3.yaml"),
+        "--tokenizer-model", "gpt2", "--model-name", "preset", "--run-name", "test",
+        "--model-dir", str(tmp_path), "--max-seq-len", "8", "--device-batch-size", "1",
+        "--total-batch-size", "64", "--num-steps", "1",
+    ] + (["--n-kv-heads", str(kv_heads)] if kv_heads != 3 else []))
+    generated = build_auto_config(vars(args), "meta", ComputeContext(device=torch.device("cpu")))
+    config = generated.model_cfg
+    assert loaded == ["gpt2"]
+    assert (config.n_layers, config.d_model, config.d_ffn) == (12, 1536, 6144)
+    assert (config.n_heads, config.n_kv_heads) == (12, kv_heads)
+    assert config.act_func == "swiglu"
+    assert config.disable_value_embeds and config.freeze_res_connections
+    assert (config.res_h, config.res_x0) == (1.0, 0.0)
+    model = build_meta_model(config)
+    assert all(p.device.type == "meta" for p in model.parameters())
+    assert model.n_params == sum(p.numel() for p in model.parameters()) == expected_parameters
+    assert sum(p.numel() for p in model.parameters() if not p.requires_grad) == 24
+    assert generated.base_train["target_tokens"] == int(11 * model.n_scaling_params())
+    assert generated.base_train["n_flops_per_token"] == model.estimate_flops()
+
+
+def test_architecture_yaml_overrides_apply_before_scaling(monkeypatch, tmp_path):
+    path = tmp_path / "architecture.yaml"
+    path.write_text(
+        "act_func: swiglu\nd_head: 16\nn_kv_heads: 2\n"
+        "use_packed_attn_kernel: true\nwindow_pattern: L\n"
+    )
+    config = _auto_config(
+        tmp_path, architecture_config=path, n_kv_heads=None,
+        use_packed_attn_kernel=False,
+    )
+    assert config.act_func == "swiglu"
+    assert config.d_head == 64  # Explicit helper setting overrides the file.
+    assert config.n_kv_heads is None
+    assert config.use_packed_attn_kernel is False
+
+    observed = []
+    original = AutoGPTConfig.build_transformer_config
+
+    def capture(self, depth, vocab_size):
+        model_cfg = original(self, depth, vocab_size)
+        observed.append(model_cfg)
+        return model_cfg
+
+    monkeypatch.setattr(AutoGPTConfig, "build_transformer_config", capture)
+    monkeypatch.setattr("gpt_lab.model.auto.resolve_tokenizer", lambda *_args: "dummy")
+    monkeypatch.setattr(
+        "gpt_lab.model.auto.load_tokenizer",
+        lambda *_args, **kwargs: _DummyTokenizer(4096, kwargs["special_tokens"]),
+    )
+    generated = config.generate_gpt_config("cpu")
+    assert [cfg.n_layers for cfg in observed] == [3, config.reference_depth(), 3]
+    for cfg in observed:
+        assert cfg.act_func == "swiglu"
+        assert cfg.d_head == 64
+        assert cfg.n_kv_heads == cfg.n_heads
+        assert cfg.window_pattern == "L"
+        assert cfg.use_packed_attn_kernel is False
+    model = build_meta_model(generated.model_cfg)
+    assert generated.base_train["target_tokens"] == int(11 * model.n_scaling_params())
+    assert generated.base_train["n_flops_per_token"] == model.estimate_flops()
+
+    # Resolved configs survive removal of the source file.
+    saved = config.model_dump_json()
+    assert "architecture_config" not in config.model_dump()
+    path.unlink()
+    restored = AutoGPTConfig.model_validate_json(saved)
+    assert restored.build_transformer_config(3, 4096) == generated.model_cfg
+
+
+@pytest.mark.parametrize("filename, contents, error", [
+    ("architecture.json", "{}", "must be a YAML file"),
+    ("architecture.yaml", "act_func: [", "Invalid architecture YAML"),
+    ("architecture.yaml", "- swiglu", "must map field names"),
+    ("architecture.yaml", "typo: true", "Unknown architecture fields"),
+    ("architecture.yaml", "n_steps: 10", "Unknown architecture fields"),
+    ("architecture.yaml", "act_func: unknown", "act_func"),
+])
+def test_invalid_architecture_yaml_is_rejected(tmp_path, filename, contents, error):
+    path = tmp_path / filename
+    path.write_text(contents)
+    with pytest.raises(ValueError, match=error):
+        _auto_config(tmp_path, architecture_config=path)
+
+
+@pytest.mark.parametrize("flags, expected", [
+    ([], True),
+    (["--disable-value-embeds", "--freeze-res-connections"], True),
+    (["--disable-value-embeds", "true", "--freeze-res-connections", "true"], True),
+    (["--disable-value-embeds", "false", "--freeze-res-connections", "false"], False),
+])
+def test_cli_architecture_defaults_and_boolean_overrides(monkeypatch, tmp_path, flags, expected):
+    from gpt_lab.cli.parser import build_parser
+    from gpt_lab.workflows.train_base import build_auto_config
+
+    path = tmp_path / "architecture.yaml"
+    path.write_text(
+        "depth: 4\nd_head: 64\nact_func: swiglu\ntie_embeddings: embs;head\n"
+        "disable_value_embeds: true\nfreeze_res_connections: true\nres_h: 1.0\nres_x0: 0.0\n"
+    )
+    # Stop at the resolved configuration; model behavior is checked separately.
+    monkeypatch.setattr(AutoGPTConfig, "generate_gpt_config", lambda self, device: self)
+    args = build_parser().parse_args(["train", "--architecture-config", str(path), "--depth", "6"] + flags)
+    config = build_auto_config(vars(args), "cpu", ComputeContext(device=torch.device("cpu")))
+    assert config.depth == 6
+    assert config.d_head == 64
+    assert config.act_func == "swiglu"
+    assert config.disable_value_embeds is expected
+    assert config.freeze_res_connections is expected
+    model_cfg = config.build_transformer_config(config.depth, 4096)
+    assert model_cfg.res_h == 1.0
+    assert model_cfg.res_x0 == 0.0
+
+
+def test_training_architecture_defaults_without_a_preset(monkeypatch):
+    from gpt_lab.cli.parser import build_parser
+    from gpt_lab.workflows.train_base import build_auto_config
+
+    monkeypatch.setattr(AutoGPTConfig, "generate_gpt_config", lambda self, device: self)
+    args = build_parser().parse_args(["train"])
+    config = build_auto_config(vars(args), "cpu", ComputeContext(device=torch.device("cpu")))
+    assert (config.depth, config.d_head, config.aspect_ratio, config.max_seq_len) == (12, 128, 64, 2048)
+    assert config.act_func == "relu_squared"
+    assert config.tie_embeddings == "embs;value_embs;head"
+    assert not config.disable_value_embeds
+    assert not config.freeze_res_connections
+
+
+@pytest.mark.parametrize("flag", ["--disable-value-embeds", "--freeze-res-connections"])
+def test_cli_rejects_invalid_boolean(flag):
+    from gpt_lab.cli.parser import build_parser
+
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(["train", flag, "maybe"])
+    assert error.value.code == 2
+
+
 @pytest.mark.parametrize("config_class", [TransformerConfig, AutoGPTConfig])
 def test_legacy_fused_attention_is_rejected(config_class):
     with pytest.raises(ValueError, match="attn_impl"):

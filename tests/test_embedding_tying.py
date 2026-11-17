@@ -20,6 +20,48 @@ def _config(**overrides):
     return TransformerConfig(**values)
 
 
+@pytest.mark.parametrize("disable_values", [False, True])
+@pytest.mark.parametrize("freeze_residuals", [False, True])
+def test_optional_values_and_frozen_residuals(disable_values, freeze_residuals):
+    config = _config(
+        disable_value_embeds=disable_values, freeze_res_connections=freeze_residuals,
+        tie_embeddings="embs;head", res_h=1.0, res_x0=0.0,
+    )
+    config = TransformerConfig.model_validate_json(config.model_dump_json())
+    model = build_meta_model(config).to_empty(device="cpu")
+    model.init_weights()
+    assert bool(model.value_embeds) is not disable_values
+    assert [block.attention.ve_gate is not None for block in model.blocks] == [
+        False, not disable_values, False, not disable_values,
+    ]
+    torch.testing.assert_close(model.res_h, torch.ones_like(model.res_h))
+    torch.testing.assert_close(model.res_x0, torch.zeros_like(model.res_x0))
+
+    optimizer = model.build_optimizer(TrainerConfig(comp_info=ComputeContext(device=torch.device("cpu"))))
+    optimized = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    assert optimized == {id(p) for p in model.parameters() if p.requires_grad}
+    ids = torch.randint(0, config.vocab_size, (2, config.max_context))
+    output = model(ids, ids)
+    assert torch.isfinite(output.loss)
+    output.loss.backward()
+    for residual in (model.res_h, model.res_x0):
+        assert residual.requires_grad is not freeze_residuals
+        assert (residual.grad is None) is freeze_residuals
+
+    restored = build_meta_model(config).to_empty(device="cpu")
+    restored.load_state_dict(model.state_dict(), assign=True)
+    restored.precompute_pos_enc()
+    for residual in (restored.res_h, restored.res_x0):
+        assert residual.requires_grad is not freeze_residuals
+    torch.testing.assert_close(restored(ids, ids).logits, output.logits)
+
+
+@pytest.mark.parametrize("mode", ["embs;value_embs;head", "value_embs:", "embs,value_embs"])
+def test_disabled_value_embeddings_reject_tying_references(mode):
+    with pytest.raises(ValueError, match="value embeddings are disabled"):
+        _config(disable_value_embeds=True, tie_embeddings=mode)
+
+
 MODES = [
     ("embs;head", False, False, False, False),
     ("embs;value_embs;head", False, False, False, False),
