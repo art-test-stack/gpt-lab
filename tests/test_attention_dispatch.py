@@ -19,23 +19,33 @@ def clear_kernel_cache():
     _attention_kernels.clear()
 
 
-def test_public_sdpa_compiles_before_any_eager_call():
+@pytest.mark.parametrize("mode", ["sdpa", "fa3"])
+def test_public_attention_compiles_before_any_eager_call(mode):
     code = """
         from importlib import import_module
+        from types import SimpleNamespace
+        import sys
         import torch
 
         attention = import_module("gpt_lab.model.flash_attn")
         assert not attention._flash_attn_initialized
+        mode = sys.argv[1]
+        attention.is_torch_cuda_available = lambda: mode == "fa3"
+        if mode == "fa3":
+            torch.cuda.get_device_capability = lambda: (9, 0)
+            attention.get_attention_kernel = lambda backend: SimpleNamespace(flash_attn_func=attention._sdpa_func)
+        backend = "sdpa" if mode == "sdpa" else None
         q = torch.randn(1, 4, 2, 8)
         compiled = torch.compile(
-            lambda q: attention.flash_attn_func(q, q, q, backend="sdpa"),
+            lambda q: attention.flash_attn_func(q, q, q, backend=backend),
             backend="eager", fullgraph=True,
         )
         output = compiled(q)
-        assert not attention._flash_attn_initialized
+        assert attention._flash_attn_initialized == (mode != "sdpa")
+        assert (attention._flash_attn is not None) == (mode == "fa3")
         torch.testing.assert_close(output, attention._sdpa_func(q, q, q))
     """
-    process = subprocess.run([sys.executable, "-c", textwrap.dedent(code)],
+    process = subprocess.run([sys.executable, "-c", textwrap.dedent(code), mode],
                              capture_output=True, text=True, timeout=60)
     assert process.returncode == 0, process.stdout + process.stderr
 

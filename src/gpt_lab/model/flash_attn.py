@@ -23,6 +23,8 @@ _flash_attn_initialized = False
 _flash_attn_init_lock = Lock()
 
 
+# The None result is constant; initialization must run outside the tensor graph.
+@torch.compiler.assume_constant_result
 def _initialize_flash_attention():
     """Serialize first use and publish availability only after loading finishes."""
     global _flash_attn, _flash_attn2, _flash_attn_load_error, _flash_attn2_load_error
