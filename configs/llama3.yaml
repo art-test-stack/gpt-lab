@@ -1,13 +1,12 @@
 # Llama-3-style preset with parameter-free RMSNorm.
 # shortcut: retains the current normalization, softcap, and 4x FFN rules; revisit for Llama 3 equation parity.
 depth: 12
-# Llama 3 8B width/depth: 4096 / 32 = 128. Depth 12 gives width 1536.
+# Experiment choice: width/depth 96; depth 12 gives width 1152, depth 16 gives 1536.
 # Existing training/vocabulary scaling rules are uncalibrated for this preset.
-aspect_ratio: 128
+aspect_ratio: 96
 d_head: 128
-# At depth 12, three KV heads preserve the 8B model's four query heads per KV.
-# This is a fixed count: depth overrides must be divisible by three.
-n_kv_heads: 3
+# MHA follows the query head count at both target and reference depths.
+n_kv_heads: null
 act_func: swiglu
 window_pattern: L
 tie_embeddings: embs;head
