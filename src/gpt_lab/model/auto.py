@@ -1,9 +1,9 @@
 import math
 import warnings
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar, Optional
 
 from gpt_lab.utils.distributed import ComputeContext
 from gpt_lab.utils.default import DATA_DIR, MODELS_FOLDER, TOKENIZERS_FOLDER
@@ -51,6 +51,10 @@ class AutoGPTConfig(BaseModel):
     tokenizer determines the final vocabulary. Training horizon priority is
     explicit steps, then target FLOPs, then the data-to-parameter ratio.
     Architecture overrides apply to probe, target, and reference models.
+    An architecture_config YAML file supplies architecture defaults; explicit
+    fields override the file before any scaling rules run.
+    Architecture selection does not recalibrate training or vocabulary scaling
+    rules; their inherited constants remain experimental for a new preset.
     Defaults use dense transformers; other architectures need a compatible
     model builder and parameter/FLOPs accounting.
     """
@@ -76,11 +80,23 @@ class AutoGPTConfig(BaseModel):
     )
 
     # Model
+    architecture_config: Optional[str | Path] = Field(default=None, exclude=True)
+    architecture_fields: ClassVar[frozenset[str]] = frozenset({
+        "depth", "aspect_ratio", "d_head", "n_kv_heads", "tie_embeddings",
+        "act_func", "max_seq_len", "window_pattern", "window_size",
+        "attn_softcap", "softcap", "attn_impl", "use_packed_attn_kernel",
+        "quantization",
+        "disable_value_embeds", "freeze_res_connections", "res_h", "res_x0",
+    })
     depth: int = 20
     aspect_ratio: int = 64
     d_head: int = 2**9 # 512
     n_kv_heads: Optional[int] = None
     tie_embeddings: str = "embs;value_embs;head"
+    disable_value_embeds: bool = False
+    freeze_res_connections: bool = False
+    res_h: Optional[float] = None
+    res_x0: Optional[float] = None
     act_func: FFNActivation = "relu_squared"
     # Deprecated compatibility alias. The old field was named as a dimension
     # but was always consumed as a head count.
@@ -104,6 +120,28 @@ class AutoGPTConfig(BaseModel):
     n_steps: int = -1
     target_flops: float = -1.0
     target_param_data_ratio: float = 11.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def load_architecture_config(cls, values):
+        if not isinstance(values, dict) or values.get("architecture_config") is None:
+            return values
+        import yaml
+
+        path = Path(values["architecture_config"])
+        if path.suffix not in (".yaml", ".yml"):
+            raise ValueError("Architecture configuration must be a YAML file")
+        try:
+            with path.open() as file:
+                architecture = yaml.safe_load(file)
+        except yaml.YAMLError as error:
+            raise ValueError(f"Invalid architecture YAML: {path}") from error
+        if not isinstance(architecture, dict):
+            raise ValueError("Architecture YAML must map field names to values")
+        unknown = architecture.keys() - cls.architecture_fields
+        if unknown:
+            raise ValueError(f"Unknown architecture fields: {sorted(unknown, key=str)}")
+        return architecture | values
 
     def model_post_init(self, context):
         if self.special_tokens is None:
@@ -195,6 +233,10 @@ class AutoGPTConfig(BaseModel):
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             tie_embeddings=self.tie_embeddings,
+            disable_value_embeds=self.disable_value_embeds,
+            freeze_res_connections=self.freeze_res_connections,
+            res_h=self.res_h,
+            res_x0=self.res_x0,
             d_head=self.d_head,
             window_pattern=self.window_pattern or "SSSL",
             window_size=self.window_size,
@@ -477,7 +519,10 @@ class AutoGPTConfig(BaseModel):
             dist.barrier()
         # Display the generated configuration for verification
         print0_dict("AutoGPTConfig generated the following tokenizer configuration", tokenizer.config.model_dump())
-        print0_dict("AutoGPTConfig generated the following model configuration", model.config.model_dump())
+        print0_dict("AutoGPTConfig generated the following model configuration", model.config.model_dump() | {
+            "depth": model.config.n_layers,
+            "aspect_ratio": model.config.d_model / model.config.n_layers,
+        })
         
         print0_dict("Model Parameter counts", model.n_params_per_layer())
         print0(f"Estimated FLOPS per token: {training_config['n_flops_per_token']:.2e}")

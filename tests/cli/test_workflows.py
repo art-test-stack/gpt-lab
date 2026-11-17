@@ -110,6 +110,8 @@ def training_dependencies(monkeypatch):
     manager.load.return_value = model, tokenizer, checkpoint, saved_config
     factory = Mock(return_value=manager)
     auto = Mock()
+    from gpt_lab.model.auto import AutoGPTConfig
+    auto.architecture_fields = AutoGPTConfig.architecture_fields
     auto.return_value.generate_gpt_config.return_value = meta
     loader = Mock(side_effect=['train-loader', 'val-loader'])
     trainer = Mock()
@@ -187,6 +189,21 @@ def test_training_forwards_logging_backend(training_dependencies, mode, backend)
     assert deps.board_factory.call_args.kwargs['resume'] is (mode == 'resume')
     assert deps.trainer_factory.call_args.kwargs['board'] is deps.board
     deps.board.close.assert_called_once()
+
+
+@pytest.mark.parametrize('mode', ['auto', 'resume'])
+def test_training_logs_resolved_depth_and_aspect_ratio(training_dependencies, mode):
+    from gpt_lab.cli.commands.base import run
+    deps = training_dependencies
+    deps.model.config.n_layers = 16
+    deps.model.config.d_model = 1536
+    args = parse(f'train {mode} --device cpu --board dummy')
+    if mode == 'auto':
+        args.depth, args.aspect_ratio = 4, 64
+    run(args)
+    logged = deps.board_factory.call_args.kwargs['config']
+    assert logged['depth'] == 16
+    assert logged['aspect_ratio'] == 96
 
 
 def test_auto_preserves_configuration_and_cleanup_on_failure(training_dependencies):

@@ -1,0 +1,16 @@
+# Llama-3-style preset with parameter-free RMSNorm.
+# shortcut: retains the current normalization, softcap, and 4x FFN rules; revisit for Llama 3 equation parity.
+depth: 12
+# Experiment choice: width/depth 96; depth 12 gives width 1152, depth 16 gives 1536.
+# Existing training/vocabulary scaling rules are uncalibrated for this preset.
+aspect_ratio: 96
+d_head: 128
+# MHA follows the query head count at both target and reference depths.
+n_kv_heads: null
+act_func: swiglu
+window_pattern: L
+tie_embeddings: embs;head
+disable_value_embeds: true
+freeze_res_connections: true
+res_h: 1.0
+res_x0: 0.0
