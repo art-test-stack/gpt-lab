@@ -22,6 +22,7 @@ flash_attention_is_installed = False
 
 
 def _initialize_flash_attention():
+    """Serialize first use and publish availability only after loading finishes."""
     global _flash_attn, _flash_attn2, _flash_attn_load_error, _flash_attn2_load_error
     global _flash_attn_initialized, flash_attention_is_installed
     if _flash_attn_initialized:
@@ -395,14 +396,55 @@ def _load_flash_attn_functions(backend):
 
 
 def load_flash_attn(backend):
-    """Bind a namespace once during model initialization."""
+    """Bind attention functions during model initialization, after device setup.
+
+    Args:
+        backend: "sdpa", "fa2", "fa3", or a Hub repository ("owner/name").
+            None retains the implicit default: FA3 when available, otherwise SDPA.
+            Explicit kernel requests raise if loading fails.
+
+    Returns:
+        Namespace exposing flash_attn_func, flash_attn_qkvpacked_func, and
+        flash_attn_with_kvcache with the signatures documented below, excluding
+        the backend argument. Also exposes packed_fa3, supports_attn_weights,
+        and flash_attention_is_installed (whether FA3 loaded successfully).
+        Explicit packed calls support FA3; backend=None retains legacy dispatch.
+    """
     return SimpleNamespace(**_load_flash_attn_functions(backend))
 
 
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
                     window_size=(-1, -1), alibi_slopes=None, deterministic=False,
                     backend=None, use_packed=False):
-    """Compatibility entrypoint; models use the functions selected during initialization."""
+    """Compute attention from separate Q/K/V tensors.
+
+    Args:
+        q: (batch_size, seqlen_q, nheads_q, headdim).
+        k: (batch_size, seqlen_k, nheads_kv, headdim).
+        v: Same shape as k. MQA/GQA uses fewer KV heads than query heads;
+            nheads_q must be divisible by nheads_kv.
+        dropout_p: Attention dropout probability; set to 0.0 during evaluation.
+            FA3 requires 0.0.
+        softmax_scale: Scale applied to QK^T; None uses 1 / sqrt(headdim).
+        causal: Apply a causal mask aligned to the bottom right when sequence
+            lengths differ.
+        window_size: (left, right) context limits; -1 means unlimited.
+            Query i attends within [i + seqlen_k - seqlen_q - left,
+            i + seqlen_k - seqlen_q + right], subject to the causal mask.
+        alibi_slopes: Optional fp32 slopes of shape (nheads_q,) or
+            (batch_size, nheads_q). Unsupported by FA3 and SDPA here.
+        deterministic: Request deterministic backward from native kernels;
+            ignored by the SDPA wrapper.
+        backend: Selection described in load_flash_attn. Hub kernels must
+            support any requested non-default dropout or ALiBi options.
+        use_packed: Use a kernel's packed entrypoint when available and Q/K/V
+            shapes match; otherwise retain separate inputs. Ignored by SDPA.
+
+    Returns:
+        Attention output of shape (batch_size, seqlen_q, nheads_q, headdim).
+
+    Compatibility entrypoint; models bind functions once with load_flash_attn.
+    """
     return _load_flash_attn_functions(backend)['flash_attn_func'](
         q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes,
         deterministic, use_packed)
@@ -411,7 +453,32 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
 def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
                              window_size=(-1, -1), alibi_slopes=None, deterministic=False,
                              num_heads_q=None, backend=None):
-    """Compatibility entrypoint for the existing packed-call API."""
+    """Compute attention from already packed Q/K/V tensors.
+
+    Args:
+        qkv: (batch_size, seqlen, 3, nheads, headdim), or the FA3 layout
+            (batch_size, seqlen, num_heads_q + 2 * num_heads_kv, headdim).
+            The implicit SDPA/FA2 paths require the five-dimensional layout.
+        dropout_p: Attention dropout probability; use 0.0 during evaluation.
+            FA3 requires 0.0.
+        softmax_scale: Scale applied to QK^T; None uses 1 / sqrt(headdim).
+        causal: Whether to apply causal attention.
+        window_size: (left, right) context limits around each query position;
+            -1 means unlimited.
+        alibi_slopes: Optional fp32 slopes of shape (nheads,) or
+            (batch_size, nheads); unsupported by FA3 and SDPA here.
+        deterministic: Request deterministic native backward; ignored by SDPA.
+        num_heads_q: Number of query heads for FA3's four-dimensional layout;
+            ignored by the implicit SDPA/FA2 paths.
+        backend: "fa3" for an explicit packed call. None retains implicit
+            FA3/SDPA selection and the legacy Ampere FA2 fast path. Other
+            explicit backends are unsupported by this entrypoint.
+
+    Returns:
+        Attention output of shape (batch_size, seqlen, nheads_q, headdim).
+
+    Models use the corresponding function bound by load_flash_attn.
+    """
     return _load_flash_attn_functions(backend)['flash_attn_qkvpacked_func'](
         qkv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, deterministic, num_heads_q)
 
@@ -421,7 +488,38 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, rotary_cos=None
                            block_table=None, softmax_scale=None, causal=True,
                            window_size=(-1, -1), rotary_interleaved=True, alibi_slopes=None,
                            backend=None):
-    """Compatibility entrypoint retaining the existing implicit backend default."""
+    """Attend to a KV cache, optionally appending new keys and values in place.
+
+    Args:
+        q: (batch_size, seqlen_q, nheads_q, headdim).
+        k_cache: Preallocated (batch_size_cache, seqlen_cache, nheads_kv, headdim).
+        v_cache: Same shape as k_cache. The cache must have capacity for any
+            appended tokens. MQA/GQA requires nheads_q divisible by nheads_kv.
+        k: Optional new keys (batch_size, seqlen_new, nheads_kv, headdim).
+        v: Optional new values with the same shape as k; provide both together.
+        rotary_cos, rotary_sin: Ignored; apply RoPE before calling this wrapper.
+        cache_seqlens: Existing cache lengths passed to native kernels.
+            SDPA requires an indexable tensor, reads cache_seqlens[0], and
+            assumes equal positions across the batch and seqlen_new == seqlen_q.
+            This wrapper does not advance the supplied lengths.
+        cache_batch_idx: Optional native cache row indices, typically an int32
+            tensor of shape (batch_size,). Ignored by SDPA, which uses batch
+            rows directly.
+        block_table: Ignored; paged KV caches are not supported by this wrapper.
+        softmax_scale: Scale applied to QK^T; None uses 1 / sqrt(headdim).
+        causal: Apply causal attention with bottom-right mask alignment.
+        window_size: (left, right) context limits as in flash_attn_func.
+        rotary_interleaved: Ignored; RoPE is handled externally.
+        alibi_slopes: Ignored by this cache wrapper.
+        backend: Selection described in load_flash_attn. Explicit native
+            backends must export flash_attn_with_kvcache or the call raises.
+
+    Returns:
+        Attention output of shape (batch_size, seqlen_q, nheads_q, headdim).
+        Native cache kernels are intended for inference without backward.
+
+    Models use the corresponding function bound by load_flash_attn.
+    """
     return _load_flash_attn_functions(backend)['flash_attn_with_kvcache'](
         q, k_cache, v_cache, k, v, rotary_cos, rotary_sin, cache_seqlens, cache_batch_idx,
         block_table, softmax_scale, causal, window_size, rotary_interleaved, alibi_slopes)
