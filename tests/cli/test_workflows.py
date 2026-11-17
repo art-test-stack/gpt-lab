@@ -191,6 +191,21 @@ def test_training_forwards_logging_backend(training_dependencies, mode, backend)
     deps.board.close.assert_called_once()
 
 
+@pytest.mark.parametrize('mode', ['auto', 'resume'])
+def test_training_logs_resolved_depth_and_aspect_ratio(training_dependencies, mode):
+    from gpt_lab.cli.commands.base import run
+    deps = training_dependencies
+    deps.model.config.n_layers = 16
+    deps.model.config.d_model = 1536
+    args = parse(f'train {mode} --device cpu --board dummy')
+    if mode == 'auto':
+        args.depth, args.aspect_ratio = 4, 64
+    run(args)
+    logged = deps.board_factory.call_args.kwargs['config']
+    assert logged['depth'] == 16
+    assert logged['aspect_ratio'] == 96
+
+
 def test_auto_preserves_configuration_and_cleanup_on_failure(training_dependencies):
     from gpt_lab.cli.commands.base import run
     deps = training_dependencies

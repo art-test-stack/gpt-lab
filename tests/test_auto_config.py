@@ -115,6 +115,8 @@ def test_llama_d16_mha_training_sizing_on_four_devices(monkeypatch, tmp_path):
 
 
 def test_architecture_yaml_overrides_apply_before_scaling(monkeypatch, tmp_path):
+    printed = {}
+    monkeypatch.setattr("gpt_lab.model.auto.print0_dict", lambda title, values: printed.update({title: values}))
     path = tmp_path / "architecture.yaml"
     path.write_text(
         "act_func: swiglu\nd_head: 16\nn_kv_heads: 2\n"
@@ -144,6 +146,10 @@ def test_architecture_yaml_overrides_apply_before_scaling(monkeypatch, tmp_path)
         lambda *_args, **kwargs: _DummyTokenizer(4096, kwargs["special_tokens"]),
     )
     generated = config.generate_gpt_config("cpu")
+    logged = printed["AutoGPTConfig generated the following model configuration"]
+    assert logged["depth"] == generated.model_cfg.n_layers == 3
+    assert logged["aspect_ratio"] == generated.model_cfg.d_model / 3
+    assert logged["aspect_ratio"] != config.aspect_ratio
     assert [cfg.n_layers for cfg in observed] == [3, config.reference_depth(), 3]
     for cfg in observed:
         assert cfg.act_func == "swiglu"
