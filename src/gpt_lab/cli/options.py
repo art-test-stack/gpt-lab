@@ -13,6 +13,12 @@ def attention_impl(value: str) -> str:
     raise argparse.ArgumentTypeError("expected sdpa, fa2, fa3, or a kernel repository name (owner/name)")
 
 
+def boolean(value: str) -> bool:
+    if value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 class ArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args, default_subcommand=None, **kwargs):
         self.default_subcommand = default_subcommand
