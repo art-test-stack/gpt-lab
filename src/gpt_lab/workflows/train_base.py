@@ -35,6 +35,9 @@ if TYPE_CHECKING:
     from gpt_lab.utils.distributed import ComputeContext
 
 
+_UNSET = object()
+
+
 def train_base(
     *,
     optim_config: OptimizerConfig | None = None,
@@ -58,24 +61,29 @@ def train_base(
     monitor_grad_norms=False,
     device_batch_size=32,
     use_nanochat_dataloader=False,
-    max_seq_len=2048,
+    architecture_config=None,
+    max_seq_len=_UNSET,
     tokenizer_model=None,
     vocab_size=-1,
     pat_str=None,
     train_tokenizer=False,
-    depth=12,
-    aspect_ratio=64,
-    d_head=128,
-    act_func="relu_squared",
+    depth=_UNSET,
+    aspect_ratio=_UNSET,
+    d_head=_UNSET,
+    act_func=_UNSET,
     fp8_ffn_forward=False,
-    n_kv_heads=None,
-    tie_embeddings="embs;value_embs;head",
-    window_pattern=None,
-    window_size=None,
-    softcap=18.0,
-    attn_softcap=None,
-    attn_impl='sdpa',
-    use_packed_attn_kernel=False,
+    n_kv_heads=_UNSET,
+    tie_embeddings=_UNSET,
+    disable_value_embeds=_UNSET,
+    freeze_res_connections=_UNSET,
+    res_h=_UNSET,
+    res_x0=_UNSET,
+    window_pattern=_UNSET,
+    window_size=_UNSET,
+    softcap=_UNSET,
+    attn_softcap=_UNSET,
+    attn_impl=_UNSET,
+    use_packed_attn_kernel=_UNSET,
     num_steps=-1,
     stop_after_step=None,
     cuda_graph_mode=None,
@@ -107,7 +115,7 @@ def train_base(
         if not isinstance(optim_config, OptimizerConfig):
             raise TypeError("optim_config must be a loaded OptimizerConfig")
     model_dir = str(model_dir or get_cache_dir() / "models")
-    parameters = locals().copy()
+    parameters = {key: value for key, value in locals().items() if value is not _UNSET}
     import os
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -343,6 +351,13 @@ def build_auto_config(parameters: dict, device, comp_info: ComputeContext):
     """Construct the existing auto configuration independently of training."""
     from gpt_lab.model.auto import AutoGPTConfig
 
+    architecture = {
+        key: parameters[key] for key in AutoGPTConfig.architecture_fields
+        if key in parameters
+    }
+    if parameters.get("architecture_config") is None:
+        # Keep the training entry point's historical defaults.
+        architecture = {"depth": 12, "d_head": 128} | architecture
     return AutoGPTConfig(
         # metadata
         name=parameters["model_name"],
@@ -350,25 +365,14 @@ def build_auto_config(parameters: dict, device, comp_info: ComputeContext):
         dirname=parameters["model_dir"],
         random_seed=parameters["random_seed"],
         comp_info=comp_info,
-        max_seq_len=parameters["max_seq_len"],
         # tokenizer
         tokenizer_model="auto" if parameters["train_tokenizer"] else parameters.get("tokenizer_model"),
         train_tokenizer=parameters["train_tokenizer"],
         vocab_size=parameters["vocab_size"],
         pat_str=parameters["pat_str"],
         # model architecture
-        depth=parameters["depth"],
-        aspect_ratio=parameters["aspect_ratio"],
-        d_head=parameters["d_head"],
-        act_func=parameters.get("act_func", "relu_squared"),
-        n_kv_heads=parameters["n_kv_heads"],
-        tie_embeddings=parameters["tie_embeddings"],
-        window_pattern=parameters["window_pattern"],
-        window_size=parameters["window_size"],
-        softcap=parameters["softcap"],
-        attn_softcap=parameters["attn_softcap"],
-        attn_impl=parameters["attn_impl"],
-        use_packed_attn_kernel=parameters.get("use_packed_attn_kernel", False),
+        architecture_config=parameters.get("architecture_config"),
+        **architecture,
         # training horizon targets
         n_steps=parameters["num_steps"],
         target_flops=parameters["target_flops"],
