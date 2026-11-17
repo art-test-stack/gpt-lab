@@ -364,13 +364,14 @@ def _load_flash_attn_functions(backend):
     _initialize_flash_attention()
     flash_attention_is_installed = _flash_attn is not None
     automatic = backend is None
+    fa2_packed = getattr(_flash_attn2, 'flash_attn_qkvpacked_func', None) if automatic else None
     if automatic:
         backend = 'fa3' if flash_attention_is_installed else 'sdpa'
     if backend in ('sdpa', 'torch', 'raw'):
         separate = _sdpa_func if backend == 'sdpa' else partial(_unsupported_attention, _backend=backend)
         packed = _sdpa_qkvpacked_func if automatic else partial(_unsupported_packed, _backend=backend)
-        if automatic and _flash_attn2 is not None:
-            packed = partial(_automatic_qkvpacked, _function=_flash_attn2.flash_attn_qkvpacked_func,
+        if callable(fa2_packed):
+            packed = partial(_automatic_qkvpacked, _function=fa2_packed,
                              _fallback=packed)
         return dict(
             flash_attn_func=separate, flash_attn_qkvpacked_func=packed,
@@ -394,8 +395,8 @@ def _load_flash_attn_functions(backend):
         if callable(packed):
             packed = partial(_hub_call, _function=packed, _options=options['flash_attn_qkvpacked_func'], _backend=backend)
         separate = partial(_hub_func, _function=function, _packed=packed)
-    if automatic and _flash_attn2 is not None:
-        packed_call = partial(_automatic_qkvpacked, _function=_flash_attn2.flash_attn_qkvpacked_func,
+    if callable(fa2_packed):
+        packed_call = partial(_automatic_qkvpacked, _function=fa2_packed,
                               _fallback=packed_call)
     cache = getattr(kernel, 'flash_attn_with_kvcache', None)
     cache_call = (partial(_native_with_kvcache, _function=cache) if callable(cache)
@@ -490,8 +491,9 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
             ignored by the implicit SDPA/FA2 paths.
         backend: "fa3" for an explicit packed call. None retains implicit
             dispatch: already-loaded FA2 takes priority for eligible BF16 causal
-            (512, 0) calls, followed by FA3 when loaded, otherwise SDPA. Other
-            explicit backends raise ValueError before backend loading.
+            (512, 0) calls when its packed entrypoint is callable, followed by
+            FA3 when loaded, otherwise SDPA. Other explicit backends raise
+            ValueError before backend loading.
 
     Returns:
         Attention output of shape (batch_size, seqlen, nheads_q, headdim).

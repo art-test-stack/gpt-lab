@@ -233,6 +233,38 @@ def test_implicit_packed_dispatch_preserves_fa2_priority(monkeypatch, entrypoint
     assert calls == [expected]
 
 
+@pytest.mark.parametrize("fa3_loaded", [False, True])
+@pytest.mark.parametrize("packed_entrypoint", ["missing", "not_callable"])
+def test_implicit_separate_and_cache_allow_fa2_without_packed(monkeypatch, fa3_loaded, packed_entrypoint):
+    attention = import_module("gpt_lab.model.flash_attn")
+    fa2 = SimpleNamespace(flash_attn_func=attention._sdpa_fallback)
+    if packed_entrypoint == "not_callable":
+        fa2.flash_attn_qkvpacked_func = object()
+    fa3 = SimpleNamespace(flash_attn_func=attention._sdpa_fallback,
+        flash_attn_qkvpacked_func=attention._sdpa_qkvpacked_func,
+        flash_attn_with_kvcache=attention._sdpa_with_kvcache)
+    monkeypatch.setattr(attention, "_flash_attn_initialized", True)
+    monkeypatch.setattr(attention, "_flash_attn", fa3 if fa3_loaded else None)
+    monkeypatch.setattr(attention, "_flash_attn2", fa2)
+    q, k, v = torch.randn(3, 1, 4, 2, 8).unbind(0)
+    expected = attention._sdpa_func(q, k, v, causal=True)
+
+    output = attention.flash_attn_func(q, k, v, causal=True)
+    torch.testing.assert_close(output, expected)
+    k_cache, v_cache = torch.zeros_like(k), torch.zeros_like(v)
+    cached = attention.flash_attn_with_kvcache(q, k_cache, v_cache, k, v,
+        cache_seqlens=torch.zeros(1, dtype=torch.int32), causal=True)
+    torch.testing.assert_close(cached, expected)
+    torch.testing.assert_close(k_cache, k)
+    torch.testing.assert_close(v_cache, v)
+    tensor = torch.stack((q, k, v), dim=2).bfloat16()
+    qkv = SimpleNamespace(is_cuda=True, dtype=tensor.dtype, size=tensor.size,
+                          to=tensor.to, unbind=tensor.unbind)
+    packed = attention.flash_attn_qkvpacked_func(qkv, causal=True, window_size=(512, 0))
+    expected_packed = attention._sdpa_qkvpacked_func(tensor, causal=True, window_size=(512, 0))
+    torch.testing.assert_close(packed, expected_packed)
+
+
 def test_custom_kernel_kvcache_dispatch(monkeypatch):
     attention = import_module("gpt_lab.model.flash_attn")
     q = torch.randn(1, 1, 2, 8)
