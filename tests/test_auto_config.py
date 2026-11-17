@@ -45,10 +45,10 @@ def _auto_config(tmp_path: Path, **overrides) -> AutoGPTConfig:
 
 
 @pytest.mark.parametrize("kv_heads, expected_parameters", [
-    (3, 565_051_416),
-    (12, 607_518_744),
+    (None, 370_704_408),
+    (3, 349_470_744),
 ])
-def test_llama_preset_with_gpt2_and_mha_override(monkeypatch, tmp_path, kv_heads, expected_parameters):
+def test_llama_preset_with_gpt2_and_gqa_override(monkeypatch, tmp_path, kv_heads, expected_parameters):
     from gpt_lab.cli.parser import build_parser
     from gpt_lab.model.layers import Linear
     from gpt_lab.workflows.train_base import build_auto_config
@@ -71,12 +71,12 @@ def test_llama_preset_with_gpt2_and_mha_override(monkeypatch, tmp_path, kv_heads
         "--tokenizer-model", "gpt2", "--model-name", "preset", "--run-name", "test",
         "--model-dir", str(tmp_path), "--max-seq-len", "8", "--device-batch-size", "1",
         "--total-batch-size", "64", "--num-steps", "1",
-    ] + (["--n-kv-heads", str(kv_heads)] if kv_heads != 3 else []))
+    ] + (["--n-kv-heads", str(kv_heads)] if kv_heads is not None else []))
     generated = build_auto_config(vars(args), "meta", ComputeContext(device=torch.device("cpu")))
     config = generated.model_cfg
     assert loaded == ["gpt2"]
-    assert (config.n_layers, config.d_model, config.d_ffn) == (12, 1536, 6144)
-    assert (config.n_heads, config.n_kv_heads) == (12, kv_heads)
+    assert (config.n_layers, config.d_model, config.d_ffn) == (12, 1152, 4608)
+    assert (config.n_heads, config.n_kv_heads) == (9, kv_heads or 9)
     assert config.act_func == "swiglu"
     assert config.disable_value_embeds and config.freeze_res_connections
     assert (config.res_h, config.res_x0) == (1.0, 0.0)
@@ -86,6 +86,32 @@ def test_llama_preset_with_gpt2_and_mha_override(monkeypatch, tmp_path, kv_heads
     assert sum(p.numel() for p in model.parameters() if not p.requires_grad) == 24
     assert generated.base_train["target_tokens"] == int(11 * model.n_scaling_params())
     assert generated.base_train["n_flops_per_token"] == model.estimate_flops()
+
+
+def test_llama_d16_mha_training_sizing_on_four_devices(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from gpt_lab.model.layers import Linear
+
+    monkeypatch.setattr(Linear.__init__, "__defaults__", (False, torch.device("meta"), None))
+    config = AutoGPTConfig(
+        architecture_config=Path(__file__).resolve().parents[1] / "configs/llama3.yaml",
+        depth=16, tokenizer_model="gpt2", target_param_data_ratio=15,
+        device_batch_size=16, dirname=tmp_path, run_name="sizing",
+        comp_info=ComputeContext(
+            device=torch.device("cpu"),
+            mesh=SimpleNamespace(size=lambda: 4, get_rank=lambda: 0),
+        ),
+    )
+    model = config.build_meta_model_from_depth(config.depth, 50_257)
+    reference = config.build_meta_model_from_depth(config.reference_depth(), 50_257)
+    assert all(p.device.type == "meta" for m in (model, reference) for p in m.parameters())
+    assert (model.config.n_layers, model.config.d_model, model.config.d_ffn) == (16, 1536, 6144)
+    assert (model.config.n_heads, model.config.n_kv_heads) == (12, 12)
+    assert (reference.config.n_heads, reference.config.n_kv_heads) == (9, 9)
+    assert model.n_params == 758_513_696
+    assert model.n_scaling_params() == 681_246_720
+    training = config.build_training_config(model, reference)
+    assert (training["n_steps"], training["n_acc_steps"], training["total_batch_size"]) == (19490, 4, 524288)
 
 
 def test_architecture_yaml_overrides_apply_before_scaling(monkeypatch, tmp_path):
