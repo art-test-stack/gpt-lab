@@ -186,6 +186,44 @@ def test_joint_update_and_checkpoint_keep_legacy_layout(tmp_path, opt_name):
                 optimizer.load_state_dict(load_tensor_state(path))
 
 
+@pytest.mark.parametrize("opt_name", ["muon", "normuon"])
+@pytest.mark.parametrize("splits,muon_calls", [
+    (None, ["compiled"]),
+    ((8, 2, 2), ["eager", "eager"]),
+    ((2,) * 6, ["compiled"]),
+])
+def test_qkv_batches_share_storage_and_limit_cpu_fallback(monkeypatch, opt_name, splits, muon_calls):
+    params = [torch.nn.Parameter(torch.randn(12, 8)) for _ in range(2)]
+    group = dict(params=params, opt=opt_name, lr=0.02, momentum=0.95, beta=0.9, ns_steps=5, weight_decay=0.1)
+    if splits is not None:
+        group["qkv_split_sizes"] = splits
+    optimizer = OptimizerFactory([group], comp_info=ComputeContext(device=torch.device("cpu")))
+    strategy = optimizer.backend.strategies[opt_name]
+    kernel = strategy.step_kernel.__wrapped__
+    calls, storage = [], []
+
+    def observe(kind, *args, **kwargs):
+        calls.append(kind)
+        storage.append(tuple(t.untyped_storage().data_ptr() for t in args[:3]))
+        kernel(*args, **kwargs)
+
+    def eager(*args, **kwargs):
+        observe("eager", *args, **kwargs)
+
+    def compiled(*args, **kwargs):
+        observe("compiled", *args, **kwargs)
+
+    compiled.__wrapped__ = eager
+    monkeypatch.setattr(type(strategy), "step_kernel", staticmethod(compiled))
+    for p in params:
+        p.grad = torch.randn_like(p)
+    optimizer.step()
+
+    assert calls == (muon_calls if opt_name == "muon" else ["compiled"] * len(muon_calls))
+    assert all(pointers == storage[0] for pointers in storage)
+    assert storage[0][2] == optimizer.state[params[0]]["momentum_buffer"].untyped_storage().data_ptr()
+
+
 def _reference_normuon_update(grad, momentum, second_moment, beta, beta2, steps):
     # Unbatched official reference; MIT (c) 2025 zichongli5, LICENSES/NorMuon-MIT.txt.
     momentum.lerp_(grad, 1 - beta)
