@@ -168,7 +168,8 @@ class CausalSelfAttention(Module):
         self.o_proj = Linear(config.d_model, config.d_model, bias=False)
 
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_heads, bias=False) if has_ve(layer_idx, config.n_layers) else None
+        self.ve_gate = (Linear(self.ve_gate_channels, self.n_kv_heads, bias=False)
+                        if not config.disable_value_embeds and has_ve(layer_idx, config.n_layers) else None)
 
     @torch.no_grad()
     def init_weights(self) -> None:
