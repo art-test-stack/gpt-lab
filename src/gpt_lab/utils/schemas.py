@@ -296,6 +296,10 @@ class TransformerConfig(BaseModel):
     n_layers: int = NUM_LAYERS
     d_head: int = DIM_HEAD  # dim_model // num_heads
     tie_embeddings: str = "embs;value_embs;head"
+    disable_value_embeds: bool = False
+    freeze_res_connections: bool = False
+    res_h: Optional[float] = Field(default=None, allow_inf_nan=False)
+    res_x0: Optional[float] = Field(default=None, allow_inf_nan=False)
 
     dropout: float = .0 # DROPOUT
     attention_dropout: Optional[float] = None
@@ -332,6 +336,11 @@ class TransformerConfig(BaseModel):
         
         object.__setattr__(self, "n_kv_heads", self.n_kv_heads or self.n_heads)
         groups = parse_embedding_groups(self.tie_embeddings)
+        if self.disable_value_embeds and any(
+            token.strip().removesuffix(":") == "value_embs"
+            for part in self.tie_embeddings.split(";") for token in part.split(",")
+        ):
+            raise ValueError("tie_embeddings mentions value_embs, but value embeddings are disabled")
         if any("value_embs" in group and len(group) > 1 for group in groups) and self.n_kv_heads * self.d_head != self.d_model:
             raise ValueError(
                 "Tying value_embs to embs or head requires n_kv_heads * d_head == d_model; "
