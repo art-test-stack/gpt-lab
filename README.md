@@ -233,6 +233,66 @@ The library provides a minimalistic automatic configuration system that computes
 
 Subclass `AutoGPTConfig` to override individual scaling rules; see its [class docstring](./src/gpt_lab/model/auto.py) for the methods and an example.
 
+Pass `architecture_config="configs/my-architecture.yaml"` to `AutoGPTConfig`
+to load architecture defaults from a flat YAML mapping, using its field names
+(for example, `act_func: swiglu` and `d_head: 128`). Explicit constructor fields
+override the file, including `False` and `None`. The resolved architecture is
+used for the vocabulary probe, target model, and reference model before training
+scaling is computed. Training and tokenizer settings do not belong in this file.
+Saved configurations contain the resolved values and do not require the YAML
+file when loaded again.
+
+The CLI accepts the same file with `--architecture-config <path>`. Omitted
+architecture options use the file, while explicit options override it.
+`--disable-value-embeds` removes value embedding tables and gates; `value_embs`
+must then be absent from `--tie-embeddings` (for example, use `'embs;head'`).
+`--freeze-res-connections` makes the residual mixing parameters non-trainable
+and excludes them from the optimizer. Both flags accept an optional `true` or
+`false`; a bare flag means `true`. Explicit `false` reverses a preset setting.
+Set `--res-h 1 --res-x0 0` to preserve the hidden stream without blending the
+initial embeddings at each layer. These values can also be set as `res_h` and
+`res_x0` in YAML; omitted values retain the existing initialization schedules.
+The switches and residual values are saved with the model configuration.
+Existing checkpoints default to enabled value embeddings and trainable residuals.
+
+Use `gpt-lab train --architecture-config configs/llama3.yaml --tokenizer-model gpt2`
+for the Llama-3-style preset with the GPT-2 tokenizer. Its `aspect_ratio: 128`
+comes from Llama 3 8B's width/depth ratio, `4096 / 32`. With `d_head: 128`, the
+default depth of 12 gives width 1536, 12 query heads, and three fixed KV heads,
+preserving four query heads per KV head at that depth. Add `--n-kv-heads 12` for
+MHA. GQA depth overrides must be divisible by three; explicit KV-head overrides
+must divide both target and reference query head counts. Width scaling keeps its
+existing rules. RMSNorm stays parameter-free;
+this preset retains the current input/Q/K normalization, logit softcap, and 4x
+FFN width, so it does not reproduce the original Llama 3 equations exactly.
+With 50,257 vocabulary entries, padded to 50,304 embedding rows, it contains
+565,051,416 parameters including 24 frozen residual scalars (counted on meta).
+
+The width/depth ratio is a sizing choice, not a constant across the Llama family:
+
+| Published model | Hidden width | Layers | Width / layers |
+| --- | ---: | ---: | ---: |
+| Llama 3 8B | 4096 | 32 | 128 |
+| Llama 3 70B | 8192 | 80 | 102.4 |
+| Llama 3.1 405B | 16384 | 126 | 130.03 |
+
+Dimensions come from [Meta's report, Table 3](https://arxiv.org/html/2407.21783v3#S3.T3).
+
+Changing the aspect ratio and model components does **not** recalibrate the
+existing scaling laws. Automatic training settings for this preset are
+experimental: the 12-layer reference model now has this architecture too, while
+the reference batch size remains 524,288 tokens. The data/parameter target
+(default 11), batch-size exponent (0.383), batch learning-rate multiplier,
+weight-decay correction, and embedding/head learning-rate width correction
+(`sqrt(768 / d_model)`) have not been validated for this variant. Parameter and
+FLOPs counts are recomputed from the resolved model; that accounting does not
+establish optimal training settings. The vocabulary-sizing rule is also
+unchanged and remains unverified here. `--tokenizer-model gpt2` bypasses that
+estimate and uses the loaded tokenizer's vocabulary. Explicit batch size and
+`--num-steps` can bypass automatic batch and horizon sizing; optimizer profiles
+still receive the existing batch/width/decay multipliers. No training calibration
+or hardware throughput measurement is implied by this preset.
+
 The system is based on the `AutoConfig` class (available in [`gpt_lab.model.auto.py`](./src/gpt_lab/model/auto.py)) and is used by `gpt-lab train`; [`scripts/train_base.py`](./scripts/train_base.py) delegates to the same command.
 
 It automatically determines:
