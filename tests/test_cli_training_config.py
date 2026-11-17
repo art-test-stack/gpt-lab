@@ -54,21 +54,64 @@ def test_normuon_override_profile():
     assert groups["embeddings"]["opt"] == groups["head"]["opt"] == "adamw"
 
 
-@pytest.mark.parametrize("mode,splits", [
-    ("joint", ()), ("projection", (16, 8, 8)), ("head", (8, 8, 8, 8)),
-])
-def test_qkv_optimizer_profile_keeps_one_projection_per_layer(tmp_path, mode, splits):
+@pytest.mark.parametrize("mode", ["joint", "projection", "head"])
+@pytest.mark.parametrize("kv_heads", [1, 2])
+@pytest.mark.parametrize("opt_name", ["muon", "normuon"])
+def test_qkv_optimizer_profile_keeps_one_projection_per_layer(tmp_path, monkeypatch, mode, kv_heads, opt_name):
     path = tmp_path / "optimizer.yaml"
-    path.write_text(f"transformer:\n  muon_qkv: {mode}\n")
+    path.write_text(f"transformer:\n  opt: {opt_name}\n  muon_qkv: {mode}\n")
     profile = OptimizerConfig.from_file(path)
     config = TrainerConfig(optim_config=profile, comp_info=ComputeContext(device=torch.device("cpu")))
     model = build_meta_model(TransformerConfig(
-        vocab_size=300, max_context=4, d_model=16, d_ffn=32,
-        n_heads=2, n_kv_heads=1, n_layers=2, d_head=8, window_pattern="L",
+        vocab_size=300, max_context=4, d_model=16, d_ffn=(2 + 2 * kv_heads) * 8,
+        n_heads=2, n_kv_heads=kv_heads, n_layers=2, d_head=8, window_pattern="L",
+        attn_impl="sdpa",
     )).to_empty(device="cpu")
-    optimizer = model.build_optimizer(config)
+    model.init_weights()
+    model.precompute_pos_enc()
+    with torch.no_grad():
+        for block in model.blocks:
+            block.attention.o_proj.weight.normal_(std=0.1)
     qkv_params = {block.attention.qkv_proj.weight for block in model.blocks}
-    assert all(param.shape == (32, 16) for param in qkv_params)
+    names = dict(model.named_parameters())
+    assert {name for name in names if "qkv_proj" in name} == {
+        f"blocks.{i}.attention.qkv_proj.weight" for i in range(2)
+    }
+    assert all(param.shape == ((2 + 2 * kv_heads) * 8, 16) for param in qkv_params)
+    projection_calls = []
+    linear = torch.nn.functional.linear
+
+    def observe_linear(x, weight, bias=None):
+        if weight in qkv_params:
+            projection_calls.append(weight)
+        return linear(x, weight, bias)
+
+    monkeypatch.setattr(torch.nn.functional, "linear", observe_linear)
+    ids = torch.randint(0, 300, (2, 4))
+    before = model(ids, ids)
+    before.loss.backward()
+    gradients = {name: p.grad.clone() if p.grad is not None else None for name, p in names.items()}
+    assert len(projection_calls) == 2
+    model.zero_grad(set_to_none=True)
+    projection_calls.clear()
+
+    optimizer = model.build_optimizer(config)
+    assert dict(model.named_parameters()).keys() == names.keys()
+    assert all(names[name] is p for name, p in model.named_parameters())
+    assert not optimizer.state
+    after = model(ids, ids)
+    after.loss.backward()
+    torch.testing.assert_close(after.logits, before.logits)
+    torch.testing.assert_close(after.loss, before.loss)
+    assert len(projection_calls) == 2
+    for name, p in model.named_parameters():
+        if gradients[name] is None:
+            assert p.grad is None
+        else:
+            torch.testing.assert_close(p.grad, gradients[name])
+
+    splits = ((16, kv_heads * 8, kv_heads * 8) if mode == "projection"
+              else (8,) * (2 + 2 * kv_heads) if mode == "head" else ())
     for group in optimizer.param_groups:
         params = set(group["params"])
         if params & qkv_params:
