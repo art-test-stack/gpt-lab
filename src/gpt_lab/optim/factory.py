@@ -114,6 +114,8 @@ class OptimizerFactory(torch.optim.Optimizer):
         for current, saved in zip(self.param_groups, state_dict["param_groups"]):
             if tuple(current.get("qkv_split_sizes", ())) != tuple(saved.get("qkv_split_sizes", ())):
                 raise ValueError("Cannot resume with a different Muon QKV split layout")
+            if current.get("qkv_pairing") != saved.get("qkv_pairing"):
+                raise ValueError("Cannot resume with a different Muon Q/K pairing")
         if self.communication is not None:
             self.communication.reset()
         super().load_state_dict(state_dict)
