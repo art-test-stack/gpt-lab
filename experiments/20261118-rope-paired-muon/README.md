@@ -68,7 +68,9 @@ and two accumulation microsteps for 524,288 tokens per update. It schedules
 19,490 updates with a 1,300-update warmup and stops after update 400. At that
 endpoint it runs BPB on 4,194,304 tokens and CORE on up to 500 examples per
 task, then saves the final sharded checkpoint. Logs and checkpoints are in
-`gpt-lab-runs` under `/<run-name>/<arm>/`. Q/K diagnostics go to W&B.
+`gpt-lab-runs` under `/<run-name>/<arm>/`. The console shows arm starts,
+finishes, and errors. `train.log` contains full worker output and per-rank
+timings. W&B shows live training metrics, evaluation metrics, and Q/K norms.
 
 ## Polar check
 
