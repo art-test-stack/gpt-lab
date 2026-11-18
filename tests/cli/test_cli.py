@@ -93,6 +93,46 @@ def test_cli_accepts_custom_attention_kernel():
     assert args.attn_impl == "example/attention"
 
 
+@pytest.mark.parametrize('opt_name', ['muon', 'normuon'])
+@pytest.mark.parametrize('mode', [None, 'joint', 'projection', 'head'])
+def test_qkv_cli_override_is_applied_to_optimizer_profile(tmp_path, monkeypatch, opt_name, mode):
+    execute = Mock()
+    monkeypatch.setitem(sys.modules, 'gpt_lab.workflows.train_base', SimpleNamespace(train_base=execute))
+    path = tmp_path / 'optimizer.yaml'
+    contents = f'transformer:\n  opt: {opt_name}\n  muon_qkv: head\n'
+    path.write_text(contents)
+    argv = ['train', 'auto', '--optim-config-path', str(path)]
+    if mode is not None:
+        argv += ['--muon-qkv', mode]
+    main(argv)
+    execute.assert_called_once()
+    keywords = execute.call_args.kwargs
+    transformer = keywords['optim_config'].group_configs()['transformer']
+    assert transformer['muon_qkv'] == (mode or 'head')
+    assert transformer['opt'] == opt_name
+    assert transformer['lr'] == 0.02
+    assert 'muon_qkv' not in keywords
+    assert path.read_text() == contents
+
+
+def test_qkv_cli_override_rejects_other_optimizers(tmp_path, monkeypatch, capsys):
+    execute = Mock()
+    monkeypatch.setitem(sys.modules, 'gpt_lab.workflows.train_base', SimpleNamespace(train_base=execute))
+    path = tmp_path / 'optimizer.yaml'
+    path.write_text('transformer:\n  opt: adamw\n  betas: [0.9, 0.95]\n')
+    with pytest.raises(SystemExit) as error:
+        main(['train', '--optim-config-path', str(path), '--muon-qkv', 'projection'])
+    assert error.value.code == 2
+    assert 'Unsupported optimizer parameters in transformer' in capsys.readouterr().err
+    execute.assert_not_called()
+
+
+def test_qkv_cli_override_rejects_invalid_mode():
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(['train', '--muon-qkv', 'separated'])
+    assert error.value.code == 2
+
+
 def test_important_training_defaults():
     args = build_parser().parse_args(['train'])
     expected = dict(model_init='auto', model_name='ic1', run_name=None,
@@ -138,6 +178,7 @@ def test_resume_step_parsing(value, expected):
 @pytest.mark.parametrize('option', [
     '--depth 4', '--max-seq-len 128', '--d-head 64', '--n-kv-heads 2',
     '--vocab-size 4096', '--tokenizer-model gpt2', '--tie-embeddings embs,head',
+    '--muon-qkv projection',
 ])
 def test_resume_rejects_architecture_options(option):
     with pytest.raises(SystemExit) as error:

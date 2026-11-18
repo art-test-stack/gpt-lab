@@ -608,6 +608,35 @@ NorMuon uses a compiled update kernel; fusion may change intermediate BF16
 rounding relative to the eager reference implementation.
 
 Use `--optim-config-path configs/normuon.yaml` for a NorMuon override profile.
+For Muon or NorMuon, an optimizer YAML override can select the QKV update granularity.
+
+```yaml
+transformer:
+  muon_qkv: projection
+```
+
+Fresh runs can also pass `--muon-qkv joint|projection|head` to `gpt-lab train auto`;
+an explicit CLI value overrides the loaded optimizer YAML profile.
+
+- `joint` (default) updates the entire QKV matrix together.
+- `projection` updates Q, K, and V independently, including unequal row counts in GQA.
+- `head` updates each Q, K, and V head independently.
+
+All modes retain one fused QKV linear projection. Attention dispatch and the packed-attention
+opt-in are independent of this setting. Split modes reuse the compiled optimizer step on
+batches of equal-sized blocks, with normalization and learning-rate scaling based on each
+logical matrix shape. Resume with the same split layout to restore momentum and variance state.
+The default `joint` mode retains the existing optimizer checkpoint layout; incompatible split
+layouts are rejected on load.
+
+Splitting uses writable views of the existing stacked optimizer buffers. MHA projection and
+head modes each use one batched step; unequal-width GQA projections use two (Q, then K/V).
+Muon head splitting can increase factored variance storage: wide heads keep one value per input
+column per head, while the joint tall matrix keeps one per output row. NorMuon keeps row-wise
+variance in every mode. On CPU, noncontiguous Muon blocks use the existing eager kernel to avoid
+a PyTorch 2.11 Inductor fusion failure; contiguous CPU batches and CUDA keep the compiled path.
+Throughput and peak memory for these modes have not been benchmarked.
+
 Explicit preserved Muon/NorMuon/spectral-only ANVIL experiment profiles are in
 [optimizer comparison](experiments/optimizer_comparison/README.md).
 Its hyperparameters are starting values, not calibrated replacements for the

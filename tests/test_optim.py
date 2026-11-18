@@ -94,6 +94,136 @@ def test_legacy_checkpoint_gets_schedule_baselines(opt_name):
     assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.07)
 
 
+@pytest.mark.parametrize("opt_name", ["muon", "normuon"])
+@pytest.mark.parametrize("splits", [(8, 8, 8), (8, 2, 2), (2,) * 12, (2,) * 6])
+def test_split_qkv_matches_independent_matrices_after_resume(tmp_path, opt_name, splits):
+    generator = torch.Generator().manual_seed(35)
+    packed = [torch.nn.Parameter(torch.randn(sum(splits), 8, generator=generator)) for _ in range(2)]
+    parts = [[torch.nn.Parameter(block.clone()) for block in p.detach().split(splits)] for p in packed]
+    settings = dict(opt=opt_name, lr=0.02, momentum=0.95, beta=0.9, ns_steps=5, weight_decay=0.1)
+    context = ComputeContext(device=torch.device("cpu"))
+    group = dict(params=packed, qkv_split_sizes=splits, **settings)
+    optimizer = OptimizerFactory([group], comp_info=context)
+    reference = OptimizerFactory([dict(params=list(blocks), **settings) for blocks in zip(*parts)], comp_info=context)
+
+    with torch.compiler.set_stance("force_eager"):
+        for step in range(3):
+            for p, matrices in zip(packed, parts):
+                p.grad = torch.randn(p.shape, generator=generator)
+                for part, grad in zip(matrices, p.grad.split(splits)):
+                    part.grad = grad.clone()
+            optimizer.step()
+            reference.step()
+            for p, matrices in zip(packed, parts):
+                torch.testing.assert_close(p, torch.cat(matrices))
+
+            state = optimizer.state[packed[0]]
+            expected_momentum = torch.cat([
+                reference.state[part]["momentum_buffer"] for part in parts[0]
+            ], dim=1)
+            torch.testing.assert_close(state["momentum_buffer"], expected_momentum)
+            offset, block = 0, 0
+            for key, variance in state.items():
+                if key == "momentum_buffer":
+                    continue
+                assert key == f"second_momentum_buffer_{offset}"
+                for actual in variance.unbind(1):
+                    expected = reference.state[parts[0][block]]["second_momentum_buffer"]
+                    torch.testing.assert_close(actual, expected)
+                    offset += splits[block]
+                    block += 1
+            assert block == len(splits)
+
+            if step == 0:
+                path = tmp_path / "optimizer.safetensors"
+                save_tensor_state(optimizer.state_dict(), path)
+                saved = load_tensor_state(path)
+                optimizer = OptimizerFactory([group], comp_info=context)
+                optimizer.load_state_dict(saved)
+                for other_layout in (None, (sum(splits) // 2,) * 2):
+                    other_group = dict(params=packed, **settings)
+                    if other_layout is not None:
+                        other_group["qkv_split_sizes"] = other_layout
+                    incompatible = OptimizerFactory([other_group], comp_info=context)
+                    with pytest.raises(ValueError, match="different Muon QKV split layout"):
+                        incompatible.load_state_dict(saved)
+
+
+@pytest.mark.parametrize("opt_name", ["muon", "normuon"])
+def test_joint_update_and_checkpoint_keep_legacy_layout(tmp_path, opt_name):
+    from gpt_lab.optim.kernels.normuon import normuon_step_fused
+
+    generator = torch.Generator().manual_seed(50)
+    params = [torch.nn.Parameter(torch.randn(12, 4, generator=generator)) for _ in range(2)]
+    weights = torch.stack(params).detach()
+    momentum = torch.zeros_like(weights)
+    variance = torch.zeros(2, 12, 1)
+    settings = dict(opt=opt_name, lr=0.02, momentum=0.95, beta=0.9, ns_steps=5, weight_decay=0.1)
+    context = ComputeContext(device=torch.device("cpu"))
+    optimizer = OptimizerFactory([dict(params=params, **settings)], comp_info=context)
+    kernel = muon_step_fused if opt_name == "muon" else normuon_step_fused
+    lr = settings["lr"] * (3 ** 0.5 if opt_name == "muon" else 1)
+
+    with torch.compiler.set_stance("force_eager"):
+        for step in range(3):
+            for p in params:
+                p.grad = torch.randn(p.shape, generator=generator)
+            kernel.__wrapped__(
+                torch.stack([p.grad for p in params]), weights, momentum, variance,
+                *(torch.tensor(value) for value in (0.95, lr, 0.1, 0.9)), 5, -1, torch.float32,
+            )
+            optimizer.step()
+            torch.testing.assert_close(torch.stack(params), weights)
+            state = optimizer.state[params[0]]
+            assert set(state) == {"momentum_buffer", "second_momentum_buffer"}
+            torch.testing.assert_close(state["momentum_buffer"], momentum)
+            torch.testing.assert_close(state["second_momentum_buffer"], variance)
+            assert "qkv_split_sizes" not in optimizer.param_groups[0]
+            if step == 0:
+                path = tmp_path / "joint.safetensors"
+                save_tensor_state(optimizer.state_dict(), path)
+                optimizer = OptimizerFactory([dict(params=params, **settings)], comp_info=context)
+                optimizer.load_state_dict(load_tensor_state(path))
+
+
+@pytest.mark.parametrize("opt_name", ["muon", "normuon"])
+@pytest.mark.parametrize("splits,muon_calls", [
+    (None, ["compiled"]),
+    ((8, 2, 2), ["eager", "eager"]),
+    ((2,) * 6, ["compiled"]),
+])
+def test_qkv_batches_share_storage_and_limit_cpu_fallback(monkeypatch, opt_name, splits, muon_calls):
+    params = [torch.nn.Parameter(torch.randn(12, 8)) for _ in range(2)]
+    group = dict(params=params, opt=opt_name, lr=0.02, momentum=0.95, beta=0.9, ns_steps=5, weight_decay=0.1)
+    if splits is not None:
+        group["qkv_split_sizes"] = splits
+    optimizer = OptimizerFactory([group], comp_info=ComputeContext(device=torch.device("cpu")))
+    strategy = optimizer.backend.strategies[opt_name]
+    kernel = strategy.step_kernel.__wrapped__
+    calls, storage = [], []
+
+    def observe(kind, *args, **kwargs):
+        calls.append(kind)
+        storage.append(tuple(t.untyped_storage().data_ptr() for t in args[:3]))
+        kernel(*args, **kwargs)
+
+    def eager(*args, **kwargs):
+        observe("eager", *args, **kwargs)
+
+    def compiled(*args, **kwargs):
+        observe("compiled", *args, **kwargs)
+
+    compiled.__wrapped__ = eager
+    monkeypatch.setattr(type(strategy), "step_kernel", staticmethod(compiled))
+    for p in params:
+        p.grad = torch.randn_like(p)
+    optimizer.step()
+
+    assert calls == (muon_calls if opt_name == "muon" else ["compiled"] * len(muon_calls))
+    assert all(pointers == storage[0] for pointers in storage)
+    assert storage[0][2] == optimizer.state[params[0]]["momentum_buffer"].untyped_storage().data_ptr()
+
+
 def _reference_normuon_update(grad, momentum, second_moment, beta, beta2, steps):
     # Unbatched official reference; MIT (c) 2025 zichongli5, LICENSES/NorMuon-MIT.txt.
     momentum.lerp_(grad, 1 - beta)

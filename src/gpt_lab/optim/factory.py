@@ -111,6 +111,9 @@ class OptimizerFactory(torch.optim.Optimizer):
     
     def load_state_dict(self, state_dict: dict) -> None:
         """Load optimizer state dict."""
+        for current, saved in zip(self.param_groups, state_dict["param_groups"]):
+            if tuple(current.get("qkv_split_sizes", ())) != tuple(saved.get("qkv_split_sizes", ())):
+                raise ValueError("Cannot resume with a different Muon QKV split layout")
         if self.communication is not None:
             self.communication.reset()
         super().load_state_dict(state_dict)

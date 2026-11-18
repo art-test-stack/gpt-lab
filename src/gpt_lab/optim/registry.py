@@ -56,6 +56,18 @@ def _validate_group(group: dict[str, Any], idx: int) -> None:
             f"Check that your YAML config or code defaults supply all required fields."
         )
 
+    if "qkv_split_sizes" in group:
+        splits = group["qkv_split_sizes"]
+        params = group["params"]
+        if (
+            opt_name not in ("muon", "normuon") or not params
+            or not isinstance(splits, (tuple, list)) or len(splits) < 2
+            or any(type(size) is not int or size <= 0 for size in splits)
+            or any(p.ndim != 2 or p.shape != params[0].shape for p in params)
+            or sum(splits) != params[0].shape[0]
+        ):
+            raise ValueError("qkv_split_sizes must partition the rows of same-shaped Muon or NorMuon matrices")
+
     if opt_name == "normuon":
         if not isinstance(group.get("anvil_spectral", False), bool):
             raise ValueError("NorMuon anvil_spectral must be a boolean")
