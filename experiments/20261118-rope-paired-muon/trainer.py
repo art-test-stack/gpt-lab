@@ -1,13 +1,41 @@
 """Dashboard diagnostics for the three Muon arms."""
 
 import json
+import math
+from collections import deque
 from contextlib import contextmanager
+from statistics import median
 from time import perf_counter
 
 from gpt_lab.train.trainer import Trainer
 
 
 class ExperimentTrainer(Trainer):
+    def __init__(self, *, guard_mfu=False, **kwargs):
+        super().__init__(**kwargs)
+        self.mfu_window = deque(maxlen=10) if guard_mfu else None
+
+    def update_metrics(self, step_metrics, total_dt):
+        metrics = super().update_metrics(step_metrics, total_dt)
+        completed = self.state.step + 1
+        window = self.mfu_window
+        if window is None or completed <= 10:
+            return metrics
+
+        window.append(metrics["train/mfu"])
+        if completed % 10 == 0 and len(window) == 10:
+            median_mfu = median(window)
+            metrics["train/mfu_window_median"] = median_mfu
+            if not math.isfinite(median_mfu) or median_mfu <= 40:
+                metrics["train/mfu_guard_tripped"] = 1
+                metrics["train/completed_steps"] = completed
+                self.board.log(metrics, step=self.state.step)
+                raise RuntimeError(
+                    f"MFU guard stopped after update {completed}: median MFU over updates "
+                    f"{completed - 9}–{completed} was {median_mfu:.2f}%, below the required >40%."
+                )
+        return metrics
+
     def optimizer_step(self, should_log_step):
         completed = self.state.step + 1
         endpoint = self.config.n_steps
