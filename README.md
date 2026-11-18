@@ -169,10 +169,12 @@ see the [results dashboard guide](docs/results_dashboard.md). The viewer in
 
 ### Data
 
-Training packs documents in source order within each shard. Every document starts
-with BOS, and every model row starts with BOS. A continuation row starts with an
-additional BOS and uses the next unread source token. The last target in each row
-already counts as consumed.
+Training looks ahead by up to 128 documents on each rank and picks the longest
+whole document that fits the remaining row space, including its BOS. Ties follow
+read order. If none fits, the loader splits the shortest buffered document and
+carries the rest into the next row. Every document and row starts with BOS.
+A continuation row starts with BOS and uses the next unread source token.
+The last target in each row already counts as consumed.
 
 `--data-seed` controls the one-time training shard shuffle independently of
 `--random-seed`. It defaults to 42 on fresh runs and to the checkpoint seed on
@@ -183,8 +185,9 @@ last complete update and report the short ranks.
 
 Exact resume requires the same shard manifest, rank topology, batch shape, and
 tokenizer. Keep the files at those shard IDs immutable. Checkpoints save the
-ordered IDs and each rank's next unread cursor, including its position within a
-document. Checkpoints from the previous training loader cannot resume exactly.
+ordered shard IDs, next unread cursor, ordered lookahead buffer, and pending
+document with its token offset. Source-order checkpoints cannot resume this
+packing policy exactly.
 At `--log-every` intervals, the training logger reports per-rank loader
 throughput, batch wait percentiles, BOS counts, and shard I/O with retries.
 

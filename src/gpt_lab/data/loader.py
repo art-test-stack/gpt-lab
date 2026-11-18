@@ -1,4 +1,5 @@
 from array import array
+from bisect import bisect_right, insort
 from collections import deque
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple, Union
@@ -10,6 +11,8 @@ from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import DataLoaderState
 from gpt_lab.data.sharder import ShardManager
 
+_TRAIN_LOOKAHEAD_DOCS = 128
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -18,9 +21,8 @@ class ShardedDataset:
     """
     Streams tokenized documents from sharded parquet files.
 
-    Each document is tokenized on the fly and yielded as a 1-D LongTensor
-    alongside its shard state. No packing or cross-document logic here —
-    that is the sole responsibility of DistDataLoader.
+    Each document is tokenized on the fly and yielded alongside its shard state.
+    Validation uses tensors and training keeps token lists for the checkpoint.
     """
 
     def __init__(
@@ -60,7 +62,7 @@ class ShardedDataset:
         self.start_state = start_state
         self.tokenizer_threads = tokenizer_threads
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, DataLoaderState]]:
+    def __iter__(self) -> Iterator[Tuple[Union[torch.Tensor, list[int]], DataLoaderState]]:
         batch_size = 1 if self.split == "train" else 128
         bos = self.tokenizer.get_bos_token_id() if self.split == "train" else None
         for texts, state in self.sm.iterate(start_state=self.start_state, batch_size=batch_size):
@@ -70,13 +72,15 @@ class ShardedDataset:
                     if self.tokenizer is not None
                     else txt
                 )
-                if bos is not None and (not len(tokens) or int(tokens[0]) != bos):
-                    raise ValueError("Source document must begin with BOS")
-                if not isinstance(tokens, torch.Tensor):
-                    if bos is None:
-                        tokens = torch.tensor(tokens, dtype=torch.long)
-                    else:
-                        tokens = torch.frombuffer(array("q", tokens), dtype=torch.long)
+                if bos is not None:
+                    if isinstance(tokens, torch.Tensor):
+                        if tokens.ndim != 1:
+                            raise ValueError("Source document must be a 1-D token sequence")
+                        tokens = tokens.tolist()
+                    if not len(tokens) or tokens[0] != bos:
+                        raise ValueError("Source document must begin with BOS")
+                elif not isinstance(tokens, torch.Tensor):
+                    tokens = torch.tensor(tokens, dtype=torch.long)
                 yield tokens, state
 
 
@@ -90,8 +94,8 @@ class DistDataLoader:
 
     Design notes
     ------------
-    * Training tokenizes on demand and checkpoints the raw document cursor
-      and the token offset into its unfinished document.
+    * Training uses a bounded best-fit lookahead. Checkpoints retain the
+      buffer in read order, the pending suffix, and the next raw cursor.
 
     * The validation buffer is a deque sized in tokens.
 
@@ -127,11 +131,12 @@ class DistDataLoader:
             shape = dict(
                 packing_batch_size=batch_size, packing_seq_len=seq_len,
                 packing_bos_token_id=self.bos_token_id,
+                packing_lookahead_size=_TRAIN_LOOKAHEAD_DOCS,
             )
             self.initial_state = dataset.start_state
             if self.initial_state is None:
                 self.initial_state = DataLoaderState(
-                    cursor_version=1, packing_state_version=1,
+                    cursor_version=1, packing_state_version=2,
                     manifest_id=sm.manifest_id, ordered_shard_ids=sm.ordered_shard_ids,
                     data_seed=sm.data_seed, packing_rank=sm.ddp_rank, packing_world_size=sm.world_size,
                     **shape,
@@ -139,15 +144,31 @@ class DistDataLoader:
             else:
                 state = self.initial_state
                 if any(getattr(state, name) != value for name, value in shape.items()):
-                    raise ValueError("Incompatible batch shape or BOS token in training data checkpoint")
-                if state.continuation_pending != (state.document_token_offset > 0):
+                    raise ValueError("Incompatible packing configuration in training data checkpoint")
+                pending = state.pending_document
+                offset = state.document_token_offset
+                if (state.continuation_pending != (pending is not None)
+                        or (pending is None and offset != 0)
+                        or (pending is not None and not (0 < offset < len(pending) and pending[0] == self.bos_token_id))):
                     raise ValueError("Incompatible continuation state in training data checkpoint")
+                if (len(state.lookahead_documents) > _TRAIN_LOOKAHEAD_DOCS
+                        or any(not doc or doc[0] != self.bos_token_id for doc in state.lookahead_documents)):
+                    raise ValueError("Invalid lookahead buffer in training data checkpoint")
                 if not (0 <= state.shard_idx <= len(sm.shard_idx) and
-                        min(state.row_group_idx, state.offset_in_row_group, state.document_token_offset) >= 0):
+                        min(state.row_group_idx, state.offset_in_row_group) >= 0):
                     raise ValueError("Invalid next-unread training data cursor")
             self._source_cursor = self.initial_state
             self._document_offset = self.initial_state.document_token_offset
-            self._document = None
+            self._pending_document = self.initial_state.pending_document
+            self._document_tensor = (
+                torch.frombuffer(array("q", self._pending_document), dtype=torch.long)
+                if self._pending_document is not None else None
+            )
+            self._lookahead: list[tuple[int, int, list[int]]] = []
+            self._read_index = 0
+            for document in self.initial_state.lookahead_documents:
+                self._buffer_document(document)
+            self._source_exhausted = False
             self._exhausted = False
 
         # Pre-fetch budget for the validation stream.
@@ -195,7 +216,7 @@ class DistDataLoader:
 
     def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
         if self.initial_state is not None:
-            return self._next_bos_aligned()
+            return self._next_best_fit()
 
         self._refill()
         B, T = self.B, self.T
@@ -217,24 +238,44 @@ class DistDataLoader:
                 self.buffer.popleft()
         return self._output(self.last_state)
 
-    def _next_bos_aligned(self):
+    def _buffer_document(self, document: list[int]) -> None:
+        # The rightmost entry of a given length is the earliest to be read.
+        insort(self._lookahead, (len(document), -self._read_index, document))
+        self._read_index += 1
+
+    def _take_best_fit_document(self, space: int) -> Optional[list[int]]:
+        while len(self._lookahead) < _TRAIN_LOOKAHEAD_DOCS and not self._source_exhausted:
+            result = next(self.iterator, None)
+            if result is None:
+                self._source_exhausted = True
+                break
+            document, self._source_cursor = result
+            self._buffer_document(document)
+        if not self._lookahead:
+            return None
+        index = bisect_right(self._lookahead, (space, 1)) - 1
+        if index < 0:
+            shortest = self._lookahead[0][0]
+            index = bisect_right(self._lookahead, (shortest, 1)) - 1
+        return self._lookahead.pop(index)[2]
+
+    def _next_best_fit(self):
         if self._exhausted:
             raise StopIteration
         capacity = self.T + 1
         rows = self.cpu.view(self.B, capacity)
         rows[:, 0].fill_(self.bos_token_id)
         content = document_bos = continuation_bos = padding = 0
-        # Adapted from PR #13. A row's final target has already consumed that
-        # token, so the next row continues from the following source token.
+        # The final target already consumed its token before the continuation.
         for row_idx, row in enumerate(rows):
             pos = 0
             if self._document_offset:
                 continuation_bos += 1
                 pos = 1
             while pos < capacity:
-                if self._document is None:
-                    result = next(self.iterator, None)
-                    if result is None:
+                if self._pending_document is None:
+                    document = self._take_best_fit_document(capacity - pos)
+                    if document is None:
                         self._exhausted = True
                         if row_idx == 0 and pos == 0:
                             raise StopIteration
@@ -242,21 +283,20 @@ class DistDataLoader:
                         rows[row_idx + 1:].fill_(-1)
                         padding = (self.B - row_idx - 1) * self.T + self.T - max(0, pos - 1)
                         break
-                    self._document, self._after_document = result
-                    self._document_length = len(self._document)
-                    if self._document.ndim != 1 or self._document_offset >= self._document_length:
-                        raise ValueError("Invalid tokenized source document or saved document offset")
+                    self._pending_document = document
+                    self._document_tensor = torch.frombuffer(array("q", document), dtype=torch.long)
                 offset = self._document_offset
-                take = min(self._document_length - offset, capacity - pos)
-                row[pos:pos + take].copy_(self._document[offset:offset + take])
+                length = len(self._pending_document)
+                take = min(length - offset, capacity - pos)
+                row[pos:pos + take].copy_(self._document_tensor[offset:offset + take])
                 pos += take
                 document_bos += offset == 0
                 content += take - (offset == 0)
                 self._document_offset += take
-                if self._document_offset == self._document_length:
-                    self._document = None
+                if self._document_offset == length:
+                    self._pending_document = None
+                    self._document_tensor = None
                     self._document_offset = 0
-                    self._source_cursor = self._after_document
             if self._exhausted:
                 break
 
@@ -264,6 +304,8 @@ class DistDataLoader:
         self.last_state = self.initial_state.model_copy(update=dict(
             shard_idx=cursor.shard_idx, global_shard_idx=cursor.global_shard_idx,
             row_group_idx=cursor.row_group_idx, offset_in_row_group=cursor.offset_in_row_group,
+            lookahead_documents=tuple(entry[2] for entry in sorted(self._lookahead, key=lambda entry: -entry[1])),
+            pending_document=self._pending_document,
             document_token_offset=self._document_offset, continuation_pending=self._document_offset > 0,
             source_content_tokens=content, document_bos_tokens=document_bos,
             continuation_bos_tokens=continuation_bos, padding_positions=padding,

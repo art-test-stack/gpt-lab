@@ -802,7 +802,7 @@ class DataLoaderState(BaseModel):
     offset_in_row_group: int = 0
     epoch: int = 1
 
-    packing_state_version: Literal[0, 1] = 0
+    packing_state_version: Literal[0, 1, 2] = 0
     data_seed: Optional[int] = None
     manifest_id: Optional[str] = None
     ordered_shard_ids: tuple[int, ...] = ()
@@ -811,7 +811,9 @@ class DataLoaderState(BaseModel):
     packing_batch_size: Optional[int] = None
     packing_seq_len: Optional[int] = None
     packing_bos_token_id: Optional[int] = None
-    # The raw cursor points to this document until its last token is consumed.
+    packing_lookahead_size: Optional[int] = None
+    lookahead_documents: tuple[list[int], ...] = ()
+    pending_document: Optional[list[int]] = None
     document_token_offset: int = 0
     continuation_pending: bool = False
 

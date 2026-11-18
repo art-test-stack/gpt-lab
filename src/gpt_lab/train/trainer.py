@@ -791,7 +791,8 @@ class Trainer:
         finite = torch.isfinite(loss_accum) if global_loss is None else math.isfinite(global_loss)
         if not finite:
             last_consumed = self.state.train_loader_state
-            last_consumed_dataloader_metadata = last_consumed.model_dump() if last_consumed is not None else None
+            exclude = {"lookahead_documents", "pending_document"} if owned_loader else None
+            last_consumed_dataloader_metadata = last_consumed.model_dump(exclude=exclude) if last_consumed is not None else None
             log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
                 f"Accumulated loss is non-finite at optimizer {step=}.\n" \
                 f"Last consumed dataloader state: {last_consumed_dataloader_metadata}.\n" \

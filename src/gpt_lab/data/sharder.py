@@ -122,6 +122,8 @@ class ShardManager:
                 self.ordered_shard_ids = start_state.ordered_shard_ids
                 if start_state.packing_state_version == 0 or start_state.cursor_version == 0:
                     error = "Legacy dataloader checkpoint cannot resume exactly"
+                elif start_state.packing_state_version == 1:
+                    error = "Source-order dataloader checkpoint cannot resume exactly with best-fit packing"
                 elif (start_state.packing_rank, start_state.packing_world_size) != (self.ddp_rank, self.world_size):
                     error = f"Incompatible training topology: saved rank/world size {start_state.packing_rank}/{start_state.packing_world_size}, current {self.ddp_rank}/{self.world_size}"
                 elif start_state.manifest_id != self.manifest_id or sorted(self.ordered_shard_ids) != canonical_ids:
