@@ -12,12 +12,15 @@ def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--pairing", choices=("real", "rope", "shuffled"), required=True)
     parser.add_argument("--benchmark-timing", action="store_true", help="Print synchronized timings per rank.")
+    parser.add_argument("--guard-mfu", action="store_true", help="Require median MFU above 40%% per 10 updates after startup.")
     register(parser)
     args = parser.parse_args()
     pairing = args.pairing
     benchmark_timing = args.benchmark_timing
+    guard_mfu = args.guard_mfu
     del args.pairing
     del args.benchmark_timing
+    del args.guard_mfu
     if args.model_init == "auto":
         if args.muon_qkv not in (None, "head"):
             parser.error("the experiment requires --muon-qkv head")
@@ -26,7 +29,10 @@ def main():
     from optimizer import configure_experiment_muon
     from trainer import BenchmarkTrainer, ExperimentTrainer
 
-    trainer_factory = partial(BenchmarkTrainer, worker_start=worker_start) if benchmark_timing else ExperimentTrainer
+    trainer_factory = (
+        partial(BenchmarkTrainer, worker_start=worker_start, guard_mfu=guard_mfu)
+        if benchmark_timing else partial(ExperimentTrainer, guard_mfu=guard_mfu)
+    )
     try:
         run(
             args,
