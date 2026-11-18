@@ -70,7 +70,8 @@ endpoint it runs BPB on 4,194,304 tokens and CORE on up to 500 examples per
 task, then saves the final sharded checkpoint. Logs and checkpoints are in
 `gpt-lab-runs` under `/<run-name>/<arm>/`. The console shows arm starts,
 finishes, and errors. `train.log` contains full worker output and per-rank
-timings. W&B shows live training metrics, evaluation metrics, and Q/K norms.
+timings. W&B shows training metrics on every update, plus evaluation metrics
+and the sampled Q/K norms.
 
 ## Polar check
 
