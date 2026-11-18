@@ -1,13 +1,16 @@
+import errno
+import hashlib
 import json
 import os
+import random
 import tempfile
-import warnings
-import errno
-from pathlib import Path
-from typing import Union, List, Optional, Tuple, Iterator, Dict
 import time
+import warnings
+from pathlib import Path
+from typing import Iterator, List, Optional, Tuple, Union
  
 import pyarrow.parquet as pq
+import torch.distributed as dist
 from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -36,19 +39,10 @@ class ShardManager:
     Supports auto-downloading missing shards from a base URL, and can be used in distributed training settings.
     This class assumes that the dataset is split into multiple Parquet files (shards) and that each shard can be read independently. 
     These shards are expected to be named in the specific format 'shard_{:05d}.parquet' (e.g., shard_00000.parquet, shard_00001.parquet, etc.) 
-    where the ids (integers) are contiguous starting from 0 until 'max_shards'.
-    
-    This class supposes a specific workflow where the last shard (i.e id = max_shards - 1) is reserved for validation and the rest (0, ..., shard_limit - 1) for training.
-
-    > [!WARNING]
-    > If 'base_url' is provided, it will attempt to download shards until it reaches 'max_shards'. If 'max_shards' is not set,
-    > it will attempt to download every shard under the following format: {base_url}/shard_00000.parquet, {base_url}/shard_00001.parquet, etc. until it encounters a missing shard.
-    > If shard names do not follow this format under the base_url, they just will be ignored.
-
-    This class provides the following features:
-        - filesystem view
-        - download engine
-        - streaming iterator
+    where the IDs are contiguous from zero. `max_shards` is the last ID
+    reserved for validation. Training takes one pass over owned shards from
+    the preceding IDs, optionally limited to `shard_limit` training shards.
+    Missing remote shards are downloaded when an assigned rank needs them.
     """
     def __init__(
         self,
@@ -64,6 +58,8 @@ class ShardManager:
         download_poll_interval: float = 1.0,
         # dist settings
         comp_info: Optional[ComputeContext] = None,
+        data_seed: Optional[int] = None,
+        start_state: Optional[DataLoaderState] = None,
     ):
         assert split in ["train", "val"], f"split must be 'train' or 'val'. Got {split=!r}."
         if cachedir is None:
@@ -77,9 +73,9 @@ class ShardManager:
         self.ds_path = ds_path
 
         metadata = self.load_metadata()
-        max_shards = max_shards or metadata.get("max_shards", None)
+        max_shards = max_shards if max_shards is not None else metadata.get("max_shards")
 
-        self.base_url = base_url
+        self.base_url = base_url or ""
         self.column_name = column_name
         self.split = split
 
@@ -89,54 +85,79 @@ class ShardManager:
         self.ddp_rank = comp_info.rank
         self.world_size = comp_info.world_size
 
-        self._session = None
-
-        if self.base_url is not None and self.base_url != "":
-            self._session = self._create_session()
-
-        if self.base_url is None:
-            self.base_url = ""
-            base_url = ""
-
-
-        if shard_limit is not None and max_shards is not None:
-            assert shard_limit <= max_shards, f"shard_limit ({shard_limit}) must be <= max_shards ({max_shards}). Got {shard_limit=}, {max_shards=}."
-        assert shard_limit is None or shard_limit >= 2, f"shard_limit must be None or >= 2 for having at least one training shard and one validation shard. Got {shard_limit=}."
-        self.shard_limit = shard_limit # shard limit is dynamic -> not in metadata
-        self.max_shards = max_shards or self.get_num_remote_shards()
-        self.target_shard = (self.shard_limit or self.max_shards) if self.split == "train" else (self.max_shards or self.shard_limit) # shards are 0, ..., max_shards
-        self.shard_idx = list(range(self.target_shard)) if self.split == "train" else [self.target_shard] # always reserve last shard for val
-        
+        self._session = self._create_session() if self.base_url else None
+        self.max_shards = max_shards if max_shards is not None else self.get_num_remote_shards()
+        if shard_limit is not None and not 1 <= shard_limit <= self.max_shards:
+            raise ValueError(f"shard_limit must be between 1 and {self.max_shards}: got {shard_limit}")
+        self.shard_limit = shard_limit
         self.refresh_interval = refresh_interval
         self.download_poll_interval = download_poll_interval
         self._stop = False
 
-        world_size = self.world_size
-        assert self.max_shards is None or self.max_shards >= self.world_size, f"max_shards must be None or >= world_size. Got {max_shards=}, {world_size=}."
-        assert self.shard_limit is None or self.shard_limit >= self.world_size, f"shard_limit must be None or >= world_size for proper DDP sharding. Got {shard_limit=}, {world_size=}."
-
-        self.prepare_shards(warn=self.ddp_rank == 0)
-
         expected_metadata = {
             "name": name, 
-            "base_url": base_url,
+            "base_url": self.base_url,
             "column_name": column_name,
             "max_shards": self.max_shards,
         }
 
-        if self.ddp_rank == 0:
-            if not metadata:
-                self.save_metadata(expected_metadata)
+        mismatches = {
+            key: (metadata.get(key), expected)
+            for key, expected in expected_metadata.items()
+            if metadata and metadata.get(key) != expected
+        }
+        error = f"Dataset metadata does not match configuration: {mismatches}" if mismatches else None
+        if self.split == "train":
+            canonical_ids = list(range(self.shard_limit or self.max_shards))
+            if not canonical_ids:
+                raise ValueError(f"No training shards in {self.ds_path}")
+            manifest = {**expected_metadata, "training_shard_ids": canonical_ids}
+            self.manifest_id = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+            if start_state is None:
+                self.data_seed = 42 if data_seed is None else data_seed
+                random.Random(self.data_seed).shuffle(canonical_ids)
+                self.ordered_shard_ids = tuple(canonical_ids)
             else:
-                mismatches = {
-                    key: (metadata.get(key), expected_value)
-                    for key, expected_value in expected_metadata.items()
-                    if metadata.get(key) != expected_value
-                }
-                if mismatches:
-                    raise ValueError(
-                        f"Dataset metadata does not match configuration: {mismatches}"
-                    )
+                self.data_seed = start_state.data_seed
+                self.ordered_shard_ids = start_state.ordered_shard_ids
+                if start_state.packing_state_version == 0 or start_state.cursor_version == 0:
+                    error = "Legacy dataloader checkpoint cannot resume exactly"
+                elif (start_state.packing_rank, start_state.packing_world_size) != (self.ddp_rank, self.world_size):
+                    error = f"Incompatible training topology: saved rank/world size {start_state.packing_rank}/{start_state.packing_world_size}, current {self.ddp_rank}/{self.world_size}"
+                elif start_state.manifest_id != self.manifest_id or sorted(self.ordered_shard_ids) != canonical_ids:
+                    error = "Incompatible training shard manifest"
+                elif self.data_seed is None or (data_seed is not None and data_seed != self.data_seed):
+                    error = f"Incompatible training data seed: saved {self.data_seed}, requested {data_seed}"
+            self.shard_idx = self.ordered_shard_ids[self.ddp_rank::self.world_size]
+            if self.base_url == "" and error is None:
+                start = 0 if start_state is None else start_state.shard_idx
+                missing = [shard_id for shard_id in self.shard_idx[start:] if not self.get_shard_path(shard_id).is_file()]
+                if missing:
+                    error = f"Missing training shards in {self.ds_path}: {missing}"
+            if self.comp_info.is_distributed:
+                identity = (self.manifest_id, self.ordered_shard_ids, self.data_seed)
+                identities = [None] * self.world_size
+                dist.all_gather_object(identities, (identity, error))
+                errors = [f"rank {rank}: {message}" for rank, (_, message) in enumerate(identities) if message]
+                if errors:
+                    raise ValueError("Cannot initialize training data. " + ". ".join(errors))
+                if any(other != identity for other, _ in identities):
+                    raise ValueError("Training shard manifests or data seeds differ across ranks")
+            elif error:
+                raise ValueError(error)
+        else:
+            if error:
+                raise ValueError(error)
+            self.shard_idx = (self.max_shards,)
+        self.opened_shards: list[int] = []
+        self.downloaded_shards: list[int] = []
+        self.read_retries: list[int] = []
+        self.download_retries: list[int] = []
+
+        if self.ddp_rank == 0 and not metadata:
+            self.save_metadata(expected_metadata)
+
+        self.shard_paths = [self.get_shard_path(shard_id) for shard_id in self.shard_idx]
 
     def save_metadata(self, metadata: dict):
         metadata_path = self.ds_path / "meta.json"
@@ -190,6 +211,8 @@ class ShardManager:
             total=max_retries,
             backoff_factor=backoff_factor,
             status_forcelist=status_forcelist,
+            allowed_methods={"HEAD"},
+            connect=0,
         )
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("http://", adapter)
@@ -227,7 +250,7 @@ class ShardManager:
                 lo = mid + 1
             else:
                 hi = mid
-        return lo
+        return lo - 1
     
     def list_local_shards(self):
         return list(sorted(
@@ -235,39 +258,13 @@ class ShardManager:
             if p.suffix == ".parquet"
         ))
 
-    def prepare_shards(self, warn: bool = False):
-        local_shard_paths = self.list_local_shards()
-        local_shard_idx = set([int(p.stem.split("_")[1]) for p in local_shard_paths])
-
-        shards_to_download = []
-        for idx in range(self.target_shard):
-            if idx not in local_shard_idx:
-                shards_to_download.append(idx)
-
-        if shards_to_download and self.base_url is not None:
-            self.download(shards_to_download, verbose=warn)
-            
-        shard_paths = [
-            p for p in self.list_local_shards()
-            if int(p.stem.split("_")[1]) in self.shard_idx
-        ]
-        if self.split == "train":
-            assert len(self.shard_idx) == len(shard_paths), f"Expected {self.target_shard} shards but found {len(self.shard_idx)}. Got {self.shard_idx=}, {local_shard_paths=}."
-            self.shard_paths = [
-                p for p in shard_paths
-                if int(p.stem.split("_")[1]) % self.world_size == self.ddp_rank
-            ]
-        else:
-            assert len(shard_paths) == 1 and self.shard_idx[0] == self.target_shard, f"Expected exactly 1 validation shard but found {len(shard_paths)}. Got {shard_paths=}."
-            self.shard_paths = shard_paths
-    
     def download(
         self,
         shard_indices: List[int],
         max_retries: int = 5,
         verbose: bool = True,
     ):  
-        if self.base_url is None: 
+        if not self.base_url:
             raise ValueError("base_url must be set to download shards")
         for idx in shard_indices:
             filepath = self.get_shard_path(idx)
@@ -276,24 +273,28 @@ class ShardManager:
                 continue
 
             url = f"{self.base_url}/{filename}"
-            tmp = str(filepath) + ".tmp"
+            tmp = f"{filepath}.{self.ddp_rank}.tmp"
             for attempt in range(max_retries):
                 try:
                     if verbose:
                         print(f"Downloading {filename}")
 
-                    r = self._session.get(url, stream=True, timeout=30)
-                    r.raise_for_status()
-                    with open(tmp, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
+                    with self._session.get(url, stream=True, timeout=30) as r:
+                        r.raise_for_status()
+                        with open(tmp, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
                     os.rename(tmp, filepath)
+                    self.downloaded_shards.append(idx)
                     break
 
-                except Exception:
+                except Exception as exc:
                     if os.path.exists(tmp):
                         os.remove(tmp)
+                    if attempt + 1 == max_retries:
+                        raise OSError(f"Failed to download shard {idx} on rank {self.ddp_rank}") from exc
+                    self.download_retries.append(idx)
                     time.sleep(2 ** attempt)
 
     def iterate(
@@ -302,7 +303,7 @@ class ShardManager:
         batch_size: int = 128,
     ) -> Iterator[Tuple[List[str], DataLoaderState]]:
         is_resuming = start_state is not None
-        state = start_state or DataLoaderState()
+        state = start_state.model_copy() if start_state is not None else DataLoaderState()
         max_read_retries = 5
         row_group_start = 0 if self.split == "train" else self.ddp_rank
         row_group_stride = 1 if self.split == "train" else self.world_size
@@ -310,14 +311,14 @@ class ShardManager:
         while True:
             while state.shard_idx < len(self.shard_paths):
                 shard_path = self.shard_paths[state.shard_idx]
-                state.global_shard_idx = int(
-                    shard_path.stem.split("_")[1]
-                )
-
+                state.global_shard_idx = self.shard_idx[state.shard_idx]
+                if not shard_path.is_file() and self.base_url:
+                    self.download([state.global_shard_idx], verbose=self.ddp_rank == 0)
+                self.opened_shards.append(state.global_shard_idx)
                 pf = pq.ParquetFile(shard_path)
 
                 try:
-                    if is_resuming:
+                    if is_resuming and state.cursor_version == 0:
                         base = state.row_group_idx // row_group_stride
                         state.row_group_idx = (
                             (base + 1) * row_group_stride + row_group_start
@@ -327,8 +328,9 @@ class ShardManager:
                             state.shard_idx += 1
                             state.row_group_idx = row_group_start
                             state.offset_in_row_group = 0
+                            is_resuming = False
                             continue
-                    else:
+                    elif not is_resuming:
                         state.row_group_idx = row_group_start
 
                     while state.row_group_idx < pf.num_row_groups:
@@ -337,6 +339,7 @@ class ShardManager:
                                 # `pf` is set to None after a failed read.
                                 # Reopening here means open failures are retried too.
                                 if pf is None:
+                                    self.opened_shards.append(state.global_shard_idx)
                                     pf = pq.ParquetFile(shard_path)
 
                                 rg = pf.read_row_group(
@@ -372,6 +375,7 @@ class ShardManager:
                                     ) from exc
 
                                 delay = 2**attempt
+                                self.read_retries.append(state.global_shard_idx)
 
                                 warnings.warn(
                                     "Transient Parquet I/O error; "
@@ -389,28 +393,32 @@ class ShardManager:
 
                         batch = rg.column(self.column_name).to_pylist()
 
-                        for i in range(0, len(batch), batch_size):
-                            if (
-                                is_resuming
-                                and i < state.offset_in_row_group
-                            ):
-                                continue
-
-                            if is_resuming:
-                                is_resuming = False
-
+                        offset = state.offset_in_row_group if is_resuming and state.cursor_version == 1 else 0
+                        if not 0 <= offset <= len(batch):
+                            raise ValueError(f"Dataloader cursor offset {offset} is outside row group of length {len(batch)}")
+                        is_resuming = False
+                        for i in range(offset, len(batch), batch_size):
+                            chunk = batch[i:i + batch_size]
+                            next_offset = i + len(chunk)
+                            next_group = state.row_group_idx
+                            next_shard = state.shard_idx
+                            if next_offset == len(batch):
+                                next_group += row_group_stride
+                                next_offset = 0
+                                if next_group >= pf.num_row_groups:
+                                    next_shard += 1
+                                    next_group = row_group_start
                             yield (
-                                batch[i:i + batch_size],
+                                chunk,
                                 DataLoaderState(
-                                    shard_idx=state.shard_idx,
+                                    shard_idx=next_shard,
                                     global_shard_idx=(
                                         state.global_shard_idx
                                     ),
-                                    row_group_idx=(
-                                        state.row_group_idx
-                                    ),
-                                    offset_in_row_group=i,
+                                    row_group_idx=next_group,
+                                    offset_in_row_group=next_offset,
                                     epoch=state.epoch,
+                                    cursor_version=1,
                                 ),
                             )
 
@@ -428,7 +436,11 @@ class ShardManager:
 
                 state.shard_idx += 1
                 state.row_group_idx = row_group_start
+                state.offset_in_row_group = 0
+                is_resuming = False
 
+            if self.split == "train":
+                return
             state.shard_idx = 0
             state.row_group_idx = row_group_start
             state.offset_in_row_group = 0

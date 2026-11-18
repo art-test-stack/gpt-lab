@@ -46,6 +46,7 @@ def train_base(
     run_name=None,
     model_dir=None,
     random_seed=42,
+    data_seed=None,
     device='auto',
     board='wandb',
     board_dir=None,
@@ -60,7 +61,6 @@ def train_base(
     log_every=250,
     monitor_grad_norms=False,
     device_batch_size=32,
-    use_nanochat_dataloader=False,
     architecture_config=None,
     max_seq_len=_UNSET,
     tokenizer_model=None,
@@ -225,11 +225,10 @@ def train_base(
 
         resume_state = None
         if is_resumed:
-            print("ckpt_data.trainer_state", ckpt_data.trainer_state)
             if ckpt_data and hasattr(ckpt_data.trainer_state, "train_loader_state") and ckpt_data.trainer_state.train_loader_state is not None:
                 resume_state = ckpt_data.trainer_state.train_loader_state
             else:
-                log0("No dataloader state found in checkpoint data. Resuming without dataloader state.", logger=logger, level="warning")
+                raise ValueError("Checkpoint has no training dataloader state and cannot resume exactly")
 
         loader_common_kwargs = dict(
             name=ds_name,
@@ -241,10 +240,9 @@ def train_base(
             max_shards=None, # TODO: configured based on configs/data.yaml
             batch_size=base_training_config.get("device_batch_size", device_batch_size),
             comp_info=comp_info,
-            use_nanochat=use_nanochat_dataloader,
         )
         # TODO: add option to configure buffer size
-        train_loader = build_dataloader(split="train", resume_state=resume_state, **loader_common_kwargs)
+        train_loader = build_dataloader(split="train", resume_state=resume_state, data_seed=data_seed, **loader_common_kwargs)
         val_loader = build_dataloader(split="val", **loader_common_kwargs)
 
         # ------------------------------------------------------------------------------

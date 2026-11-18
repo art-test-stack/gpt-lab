@@ -1,0 +1,216 @@
+from datetime import timedelta
+import json
+import os
+from pathlib import Path
+import random
+import sys
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.distributed.device_mesh import init_device_mesh
+from torch.nn.parallel import DistributedDataParallel
+
+from gpt_lab.data.loader import build_dataloader
+from gpt_lab.model.checkpoint import CheckpointManager
+from gpt_lab.train.trainer import Trainer, TrainingDataExhaustedError
+from gpt_lab.utils.board import DummyBoard
+from gpt_lab.utils.distributed import ComputeContext
+from gpt_lab.utils.schemas import TrainerConfig
+
+
+class IntegerTokenizer:
+    def get_bos_token_id(self):
+        return 0
+
+    def __call__(self, text, *, prepend_bos, threads):
+        return [0] + [int(token) for token in text.split()]
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_bos_aligned_training_rows(tmp_path, batch_size):
+    dataset = tmp_path / "letters"
+    dataset.mkdir()
+    pq.write_table(pa.table({"text": ["1 2 3 4 5", "6 7"]}), dataset / "shard_00000.parquet")
+
+    loader = build_dataloader(
+        name=dataset.name,
+        cachedir=tmp_path,
+        max_shards=1,
+        tokenizer=IntegerTokenizer(),
+        batch_size=batch_size,
+        seq_len=4,
+        buffer_size=10,
+        comp_info=ComputeContext(device=torch.device("cpu")),
+    )
+    inputs, targets = [], []
+    for _ in range(2 // batch_size):
+        x, y, _ = next(loader)
+        inputs.extend(x.tolist())
+        targets.extend(y.tolist())
+
+    assert inputs == [[0, 1, 2, 3], [0, 5, 0, 6]]
+    assert targets == [[1, 2, 3, 4], [5, 0, 6, 7]]
+
+
+@pytest.mark.parametrize(
+    "changes, message",
+    [
+        ({"packing_world_size": 2}, "Incompatible training topology"),
+        ({"ordered_shard_ids": (1,)}, "Incompatible training shard manifest"),
+        ({"packing_state_version": 0}, "Legacy dataloader checkpoint cannot resume exactly"),
+    ],
+)
+def test_incompatible_training_checkpoint_fails_before_open(tmp_path, monkeypatch, changes, message):
+    dataset = tmp_path / "tokens"
+    dataset.mkdir()
+    pq.write_table(pa.table({"text": ["1 2 3 4"]}), dataset / "shard_00000.parquet")
+    args = dict(name=dataset.name, cachedir=tmp_path, max_shards=1, tokenizer=IntegerTokenizer(),
+                batch_size=1, seq_len=4, comp_info=ComputeContext(device=torch.device("cpu")))
+    _, _, state = next(build_dataloader(**args))
+
+    def forbidden_open(*args, **kwargs):
+        pytest.fail("Incompatible checkpoint opened a training shard")
+
+    monkeypatch.setattr(pq, "ParquetFile", forbidden_open)
+    with pytest.raises(ValueError, match=message):
+        build_dataloader(**args, resume_state=state.model_copy(update=changes))
+
+
+class RecordingModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(256, 8)
+        self.lm_head = torch.nn.Linear(8, 256)
+        self.batches = []
+
+    def forward(self, x, y):
+        self.batches.append((x.tolist(), y.tolist()))
+        return self.lm_head(self.embed(x))
+
+
+def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
+    torch.set_num_threads(1)
+    torch.manual_seed(17)
+    random.seed(rank + 100)
+    torch.compile = lambda model, **kwargs: model
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo0" if sys.platform == "darwin" else "lo"
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=(tmp_path / "rendezvous").as_uri(),
+        timeout=timedelta(seconds=45),
+    )
+    try:
+        context = ComputeContext(device=torch.device("cpu"), mesh=init_device_mesh("cpu", (2,), mesh_dim_names=("dp",)))
+        tokenizer = IntegerTokenizer()
+        args = dict(name="tokens", cachedir=tmp_path, max_shards=5, tokenizer=tokenizer,
+                    batch_size=1, seq_len=4, comp_info=context)
+        config = TrainerConfig(
+            comp_info=context, n_steps=7, stop_after_step=6, device_batch_size=1, n_acc_steps=2,
+            total_batch_size=16, n_flops_per_token=10, eval_bpb_every=0, eval_core_every=0,
+            sample_every=0, save_every=1, log_every=0,
+        )
+        original_open = pq.ParquetFile
+        opens = []
+
+        def record_open(path, *args, **kwargs):
+            opens.append(int(Path(path).stem.split("_")[1]))
+            return original_open(path, *args, **kwargs)
+
+        pq.ParquetFile = record_open
+
+        def make_trainer(run_name, checkpoint=None, cap=6):
+            loader = build_dataloader(
+                **args, data_seed=83 if checkpoint is None else None,
+                resume_state=None if checkpoint is None else checkpoint.trainer_state.train_loader_state,
+            )
+            model = DistributedDataParallel(RecordingModel())
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
+            optimizer.update_hyperparams = lambda **kwargs: None
+            (tmp_path / "test" / run_name).mkdir(parents=True, exist_ok=True)
+            manager = CheckpointManager(
+                model_name="test", model_run=run_name, model_cachedir=tmp_path,
+                comp_info=context, optimizer_state_layout="sharded",
+            )
+            if checkpoint is not None:
+                model.load_state_dict(checkpoint.model_state)
+                optimizer.load_state_dict(checkpoint.optimizer_state)
+            return Trainer(
+                model, tokenizer, loader, None, config=config.model_copy(update={"stop_after_step": cap}),
+                optimizer=optimizer, checkpoint_manager=manager, board=DummyBoard(),
+                resume_state=None if checkpoint is None else checkpoint.trainer_state,
+            )
+
+        uninterrupted = make_trainer("uninterrupted")
+        uninterrupted.train()
+        expected = uninterrupted.model.module.batches
+        owned = order[rank::2]
+        initial_opens = opens[:]
+        assert initial_opens == owned
+        assert len(expected) == 12
+
+        resumed_opens = []
+        for step, (shard, group, doc_offset) in enumerate([(0, 0, 9), (0, 1, 0), (1, 0, 0)]):
+            opens.clear()
+            saved = uninterrupted.ckpt_manager.load_states(step=step, load_scaler=False)
+            state = saved.trainer_state.train_loader_state
+            assert (state.shard_idx, state.row_group_idx, state.document_token_offset) == (shard, group, doc_offset)
+            assert state.continuation_pending == (doc_offset != 0)
+            assert state.ordered_shard_ids == tuple(order)
+            assert (state.data_seed, state.packing_rank, state.packing_world_size) == (83, rank, 2)
+            restarted = make_trainer(f"resume-{step}", saved)
+            restarted.train()
+            assert restarted.model.module.batches == expected[(step + 1) * 2:]
+            assert opens == owned[shard:]
+            resumed_opens.append(opens[:])
+
+        opens.clear()
+        loader = build_dataloader(**args, data_seed=83)
+        content = []
+        for x, y, state in loader:
+            assert x[0, 0].item() == tokenizer.get_bos_token_id()
+            row = [*x[0].tolist(), y[0, -1].item()]
+            tokens = [token for token in row if token > 0]
+            assert len(tokens) == state.source_content_tokens
+            content.extend(tokens)
+        assert content == [int(token) for shard in owned for text in texts_by_shard[shard] for token in text.split()]
+        assert opens == owned
+        (tmp_path / f"io-{rank}.json").write_text(json.dumps([initial_opens, resumed_opens, opens]))
+
+        saved = uninterrupted.ckpt_manager.load_states(step=5, load_scaler=False)
+        short = make_trainer("shortfall", saved, cap=7)
+        with pytest.raises(TrainingDataExhaustedError, match=r"ranks \[1\].*update 7 of 7"):
+            short.train()
+        assert short.state.completed_steps == 6
+        restored = short.ckpt_manager.load_states(step=5, load_scaler=False)
+        assert restored.trainer_state.train_loader_state == saved.trainer_state.train_loader_state
+        for name, tensor in restored.model_state.items():
+            torch.testing.assert_close(tensor, saved.model_state[name], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo unavailable")
+def test_distributed_training_loader_ownership_and_exact_checkpoint_resume(tmp_path):
+    dataset = tmp_path / "tokens"
+    dataset.mkdir()
+    order = list(range(5))
+    random.Random(83).shuffle(order)
+    texts_by_shard = []
+    for shard_id in range(5):
+        tokens = iter(range(shard_id * 32 + 1, (shard_id + 1) * 32))
+        lengths = [10, 5, 4, 4]
+        if shard_id == order[-2]:
+            lengths.append(5)
+        texts = [" ".join(str(next(tokens)) for _ in range(length)) for length in lengths]
+        texts_by_shard.append(texts)
+        pq.write_table(pa.table({"text": texts}), dataset / f"shard_{shard_id:05d}.parquet", row_group_size=2)
+    mp.spawn(_training_loader_worker, args=(tmp_path, order, texts_by_shard), nprocs=2, join=True)
+
+    rank0, rank1 = [json.loads((tmp_path / f"io-{rank}.json").read_text()) for rank in range(2)]
+    for rank0_opens, rank1_opens in zip([rank0[0], *rank0[1], rank0[2]], [rank1[0], *rank1[1], rank1[2]]):
+        assert set(rank0_opens).isdisjoint(rank1_opens)
+    assert sorted(rank0[2] + rank1[2]) == list(range(5))

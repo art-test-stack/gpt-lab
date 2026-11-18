@@ -12,11 +12,14 @@ Key responsibilities:
 from typing import Any, Optional, Callable, Union
 from pathlib import Path
 from contextlib import ExitStack, contextmanager, nullcontext
+from collections import Counter
 
 import time
 import gc
+import json
 import math
 import logging
+import statistics
 from packaging.version import parse
 
 import torch
@@ -44,6 +47,10 @@ from gpt_lab.model.gpt import DenseTransformer
 from gpt_lab.model.checkpoint import CheckpointManager, make_default_run_name
 
 logger = logging.getLogger(__name__)
+
+
+class TrainingDataExhaustedError(RuntimeError):
+    """At least one rank cannot supply a full optimizer update."""
 
 # ============================================================================
 # Configuration & State
@@ -189,6 +196,7 @@ class Trainer:
         self.config = config
         self.compiled_training_loss = None
         self._forward_backward_graph = None
+        self._next_batch_wait = 0.0
         if config.cuda_graph_mode != "disabled":
             if config.comp_info.device_type != "cuda":
                 raise ValueError("CUDA graph capture requires CUDA")
@@ -365,6 +373,9 @@ class Trainer:
         step = self.state.completed_steps
         n_steps = self.config.n_steps
         step_limit = min(n_steps, self.config.stop_after_step) if self.config.stop_after_step is not None else n_steps
+        initial_data_state = getattr(self.train_loader, "initial_state", None)
+        if isinstance(initial_data_state, DataLoaderState) and step == 0:
+            self.state.train_loader_state = initial_data_state
         if step >= step_limit:
             self.compiled_model = None
             self.save_checkpoint()
@@ -394,11 +405,12 @@ class Trainer:
         if self.config.comp_info.is_distributed:
             dist.barrier()
 
-        batch = self.prepare_batch(next(train_iter)) # prefetch
+        startup_start = time.perf_counter()
+        batch = self._next_training_batch(train_iter)
         _, dataloader_state, _ = batch
-
-        print(f"[rank={rank}] after prefetch", flush=True)
-        if dataloader_state is None:
+        if isinstance(initial_data_state, DataLoaderState):
+            logger.info("Training loader startup rank=%d first_batch_ms=%.3f", rank, (time.perf_counter() - startup_start) * 1000)
+        elif dataloader_state is None:
             self.state.train_loader_state = None
             log0(
                 "No dataloader state provided. Dataloader state will not be saved "
@@ -424,6 +436,10 @@ class Trainer:
             self.board.log({"train/capture_startup_seconds": time.perf_counter() - capture_start}, step=step)
 
         total_dt = []  # For ETA calculation
+        loader_waits = []
+        loader_counts = Counter()
+        io_offsets = {}
+        short_ranks = []
 
         while step < step_limit:
             self.state.step = step
@@ -442,6 +458,10 @@ class Trainer:
             # ================================================================
 
             batch, step_metrics = self.train_step(train_iter, batch, should_log_step)
+            short_ranks = step_metrics.get("data_shortfall_ranks", [])
+            if short_ranks:
+                self.state.step = max(0, self.state.completed_steps - 1)
+                break
 
             # ================================================================
             # Logging and metrics
@@ -450,7 +470,14 @@ class Trainer:
             metrics = self.update_metrics(step_metrics, total_dt)
             self.state.completed_steps = step + 1
             metrics["train/completed_steps"] = self.state.completed_steps
+            if self.config.log_every != 0 and "loader_waits" in step_metrics:
+                loader_waits.extend(step_metrics["loader_waits"])
+                loader_counts.update(step_metrics["loader_counts"])
             if should_log_step:
+                if loader_waits:
+                    self._log_training_loader(step, loader_waits, loader_counts, io_offsets)
+                    loader_waits.clear()
+                    loader_counts.clear()
                 self.log_metrics(metrics)
 
             completed = self.state.completed_steps
@@ -516,13 +543,22 @@ class Trainer:
         self._forward_backward_graph = None
 
         print0("=" * 70)
-        print0(f"Training completed!")
+        if not short_ranks:
+            print0("Training completed!")
         print0(f"Total tokens: {self.state.n_tokens:,}")
         print0(f"Total time: {self.state.total_training_time/60:.1f} minutes")
         print0("=" * 70)
 
         # Final checkpoint
         self.save_checkpoint()
+        if short_ranks:
+            message = (
+                f"Training shard pass ran short on ranks {short_ranks} before optimizer update "
+                f"{self.state.completed_steps + 1} of {step_limit}. "
+                f"Saved {self.state.completed_steps} complete updates. Allocate more fresh training shards."
+            )
+            log0(message, level="error", logger=logger)
+            raise TrainingDataExhaustedError(message)
         if self.config.stop_after_step is not None:
             self.board.log({"train/completed_steps": self.state.completed_steps}, step=self.state.step)
 
@@ -551,11 +587,13 @@ class Trainer:
 
         # Equal token counts per rank make the rank mean the global batch loss.
         # Reduce a detached copy so reporting cannot change the training loss.
-        loss_tensor = step_metrics["loss"].detach().float().clone()
-        if self.config.comp_info.is_distributed:
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            loss_tensor.div_(world_size)
-        loss_accum = loss_tensor.item()
+        loss_accum = step_metrics.get("global_loss")
+        if loss_accum is None:
+            loss_tensor = step_metrics["loss"].detach().float().clone()
+            if self.config.comp_info.is_distributed:
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                loss_tensor.div_(world_size)
+            loss_accum = loss_tensor.item()
         eff_global_tokens = step_metrics["tokens"]
 
         smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_accum
@@ -623,6 +661,42 @@ class Trainer:
         self.metrics.append(metrics, step)
         self.board.log(metrics, step=step)
 
+    def _log_training_loader(self, step, waits, counts, io_offsets):
+        seconds = sum(waits)
+        waits = sorted(waits)
+        sm = self.train_loader.dataset.sm
+        metrics = {
+            **counts,
+            "target_positions_per_s": counts["target_positions"] / seconds,
+            "source_content_tokens_per_s": counts["source_content_tokens"] / seconds,
+            "next_batch_median_ms": statistics.median(waits) * 1000,
+            "next_batch_p95_ms": waits[math.ceil(0.95 * len(waits)) - 1] * 1000,
+            "discarded_content_tokens": 0,
+        }
+        for name in ("opened_shards", "downloaded_shards", "read_retries", "download_retries"):
+            events = getattr(sm, name)
+            metrics[name] = events[io_offsets.get(name, 0):]
+            io_offsets[name] = len(events)
+        logger.info("Training loader rank=%d step=%d %s", self.config.comp_info.rank, step, json.dumps(metrics))
+
+    def _next_training_batch(self, train_iter):
+        loader = getattr(self, "train_loader", None)
+        if not isinstance(getattr(loader, "initial_state", None), DataLoaderState):
+            return self.prepare_batch(next(train_iter))
+        start = time.perf_counter()
+        raw = next(train_iter, None)
+        if raw is None:
+            inputs = loader.inputs.zero_()
+            self._next_batch_wait = time.perf_counter() - start
+            return (inputs, inputs), None, 0
+        payload, state, tokens = self.prepare_batch(raw)
+        self._next_batch_wait = time.perf_counter() - start
+        if state.padding_positions:
+            # Keep the collective schedule valid until the existing loss
+            # reduction can make the shortfall visible before optimizer.step.
+            return (payload[0], payload[0]), state, tokens - state.padding_positions
+        return payload, state, tokens
+
     def train_step(self, train_iter, batch, should_log_step: bool):
         """Run one optimizer step and return (next_batch, step_metrics).
 
@@ -651,12 +725,27 @@ class Trainer:
         loss_accum = torch.zeros((), device=self.device, dtype=torch.float32)
 
         eff_global_tokens = 0
+        loader = getattr(self, "train_loader", None)
+        owned_loader = isinstance(getattr(loader, "initial_state", None), DataLoaderState)
+        log_loader = owned_loader and self.config.log_every != 0
+        committed_cursor = self.state.train_loader_state
+        loader_waits = []
+        loader_counts = Counter()
+        exhausted = False
 
         self.synchronize()
         step_start_time = time.perf_counter()
 
         for acc_step in range(n_acc_steps):
             eff_global_tokens += token_count * world_size
+            if owned_loader:
+                exhausted |= token_count != loader.B * loader.T
+            if log_loader:
+                loader_waits.append(self._next_batch_wait)
+                if dataloader_state is not None:
+                    loader_counts["source_content_tokens"] += dataloader_state.source_content_tokens
+                    loader_counts["document_bos_tokens"] += dataloader_state.document_bos_tokens
+                    loader_counts["continuation_bos_tokens"] += dataloader_state.continuation_bos_tokens
 
             self.state.train_loader_state = dataloader_state
             if self._forward_backward_graph is not None:
@@ -676,12 +765,33 @@ class Trainer:
 
             loss_accum.add_(loss.detach().float())
 
-            last_consumed_dataloader_metadata = (
-                dataloader_state.model_dump() if dataloader_state is not None else None
-            )
-            payload, dataloader_state, token_count = self.prepare_batch(next(train_iter))
+            # Pack the next batch on the host while queued backward work runs.
+            payload, dataloader_state, token_count = self._next_training_batch(train_iter)
 
-        if not torch.isfinite(loss_accum):
+        global_loss = None
+        short_ranks = []
+        if owned_loader and self.config.comp_info.is_distributed:
+            if communication is not None and communication.mode == "backward":
+                self.optimizer.finish_gradient_communication()
+            outcome = loss_accum.new_zeros(world_size + 1)
+            outcome[0].copy_(loss_accum)
+            if exhausted:
+                outcome[1 + self.config.comp_info.rank] = 1
+            dist.all_reduce(outcome)
+            total_loss, *shortfalls = outcome.tolist()
+            global_loss = total_loss / world_size
+            short_ranks = [rank for rank, short in enumerate(shortfalls) if short]
+        elif exhausted:
+            short_ranks = [0]
+        if short_ranks:
+            self.state.train_loader_state = committed_cursor
+            self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
+            return (payload, dataloader_state, token_count), {"data_shortfall_ranks": short_ranks}
+
+        finite = torch.isfinite(loss_accum) if global_loss is None else math.isfinite(global_loss)
+        if not finite:
+            last_consumed = self.state.train_loader_state
+            last_consumed_dataloader_metadata = last_consumed.model_dump() if last_consumed is not None else None
             log_error("⛔️ BAD ACCUMULATED LOSS DETECTED !\n" \
                 f"Accumulated loss is non-finite at optimizer {step=}.\n" \
                 f"Last consumed dataloader state: {last_consumed_dataloader_metadata}.\n" \
@@ -699,7 +809,7 @@ class Trainer:
 
         self.synchronize()
         step_end_time = time.perf_counter()
-        return (payload, dataloader_state, token_count), {
+        metrics = {
             "loss": loss_accum,
             "tokens": eff_global_tokens,
             "step_time": step_end_time - step_start_time,
@@ -707,6 +817,13 @@ class Trainer:
             "muon_momentum": muon_momentum,
             "weight_decay": weight_decay,
         }
+        if owned_loader:
+            metrics["global_loss"] = global_loss
+        if log_loader:
+            loader_counts["target_positions"] = eff_global_tokens // world_size
+            loader_counts["bos_starting_rows"] = loader.B * n_acc_steps
+            metrics.update(loader_waits=loader_waits, loader_counts=loader_counts)
+        return (payload, dataloader_state, token_count), metrics
 
     def optimizer_step(self, should_log_step: bool):
         """Apply accumulated gradients, update the scaler, and clear gradients.

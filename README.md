@@ -169,11 +169,24 @@ see the [results dashboard guide](docs/results_dashboard.md). The viewer in
 
 ### Data
 
-**TLDR;** The dataloader is easily built with the following code snippet. It employs the following strategies:
-- Streaming (not mmap, not in-memory)
-- Packed (not padded batching)
-- Distributed (not replicated dataset)
-- Lazy (not pre-tokenized)
+Training packs documents in source order within each shard. Every document starts
+with BOS, and every model row starts with BOS. A continuation row starts with an
+additional BOS and uses the next unread source token. The last target in each row
+already counts as consumed.
+
+`--data-seed` controls the one-time training shard shuffle independently of
+`--random-seed`. It defaults to 42 on fresh runs and to the checkpoint seed on
+resume. Each global rank takes its slice of the same ordered shard IDs and opens
+or downloads only its own files. Training makes one pass. If any rank cannot
+fill an optimizer update before the configured step limit, all ranks stop at the
+last complete update and report the short ranks.
+
+Exact resume requires the same shard manifest, rank topology, batch shape, and
+tokenizer. Keep the files at those shard IDs immutable. Checkpoints save the
+ordered IDs and each rank's next unread cursor, including its position within a
+document. Checkpoints from the previous training loader cannot resume exactly.
+At `--log-every` intervals, the training logger reports per-rank loader
+throughput, batch wait percentiles, BOS counts, and shard I/O with retries.
 
 ```python
 from gpt_lab.data.loader import build_dataloader, DistDataLoader
