@@ -80,6 +80,61 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+
+def _packed_complex_mm(ar: Tensor, ai: Tensor, br: Tensor, bi: Tensor, dtype: torch.dtype):
+    """Evaluate (ar + i ai) @ (br + i bi) with one real GEMM."""
+    top = torch.cat((ar, -ai), dim=-1)
+    bottom = torch.cat((ai, ar), dim=-1)
+    left = torch.cat((top, bottom), dim=-2).to(dtype)
+    right = torch.cat((br, bi), dim=-2).to(dtype)
+    return (left @ right).float().chunk(2, dim=-2)
+
+
+def paired_polar_express(
+    proposal: Tensor, ns_steps: int, compute_dtype: torch.dtype,
+    pair_indices: tuple[Tensor, Tensor] | None = None,
+) -> Tensor:
+    """Apply one Hermitian polar map per head, optionally re-pairing its rows."""
+    if pair_indices is not None:
+        order, inverse = pair_indices
+        proposal = proposal.index_select(-2, order)
+    dtype = torch.bfloat16 if compute_dtype == torch.bfloat16 else torch.float32
+    x = proposal.to(dtype).float()
+    # Normalize jointly over both components. Keep scalar and polynomial arithmetic in FP32.
+    x = x / (x.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    xr, xi = x[..., ::2, :], x[..., 1::2, :]
+    for a, b, c in polar_express_coeffs[:ns_steps]:
+        hr, hi = _packed_complex_mm(xr, xi, xr.mT, -xi.mT, dtype)
+        h2r, h2i = _packed_complex_mm(hr, hi, hr, hi, dtype)
+        pr = b * hr + c * h2r
+        pi = b * hi + c * h2i
+        dr, di = _packed_complex_mm(pr, pi, xr, xi, dtype)
+        xr, xi = a * xr + dr, a * xi + di
+    output = torch.stack((xr, xi), dim=-2).flatten(-3, -2).to(dtype)
+    return output if pair_indices is None else output.index_select(-2, inverse)
+
+
+def _real_polar_express(g: Tensor, ns_steps: int, compute_dtype: torch.dtype) -> Tensor:
+    # Skip the low-precision cast for FP16, whose exponent range is too narrow here.
+    X = g.bfloat16() if compute_dtype == torch.bfloat16 else g
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    if g.size(-2) > g.size(-1):
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    return X
+
+
+def _head_norm(heads: Tensor) -> Tensor:
+    return torch.linalg.vector_norm(heads.float(), dim=(-2, -1))
+
+
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
@@ -93,32 +148,35 @@ def muon_step_fused(
     ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
     red_dim: int,                   # -1 or -2 - reduction dimension for variance
     compute_dtype: torch.dtype,     # torch.float16, torch.bfloat16, or torch.float32
-) -> None:
+    *,
+    paired_heads: int = 0,
+    pair_indices: tuple[Tensor, Tensor] | None = None,
+    monitor_indices: tuple[Tensor, Tensor] | None = None,
+) -> Tensor | None:
     """
     Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
     All in one compiled graph to eliminate Python overhead between ops.
     Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
     """
 
+    if monitor_indices is not None:
+        gradient_norm = _head_norm(stacked_grads[monitor_indices])
+
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
+    if monitor_indices is not None:
+        proposal_norm = _head_norm(g[monitor_indices])
 
-    # Polar express
-    # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
-    X = g.bfloat16() if compute_dtype == torch.bfloat16 else g
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else: # Wide matrix (original math)
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
+    if paired_heads:
+        qk, v = g[..., :paired_heads, :, :], g[..., paired_heads:, :, :]
+        qk = paired_polar_express(qk, ns_steps, compute_dtype, pair_indices)
+        X = torch.cat((qk, _real_polar_express(v, ns_steps, compute_dtype)), dim=-3)
+    else:
+        X = _real_polar_express(g, ns_steps, compute_dtype)
+    if monitor_indices is not None:
+        polar_norm = _head_norm(X[monitor_indices])
     g = X.to(stacked_params.dtype)
 
     # Variance reduction
@@ -138,4 +196,16 @@ def muon_step_fused(
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+    update = lr * g
+    decay = lr * wd * stacked_params * mask
+    if monitor_indices is not None:
+        before = stacked_params[monitor_indices]
+        update_norm = _head_norm(update[monitor_indices])
+        decay_norm = _head_norm(decay[monitor_indices])
+    stacked_params.sub_(update + decay)
+    if monitor_indices is not None:
+        displacement = _head_norm(stacked_params[monitor_indices].float() - before.float())
+        weight_norm = _head_norm(before)
+        ratio = torch.where(weight_norm > 0, displacement / weight_norm, float("nan"))
+        return torch.stack((gradient_norm, proposal_norm, polar_norm, update_norm, decay_norm, displacement, ratio), dim=-1)
+    return None
