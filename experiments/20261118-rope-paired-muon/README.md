@@ -56,7 +56,8 @@ modal run -e main experiments/20261118-rope-paired-muon/modal_trainbase.py \
   --run-name rope-muon-s42-400 --seed 42
 ```
 
-Use a unique run name. The command uploads the experiment's training files,
+Use a unique run name. The launcher checks `gpt-lab-runs` for that name
+before requesting GPUs. The command uploads the experiment's training files,
 package source, lockfile, and Llama configuration from this checkout to
 Modal. The worker runs A, B, and C sequentially on one node with eight H100s.
 Use `--arm A`, `--arm B`, or `--arm C` for a single arm. All three share
