@@ -74,6 +74,13 @@ finishes, and errors. `train.log` contains full worker output and per-rank
 timings. W&B shows training metrics on every update, plus evaluation metrics
 and the sampled Q/K norms.
 
+The Modal launcher enables `--guard-mfu`. Each arm skips the first 10
+completed updates and checks the median `train/mfu` over updates 11–20,
+21–30, and each subsequent full window. A median at or below 40% ends the
+allocation before the next update, evaluation, or final checkpoint. W&B
+records `train/mfu_window_median` and marks a failure with
+`train/mfu_guard_tripped`. The worker saves the failed arm's log to the volume.
+
 ## Polar check
 
 ```bash
