@@ -31,6 +31,10 @@ from typing import TYPE_CHECKING
 from gpt_lab.utils.paths import get_cache_dir
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from gpt_lab.model.gpt import BaseTransformer
+    from gpt_lab.optim.factory import OptimizerFactory
+    from gpt_lab.train.trainer import Trainer
     from gpt_lab.utils.schemas import OptimizerConfig
     from gpt_lab.utils.distributed import ComputeContext
 
@@ -97,12 +101,15 @@ def train_base(
     final_lr_frac=0.05,
     checkpoint_step=None,
     checkpoint_dir=None,
+    configure_optimizer: Callable[[BaseTransformer, OptimizerFactory], None] | None = None,
+    trainer_factory: Callable[..., Trainer] | None = None,
 ) -> None:
     """Train from Python keywords using a loaded base optimizer profile.
 
     Fresh runs require optim_config; resume restores the saved architecture,
     trainer settings, and optimizer state. The CLI only loads files and forwards
     keywords. The profile supplies base values, which scaling laws adjust once.
+    Experiments can configure the optimizer before state restore and extend Trainer.
     """
     if model_init not in ("auto", "resume"):
         raise ValueError("model_init must be auto or resume")
@@ -116,6 +123,8 @@ def train_base(
             raise TypeError("optim_config must be a loaded OptimizerConfig")
     model_dir = str(model_dir or get_cache_dir() / "models")
     parameters = {key: value for key, value in locals().items() if value is not _UNSET}
+    parameters.pop("configure_optimizer")
+    parameters.pop("trainer_factory")
     import os
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -259,12 +268,9 @@ def train_base(
                 trainer_config = TrainerConfig.model_validate(
                     trainer_config.model_dump() | {"cuda_graph_mode": cuda_graph_mode, "comp_info": comp_info}
                 )
-            if stop_after_step is not None or cuda_graph_mode is not None:
-                ckpt_manager.save_training_config(trainer_config)
             # TODO: add option to override some trainer config parameters from CLI args even when resuming (eg: evaluation frequency, save frequency, etc.)
         else:
             trainer_config = build_trainer_config(parameters, comp_info, base_training_config)
-            ckpt_manager.save_training_config(trainer_config)
         print0_dict("Trainer config", trainer_config.model_dump())
 
         # ------------------------------------------------------------------------------
@@ -272,9 +278,13 @@ def train_base(
         # ------------------------------------------------------------------------------
 
         optimizers = model.build_optimizer(trainer_config, optim_config=optim_config)
+        if configure_optimizer is not None:
+            configure_optimizer(model, optimizers)
         if is_resumed and ckpt_data and ckpt_data.optimizer_state is not None:
             log0("Loading optimizer state from checkpoint data.", logger=logger)
             optimizers.load_state_dict(ckpt_data.optimizer_state)
+        if not is_resumed or stop_after_step is not None or cuda_graph_mode is not None:
+            ckpt_manager.save_training_config(trainer_config)
 
         # ------------------------------------------------------------------------------
         # INIT BOARD
@@ -307,7 +317,7 @@ def train_base(
 
         from gpt_lab.train.trainer import Trainer
 
-        trainer = Trainer(
+        trainer = (trainer_factory or Trainer)(
             model=model, tokenizer=tokenizer, optimizer=optimizers,
             train_loader=train_loader, val_loader=val_loader,
             config=trainer_config, board=board_instance, checkpoint_manager=ckpt_manager,
