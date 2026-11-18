@@ -96,7 +96,7 @@ def resolve_checkpoint(args: Namespace) -> Namespace:
     return Namespace(**(vars(args) | resolve_path(args.checkpoint_dir, args.checkpoint_step)))
 
 
-def run(args: Namespace) -> None:
+def run(args: Namespace, *, configure_optimizer=None, trainer_factory=None) -> None:
     from gpt_lab.utils.schemas import OptimizerConfig
     from gpt_lab.workflows.train_base import train_base
 
@@ -108,4 +108,8 @@ def run(args: Namespace) -> None:
     if getattr(args, "muon_qkv", None) is not None:
         profile.groups["transformer"]["muon_qkv"] = args.muon_qkv
         profile = OptimizerConfig.model_validate(profile.model_dump())
+    if configure_optimizer is not None:
+        parameters["configure_optimizer"] = configure_optimizer
+    if trainer_factory is not None:
+        parameters["trainer_factory"] = trainer_factory
     train_base(optim_config=profile, **parameters)
