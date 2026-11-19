@@ -73,6 +73,31 @@ def test_best_fit_training_rows(tmp_path, batch_size):
     assert y.tolist() == targets[2:2 + batch_size]
 
 
+def test_resume_keeps_saved_lookahead_size(tmp_path, monkeypatch):
+    dataset = tmp_path / "tokens"
+    dataset.mkdir()
+    texts = [f"{i} {i}" for i in range(1, 151)]
+    pq.write_table(pa.table({"text": texts}), dataset / "shard_00000.parquet")
+    args = dict(name=dataset.name, cachedir=tmp_path, max_shards=1, tokenizer=IntegerTokenizer(),
+                batch_size=1, seq_len=4, comp_info=ComputeContext(device=torch.device("cpu")))
+
+    with monkeypatch.context() as previous:
+        previous.setattr(loader_module, "_TRAIN_LOOKAHEAD_DOCS", 128)
+        uninterrupted = build_dataloader(**args)
+        _, _, saved = next(uninterrupted)
+    _, _, fresh_state = next(build_dataloader(**args))
+    assert fresh_state.packing_lookahead_size == 16
+    assert len(fresh_state.lookahead_documents) <= 16 < len(saved.lookahead_documents)
+    resumed = build_dataloader(**args, resume_state=saved)
+    for _ in range(3):
+        expected_x, expected_y, expected_state = next(uninterrupted)
+        x, y, state = next(resumed)
+        assert torch.equal(x, expected_x)
+        assert torch.equal(y, expected_y)
+        assert state == expected_state
+        assert state.packing_lookahead_size == 128
+
+
 @pytest.mark.parametrize(
     "changes, message",
     [
@@ -80,6 +105,7 @@ def test_best_fit_training_rows(tmp_path, batch_size):
         ({"ordered_shard_ids": (1,)}, "Incompatible training shard manifest"),
         ({"packing_state_version": 0}, "Legacy dataloader checkpoint cannot resume exactly"),
         ({"packing_state_version": 1}, "Source-order dataloader checkpoint cannot resume exactly"),
+        ({"packing_lookahead_size": 0}, "Invalid lookahead size"),
     ],
 )
 def test_incompatible_training_checkpoint_fails_before_open(tmp_path, monkeypatch, changes, message):
@@ -109,6 +135,11 @@ class RecordingModel(torch.nn.Module):
     def forward(self, x, y):
         self.batches.append((x.tolist(), y.tolist()))
         return self.lm_head(self.dropout(self.embed(x)))
+
+
+class DelegatingTrainer(Trainer):
+    def train_step(self, train_iter, batch, should_log_step):
+        return super().train_step(train_iter, batch, should_log_step)
 
 
 def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
@@ -144,7 +175,7 @@ def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
 
         initial_rng = capture_rng_state()
 
-        def make_trainer(run_name, checkpoint=None, cap=3, dataset="tokens"):
+        def make_trainer(run_name, checkpoint=None, cap=3, dataset="tokens", trainer_class=Trainer):
             set_rng_state(initial_rng)
             loader = build_dataloader(
                 **(args | {"name": dataset}), data_seed=83 if checkpoint is None else None,
@@ -162,7 +193,7 @@ def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
                 model.load_state_dict(checkpoint.model_state)
                 optimizer.load_state_dict(checkpoint.optimizer_state)
                 set_rng_state(checkpoint.rng_state)
-            return Trainer(
+            return trainer_class(
                 model, tokenizer, loader, None, config=config.model_copy(update={"stop_after_step": cap}),
                 optimizer=optimizer, checkpoint_manager=manager, board=DummyBoard(),
                 resume_state=None if checkpoint is None else checkpoint.trainer_state,
@@ -215,7 +246,7 @@ def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
         (tmp_path / f"io-{rank}.json").write_text(json.dumps([initial_opens, resumed_opens, opens]))
 
         saved = uninterrupted.ckpt_manager.load_states(step=2, load_scaler=False)
-        short = make_trainer("shortfall", cap=4)
+        short = make_trainer("shortfall", cap=4, trainer_class=DelegatingTrainer)
         with pytest.raises(TrainingDataExhaustedError, match=r"ranks \[1\].*update 4 of 4"):
             short.train()
         assert short.state.completed_steps == 3

@@ -169,7 +169,7 @@ see the [results dashboard guide](docs/results_dashboard.md). The viewer in
 
 ### Data
 
-Training looks ahead by up to 128 documents on each rank and picks the longest
+Fresh training runs look ahead by up to 16 documents on each rank and pick the longest
 whole document that fits the remaining row space, including its BOS. Ties follow
 read order. If none fits, the loader splits the shortest buffered document and
 carries the rest into the next row. Every document and row starts with BOS.
@@ -187,12 +187,21 @@ the optimizer step.
 
 Exact resume requires the same shard manifest, rank topology, batch shape, and
 tokenizer. Keep the files at those shard IDs immutable. Checkpoints save the
-ordered shard IDs, next unread cursor, ordered lookahead buffer, and pending
-document with its token offset. Source-order checkpoints cannot resume this
-packing policy exactly.
+ordered shard IDs, next unread cursor, lookahead size and buffer, and pending
+document with its token offset. Resumed runs retain the checkpoint's lookahead
+size, including 128 for runs started with the previous default. Source-order
+checkpoints cannot resume this packing policy exactly.
 At `--log-every` intervals, the training logger reports end-to-end throughput,
-per-rank packing counts and shard I/O. Batch-fetch wall time includes the
-blocking device copy and any queued GPU work it waits for.
+per-rank packing counts, committed source content tokens per second, and shard
+I/O. The source rate uses the completed training updates since the preceding
+log. Batch-fetch wall time includes the blocking device copy and any queued
+GPU work it waits for.
+
+Custom training loaders stream by default. To opt into full-update preflight,
+set `supports_training_staging = True` on every rank, provide
+`allocate_training_buffers(count)` with independent writable slots, and have
+`next_full_batch(slot)` fill the requested slot or signal exhaustion. Trainers
+that wrap `super().train_step()` keep preflight for these loaders.
 
 ```python
 from gpt_lab.data.loader import build_dataloader, DistDataLoader

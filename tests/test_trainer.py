@@ -11,6 +11,7 @@ from gpt_lab.utils.schemas import (
     TransformerConfig,
 )
 import tempfile
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 import itertools
@@ -487,10 +488,16 @@ def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
         "n_flops_per_token": 100, "eval_bpb_every": 0,
         "eval_core_every": 0, "sample_every": 0, "log_every": log_every,
     })
-    batches = [dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3,
-                    state=DataLoaderState(epoch=i + 1, offset_in_row_group=i) if with_state else None)
-               for i in range(4)]
-    trainer.train_loader = batches
+    states = [DataLoaderState(epoch=i + 1, offset_in_row_group=i) if with_state else None for i in range(4)]
+    shared_batch = dict(features=torch.empty(2, 2), targets=torch.zeros(2, 2), tokens=3)
+
+    def batches():
+        for i, state in enumerate(states):
+            shared_batch["features"].fill_(i + 1)
+            shared_batch["state"] = state
+            yield shared_batch
+
+    trainer.train_loader = batches()
     trainer.optimizer.update_hyperparams = Mock()
     trainer.ckpt_manager.save = lambda **kwargs: save_checkpoint(
         checkpoint_dir=tmp_path, comp_info=trainer.config.comp_info, **kwargs,
@@ -504,7 +511,8 @@ def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
     compute_loss = trainer.compute_loss
 
     def capture_loss(payload):
-        seen_payloads.append(payload)
+        assert payload is shared_batch
+        seen_payloads.append((payload["features"][0, 0].item(), payload["state"]))
         return compute_loss(payload)
 
     trainer.compute_loss = capture_loss
@@ -512,17 +520,76 @@ def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
 
     trainer.train()
 
-    assert all(seen is raw for seen, raw in zip(seen_payloads, batches))
-    assert len(seen_payloads) == 4
+    assert seen_payloads == list(zip(range(1, 5), states))
     assert trainer.state.n_tokens == 12
     assert not torch.equal(model.weight, initial_weight)
     assert model.weight.grad is None
     warnings = [record for record in caplog.records if "No dataloader state provided" in record.message]
     assert len(warnings) == (0 if with_state else 1)
     loaded = load_checkpoint(tmp_path, step=1, comp_info=trainer.config.comp_info, load_scaler=False)
-    assert loaded.trainer_state.train_loader_state == batches[3]["state"]
+    assert loaded.trainer_state.train_loader_state == states[-1]
     assert loaded.trainer_state.n_tokens == 12
     assert len(board.records) == (2 if log_every else 0)
+
+
+def test_opt_in_staging_and_committed_source_throughput(tmp_path, monkeypatch, caplog):
+    trainer, _, _ = _make_trainer(tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer)
+    trainer.config = trainer.config.model_copy(update=dict(
+        n_steps=3, n_acc_steps=2, total_batch_size=6, n_flops_per_token=100,
+        eval_bpb_every=0, eval_core_every=0, sample_every=0, log_every=2,
+    ))
+    trainer.optimizer.update_hyperparams = Mock()
+    trainer.save_checkpoint = Mock()
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+    for name in ("collect", "freeze", "disable"):
+        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
+    caplog.set_level("INFO", logger="gpt_lab.train.trainer")
+    values = iter(range(1, 7))
+    targets = torch.zeros(2, 2)
+    committed = [1000]  # Counters left over from an earlier trainer invocation.
+
+    def next_full_batch(features):
+        value = next(values)
+        features.fill_(value)
+        return dict(features=features, targets=targets, tokens=3,
+                    state=DataLoaderState(source_content_tokens=value))
+
+    def take_training_metrics():
+        count = sum(committed)
+        committed.clear()
+        return {"source_content_tokens": count}
+
+    trainer.train_loader = SimpleNamespace(
+        supports_training_staging=True,
+        allocate_training_buffers=lambda count: [torch.empty(2, 2) for _ in range(count)],
+        next_full_batch=Mock(side_effect=next_full_batch),
+        record_training_update=lambda states: committed.extend(state.source_content_tokens for state in states),
+        take_training_metrics=take_training_metrics,
+    )
+    seen = []
+    compute_loss = trainer.compute_loss
+    update_metrics = trainer.update_metrics
+
+    def record_loss(payload):
+        seen.append(int(payload["features"][0, 0]))
+        return compute_loss(payload)
+
+    def fixed_duration(step_metrics, total_dt):
+        step_metrics["step_time"] = (0.5, 1.0, 3.0)[trainer.state.step]
+        return update_metrics(step_metrics, total_dt)
+
+    trainer.compute_loss = record_loss
+    trainer.update_metrics = fixed_duration
+    trainer.train()
+
+    assert seen == list(range(1, 7))
+    assert trainer.train_loader.next_full_batch.call_count == 6
+    assert trainer.state.train_loader_state.source_content_tokens == 6
+    loader_logs = [json.loads(record.message.split(" ", maxsplit=4)[-1])
+                   for record in caplog.records if record.message.startswith("Training loader rank=")]
+    assert [(row["source_content_tokens"], row["source_content_tokens_per_s"]) for row in loader_logs] == [
+        (3, 6.0), (18, 4.5),
+    ]
 
 
 @pytest.mark.fast

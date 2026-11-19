@@ -11,7 +11,7 @@ from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import DataLoaderState
 from gpt_lab.data.sharder import ShardManager
 
-_TRAIN_LOOKAHEAD_DOCS = 128
+_TRAIN_LOOKAHEAD_DOCS = 16
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -131,27 +131,31 @@ class DistDataLoader:
             shape = dict(
                 packing_batch_size=batch_size, packing_seq_len=seq_len,
                 packing_bos_token_id=self.bos_token_id,
-                packing_lookahead_size=_TRAIN_LOOKAHEAD_DOCS,
             )
+            self._lookahead_size = _TRAIN_LOOKAHEAD_DOCS
             self.initial_state = dataset.start_state
             if self.initial_state is None:
                 self.initial_state = DataLoaderState(
                     cursor_version=1, packing_state_version=2,
                     manifest_id=sm.manifest_id, ordered_shard_ids=sm.ordered_shard_ids,
                     data_seed=sm.data_seed, packing_rank=sm.ddp_rank, packing_world_size=sm.world_size,
+                    packing_lookahead_size=self._lookahead_size,
                     **shape,
                 )
             else:
                 state = self.initial_state
                 if any(getattr(state, name) != value for name, value in shape.items()):
                     raise ValueError("Incompatible packing configuration in training data checkpoint")
+                if state.packing_lookahead_size is None or state.packing_lookahead_size < 1:
+                    raise ValueError("Invalid lookahead size in training data checkpoint")
+                self._lookahead_size = state.packing_lookahead_size
                 pending = state.pending_document
                 offset = state.document_token_offset
                 if (state.continuation_pending != (pending is not None)
                         or (pending is None and offset != 0)
                         or (pending is not None and not (0 < offset < len(pending) and pending[0] == self.bos_token_id))):
                     raise ValueError("Incompatible continuation state in training data checkpoint")
-                if (len(state.lookahead_documents) > _TRAIN_LOOKAHEAD_DOCS
+                if (len(state.lookahead_documents) > self._lookahead_size
                         or any(not doc or doc[0] != self.bos_token_id for doc in state.lookahead_documents)):
                     raise ValueError("Invalid lookahead buffer in training data checkpoint")
                 if not (0 <= state.shard_idx <= len(sm.shard_idx) and
@@ -246,7 +250,7 @@ class DistDataLoader:
         self._read_index += 1
 
     def _take_best_fit_document(self, space: int) -> Optional[list[int]]:
-        while len(self._lookahead) < _TRAIN_LOOKAHEAD_DOCS and not self._source_exhausted:
+        while len(self._lookahead) < self._lookahead_size and not self._source_exhausted:
             result = next(self.iterator, None)
             if result is None:
                 self._source_exhausted = True
@@ -260,6 +264,11 @@ class DistDataLoader:
             shortest = self._lookahead[0][0]
             index = bisect_right(self._lookahead, (shortest, 1)) - 1
         return self._lookahead.pop(index)[2]
+
+    @property
+    def supports_training_staging(self):
+        """Training splits can fill independent slots before an optimizer update."""
+        return self.initial_state is not None
 
     def allocate_training_buffers(self, count):
         return [(torch.empty_like(self.inputs), torch.empty_like(self.targets)) for _ in range(count)]
