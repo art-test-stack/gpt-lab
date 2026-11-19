@@ -1,6 +1,6 @@
 from array import array
 from bisect import bisect_right, insort
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple, Union
 
@@ -170,6 +170,8 @@ class DistDataLoader:
                 self._buffer_document(document)
             self._source_exhausted = False
             self._exhausted = False
+            self._training_counts = Counter()
+            self._io_offsets = {}
 
         # Pre-fetch budget for the validation stream.
         self.token_buffer_size = buffer_size or (batch_size * seq_len * 16)
@@ -259,7 +261,36 @@ class DistDataLoader:
             index = bisect_right(self._lookahead, (shortest, 1)) - 1
         return self._lookahead.pop(index)[2]
 
-    def _next_best_fit(self):
+    def allocate_training_buffers(self, count):
+        return [(torch.empty_like(self.inputs), torch.empty_like(self.targets)) for _ in range(count)]
+
+    def next_full_batch(self, output):
+        """Fill a caller-owned training slot, or return None on exhaustion."""
+        try:
+            return self._next_best_fit(output)
+        except StopIteration:
+            return None
+
+    def record_training_update(self, states):
+        for state in states:
+            self._training_counts.update(
+                target_positions=self.B * self.T,
+                bos_starting_rows=self.B,
+                source_content_tokens=state.source_content_tokens,
+                document_bos_tokens=state.document_bos_tokens,
+                continuation_bos_tokens=state.continuation_bos_tokens,
+            )
+
+    def take_training_metrics(self):
+        metrics = dict(self._training_counts, discarded_content_tokens=0)
+        self._training_counts.clear()
+        for name in ("opened_shards", "downloaded_shards", "read_retries", "download_retries"):
+            events = getattr(self.dataset.sm, name)
+            metrics[name] = events[self._io_offsets.get(name, 0):]
+            self._io_offsets[name] = len(events)
+        return metrics
+
+    def _next_best_fit(self, output=None):
         if self._exhausted:
             raise StopIteration
         capacity = self.T + 1
@@ -300,6 +331,9 @@ class DistDataLoader:
             if self._exhausted:
                 break
 
+        if output is not None and padding:
+            return None
+
         cursor = self._source_cursor
         self.last_state = self.initial_state.model_copy(update=dict(
             shard_idx=cursor.shard_idx, global_shard_idx=cursor.global_shard_idx,
@@ -310,17 +344,18 @@ class DistDataLoader:
             source_content_tokens=content, document_bos_tokens=document_bos,
             continuation_bos_tokens=continuation_bos, padding_positions=padding,
         ))
-        return self._output(self.last_state)
+        return self._output(self.last_state, output)
 
-    def _output(self, state):
+    def _output(self, state, output=None):
         # Blocking host-to-device transfer.
         self.gpu.copy_(self.cpu, non_blocking=False)
         data = self.gpu.view(self.B, self.T + 1)
-        self.inputs.copy_(data[:, :-1])
-        self.targets.copy_(data[:, 1:])
+        inputs, targets = (self.inputs, self.targets) if output is None else output
+        inputs.copy_(data[:, :-1])
+        targets.copy_(data[:, 1:])
         if state is not None and state.padding_positions:
-            self.inputs.masked_fill_(self.inputs == -1, self.bos_token_id)
-        return self.inputs, self.targets, state
+            inputs.masked_fill_(inputs == -1, self.bos_token_id)
+        return inputs, targets, state
 
 # just to compare
 """

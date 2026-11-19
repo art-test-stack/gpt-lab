@@ -489,7 +489,7 @@ def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
     })
     batches = [dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3,
                     state=DataLoaderState(epoch=i + 1, offset_in_row_group=i) if with_state else None)
-               for i in range(5)]
+               for i in range(4)]
     trainer.train_loader = batches
     trainer.optimizer.update_hyperparams = Mock()
     trainer.ckpt_manager.save = lambda **kwargs: save_checkpoint(
@@ -646,7 +646,7 @@ def test_nonfinite_loss_completes_accumulation_reports_last_metadata_and_aborts(
     assert "Exact consumed-batch tensors were not captured" in message
     assert "Batch payload:" not in message
     assert fetched == [0, 1, 2]
-    assert trainer.state.train_loader_state is states[1]
+    assert trainer.state.train_loader_state == DataLoaderState()
     trainer.optimizer_step.assert_not_called()
     torch.testing.assert_close(model.weight, initial_weight)
     assert not (tmp_path / "bad_batch.safetensors").exists()

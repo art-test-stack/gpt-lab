@@ -181,15 +181,18 @@ The last target in each row already counts as consumed.
 resume. Each global rank takes its slice of the same ordered shard IDs and opens
 or downloads only its own files. Training makes one pass. If any rank cannot
 fill an optimizer update before the configured step limit, all ranks stop at the
-last complete update and report the short ranks.
+last complete update and report the short ranks before running another forward.
+The trainer stages the next update during backward and commits the cursor after
+the optimizer step.
 
 Exact resume requires the same shard manifest, rank topology, batch shape, and
 tokenizer. Keep the files at those shard IDs immutable. Checkpoints save the
 ordered shard IDs, next unread cursor, ordered lookahead buffer, and pending
 document with its token offset. Source-order checkpoints cannot resume this
 packing policy exactly.
-At `--log-every` intervals, the training logger reports per-rank loader
-throughput, batch wait percentiles, BOS counts, and shard I/O with retries.
+At `--log-every` intervals, the training logger reports end-to-end throughput,
+per-rank packing counts and shard I/O. Batch-fetch wall time includes the
+blocking device copy and any queued GPU work it waits for.
 
 ```python
 from gpt_lab.data.loader import build_dataloader, DistDataLoader

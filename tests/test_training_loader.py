@@ -16,11 +16,12 @@ from torch.nn.parallel import DistributedDataParallel
 
 from gpt_lab.data import loader as loader_module
 from gpt_lab.data.loader import build_dataloader
-from gpt_lab.model.checkpoint import CheckpointManager
+from gpt_lab.model.checkpoint import CheckpointManager, capture_rng_state, set_rng_state
 from gpt_lab.train.trainer import Trainer, TrainingDataExhaustedError
 from gpt_lab.utils.board import DummyBoard
 from gpt_lab.utils.distributed import ComputeContext
 from gpt_lab.utils.schemas import DataLoaderState, TrainerConfig
+from tests.test_checkpoint import assert_rng_state_consistency
 
 
 class IntegerTokenizer:
@@ -101,12 +102,13 @@ class RecordingModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.embed = torch.nn.Embedding(256, 8)
+        self.dropout = torch.nn.Dropout(0.35)
         self.lm_head = torch.nn.Linear(8, 256)
         self.batches = []
 
     def forward(self, x, y):
         self.batches.append((x.tolist(), y.tolist()))
-        return self.lm_head(self.embed(x))
+        return self.lm_head(self.dropout(self.embed(x)))
 
 
 def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
@@ -140,9 +142,12 @@ def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
 
         pq.ParquetFile = record_open
 
-        def make_trainer(run_name, checkpoint=None, cap=3):
+        initial_rng = capture_rng_state()
+
+        def make_trainer(run_name, checkpoint=None, cap=3, dataset="tokens"):
+            set_rng_state(initial_rng)
             loader = build_dataloader(
-                **args, data_seed=83 if checkpoint is None else None,
+                **(args | {"name": dataset}), data_seed=83 if checkpoint is None else None,
                 resume_state=None if checkpoint is None else checkpoint.trainer_state.train_loader_state,
             )
             model = DistributedDataParallel(RecordingModel())
@@ -156,6 +161,7 @@ def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
             if checkpoint is not None:
                 model.load_state_dict(checkpoint.model_state)
                 optimizer.load_state_dict(checkpoint.optimizer_state)
+                set_rng_state(checkpoint.rng_state)
             return Trainer(
                 model, tokenizer, loader, None, config=config.model_copy(update={"stop_after_step": cap}),
                 optimizer=optimizer, checkpoint_manager=manager, board=DummyBoard(),
@@ -192,8 +198,10 @@ def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
         loader = build_dataloader(**args, data_seed=83)
         content = []
         document_starts = 0
+        reference_batches = []
         for x, y, state in loader:
             assert x[0, 0].item() == tokenizer.get_bos_token_id()
+            reference_batches.append((x.tolist(), y.tolist()))
             row = [*x[0].tolist(), y[0, -1].item()]
             tokens = [token for token in row if token > 0]
             assert len(tokens) == state.source_content_tokens
@@ -202,18 +210,37 @@ def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
         documents = [text for shard in owned for text in texts_by_shard[shard]]
         assert sorted(content) == sorted(int(token) for text in documents for token in text.split())
         assert document_starts == len(documents)
+        assert expected == reference_batches[:len(expected)]
         assert opens == owned
         (tmp_path / f"io-{rank}.json").write_text(json.dumps([initial_opens, resumed_opens, opens]))
 
         saved = uninterrupted.ckpt_manager.load_states(step=2, load_scaler=False)
-        short = make_trainer("shortfall", saved, cap=4)
+        short = make_trainer("shortfall", cap=4)
         with pytest.raises(TrainingDataExhaustedError, match=r"ranks \[1\].*update 4 of 4"):
             short.train()
         assert short.state.completed_steps == 3
+        assert short.model.module.batches == expected
         restored = short.ckpt_manager.load_states(step=2, load_scaler=False)
         assert restored.trainer_state.train_loader_state == saved.trainer_state.train_loader_state
-        for name, tensor in restored.model_state.items():
-            torch.testing.assert_close(tensor, saved.model_state[name], rtol=0, atol=0)
+        torch.testing.assert_close(restored.model_state, saved.model_state, rtol=0, atol=0)
+        torch.testing.assert_close(restored.optimizer_state, saved.optimizer_state, rtol=0, atol=0)
+        assert_rng_state_consistency(restored.rng_state, saved.rng_state)
+
+        exact = make_trainer("exact-cap", dataset="exact")
+        take = exact.train_loader.next_full_batch
+        reads = 0
+
+        def count_reads(output):
+            nonlocal reads
+            reads += 1
+            return take(output)
+
+        exact.train_loader.next_full_batch = count_reads
+        exact.train()
+        assert exact.state.completed_steps == 3
+        assert reads == len(exact.model.module.batches) == 6
+        if rank == 1:
+            assert take(exact.train_loader.allocate_training_buffers(1)[0]) is None
     finally:
         dist.destroy_process_group()
 
@@ -222,6 +249,8 @@ def _training_loader_worker(rank, tmp_path, order, texts_by_shard):
 def test_distributed_training_loader_ownership_and_exact_checkpoint_resume(tmp_path):
     dataset = tmp_path / "tokens"
     dataset.mkdir()
+    exact = tmp_path / "exact"
+    exact.mkdir()
     order = list(range(5))
     random.Random(83).shuffle(order)
     texts_by_shard = []
@@ -233,6 +262,9 @@ def test_distributed_training_loader_ownership_and_exact_checkpoint_resume(tmp_p
         texts = [" ".join(str(next(tokens)) for _ in range(length)) for length in lengths]
         texts_by_shard.append(texts)
         pq.write_table(pa.table({"text": texts}), dataset / f"shard_{shard_id:05d}.parquet", row_group_size=2)
+        exact_docs = [" ".join(str(token) for token in range(start, start + 4)) for start in
+                      (shard_id * 32 + 1, shard_id * 32 + 5, shard_id * 32 + 9)]
+        pq.write_table(pa.table({"text": exact_docs}), exact / f"shard_{shard_id:05d}.parquet")
     mp.spawn(_training_loader_worker, args=(tmp_path, order, texts_by_shard), nprocs=2, join=True)
 
     rank0, rank1 = [json.loads((tmp_path / f"io-{rank}.json").read_text()) for rank in range(2)]
