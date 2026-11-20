@@ -876,14 +876,17 @@ class Trainer:
             1,
             math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
         )
-        with self.val_context(self.compiled_model):
-            val_res = compute_bpb(
-                self.compiled_model,
-                self.val_loader(),
-                eval_steps,
-                comp_info=self.config.comp_info,
-                token_bytes=self.tokenizer.token_bytes
-            )
+        try:
+            with self.val_context(self.compiled_model):
+                val_res = compute_bpb(
+                    self.compiled_model,
+                    self.val_loader(),
+                    eval_steps,
+                    comp_info=self.config.comp_info,
+                    token_bytes=self.tokenizer.token_bytes
+                )
+        finally:
+            self.compiled_model.train()
         print0(f"Step {step:05d} | "\
                f"Validation bpb: {val_res['bpb']:.6f} | "\
             f"Validation loss: {val_res['loss']:.6f}")
@@ -908,7 +911,6 @@ class Trainer:
         }
         self.board.log(board_dict, step=step)
         self.eval_metrics.append(board_dict, step=step)
-        self.compiled_model.train()
 
     def evaluate_core(self):
         """Run CORE evaluation, log metrics, and track the best score.

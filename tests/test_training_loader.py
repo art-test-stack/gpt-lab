@@ -1,9 +1,11 @@
 from datetime import timedelta
+from itertools import islice
 import json
 import os
 from pathlib import Path
 import random
 import sys
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,6 +18,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from gpt_lab.data import loader as loader_module
 from gpt_lab.data.loader import build_dataloader
+from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.model.checkpoint import CheckpointManager, capture_rng_state, set_rng_state
 from gpt_lab.train.trainer import Trainer, TrainingDataExhaustedError
 from gpt_lab.utils.board import DummyBoard
@@ -30,6 +33,66 @@ class IntegerTokenizer:
 
     def __call__(self, text, *, prepend_bos, threads):
         return [0] + [int(token) for token in text.split()]
+
+
+@pytest.mark.parametrize("tokenizer", [IntegerTokenizer(), None], ids=["best-fit", "pretokenized"])
+def test_validation_rank_without_row_groups_exhausts(tmp_path, monkeypatch, tokenizer):
+    dataset = tmp_path / "tokens"
+    dataset.mkdir()
+    pq.write_table(pa.table({"text": ["1 2 3 4"]}), dataset / "shard_00001.parquet")
+    make_loader = build_dataloader(
+        name=dataset.name, cachedir=tmp_path, max_shards=1, split="val",
+        tokenizer=tokenizer, batch_size=1, seq_len=4,
+        comp_info=SimpleNamespace(rank=1, world_size=2, device=torch.device("cpu")),
+    )
+    loader = make_loader()
+    open_parquet = pq.ParquetFile
+
+    def open_once(path):
+        assert loader.dataset.sm.opened_shards == [1]
+        return open_parquet(path)
+
+    monkeypatch.setattr(pq, "ParquetFile", open_once)
+    assert next(loader, None) is None
+    assert next(loader, None) is None
+    assert loader.dataset.sm.opened_shards == [1]
+
+
+def _validation_worker(rank, tmp_path):
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo0" if sys.platform == "darwin" else "lo"
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=(tmp_path / "rendezvous").as_uri(),
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        context = ComputeContext(device=torch.device("cpu"), mesh=init_device_mesh("cpu", (2,), mesh_dim_names=("dp",)))
+        make_loader = build_dataloader(
+            name="tokens", cachedir=tmp_path, max_shards=1, split="val", tokenizer=IntegerTokenizer(),
+            batch_size=1, seq_len=4, comp_info=context,
+        )
+        assert len(list(islice(make_loader(), 3))) == 2 - rank
+        calls = []
+
+        def model(x, y, reduction):
+            calls.append((x.tolist(), y.tolist()))
+            return torch.ones_like(y, dtype=torch.float32)
+
+        model.get_device = lambda: context.device
+        with pytest.raises(RuntimeError, match=r"Validation exhausted after 1 of 2 full batches on ranks \[1\]"):
+            compute_bpb(model, make_loader(), 2, torch.ones(20), comp_info=context)
+        first = 1 + 10 * rank
+        assert calls == [([[0, first, first + 1, first + 2]], [[first, first + 1, first + 2, first + 3]])]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo unavailable")
+def test_distributed_validation_rejects_uneven_exhaustion(tmp_path):
+    dataset = tmp_path / "tokens"
+    dataset.mkdir()
+    pq.write_table(pa.table({"text": ["1 2 3 4 5 6 7 8", "11 12 13 14 15 16"]}),
+                   dataset / "shard_00001.parquet", row_group_size=1)
+    mp.spawn(_validation_worker, args=(tmp_path,), nprocs=2, join=True)
 
 
 @pytest.mark.fast

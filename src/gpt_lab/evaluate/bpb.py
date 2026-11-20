@@ -1,7 +1,6 @@
 # https://medium.com/@dip.patel.ict/bits-per-byte-bpb-a-tokenizer-agnostic-way-to-measure-llms-25dfed3f41af
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import math 
 from typing import Optional
 
@@ -34,7 +33,7 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info
         - loss (float): The average loss per token, for debugging.
     """
     dist_is_init = comp_info.is_distributed if comp_info is not None else is_ddp_initialized()
-    world_size = comp_info.world_size if comp_info is not None else 1
+    world_size = comp_info.world_size if comp_info is not None else (dist.get_world_size() if dist_is_init else 1)
     
     device = model.get_device() if hasattr(model, "get_device") else next(model.parameters()).device
 
@@ -44,10 +43,23 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info
     total_loss  = torch.tensor(0.0, dtype=torch.float32, device=device)  # scalar, for debugging
 
     token_bytes = token_bytes.to(device=device, dtype=torch.int64)     # (V,)
-    
+    short_ranks = None
+    if dist_is_init and world_size > 1:
+        rank = comp_info.rank if comp_info is not None else dist.get_rank()
+        short_ranks = torch.zeros(world_size, dtype=torch.int32, device=device)
+
     batch_iter = iter(batches)
-    for _ in range(steps):
-        x, y, _ = next(batch_iter)
+    for completed in range(steps):
+        batch = next(batch_iter, None)
+        short = batch is None
+        if short_ranks is not None:
+            short_ranks[rank] = short
+            dist.all_reduce(short_ranks)
+            short = bool(short_ranks.any().item())
+        if short:
+            ranks = short_ranks.nonzero().flatten().tolist() if short_ranks is not None else [0]
+            raise RuntimeError(f"Validation exhausted after {completed} of {steps} full batches on ranks {ranks}")
+        x, y, _ = batch
 
         output = model(x, y, reduction="none") # (B, Seq) NATs
         try:

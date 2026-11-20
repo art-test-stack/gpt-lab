@@ -218,7 +218,13 @@ data_loader: DistDataLoader = build_dataloader(
 ) 
 ```
 
-Notice that if you use split `val`, you will get a simple function that returns a dataloader; which permits to ensure the same validation set across different training runs, steps, etc.
+With `split="val"`, `build_dataloader` returns a factory. Each call starts a
+fresh pass over the held-out shard. Rank `r` reads row groups `r`,
+`r + world_size`, and so on, using the lossless BOS packer with a fixed
+16-document lookahead for tokenized text. Validation yields full batches.
+If any rank runs short of the requested batches, BPB evaluation raises on
+every rank before publishing a score. Use the same shard, tokenizer, sequence
+length, batch size, rank count, and evaluation budget across runs you compare.
 
 ```python
 from gpt_lab.data.loader import build_dataloader

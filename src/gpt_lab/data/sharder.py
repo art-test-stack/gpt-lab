@@ -310,140 +310,132 @@ class ShardManager:
         row_group_start = 0 if self.split == "train" else self.ddp_rank
         row_group_stride = 1 if self.split == "train" else self.world_size
 
-        while True:
-            while state.shard_idx < len(self.shard_paths):
-                shard_path = self.shard_paths[state.shard_idx]
-                state.global_shard_idx = self.shard_idx[state.shard_idx]
-                if not shard_path.is_file() and self.base_url:
-                    self.download([state.global_shard_idx], verbose=self.ddp_rank == 0)
-                self.opened_shards.append(state.global_shard_idx)
-                pf = pq.ParquetFile(shard_path)
+        while state.shard_idx < len(self.shard_paths):
+            shard_path = self.shard_paths[state.shard_idx]
+            state.global_shard_idx = self.shard_idx[state.shard_idx]
+            if not shard_path.is_file() and self.base_url:
+                self.download([state.global_shard_idx], verbose=self.ddp_rank == 0)
+            self.opened_shards.append(state.global_shard_idx)
+            pf = pq.ParquetFile(shard_path)
 
-                try:
-                    if is_resuming and state.cursor_version == 0:
-                        base = state.row_group_idx // row_group_stride
-                        state.row_group_idx = (
-                            (base + 1) * row_group_stride + row_group_start
-                        )
+            try:
+                if is_resuming and state.cursor_version == 0:
+                    base = state.row_group_idx // row_group_stride
+                    state.row_group_idx = (
+                        (base + 1) * row_group_stride + row_group_start
+                    )
 
-                        if state.row_group_idx >= pf.num_row_groups:
-                            state.shard_idx += 1
-                            state.row_group_idx = row_group_start
-                            state.offset_in_row_group = 0
-                            is_resuming = False
-                            continue
-                    elif not is_resuming:
+                    if state.row_group_idx >= pf.num_row_groups:
+                        state.shard_idx += 1
                         state.row_group_idx = row_group_start
+                        state.offset_in_row_group = 0
+                        is_resuming = False
+                        continue
+                elif not is_resuming:
+                    state.row_group_idx = row_group_start
 
-                    while state.row_group_idx < pf.num_row_groups:
-                        for attempt in range(max_read_retries):
-                            try:
-                                # `pf` is set to None after a failed read.
-                                # Reopening here means open failures are retried too.
-                                if pf is None:
-                                    self.opened_shards.append(state.global_shard_idx)
-                                    pf = pq.ParquetFile(shard_path)
+                while state.row_group_idx < pf.num_row_groups:
+                    for attempt in range(max_read_retries):
+                        try:
+                            # `pf` is set to None after a failed read.
+                            # Reopening here means open failures are retried too.
+                            if pf is None:
+                                self.opened_shards.append(state.global_shard_idx)
+                                pf = pq.ParquetFile(shard_path)
 
-                                rg = pf.read_row_group(
-                                    state.row_group_idx,
-                                    columns=[self.column_name],
-                                )
-                                break
+                            rg = pf.read_row_group(
+                                state.row_group_idx,
+                                columns=[self.column_name],
+                            )
+                            break
 
-                            except OSError as exc:
-                                is_io_error = exc.errno == errno.EIO
+                        except OSError as exc:
+                            is_io_error = exc.errno == errno.EIO
 
-                                if pf is not None:
-                                    try:
-                                        pf.close()
-                                    except Exception:
-                                        pass
-                                    pf = None
+                            if pf is not None:
+                                try:
+                                    pf.close()
+                                except Exception:
+                                    pass
+                                pf = None
 
-                                if (
-                                    not is_io_error
-                                    or attempt == max_read_retries - 1
-                                ):
-                                    raise OSError(
-                                        "Failed to read Parquet row group: "
-                                        f"path={shard_path}, "
-                                        f"global_shard="
-                                        f"{state.global_shard_idx}, "
-                                        f"row_group="
-                                        f"{state.row_group_idx}, "
-                                        f"rank={self.ddp_rank}, "
-                                        f"attempt={attempt + 1}/"
-                                        f"{max_read_retries}"
-                                    ) from exc
-
-                                delay = 2**attempt
-                                self.read_retries.append(state.global_shard_idx)
-
-                                warnings.warn(
-                                    "Transient Parquet I/O error; "
-                                    "reopening and retrying: "
+                            if (
+                                not is_io_error
+                                or attempt == max_read_retries - 1
+                            ):
+                                raise OSError(
+                                    "Failed to read Parquet row group: "
                                     f"path={shard_path}, "
                                     f"global_shard="
                                     f"{state.global_shard_idx}, "
                                     f"row_group="
                                     f"{state.row_group_idx}, "
                                     f"rank={self.ddp_rank}, "
-                                    f"retry_in={delay}s"
-                                )
+                                    f"attempt={attempt + 1}/"
+                                    f"{max_read_retries}"
+                                ) from exc
 
-                                time.sleep(delay)
+                            delay = 2**attempt
+                            self.read_retries.append(state.global_shard_idx)
 
-                        batch = rg.column(self.column_name).to_pylist()
-
-                        offset = state.offset_in_row_group if is_resuming and state.cursor_version == 1 else 0
-                        if not 0 <= offset <= len(batch):
-                            raise ValueError(f"Dataloader cursor offset {offset} is outside row group of length {len(batch)}")
-                        is_resuming = False
-                        for i in range(offset, len(batch), batch_size):
-                            chunk = batch[i:i + batch_size]
-                            next_offset = i + len(chunk)
-                            next_group = state.row_group_idx
-                            next_shard = state.shard_idx
-                            if next_offset == len(batch):
-                                next_group += row_group_stride
-                                next_offset = 0
-                                if next_group >= pf.num_row_groups:
-                                    next_shard += 1
-                                    next_group = row_group_start
-                            yield (
-                                chunk,
-                                DataLoaderState(
-                                    shard_idx=next_shard,
-                                    global_shard_idx=(
-                                        state.global_shard_idx
-                                    ),
-                                    row_group_idx=next_group,
-                                    offset_in_row_group=next_offset,
-                                    epoch=state.epoch,
-                                    cursor_version=1,
-                                ),
+                            warnings.warn(
+                                "Transient Parquet I/O error; "
+                                "reopening and retrying: "
+                                f"path={shard_path}, "
+                                f"global_shard="
+                                f"{state.global_shard_idx}, "
+                                f"row_group="
+                                f"{state.row_group_idx}, "
+                                f"rank={self.ddp_rank}, "
+                                f"retry_in={delay}s"
                             )
 
-                        state.offset_in_row_group = 0
-                        state.row_group_idx += row_group_stride
+                            time.sleep(delay)
 
-                finally:
-                    # Also executes for resume `continue`, exceptions and
-                    # generator shutdown.
-                    if pf is not None:
-                        try:
-                            pf.close()
-                        except Exception:
-                            pass
+                    batch = rg.column(self.column_name).to_pylist()
 
-                state.shard_idx += 1
-                state.row_group_idx = row_group_start
-                state.offset_in_row_group = 0
-                is_resuming = False
+                    offset = state.offset_in_row_group if is_resuming and state.cursor_version == 1 else 0
+                    if not 0 <= offset <= len(batch):
+                        raise ValueError(f"Dataloader cursor offset {offset} is outside row group of length {len(batch)}")
+                    is_resuming = False
+                    for i in range(offset, len(batch), batch_size):
+                        chunk = batch[i:i + batch_size]
+                        next_offset = i + len(chunk)
+                        next_group = state.row_group_idx
+                        next_shard = state.shard_idx
+                        if next_offset == len(batch):
+                            next_group += row_group_stride
+                            next_offset = 0
+                            if next_group >= pf.num_row_groups:
+                                next_shard += 1
+                                next_group = row_group_start
+                        yield (
+                            chunk,
+                            DataLoaderState(
+                                shard_idx=next_shard,
+                                global_shard_idx=(
+                                    state.global_shard_idx
+                                ),
+                                row_group_idx=next_group,
+                                offset_in_row_group=next_offset,
+                                epoch=state.epoch,
+                                cursor_version=1,
+                            ),
+                        )
 
-            if self.split == "train":
-                return
-            state.shard_idx = 0
+                    state.offset_in_row_group = 0
+                    state.row_group_idx += row_group_stride
+
+            finally:
+                # Also executes for resume `continue`, exceptions and
+                # generator shutdown.
+                if pf is not None:
+                    try:
+                        pf.close()
+                    except Exception:
+                        pass
+
+            state.shard_idx += 1
             state.row_group_idx = row_group_start
             state.offset_in_row_group = 0
-            state.epoch += 1
+            is_resuming = False

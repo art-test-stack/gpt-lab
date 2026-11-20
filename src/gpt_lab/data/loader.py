@@ -12,6 +12,7 @@ from gpt_lab.utils.schemas import DataLoaderState
 from gpt_lab.data.sharder import ShardManager
 
 _TRAIN_LOOKAHEAD_DOCS = 16
+_VAL_LOOKAHEAD_DOCS = 16
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -22,7 +23,7 @@ class ShardedDataset:
     Streams tokenized documents from sharded parquet files.
 
     Each document is tokenized on the fly and yielded alongside its shard state.
-    Validation uses tensors and training keeps token lists for the checkpoint.
+    Tokenized text stays in lists for BOS packing and training checkpoints.
     """
 
     def __init__(
@@ -64,7 +65,7 @@ class ShardedDataset:
 
     def __iter__(self) -> Iterator[Tuple[Union[torch.Tensor, list[int]], DataLoaderState]]:
         batch_size = 1 if self.split == "train" else 128
-        bos = self.tokenizer.get_bos_token_id() if self.split == "train" else None
+        bos = self.tokenizer.get_bos_token_id() if self.tokenizer is not None else None
         for texts, state in self.sm.iterate(start_state=self.start_state, batch_size=batch_size):
             for txt in texts:
                 tokens = (
@@ -94,16 +95,15 @@ class DistDataLoader:
 
     Design notes
     ------------
-    * Training uses a bounded best-fit lookahead. Checkpoints retain the
-      buffer in read order, the pending suffix, and the next raw cursor.
-
-    * The validation buffer is a deque sized in tokens.
+    * Tokenized text uses a bounded best-fit lookahead. Training checkpoints
+      retain the buffer in read order, the pending suffix, and the next raw cursor.
+      Validation starts fresh on each pass and yields only full batches.
 
     * Documents are separated by an explicit BOS token so the model always
       sees clean boundaries: …doc_N_last [BOS] doc_N+1_first…
-      Training rows also start with BOS when continuing a document.
+      Best-fit rows also start with BOS when continuing a document.
 
-    * Training keeps an offset into the current document even when the
+    * Best-fit packing keeps an offset into the current document even when the
       document spans multiple batches.
 
     * Output tensors (self.inputs, self.targets) are pre-allocated once
@@ -125,8 +125,12 @@ class DistDataLoader:
         self.device = torch.device(device)
         self.eos_token_id = eos_token_id
         self.initial_state = None
-        if getattr(dataset, "split", None) == "train":
+        split = getattr(dataset, "split", None)
+        self._validation = split == "val"
+        self._best_fit = split == "train" or (self._validation and getattr(dataset, "tokenizer", None) is not None)
+        if self._best_fit:
             self.bos_token_id = dataset.tokenizer.get_bos_token_id()
+        if split == "train":
             sm = dataset.sm
             shape = dict(
                 packing_batch_size=batch_size, packing_seq_len=seq_len,
@@ -161,23 +165,27 @@ class DistDataLoader:
                 if not (0 <= state.shard_idx <= len(sm.shard_idx) and
                         min(state.row_group_idx, state.offset_in_row_group) >= 0):
                     raise ValueError("Invalid next-unread training data cursor")
-            self._source_cursor = self.initial_state
-            self._document_offset = self.initial_state.document_token_offset
-            self._pending_document = self.initial_state.pending_document
+            self._training_counts = Counter()
+            self._io_offsets = {}
+        elif self._best_fit:
+            self._lookahead_size = _VAL_LOOKAHEAD_DOCS
+
+        if self._best_fit:
+            self._source_cursor = self.initial_state or DataLoaderState()
+            self._document_offset = self._source_cursor.document_token_offset
+            self._pending_document = self._source_cursor.pending_document
             self._document_tensor = (
                 torch.frombuffer(array("q", self._pending_document), dtype=torch.long)
                 if self._pending_document is not None else None
             )
             self._lookahead: list[tuple[int, int, list[int]]] = []
             self._read_index = 0
-            for document in self.initial_state.lookahead_documents:
+            for document in self._source_cursor.lookahead_documents:
                 self._buffer_document(document)
             self._source_exhausted = False
             self._exhausted = False
-            self._training_counts = Counter()
-            self._io_offsets = {}
 
-        # Pre-fetch budget for the validation stream.
+        # Pre-fetch budget for streams of pretokenized tensors.
         self.token_buffer_size = buffer_size or (batch_size * seq_len * 16)
 
         self.iterator = iter(dataset)
@@ -208,10 +216,6 @@ class DistDataLoader:
             try:
                 tokens, state = next(self.iterator)
             except StopIteration:
-                if getattr(self.dataset, "split", None) == "val":
-                    # Validation set is finite — wrap around silently.
-                    self.iterator = iter(self.dataset)
-                    continue
                 break
 
             self.buffer.append((tokens, state))
@@ -221,7 +225,7 @@ class DistDataLoader:
         return self
 
     def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
-        if self.initial_state is not None:
+        if self._best_fit:
             return self._next_best_fit()
 
         self._refill()
@@ -232,6 +236,8 @@ class DistDataLoader:
             if not self.buffer:
                 self._refill()
                 if not self.buffer:
+                    if self._validation:
+                        raise StopIteration
                     raise RuntimeError("DistDataLoader buffer is empty mid-batch")
             tokens, self.last_state = self.buffer[0]
             take = min(len(tokens), total - pos)
@@ -317,7 +323,7 @@ class DistDataLoader:
                     document = self._take_best_fit_document(capacity - pos)
                     if document is None:
                         self._exhausted = True
-                        if row_idx == 0 and pos == 0:
+                        if self._validation or (row_idx == 0 and pos == 0):
                             raise StopIteration
                         row[pos:].fill_(-1)
                         rows[row_idx + 1:].fill_(-1)
@@ -344,14 +350,20 @@ class DistDataLoader:
             return None
 
         cursor = self._source_cursor
+        counts = dict(
+            source_content_tokens=content, document_bos_tokens=document_bos,
+            continuation_bos_tokens=continuation_bos, padding_positions=padding,
+        )
+        if self._validation:
+            self.last_state = cursor.model_copy(update=counts)
+            return self._output(self.last_state)
         self.last_state = self.initial_state.model_copy(update=dict(
             shard_idx=cursor.shard_idx, global_shard_idx=cursor.global_shard_idx,
             row_group_idx=cursor.row_group_idx, offset_in_row_group=cursor.offset_in_row_group,
             lookahead_documents=tuple(entry[2] for entry in sorted(self._lookahead, key=lambda entry: -entry[1])),
             pending_document=self._pending_document,
             document_token_offset=self._document_offset, continuation_pending=self._document_offset > 0,
-            source_content_tokens=content, document_bos_tokens=document_bos,
-            continuation_bos_tokens=continuation_bos, padding_positions=padding,
+            **counts,
         ))
         return self._output(self.last_state, output)
 
