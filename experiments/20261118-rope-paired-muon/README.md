@@ -111,3 +111,23 @@ complex SVD polar. It uses the same relative singular-value cutoff for both
 representations and reports the polar factor on the supported subspace.
 
 Numerical results, timings, GPU-hours and the pilot budget are pending.
+
+## Sharing one polar step between a query head and its key head
+
+`check_joint_qk.py` runs a one-step CPU example with four tokens and two RoPE
+planes. At each query position after the first, the target key is the preceding
+token. Q and K keep separate weights. Arm B supplies the reference direction
+by applying the five-step polar map separately to the two gradients.
+The joint variant concatenates their proposals along input columns. Each
+complex row then contains the Q and K proposals for the same rotary frequency.
+The resulting Hermitian Gram is the sum of the Q and K row Grams.
+
+A control swaps the two complete K planes during the polar step and restores
+their order before updating the weights. All three displacements have combined
+Frobenius norm 0.05. The script reports the cross-entropy on the same tokens
+before and after each step. It uses raw gradients as proposals and omits
+momentum history, variance reduction and weight decay.
+
+```bash
+uv run --locked --extra cpu python experiments/20261118-rope-paired-muon/check_joint_qk.py
+```
