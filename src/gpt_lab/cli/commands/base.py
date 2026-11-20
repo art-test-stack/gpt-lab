@@ -8,7 +8,6 @@ def add_common_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--run-name', type=str, default=None, help='Run name for checkpointing and logging. Auto generates a name when omitted; resume selects the latest run. Resume also accepts latest, best, or -N.')
     parser.add_argument('--model-dir', type=str, default=str(cache_dir() / 'models'), help='Cache directory to save model checkpoints and logs.')
     parser.add_argument('--random-seed', type=int, default=42, help='Random seed for model initialization')
-    parser.add_argument('--data-seed', type=int, default=None, help='Seed for the one-time training shard shuffle. Defaults to 42 on fresh runs and to the saved seed on resume.')
     parser.add_argument('--optim-config-path', type=str, default=None, help='YAML overrides for the bundled base optimizer profile; values are scaled automatically.')
     parser.add_argument('--device', type=str, default='auto', help="Device to train on. If 'auto', will detect best device available. Recommended to keep as 'auto' unless you have specific needs.")
     parser.add_argument('--board', default='wandb', type=str, choices=('tensorboard', 'wandb', 'dummy'), help="Board log directory (options: 'tensorboard', 'wandb', 'dummy').")
@@ -25,6 +24,7 @@ def add_common_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--log-every', type=int, default=250, help='Log metrics every N zero-based update indices (-1 = final only, 0 = disable).')
     parser.add_argument('--monitor-grad-norms', action='store_true', help='Whether to monitor gradient norms during training. If set, will log the norm of the gradients of each parameter to the board at each training step.')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Batch size for each device during training. Batch size define further effective batch size as device_batch_size * max_seq_len * n_acc_steps.')
+    parser.add_argument('--use-nanochat-dataloader', action='store_true', help='Whether to use the nanochat dataloader instead of the default dataloader.')
     parser.add_argument('--stop-after-step', type=int, default=None, help='Absolute cap on completed optimizer steps, including before resume; >=0. Leaves the scheduling horizon unchanged. Unset retains the saved cap on resume.')
     parser.add_argument('--cuda-graph-mode', choices=('disabled', 'forward_backward'), default=None, help='Opt-in fixed-shape compiled forward/backward CUDA capture (FP32/BF16). Unset retains the saved mode on resume.')
 

@@ -795,32 +795,15 @@ class ModelCompletionOutput(ModelOutput):
     done: bool = False
 
 class DataLoaderState(BaseModel):
-    cursor_version: Literal[0, 1] = 0
     shard_idx: int = 0
     global_shard_idx: Optional[int] = None # used for debugging
     row_group_idx: int = 0
     offset_in_row_group: int = 0
     epoch: int = 1
-
-    packing_state_version: Literal[0, 1, 2] = 0
-    data_seed: Optional[int] = None
-    manifest_id: Optional[str] = None
-    ordered_shard_ids: tuple[int, ...] = ()
-    packing_rank: Optional[int] = None
-    packing_world_size: Optional[int] = None
-    packing_batch_size: Optional[int] = None
-    packing_seq_len: Optional[int] = None
-    packing_bos_token_id: Optional[int] = None
-    packing_lookahead_size: Optional[int] = None
+    packing_signature: Optional[str] = None
     lookahead_documents: tuple[list[int], ...] = ()
     pending_document: Optional[list[int]] = None
     document_token_offset: int = 0
-    continuation_pending: bool = False
-
-    source_content_tokens: int = 0
-    document_bos_tokens: int = 0
-    continuation_bos_tokens: int = 0
-    padding_positions: int = 0
 
 class TrainerState(BaseModel):
     step: int = 0

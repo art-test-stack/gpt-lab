@@ -169,39 +169,11 @@ see the [results dashboard guide](docs/results_dashboard.md). The viewer in
 
 ### Data
 
-Fresh training runs look ahead by up to 16 documents on each rank and pick the longest
-whole document that fits the remaining row space, including its BOS. Ties follow
-read order. If none fits, the loader splits the shortest buffered document and
-carries the rest into the next row. Every document and row starts with BOS.
-A continuation row starts with BOS and uses the next unread source token.
-The last target in each row already counts as consumed.
-
-`--data-seed` controls the one-time training shard shuffle independently of
-`--random-seed`. It defaults to 42 on fresh runs and to the checkpoint seed on
-resume. Each global rank takes its slice of the same ordered shard IDs and opens
-or downloads only its own files. Training makes one pass. If any rank cannot
-fill an optimizer update before the configured step limit, all ranks stop at the
-last complete update and report the short ranks before running another forward.
-The trainer stages the next update during backward and commits the cursor after
-the optimizer step.
-
-Exact resume requires the same shard manifest, rank topology, batch shape, and
-tokenizer. Keep the files at those shard IDs immutable. Checkpoints save the
-ordered shard IDs, next unread cursor, lookahead size and buffer, and pending
-document with its token offset. Resumed runs retain the checkpoint's lookahead
-size, including 128 for runs started with the previous default. Source-order
-checkpoints cannot resume this packing policy exactly.
-At `--log-every` intervals, the training logger reports end-to-end throughput,
-per-rank packing counts, committed source content tokens per second, and shard
-I/O. The source rate uses the completed training updates since the preceding
-log. Batch-fetch wall time includes the blocking device copy and any queued
-GPU work it waits for.
-
-Custom training loaders stream by default. To opt into full-update preflight,
-set `supports_training_staging = True` on every rank, provide
-`allocate_training_buffers(count)` with independent writable slots, and have
-`next_full_batch(slot)` fill the requested slot or signal exhaustion. Trainers
-that wrap `super().train_step()` keep preflight for these loaders.
+**TLDR;** The dataloader is easily built with the following code snippet. It employs the following strategies:
+- Streaming (not mmap, not in-memory)
+- Packed (not padded batching)
+- Distributed (not replicated dataset)
+- Lazy (not pre-tokenized)
 
 ```python
 from gpt_lab.data.loader import build_dataloader, DistDataLoader
@@ -218,13 +190,7 @@ data_loader: DistDataLoader = build_dataloader(
 ) 
 ```
 
-With `split="val"`, `build_dataloader` returns a factory. Each call starts a
-fresh pass over the held-out shard. Rank `r` reads row groups `r`,
-`r + world_size`, and so on, using the lossless BOS packer with a fixed
-16-document lookahead for tokenized text. Validation yields full batches.
-If any rank runs short of the requested batches, BPB evaluation raises on
-every rank before publishing a score. Use the same shard, tokenizer, sequence
-length, batch size, rank count, and evaluation budget across runs you compare.
+Notice that if you use split `val`, you will get a simple function that returns a dataloader; which permits to ensure the same validation set across different training runs, steps, etc.
 
 ```python
 from gpt_lab.data.loader import build_dataloader

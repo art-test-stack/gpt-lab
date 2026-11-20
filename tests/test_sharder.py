@@ -1,7 +1,6 @@
 import torch
 from types import SimpleNamespace
 import json
-import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -10,7 +9,6 @@ import pyarrow.parquet as pq
 import pytest
 
 from gpt_lab.data.sharder import ShardManager
-from gpt_lab.utils.schemas import DataLoaderState
 
 
 def _metadata_manager(tmp_path):
@@ -79,8 +77,6 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
 
     world_size = 8
     num_train_shards = 16
-    order = list(range(num_train_shards))
-    random.Random(42).shuffle(order)
 
     for shard_idx in range(num_train_shards):
         pq.write_table(
@@ -106,19 +102,22 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
             max_shards=num_train_shards,
             comp_info=SimpleNamespace(rank=rank, world_size=world_size, device=torch.device("cpu"), is_distributed=False),
         )
-        expected_shard_ids = set(order[rank::world_size])
+        expected_shard_ids = set(range(rank, num_train_shards, world_size))
         assigned_shard_ids = {
             int(path.stem.split("_")[1])
             for path in manager.shard_paths
         }
 
+        # Check assignment before consuming the infinite iterator so a
+        # regression cannot leave the test waiting for data forever.
         assert assigned_shard_ids == expected_shard_ids
 
         retrieved_texts = set()
         retrieved_shard_ids = set()
         iterator = manager.iterate(batch_size=1)
         try:
-            for texts, state in iterator:
+            for _ in range(len(manager.shard_paths)):
+                texts, state = next(iterator)
                 assert len(texts) == 1
                 retrieved_texts.update(texts)
                 retrieved_shard_ids.add(state.global_shard_idx)
@@ -137,7 +136,7 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
     all_retrieved_texts = set()
 
     for rank, (retrieved_texts, retrieved_shard_ids) in enumerate(worker_results):
-        expected_shard_ids = set(order[rank::world_size])
+        expected_shard_ids = set(range(rank, num_train_shards, world_size))
         assert retrieved_shard_ids == expected_shard_ids
         assert retrieved_texts == {
             f"shard-{shard_idx}"
@@ -152,29 +151,4 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
         all_retrieved_texts.update(retrieved_texts)
 
     assert all_retrieved_texts == expected_texts
-
-
-@pytest.mark.fast
-@pytest.mark.parametrize("chunks_before_resume", [1, 2, 4], ids=["in-group", "next-group", "next-shard"])
-def test_next_unread_cursor_resumes_across_boundaries(tmp_path, chunks_before_resume):
-    dataset = tmp_path / "cursor"
-    dataset.mkdir()
-    for shard_id in range(2):
-        pq.write_table(
-            pa.table({"text": [f"{shard_id}-{index}" for index in range(6)]}),
-            dataset / f"shard_{shard_id:05d}.parquet",
-            row_group_size=3,
-        )
-    manager = ShardManager(
-        name=dataset.name,
-        cachedir=tmp_path,
-        max_shards=2,
-        comp_info=SimpleNamespace(rank=0, world_size=1, is_distributed=False),
-    )
-    uninterrupted = manager.iterate(batch_size=2)
-    for _ in range(chunks_before_resume):
-        _, cursor = next(uninterrupted)
-    saved = DataLoaderState.model_validate_json(cursor.model_dump_json())
-
-    assert list(manager.iterate(start_state=saved, batch_size=2)) == list(uninterrupted)
 

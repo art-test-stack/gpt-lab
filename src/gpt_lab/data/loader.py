@@ -1,6 +1,5 @@
-from array import array
-from bisect import bisect_right, insort
-from collections import Counter, deque
+import hashlib
+import json
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple, Union
 
@@ -8,23 +7,14 @@ import torch
 
 from gpt_lab.utils.default import DATA_DIR
 from gpt_lab.utils.distributed import ComputeContext, get_comp_info
-from gpt_lab.utils.schemas import DataLoaderState
+from gpt_lab.utils.schemas import DataLoaderState, TokenizerConfig
 from gpt_lab.data.sharder import ShardManager
 
-_TRAIN_LOOKAHEAD_DOCS = 16
-_VAL_LOOKAHEAD_DOCS = 16
+_LOOKAHEAD_DOCUMENTS = 16
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
 
 class ShardedDataset:
-    """
-    Streams tokenized documents from sharded parquet files.
-
-    Each document is tokenized on the fly and yielded alongside its shard state.
-    Tokenized text stays in lists for BOS packing and training checkpoints.
-    """
+    """Read and tokenize documents alongside the cursor immediately after each one."""
 
     def __init__(
         self,
@@ -39,76 +29,45 @@ class ShardedDataset:
         cachedir: Union[str, Path] = DATA_DIR,
         comp_info: Optional[ComputeContext] = None,
         tokenizer_threads: int = 4,
-        data_seed: Optional[int] = None,
     ):
-        if isinstance(cachedir, str):
-            cachedir = Path(cachedir)
-        if comp_info is None:
-            comp_info = get_comp_info()
-
         self.sm = ShardManager(
             name=name,
             cachedir=cachedir,
             split=split,
-            base_url=base_url or "",
+            base_url=base_url,
             column_name=column,
             shard_limit=shard_limit,
             max_shards=max_shards,
             comp_info=comp_info,
-            data_seed=data_seed,
-            start_state=start_state,
         )
+        self.name = name
         self.tokenizer = tokenizer
+        self.bos_token_id = getattr(tokenizer, "get_bos_token_id", lambda: None)()
         self.split = split
         self.start_state = start_state
         self.tokenizer_threads = tokenizer_threads
 
-    def __iter__(self) -> Iterator[Tuple[Union[torch.Tensor, list[int]], DataLoaderState]]:
-        batch_size = 1 if self.split == "train" else 128
-        bos = self.tokenizer.get_bos_token_id() if self.tokenizer is not None else None
-        for texts, state in self.sm.iterate(start_state=self.start_state, batch_size=batch_size):
-            for txt in texts:
-                tokens = (
-                    self.tokenizer(txt, prepend_bos=True, threads=self.tokenizer_threads)
-                    if self.tokenizer is not None
-                    else txt
-                )
-                if bos is not None:
-                    if isinstance(tokens, torch.Tensor):
-                        if tokens.ndim != 1:
-                            raise ValueError("Source document must be a 1-D token sequence")
-                        tokens = tokens.tolist()
-                    if not len(tokens) or tokens[0] != bos:
-                        raise ValueError("Source document must begin with BOS")
-                elif not isinstance(tokens, torch.Tensor):
-                    tokens = torch.tensor(tokens, dtype=torch.long)
-                yield tokens, state
+    def __iter__(self) -> Iterator[Tuple[list[int], DataLoaderState]]:
+        for (text,), cursor in self.sm.iterate(start_state=self.start_state, batch_size=1):
+            tokens = (
+                self.tokenizer(text, prepend_bos=True, threads=self.tokenizer_threads)
+                if self.tokenizer is not None
+                else text
+            )
+            if isinstance(tokens, torch.Tensor):
+                if tokens.ndim != 1:
+                    raise ValueError("Source document must be a 1-D token sequence")
+                tokens = tokens.tolist()
+            elif not isinstance(tokens, list):
+                tokens = list(tokens)
+            if self.bos_token_id is not None and (not tokens or tokens[0] != self.bos_token_id):
+                raise ValueError("Source document must begin with BOS")
+            if tokens:
+                yield tokens, cursor
 
-
-# ---------------------------------------------------------------------------
-# Dataloader
-# ---------------------------------------------------------------------------
 
 class DistDataLoader:
-    """
-    Packs tokenized documents into fixed-shape (B, T) input/target tensors.
-
-    Design notes
-    ------------
-    * Tokenized text uses a bounded best-fit lookahead. Training checkpoints
-      retain the buffer in read order, the pending suffix, and the next raw cursor.
-      Validation starts fresh on each pass and yields only full batches.
-
-    * Documents are separated by an explicit BOS token so the model always
-      sees clean boundaries: …doc_N_last [BOS] doc_N+1_first…
-      Best-fit rows also start with BOS when continuing a document.
-
-    * Best-fit packing keeps an offset into the current document even when the
-      document spans multiple batches.
-
-    * Output tensors (self.inputs, self.targets) are pre-allocated once
-      and reused every step.
-    """
+    """Pack each row without discarding document tails, starting with BOS when available."""
 
     def __init__(
         self,
@@ -119,264 +78,110 @@ class DistDataLoader:
         buffer_size: Optional[int] = None,
         eos_token_id: Optional[int] = None,
     ):
-        self.dataset = dataset
+        if batch_size < 1 or seq_len < 1:
+            raise ValueError("Batch size and sequence length must be positive")
         self.B = batch_size
         self.T = seq_len
         self.device = torch.device(device)
-        self.eos_token_id = eos_token_id
-        self.initial_state = None
-        split = getattr(dataset, "split", None)
-        self._validation = split == "val"
-        self._best_fit = split == "train" or (self._validation and getattr(dataset, "tokenizer", None) is not None)
-        if self._best_fit:
-            self.bos_token_id = dataset.tokenizer.get_bos_token_id()
-        if split == "train":
+        self.bos_token_id = dataset.bos_token_id
+        self.lookahead_size = _LOOKAHEAD_DOCUMENTS if self.bos_token_id is not None else 1
+
+        self.signature = None
+        if dataset.split == "train":
             sm = dataset.sm
-            shape = dict(
-                packing_batch_size=batch_size, packing_seq_len=seq_len,
-                packing_bos_token_id=self.bos_token_id,
+            config = getattr(dataset.tokenizer, "config", None)
+            tokenizer = type(dataset.tokenizer)
+            signature_data = (
+                1,  # Checkpoint format and packing algorithm version.
+                dataset.name, sm.base_url, sm.column_name, sm.max_shards, sm.train_shards,
+                sm.shard_idx, sm.ddp_rank, sm.world_size,
+                batch_size, seq_len, self.lookahead_size, self.bos_token_id,
+                tokenizer.__module__, tokenizer.__qualname__,
+                config.model_dump(mode="json", exclude={"dirname", "trainer", "save_token_bytes"})
+                if isinstance(config, TokenizerConfig) else None,
             )
-            self._lookahead_size = _TRAIN_LOOKAHEAD_DOCS
-            self.initial_state = dataset.start_state
-            if self.initial_state is None:
-                self.initial_state = DataLoaderState(
-                    cursor_version=1, packing_state_version=2,
-                    manifest_id=sm.manifest_id, ordered_shard_ids=sm.ordered_shard_ids,
-                    data_seed=sm.data_seed, packing_rank=sm.ddp_rank, packing_world_size=sm.world_size,
-                    packing_lookahead_size=self._lookahead_size,
-                    **shape,
-                )
-            else:
-                state = self.initial_state
-                if any(getattr(state, name) != value for name, value in shape.items()):
-                    raise ValueError("Incompatible packing configuration in training data checkpoint")
-                if state.packing_lookahead_size is None or state.packing_lookahead_size < 1:
-                    raise ValueError("Invalid lookahead size in training data checkpoint")
-                self._lookahead_size = state.packing_lookahead_size
-                pending = state.pending_document
-                offset = state.document_token_offset
-                if (state.continuation_pending != (pending is not None)
-                        or (pending is None and offset != 0)
-                        or (pending is not None and not (0 < offset < len(pending) and pending[0] == self.bos_token_id))):
-                    raise ValueError("Incompatible continuation state in training data checkpoint")
-                if (len(state.lookahead_documents) > self._lookahead_size
-                        or any(not doc or doc[0] != self.bos_token_id for doc in state.lookahead_documents)):
-                    raise ValueError("Invalid lookahead buffer in training data checkpoint")
-                if not (0 <= state.shard_idx <= len(sm.shard_idx) and
-                        min(state.row_group_idx, state.offset_in_row_group) >= 0):
-                    raise ValueError("Invalid next-unread training data cursor")
-            self._training_counts = Counter()
-            self._io_offsets = {}
-        elif self._best_fit:
-            self._lookahead_size = _VAL_LOOKAHEAD_DOCS
+            self.signature = hashlib.sha256(json.dumps(signature_data, sort_keys=True).encode()).hexdigest()
 
-        if self._best_fit:
-            self._source_cursor = self.initial_state or DataLoaderState()
-            self._document_offset = self._source_cursor.document_token_offset
-            self._pending_document = self._source_cursor.pending_document
-            self._document_tensor = (
-                torch.frombuffer(array("q", self._pending_document), dtype=torch.long)
-                if self._pending_document is not None else None
-            )
-            self._lookahead: list[tuple[int, int, list[int]]] = []
-            self._read_index = 0
-            for document in self._source_cursor.lookahead_documents:
-                self._buffer_document(document)
-            self._source_exhausted = False
-            self._exhausted = False
+        self.cursor = dataset.start_state or DataLoaderState()
+        self.lookahead = list(self.cursor.lookahead_documents)
+        self.document = self.cursor.pending_document
+        self.offset = self.cursor.document_token_offset
+        if dataset.start_state is not None:
+            if dataset.split == "train" and self.cursor.packing_signature != self.signature:
+                raise ValueError("Incompatible training data checkpoint (loader, dataset, topology, tokenizer or batch shape)")
+            documents = self.lookahead + ([self.document] if self.document is not None else [])
+            if (len(self.lookahead) >= self.lookahead_size
+                    or any(not doc or (self.bos_token_id is not None and doc[0] != self.bos_token_id) for doc in documents)
+                    or (self.document is None and self.offset != 0)
+                    or (self.document is not None and not 0 < self.offset < len(self.document))):
+                raise ValueError("Invalid packing buffer in data checkpoint")
 
-        # Pre-fetch budget for streams of pretokenized tensors.
-        self.token_buffer_size = buffer_size or (batch_size * seq_len * 16)
-
+        self.document_tensor = torch.tensor(self.document, dtype=torch.long) if self.document is not None else None
         self.iterator = iter(dataset)
-        self.buffer: deque[Tuple[torch.Tensor, DataLoaderState]] = deque()
-        self._buffered_tokens: int = 0
-        self.last_state: Optional[DataLoaderState] = None
-
-        total = batch_size * (seq_len + 1)
-
-        # Pinned CPU staging reused after each blocking device copy.
-        self.cpu = torch.empty(
-            total, dtype=torch.long,
-            pin_memory=(self.device.type == "cuda"),
-        )
-        self.gpu = torch.empty(total, dtype=torch.long, device=self.device)
-
-        # Single contiguous allocation; inputs and targets are non-overlapping
-        # views into it.  Avoids two separate allocations per forward pass.
-        _out = torch.empty(
-            2 * batch_size * seq_len, dtype=torch.long, device=self.device
-        )
-        self.inputs  = _out[:batch_size * seq_len].view(batch_size, seq_len)
-        self.targets = _out[batch_size * seq_len:].view(batch_size, seq_len)
-
-    def _refill(self) -> None:
-        """Pull documents from the dataset until the token budget is met."""
-        while self._buffered_tokens < self.token_buffer_size:
-            try:
-                tokens, state = next(self.iterator)
-            except StopIteration:
-                break
-
-            self.buffer.append((tokens, state))
-            self._buffered_tokens += len(tokens)
+        self.next_epoch_document = None
+        self.cpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, pin_memory=self.device.type == "cuda")
+        self.gpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, device=self.device)
+        self.inputs = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
+        self.targets = torch.empty_like(self.inputs)
 
     def __iter__(self):
         return self
 
+    def _take_document(self, space: int) -> list[int]:
+        while len(self.lookahead) < self.lookahead_size:
+            if self.next_epoch_document is None:
+                self.next_epoch_document = next(self.iterator)
+            document, cursor = self.next_epoch_document
+            # Keep the resume cursor before the new epoch until the old buffer drains.
+            if self.lookahead and cursor.epoch != self.cursor.epoch:
+                break
+            self.lookahead.append(document)
+            self.cursor = cursor
+            self.next_epoch_document = None
+
+        best = None
+        for index, document in enumerate(self.lookahead):
+            if len(document) <= space and (best is None or len(document) > len(self.lookahead[best])):
+                best = index
+        if best is None:
+            # Split the shortest document when none fits, retaining its suffix.
+            best = min(range(len(self.lookahead)), key=lambda index: len(self.lookahead[index]))
+        return self.lookahead.pop(best)
+
     def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
-        if self._best_fit:
-            return self._next_best_fit()
-
-        self._refill()
-        B, T = self.B, self.T
-        total = B * (T + 1)
-        pos = 0
-        while pos < total:
-            if not self.buffer:
-                self._refill()
-                if not self.buffer:
-                    if self._validation:
-                        raise StopIteration
-                    raise RuntimeError("DistDataLoader buffer is empty mid-batch")
-            tokens, self.last_state = self.buffer[0]
-            take = min(len(tokens), total - pos)
-            self.cpu[pos : pos + take].copy_(tokens[:take])
-            pos += take
-            self._buffered_tokens -= take
-            if take < len(tokens):
-                self.buffer[0] = (tokens[take:], self.last_state)
-            else:
-                self.buffer.popleft()
-        return self._output(self.last_state)
-
-    def _buffer_document(self, document: list[int]) -> None:
-        # The rightmost entry of a given length is the earliest to be read.
-        insort(self._lookahead, (len(document), -self._read_index, document))
-        self._read_index += 1
-
-    def _take_best_fit_document(self, space: int) -> Optional[list[int]]:
-        while len(self._lookahead) < self._lookahead_size and not self._source_exhausted:
-            result = next(self.iterator, None)
-            if result is None:
-                self._source_exhausted = True
-                break
-            document, self._source_cursor = result
-            self._buffer_document(document)
-        if not self._lookahead:
-            return None
-        index = bisect_right(self._lookahead, (space, 1)) - 1
-        if index < 0:
-            shortest = self._lookahead[0][0]
-            index = bisect_right(self._lookahead, (shortest, 1)) - 1
-        return self._lookahead.pop(index)[2]
-
-    @property
-    def supports_training_staging(self):
-        """Training splits can fill independent slots before an optimizer update."""
-        return self.initial_state is not None
-
-    def allocate_training_buffers(self, count):
-        return [(torch.empty_like(self.inputs), torch.empty_like(self.targets)) for _ in range(count)]
-
-    def next_full_batch(self, output):
-        """Fill a caller-owned training slot, or return None on exhaustion."""
-        try:
-            return self._next_best_fit(output)
-        except StopIteration:
-            return None
-
-    def record_training_update(self, states):
-        for state in states:
-            self._training_counts.update(
-                target_positions=self.B * self.T,
-                bos_starting_rows=self.B,
-                source_content_tokens=state.source_content_tokens,
-                document_bos_tokens=state.document_bos_tokens,
-                continuation_bos_tokens=state.continuation_bos_tokens,
-            )
-
-    def take_training_metrics(self):
-        metrics = dict(self._training_counts, discarded_content_tokens=0)
-        self._training_counts.clear()
-        for name in ("opened_shards", "downloaded_shards", "read_retries", "download_retries"):
-            events = getattr(self.dataset.sm, name)
-            metrics[name] = events[self._io_offsets.get(name, 0):]
-            self._io_offsets[name] = len(events)
-        return metrics
-
-    def _next_best_fit(self, output=None):
-        if self._exhausted:
-            raise StopIteration
         capacity = self.T + 1
-        rows = self.cpu.view(self.B, capacity)
-        rows[:, 0].fill_(self.bos_token_id)
-        content = document_bos = continuation_bos = padding = 0
-        # The final target already consumed its token before the continuation.
-        for row_idx, row in enumerate(rows):
+        for row in self.cpu:
             pos = 0
-            if self._document_offset:
-                continuation_bos += 1
+            if self.offset and self.bos_token_id is not None:
+                row[0] = self.bos_token_id
                 pos = 1
+
             while pos < capacity:
-                if self._pending_document is None:
-                    document = self._take_best_fit_document(capacity - pos)
-                    if document is None:
-                        self._exhausted = True
-                        if self._validation or (row_idx == 0 and pos == 0):
-                            raise StopIteration
-                        row[pos:].fill_(-1)
-                        rows[row_idx + 1:].fill_(-1)
-                        padding = (self.B - row_idx - 1) * self.T + self.T - max(0, pos - 1)
-                        break
-                    self._pending_document = document
-                    self._document_tensor = torch.frombuffer(array("q", document), dtype=torch.long)
-                offset = self._document_offset
-                length = len(self._pending_document)
-                take = min(length - offset, capacity - pos)
-                row[pos:pos + take].copy_(self._document_tensor[offset:offset + take])
+                if self.document is None:
+                    self.document = self._take_document(capacity - pos)
+                    self.document_tensor = torch.tensor(self.document, dtype=torch.long)
+                take = min(len(self.document) - self.offset, capacity - pos)
+                row[pos:pos + take].copy_(self.document_tensor[self.offset:self.offset + take])
                 pos += take
-                document_bos += offset == 0
-                content += take - (offset == 0)
-                self._document_offset += take
-                if self._document_offset == length:
-                    self._pending_document = None
-                    self._document_tensor = None
-                    self._document_offset = 0
-            if self._exhausted:
-                break
+                self.offset += take
+                if self.offset == len(self.document):
+                    self.document = None
+                    self.document_tensor = None
+                    self.offset = 0
 
-        if output is not None and padding:
-            return None
+        self.gpu.copy_(self.cpu)
+        self.inputs.copy_(self.gpu[:, :-1])
+        self.targets.copy_(self.gpu[:, 1:])
+        state = self.cursor
+        if self.signature is not None:
+            state = state.model_copy(update=dict(
+                packing_signature=self.signature,
+                lookahead_documents=tuple(self.lookahead),
+                pending_document=self.document,
+                document_token_offset=self.offset,
+            ))
+        return self.inputs, self.targets, state
 
-        cursor = self._source_cursor
-        counts = dict(
-            source_content_tokens=content, document_bos_tokens=document_bos,
-            continuation_bos_tokens=continuation_bos, padding_positions=padding,
-        )
-        if self._validation:
-            self.last_state = cursor.model_copy(update=counts)
-            return self._output(self.last_state)
-        self.last_state = self.initial_state.model_copy(update=dict(
-            shard_idx=cursor.shard_idx, global_shard_idx=cursor.global_shard_idx,
-            row_group_idx=cursor.row_group_idx, offset_in_row_group=cursor.offset_in_row_group,
-            lookahead_documents=tuple(entry[2] for entry in sorted(self._lookahead, key=lambda entry: -entry[1])),
-            pending_document=self._pending_document,
-            document_token_offset=self._document_offset, continuation_pending=self._document_offset > 0,
-            **counts,
-        ))
-        return self._output(self.last_state, output)
-
-    def _output(self, state, output=None):
-        # Blocking host-to-device transfer.
-        self.gpu.copy_(self.cpu, non_blocking=False)
-        data = self.gpu.view(self.B, self.T + 1)
-        inputs, targets = (self.inputs, self.targets) if output is None else output
-        inputs.copy_(data[:, :-1])
-        targets.copy_(data[:, 1:])
-        if state is not None and state.padding_positions:
-            inputs.masked_fill_(inputs == -1, self.bos_token_id)
-        return inputs, targets, state
 
 # just to compare
 """
@@ -489,7 +294,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
         for tokens in token_lists:
-            doc_buffer.append(tokens)
+            doc_buffer.append(tokens if tokens and tokens[0] == bos_token else [bos_token, *tokens])
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
@@ -568,19 +373,55 @@ def build_dataloader(
     resume_state: Optional[DataLoaderState] = None,
     comp_info: Optional[ComputeContext] = None,
     tokenizer_threads: int = 4,
-    data_seed: Optional[int] = None,
+    use_nanochat: bool = False,
 ) -> DistDataLoader:
+    """Build a training iterator or a factory for independent validation iterators.
+
+    Native tokenized input uses a fixed 16-document lookahead. The buffer_size
+    argument configures the nanochat backend.
+    """
     if comp_info is None:
         comp_info = get_comp_info()
-    ds = ShardedDataset(
-        name=name, tokenizer=tokenizer, split=split, column=column, base_url=base_url,
-        shard_limit=shard_limit, max_shards=max_shards, cachedir=cachedir or datadir or DATA_DIR,
-        start_state=resume_state, comp_info=comp_info, tokenizer_threads=tokenizer_threads,
-        data_seed=data_seed,
-    )
-
-    def dataloader():
-        return DistDataLoader(
+    if use_nanochat:
+        if resume_state is not None and resume_state.packing_signature is not None:
+            raise ValueError("Cannot resume a native dataloader checkpoint with nanochat")
+        # This is the original dataloader from nanochat, from which I derived the pipeline for gpt-lab.
+        # So it is based on the same underlying data loading and on-the-fly tokenization
+        if resume_state is not None:
+            resume_state_dict = dict(
+                pq_idx=resume_state.shard_idx,
+                rg_idx=resume_state.row_group_idx,
+                epoch=resume_state.epoch
+            )
+        else:
+            resume_state_dict = None
+        dataloader = lambda: tokenizing_distributed_data_loader_with_state_bos_bestfit(
+            tokenizer=tokenizer,
+            B=batch_size,
+            T=seq_len,
+            split=split,
+            tokenizer_threads=tokenizer_threads,
+            tokenizer_batch_size=128,
+            device=comp_info.device,
+            resume_state_dict=resume_state_dict,
+            buffer_size=buffer_size or (batch_size * seq_len * 16),
+            base_path=Path(datadir or cachedir or DATA_DIR) / name
+        )
+    else:
+        ds = ShardedDataset(
+            name=name,
+            tokenizer=tokenizer,
+            split=split,
+            column=column,
+            base_url=base_url,
+            shard_limit=shard_limit,
+            max_shards=max_shards,
+            cachedir=cachedir or datadir or DATA_DIR,
+            start_state=resume_state,
+            comp_info=comp_info,
+            tokenizer_threads=tokenizer_threads,
+        )
+        dataloader = lambda: DistDataLoader(
             ds,
             batch_size=batch_size,
             seq_len=seq_len,
@@ -589,4 +430,5 @@ def build_dataloader(
         )
     if split == "val":
         return dataloader
-    return dataloader()
+    else:
+        return dataloader()
