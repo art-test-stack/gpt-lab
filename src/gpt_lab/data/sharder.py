@@ -4,7 +4,7 @@ import random
 import tempfile
 import warnings
 import errno
-from contextlib import suppress
+from contextlib import closing, suppress
 from pathlib import Path
 from typing import Union, List, Optional, Tuple, Iterator
 import time
@@ -15,7 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
  
 from gpt_lab.utils.default import DATA_DIR, RANDOM_SEED
-from gpt_lab.utils.schemas import DataLoaderState
+from gpt_lab.utils.schemas import DataLoaderState, DocumentRef
 from gpt_lab.utils.distributed import ComputeContext, get_comp_info
  
 SHARD_FILENAME_TEMPLATE = "shard_{:05d}.parquet"
@@ -36,8 +36,8 @@ class ShardManager:
     """Read owned Parquet shards, downloading missing shards as needed.
 
     Shards are numbered from zero. The shard with ID max_shards is reserved
-    for validation. Training owns shards by ID modulo world size and visits
-    them in a fixed shuffled order.
+    for validation. Training shuffles the global manifest once and assigns
+    each rank every world-size-th shard in that order.
     """
     def __init__(
         self,
@@ -53,6 +53,8 @@ class ShardManager:
         download_poll_interval: float = 1.0,
         # dist settings
         comp_info: Optional[ComputeContext] = None,
+        data_seed: int = RANDOM_SEED,
+        ordered_shard_ids: Optional[tuple[int, ...]] = None,
     ):
         assert split in ["train", "val"], f"split must be 'train' or 'val'. Got {split=!r}."
         if cachedir is None:
@@ -86,12 +88,19 @@ class ShardManager:
         if split == "train":
             if self.train_shards < self.world_size:
                 raise ValueError(f"Need at least {self.world_size} training shards in {self.ds_path}, found {self.train_shards}")
-            self.shard_idx = list(range(self.ddp_rank, self.train_shards, self.world_size))
-            random.Random(RANDOM_SEED).shuffle(self.shard_idx)
+            manifest = range(self.train_shards)
+            if ordered_shard_ids is None:
+                order = list(manifest)
+                random.Random(data_seed).shuffle(order)
+                ordered_shard_ids = tuple(order)
+            elif len(ordered_shard_ids) != len(manifest) or set(ordered_shard_ids) != set(manifest):
+                raise ValueError("Saved training shard order does not match the manifest")
+            self.shard_idx = list(ordered_shard_ids[self.ddp_rank::self.world_size])
         else:
             if self.max_shards < 0:
                 raise ValueError(f"No validation shard in {self.ds_path}")
             self.shard_idx = [self.max_shards]
+        self.ordered_shard_ids = ordered_shard_ids
 
         self.shard_paths = [self.get_shard_path(idx) for idx in self.shard_idx]
         if not self.base_url:
@@ -250,6 +259,28 @@ class ShardManager:
                         raise OSError(f"Failed to download shard {idx} on rank {self.ddp_rank}") from exc
                     time.sleep(2 ** attempt)
 
+    def read_documents(self, references: tuple[DocumentRef, ...]) -> Iterator[Tuple[DocumentRef, str]]:
+        """Read saved rows, opening the Parquet file once per referenced row group."""
+        local_indices = {shard: index for index, shard in enumerate(self.shard_idx)}
+        rows_by_group = {}
+        for shard, group, row in references:
+            if shard not in local_indices or min(group, row) < 0:
+                raise ValueError(f"Invalid checkpoint document reference {(shard, group, row)}")
+            rows_by_group.setdefault((shard, group), []).append(row)
+
+        for (shard, group), rows in rows_by_group.items():
+            cursor = DataLoaderState(shard_idx=local_indices[shard], global_shard_idx=shard, row_group_idx=group)
+            last_row = max(rows)
+            with closing(self.iterate(start_state=cursor, batch_size=last_row + 1)) as iterator:
+                result = next(iterator, None)
+            if result is None:
+                raise ValueError(f"Checkpoint refers to empty shard {shard}, row group {group}")
+            texts, state = result
+            if (state.global_shard_idx, state.row_group_idx) != (shard, group) or len(texts) <= last_row:
+                raise ValueError(f"Checkpoint document is missing from shard {shard}, row group {group}")
+            for row in rows:
+                yield (shard, group, row), texts[row]
+
     def iterate(
         self,
         start_state: Optional[DataLoaderState] = None,
@@ -269,6 +300,8 @@ class ShardManager:
             if (not 0 <= shard_start < len(self.shard_paths) or group_start < first_group
                     or (group_start - first_group) % stride or offset < 0 or epoch < 1):
                 raise ValueError("Invalid data checkpoint cursor")
+            if start_state.global_shard_idx is not None and start_state.global_shard_idx != self.shard_idx[shard_start]:
+                raise ValueError("Data checkpoint cursor does not match its saved shard order")
 
         while True:
             had_documents = False
@@ -328,6 +361,8 @@ class ShardManager:
 
                 group_start = first_group
 
+            if self.split == "val":
+                return
             if not had_documents and start_state is None:
                 raise ValueError(f"No {self.split} documents for rank {self.ddp_rank} in {self.ds_path}")
             start_state = None
