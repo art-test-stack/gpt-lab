@@ -794,13 +794,20 @@ class ModelCompletionOutput(ModelOutput):
     completions: Optional[List[str]] = None
     done: bool = False
 
+DocumentRef = tuple[int, int, int]  # Global shard, row group, zero-based row.
+
+
 class DataLoaderState(BaseModel):
     shard_idx: int = 0
-    global_shard_idx: Optional[int] = None # used for debugging
+    global_shard_idx: Optional[int] = None  # Physical shard ID.
     row_group_idx: int = 0
     offset_in_row_group: int = 0
     epoch: int = 1
-    # Add more fields as needed to track the state of the current iteration over a data shard
+    packing_signature: Optional[str] = None
+    ordered_shard_ids: Optional[tuple[int, ...]] = None
+    lookahead_refs: tuple[DocumentRef, ...] = ()
+    pending_document_ref: Optional[DocumentRef] = None
+    document_token_offset: int = 0
 
 class TrainerState(BaseModel):
     step: int = 0
