@@ -1,6 +1,7 @@
 import torch
 from types import SimpleNamespace
 import json
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -8,6 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from gpt_lab.data.loader import build_dataloader
 from gpt_lab.data.sharder import ShardManager
 
 
@@ -70,6 +72,34 @@ def test_empty_legacy_metadata_is_regenerated(tmp_path):
 
 
 @pytest.mark.fast
+@pytest.mark.parametrize(("texts", "batch_size", "expected"), [
+    (["1 2 3 4"], 1, [[[1, 2, 3, 4]]]),
+    (["1 2 3 4 5 6 7 8 9", "10 11 12 13"], 1, [[[10, 11, 12, 13]], [[1, 2, 3, 4]], [[5, 6, 7, 8]]]),
+    (["1 2 3 4 5 6 7 8 9", "10 11 12 13"], 2, [[[10, 11, 12, 13], [1, 2, 3, 4]]]),
+])
+def test_validation_drains_one_pass(tmp_path, texts, batch_size, expected):
+    class Tokenizer:
+        def get_bos_token_id(self):
+            return 0
+
+        def __call__(self, text, **kwargs):
+            return [0, *map(int, text.split())]
+
+    dataset = tmp_path / "fixture"
+    dataset.mkdir()
+    pq.write_table(pa.table({"text": texts}), dataset / "shard_00000.parquet")
+    context = SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu"))
+    make_loader = build_dataloader(
+        name=dataset.name, cachedir=tmp_path, tokenizer=Tokenizer(), split="val",
+        batch_size=batch_size, seq_len=4, max_shards=0, comp_info=context,
+    )
+    for _ in range(2):
+        assert [(y.tolist(), state.epoch) for _, y, state in make_loader()] == [
+            (targets, 1) for targets in expected
+        ]
+
+
+@pytest.mark.fast
 def test_training_workers_retrieve_disjoint_shards(tmp_path):
     dataset_name = "synthetic"
     dataset_path = tmp_path / dataset_name
@@ -77,6 +107,9 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
 
     world_size = 8
     num_train_shards = 16
+    seed = 1
+    order = list(range(num_train_shards))
+    random.Random(seed).shuffle(order)
 
     for shard_idx in range(num_train_shards):
         pq.write_table(
@@ -100,9 +133,10 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
             cachedir=tmp_path,
             split="train",
             max_shards=num_train_shards,
+            data_seed=seed,
             comp_info=SimpleNamespace(rank=rank, world_size=world_size, device=torch.device("cpu"), is_distributed=False),
         )
-        expected_shard_ids = set(range(rank, num_train_shards, world_size))
+        expected_shard_ids = set(order[rank::world_size])
         assigned_shard_ids = {
             int(path.stem.split("_")[1])
             for path in manager.shard_paths
@@ -136,7 +170,7 @@ def test_training_workers_retrieve_disjoint_shards(tmp_path):
     all_retrieved_texts = set()
 
     for rank, (retrieved_texts, retrieved_shard_ids) in enumerate(worker_results):
-        expected_shard_ids = set(range(rank, num_train_shards, world_size))
+        expected_shard_ids = set(order[rank::world_size])
         assert retrieved_shard_ids == expected_shard_ids
         assert retrieved_texts == {
             f"shard-{shard_idx}"
