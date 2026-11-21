@@ -46,41 +46,26 @@ keys use `qk/{q,k}/layer_<layer>/head_<head>/...`. The field
 The diagnostic reduction sends only the sampled norms to rank 0. It runs
 after the ordinary optimizer update and weight gather.
 
-## 400-update Modal comparison
+## 400-update comparison
 
-From the repository root, on a Modal account with the `gpt-lab` secret and
-the `gpt-lab-cache` and `gpt-lab-runs` volumes in the `main` environment:
-
-```bash
-modal run -e main experiments/20261118-rope-paired-muon/modal_trainbase.py \
-  --run-name rope-muon-s42-400 --seed 42
-```
-
-Use a unique run name. The launcher checks `gpt-lab-runs` for that name
-before requesting GPUs. The command uploads the experiment's training files,
-package source, lockfile, and Llama configuration from this checkout to
-Modal. The worker runs A, B, and C sequentially on one node with eight H100s.
-Use `--arm A`, `--arm B`, or `--arm C` for a single arm. All three share
-the same model seed, prepared `climbmix-base` shards, GPT-2 tokenizer, and
-evaluation configuration.
+The matched comparison runs A, B, and C sequentially on one node with eight
+H100s. All three share the same model seed, prepared `climbmix-base` shards,
+GPT-2 tokenizer, and evaluation configuration.
 GPT-Lab resolves the batch size and schedules 15 tokens per scaling parameter.
 
 The recipe uses depth 16, BF16, sequence length 2,048, device batch 16,
 and two accumulation microsteps for 524,288 tokens per update. It schedules
 19,490 updates with a 1,300-update warmup and stops after update 400. At that
 endpoint it runs BPB on 4,194,304 tokens and CORE on up to 500 examples per
-task, then saves the final sharded checkpoint. Logs and checkpoints are in
-`gpt-lab-runs` under `/<run-name>/<arm>/`. The console shows the Trainer's
-progress lines and evaluation summaries, plus arm status and errors.
-`train.log` contains full worker output and per-rank timings. W&B shows
-training metrics on every update, plus evaluation metrics and the sampled Q/K norms.
+task, then saves the final sharded checkpoint. W&B shows training metrics on
+every update, plus evaluation metrics and the sampled Q/K norms.
 
-The Modal launcher enables `--guard-mfu`. Each arm skips the first 10
+With `--guard-mfu`, each arm skips the first 10
 completed updates and checks the median `train/mfu` over updates 11–20,
 21–30, and each subsequent full window. A median at or below 40% ends the
 allocation before the next update, evaluation, or final checkpoint. W&B
 records `train/mfu_window_median` and marks a failure with
-`train/mfu_guard_tripped`. The worker saves the failed arm's log to the volume.
+`train/mfu_guard_tripped`.
 
 ## Polar check
 
