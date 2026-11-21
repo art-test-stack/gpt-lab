@@ -63,6 +63,7 @@ Modal. The worker runs A, B, and C sequentially on one node with eight H100s.
 Use `--arm A`, `--arm B`, or `--arm C` for a single arm. All three share
 the same model seed, prepared `climbmix-base` shards, GPT-2 tokenizer, and
 evaluation configuration.
+GPT-Lab resolves the batch size and schedules 15 tokens per scaling parameter.
 
 The recipe uses depth 16, BF16, sequence length 2,048, device batch 16,
 and two accumulation microsteps for 524,288 tokens per update. It schedules
