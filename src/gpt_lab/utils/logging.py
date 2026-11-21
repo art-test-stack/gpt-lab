@@ -1,5 +1,6 @@
 import logging, sys, os
 import re
+from copy import copy
 from typing import Union, Tuple
 from .common import format_value, get_rank, is_rank0
 
