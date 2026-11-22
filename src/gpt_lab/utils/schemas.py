@@ -856,8 +856,8 @@ class EvalMetrics(_BaseMetrics):
         self.best_bpb = min(self.best_bpb, log_dict.get("eval/bpb", float("inf")))
         self.bpb.append(log_dict.get("eval/bpb", float("inf")))
         self.loss.append(log_dict.get("eval/loss", float("inf")))
-        self.train_perplexity.append(log_dict.get("eval/train_perplexity", float("nan")))
-        self.val_perplexity.append(log_dict.get("eval/val_perplexity", float("nan")))
+        self.train_perplexity.append(log_dict.get("train/perplexity", float("nan")))
+        self.val_perplexity.append(log_dict.get("eval/perplexity", float("nan")))
 
 class COREMetrics(_BaseMetrics):
     accuracy: List[float] = Field(default_factory=list)

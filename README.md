@@ -768,8 +768,9 @@ uv run torchrun --standalone --nproc-per-node=8 --no-python \
   gpt-lab train --model-name ic1 --run-name baseline --depth 12
 ```
 
-On the `eval_bpb_every` schedule, base training logs `eval/train_perplexity`
-and `eval/val_perplexity` alongside validation bits per byte (BPB).
+On the `eval_bpb_every` schedule, base training logs train perplexity as
+`train/perplexity` and validation perplexity as `eval/perplexity`
+alongside validation bits per byte (BPB).
 Each pass starts a fresh iterator and uses the `n_bpb_tokens` budget per split,
 rounded up to full distributed batches. Perplexity is the exponential of the
 mean next-token cross-entropy over scored targets, including any special

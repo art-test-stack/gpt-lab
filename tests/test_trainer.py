@@ -264,8 +264,8 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     assert logged_step == step + 1
     assert trainer.ckpt_state.best_eval_completed_steps == (step + 1 if improved else None)
     assert values["eval/best_bpb"] == best
-    assert values["eval/train_perplexity"] == 2.718
-    assert values["eval/val_perplexity"] == 7.389
+    assert values["train/perplexity"] == 2.718
+    assert values["eval/perplexity"] == 7.389
     assert trainer.eval_metrics.step == [step + 1]
     assert trainer.eval_metrics.bpb == [1.5]
     assert trainer.eval_metrics.loss == [2.0]

@@ -767,14 +767,16 @@ class Trainer:
                         token_bytes=self.tokenizer.token_bytes,
                     )
         val_res = results["val"]
-        perplexities = {f"eval/{split}_perplexity": result["perplexity"] for split, result in results.items()}
+        perplexities = {"eval/perplexity": val_res["perplexity"]}
         message = (
             f"Step {step:05d} | Validation bpb: {val_res['bpb']:.6f} | "
             f"Validation loss: {val_res['loss']:.6f} | "
             f"Validation perplexity: {val_res['perplexity']:.6f}"
         )
         if "train" in results:
-            message += f" | Train perplexity: {results['train']['perplexity']:.6f}"
+            train_perplexity = results["train"]["perplexity"]
+            perplexities["train/perplexity"] = train_perplexity
+            message += f" | Train perplexity: {train_perplexity:.6f}"
         print0(message)
 
         dt_bpb_eval = time.time() - start_bpb_eval
