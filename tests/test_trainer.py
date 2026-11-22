@@ -12,7 +12,7 @@ from gpt_lab.utils.schemas import (
 )
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 import itertools
 
 from gpt_lab.utils.schemas import DataLoaderState, TrainerConfig, TrainerState
@@ -219,6 +219,8 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     trainer.compiled_model = torch.nn.Linear(2, 2)
     trainer.tokenizer = SimpleNamespace(token_bytes=torch.ones(2))
     trainer.val_loader = Mock(return_value=iter(()))
+    trainer.train_eval_loader = Mock(return_value=iter(()))
+    trainer.train_loader = iter(["next training batch"])
     trainer.config = trainer.config.model_copy(update={
         "n_bpb_tokens": 9, "save_every": 10, "save_on_best": save_on_best,
     })
@@ -228,10 +230,13 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     trainer.ckpt_state.best_eval_step = 1
     trainer.save_checkpoint = Mock()
 
-    def evaluate(*args, **kwargs):
+    def evaluate(model, batches, *args, **kwargs):
         assert not trainer.compiled_model.training
         assert torch.is_autocast_enabled("cpu")
-        return {"bpb": 1.5, "loss": 2.0}
+        if batches is trainer.val_loader.return_value:
+            return {"bpb": 1.5, "loss": 2.0, "perplexity": 7.389}
+        assert batches is trainer.train_eval_loader.return_value
+        return {"bpb": 0.5, "loss": 1.0, "perplexity": 2.718}
 
     evaluator = Mock(side_effect=evaluate)
     monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", evaluator)
@@ -239,11 +244,16 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     trainer.evaluate_bpb()
 
     trainer.val_loader.assert_called_once_with()
-    evaluator.assert_called_once_with(
-        trainer.compiled_model, trainer.val_loader.return_value, 3,
-        comp_info=trainer.config.comp_info,
-        token_bytes=trainer.tokenizer.token_bytes,
-    )
+    trainer.train_eval_loader.assert_called_once_with()
+    assert next(trainer.train_loader) == "next training batch"
+    assert evaluator.call_args_list == [
+        call(
+            trainer.compiled_model, loader.return_value, 3,
+            comp_info=trainer.config.comp_info,
+            token_bytes=trainer.tokenizer.token_bytes,
+        )
+        for loader in (trainer.val_loader, trainer.train_eval_loader)
+    ]
     improved = previous_best is None or previous_best > 1.5
     best = 1.5 if improved else previous_best
     assert trainer.ckpt_state.best_eval_value == best
@@ -254,9 +264,13 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     assert logged_step == step + 1
     assert trainer.ckpt_state.best_eval_completed_steps == (step + 1 if improved else None)
     assert values["eval/best_bpb"] == best
+    assert values["eval/train_perplexity"] == 2.718
+    assert values["eval/val_perplexity"] == 7.389
     assert trainer.eval_metrics.step == [step + 1]
     assert trainer.eval_metrics.bpb == [1.5]
     assert trainer.eval_metrics.loss == [2.0]
+    assert trainer.eval_metrics.train_perplexity == [2.718]
+    assert trainer.eval_metrics.val_perplexity == [7.389]
     assert trainer.eval_metrics.step_time_ms == [values["eval/step_time_ms"]]
 
 

@@ -564,8 +564,8 @@ class TrainerConfig(BaseModel):
     fp8_ffn_forward: bool = False
 
     # Evaluatement settings
-    eval_bpb_every: int = 250 # Evaluate val bpb every N steps (-1 = disable)
-    n_bpb_tokens: int = 80*524288 # Number of tokens to evaluate val loss on
+    eval_bpb_every: int = 250 # Evaluate every N steps and at the final step (-1 = final only, 0 = disable)
+    n_bpb_tokens: int = 80*524288 # Evaluation token budget per split
     eval_core_every: int = 2000 # Evaluate CORE metric every N steps (-1 = disable)
     n_core_tokens: int = 500 # Examples per task for CORE metric
     sample_every: int = 2000 # Sample from model every N steps (-1 = disable)
@@ -845,6 +845,8 @@ class EvalMetrics(_BaseMetrics):
     best_bpb: float = float("inf")
     bpb: List[float] = Field(default_factory=list)
     loss: List[float] = Field(default_factory=list)
+    train_perplexity: List[float] = Field(default_factory=list)
+    val_perplexity: List[float] = Field(default_factory=list)
     
     step_time_ms: List[float] = Field(default_factory=list)
     
@@ -854,6 +856,8 @@ class EvalMetrics(_BaseMetrics):
         self.best_bpb = min(self.best_bpb, log_dict.get("eval/bpb", float("inf")))
         self.bpb.append(log_dict.get("eval/bpb", float("inf")))
         self.loss.append(log_dict.get("eval/loss", float("inf")))
+        self.train_perplexity.append(log_dict.get("eval/train_perplexity", float("nan")))
+        self.val_perplexity.append(log_dict.get("eval/val_perplexity", float("nan")))
 
 class COREMetrics(_BaseMetrics):
     accuracy: List[float] = Field(default_factory=list)

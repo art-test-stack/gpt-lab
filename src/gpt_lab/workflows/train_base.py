@@ -313,6 +313,7 @@ def train_base(
             config=trainer_config, board=board_instance, checkpoint_manager=ckpt_manager,
             resume_state=ckpt_data.trainer_state if is_resumed else None,
             best_state=ckpt_data.checkpoint_state if is_resumed else None,
+            train_eval_loader=lambda: build_dataloader(split="train", **loader_common_kwargs),
         )
         if is_resumed and ckpt_data.scaler_state is not None:
             if trainer.scaler is None:

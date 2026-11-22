@@ -155,6 +155,8 @@ class Trainer:
         scaler: Optional[GradScaler] = None, # legacy checkpoint argument; not automatically created for BF16
         resume_state: Optional[TrainerState] = None,
         best_state: Optional[CheckpointState] = None,
+        *,
+        train_eval_loader: Optional[Callable] = None,
     ):
         """
         Initialize Trainer.
@@ -164,6 +166,7 @@ class Trainer:
             tokenizer: Tokenizer for evaluation
             train_loader: Training dataloader
             val_loader: Validation dataloader
+            train_eval_loader: Optional factory for a fresh training-split evaluation iterator
             config: Training configuration
             optimizer: Optimizer (or None to use model.build_optimizer())
             board: Logging board (wandb, tensorboard, etc.)
@@ -178,6 +181,7 @@ class Trainer:
         self.tokenizer = tokenizer
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.train_eval_loader = train_eval_loader
         
         # Config
         if config is None:
@@ -734,7 +738,7 @@ class Trainer:
         self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
 
     def evaluate_bpb(self):
-        """Run BPB validation, log metrics, and update the best checkpoint.
+        """Evaluate perplexity and validation BPB, then update the best checkpoint.
 
         Override this method to customize evaluation. Scheduling stays in train().
         """
@@ -750,17 +754,28 @@ class Trainer:
             1,
             math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
         )
+        results = {}
         with self.val_context(self.compiled_model):
-            val_res = compute_bpb(
-                self.compiled_model,
-                self.val_loader(),
-                eval_steps,
-                comp_info=self.config.comp_info,
-                token_bytes=self.tokenizer.token_bytes
-            )
-        print0(f"Step {step:05d} | "\
-               f"Validation bpb: {val_res['bpb']:.6f} | "\
-            f"Validation loss: {val_res['loss']:.6f}")
+            loaders = {"val": self.val_loader, "train": self.train_eval_loader}
+            for split, loader in loaders.items():
+                if loader is not None:
+                    results[split] = compute_bpb(
+                        self.compiled_model,
+                        loader(),
+                        eval_steps,
+                        comp_info=self.config.comp_info,
+                        token_bytes=self.tokenizer.token_bytes,
+                    )
+        val_res = results["val"]
+        perplexities = {f"eval/{split}_perplexity": result["perplexity"] for split, result in results.items()}
+        message = (
+            f"Step {step:05d} | Validation bpb: {val_res['bpb']:.6f} | "
+            f"Validation loss: {val_res['loss']:.6f} | "
+            f"Validation perplexity: {val_res['perplexity']:.6f}"
+        )
+        if "train" in results:
+            message += f" | Train perplexity: {results['train']['perplexity']:.6f}"
+        print0(message)
 
         dt_bpb_eval = time.time() - start_bpb_eval
 
@@ -775,6 +790,7 @@ class Trainer:
                 self.save_checkpoint()
 
         board_dict = {
+            **perplexities,
             "eval/loss": val_res['loss'],
             "eval/bpb": val_res['bpb'],
             "eval/best_bpb": self.ckpt_state.best_eval_value,
