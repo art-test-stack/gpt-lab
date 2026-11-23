@@ -10,8 +10,10 @@ the whole packed head. The result is unpacked to the real head shape.
 | A | `--pairing real auto --muon-qkv head` | Repository per-head real Muon |
 | B | `--pairing rope auto --muon-qkv head` | Genuine pairs `(0,1), (2,3), …` |
 | C | `--pairing shuffled auto --muon-qkv head` | Fixed shuffled pairs |
+| D | `--pairing joint-real auto --muon-qkv head` | One real map per matched Q/K head |
+| E | `--pairing joint-rope auto --muon-qkv head` | One genuine RoPE-paired map per matched Q/K head |
 
-Use `train.py` for all three instrumented arms. Training uses the standard
+Use `train.py` for all five instrumented arms. Training uses the standard
 fused `qkv_proj.weight`, forward GEMM, gradient accumulation and whole-matrix
 reduce-scatter. V uses the original per-head real polar map. All arms keep
 the repository's Nesterov proposal, variance normalization, learning-rate
@@ -21,9 +23,22 @@ The shuffled arm uses a dedicated RNG seeded with `20261118`. It accepts a
 row permutation only when none of its pairs share a genuine RoPE plane. It
 uses that same order for every Q and K head of the same width, then restores
 the original row order before the rest of the update. The exact order is
-stored in the optimizer checkpoint and checked on load. Resume B/C with
-`train.py --pairing rope|shuffled resume` and the saved arm, dataset and
-world size. The ordinary training CLI retains its existing modes.
+stored in the optimizer checkpoint and checked on load. Resume with
+`train.py --pairing <saved-arm> resume` and the saved dataset and world size.
+The dashboard run config records the arm under `pairing`.
+
+D and E require equal query and key head counts. For each layer and head
+index, they concatenate the Q and K Nesterov proposals along the input
+columns and apply one five-step polar map. E treats adjacent output rows as
+the real and imaginary components of one RoPE plane, so its complex matrix
+has shape `[d_head/2, 2*d_model]` and Gram `Z_Q Z_Qᴴ + Z_K Z_Kᴴ`.
+Both arms split the output back into Q and K before the per-head variance
+normalization, diagnostics, and cautious decay.
+
+```bash
+uv run --locked --extra gpu python experiments/20261118-rope-paired-muon/train.py --pairing joint-real auto --muon-qkv head
+uv run --locked --extra gpu python experiments/20261118-rope-paired-muon/train.py --pairing joint-rope auto --muon-qkv head
+```
 
 ## Dashboard metrics
 

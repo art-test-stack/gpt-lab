@@ -101,7 +101,7 @@ def train_base(
     final_lr_frac=0.05,
     checkpoint_step=None,
     checkpoint_dir=None,
-    configure_optimizer: Callable[[BaseTransformer, OptimizerFactory], None] | None = None,
+    configure_optimizer: Callable[[BaseTransformer, OptimizerFactory], dict | None] | None = None,
     trainer_factory: Callable[..., Trainer] | None = None,
 ) -> None:
     """Train from Python keywords using a loaded base optimizer profile.
@@ -109,7 +109,8 @@ def train_base(
     Fresh runs require optim_config; resume restores the saved architecture,
     trainer settings, and optimizer state. The CLI only loads files and forwards
     keywords. The profile supplies base values, which scaling laws adjust once.
-    Experiments can configure the optimizer before state restore and extend Trainer.
+    Experiments can configure the optimizer before state restore, return run
+    metadata for the dashboard, and extend Trainer.
     """
     if model_init not in ("auto", "resume"):
         raise ValueError("model_init must be auto or resume")
@@ -280,7 +281,7 @@ def train_base(
 
         optimizers = model.build_optimizer(trainer_config, optim_config=optim_config)
         if configure_optimizer is not None:
-            configure_optimizer(model, optimizers)
+            board_args.update(configure_optimizer(model, optimizers) or {})
         if is_resumed and ckpt_data and ckpt_data.optimizer_state is not None:
             log0("Loading optimizer state from checkpoint data.", logger=logger)
             optimizers.load_state_dict(ckpt_data.optimizer_state)

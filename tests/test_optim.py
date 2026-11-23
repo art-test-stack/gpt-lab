@@ -1,3 +1,6 @@
+from pathlib import Path
+from types import SimpleNamespace
+
 from gpt_lab.utils.distributed import ComputeContext
 import pytest
 import torch
@@ -147,6 +150,75 @@ def test_split_qkv_matches_independent_matrices_after_resume(tmp_path, opt_name,
                     incompatible = OptimizerFactory([other_group], comp_info=context)
                     with pytest.raises(ValueError, match="different Muon QKV split layout"):
                         incompatible.load_state_dict(saved)
+
+
+@pytest.mark.parametrize("arm", ["joint-real", "joint-rope"])
+def test_matching_qk_heads_share_one_polar_map_after_resume(tmp_path, monkeypatch, arm):
+    from gpt_lab.optim.kernels.muon import _real_polar_express, paired_polar_express
+
+    experiment = Path(__file__).resolve().parents[1] / "experiments" / "20261118-rope-paired-muon"
+    monkeypatch.syspath_prepend(str(experiment))
+    from optimizer import configure_experiment_muon
+
+    generator = torch.Generator().manual_seed(35)
+    context = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
+    lr, momentum, beta, decay = 0.02, 0.9, 0.8, 0.1
+    n_heads, d_head, d_model = 2, 4, 8
+
+    def configured_optimizer(params, pairing, n_kv_heads=n_heads):
+        blocks = [
+            SimpleNamespace(attention=SimpleNamespace(
+                n_heads=n_heads, n_kv_heads=n_kv_heads, d_head=d_head,
+                qkv_proj=SimpleNamespace(weight=p),
+            ))
+            for p in params
+        ]
+        model = SimpleNamespace(config=SimpleNamespace(positional_encoding="rope"), blocks=blocks)
+        group = dict(params=params, opt="muon", lr=lr, momentum=momentum, beta=beta, ns_steps=5,
+                     weight_decay=decay, qkv_split_sizes=(d_head,) * (n_heads + 2 * n_kv_heads))
+        optimizer = OptimizerFactory([group], comp_info=context)
+        assert configure_experiment_muon(model, optimizer, pairing=pairing) == {"pairing": pairing}
+        return optimizer
+
+    weights = torch.randn(2, 3 * n_heads, d_head, d_model, generator=generator)
+    params = [torch.nn.Parameter(w.flatten(0, 1).clone()) for w in weights]
+    first_moment = torch.zeros_like(weights)
+    variance = torch.zeros_like(weights[:, :, :1, :])
+    optimizer = configured_optimizer(params, arm)
+    polar = paired_polar_express if arm == "joint-rope" else _real_polar_express
+
+    with torch.compiler.set_stance("force_eager"):
+        for step in range(2):
+            grads = torch.randn(weights.shape, generator=generator)
+            for p, grad in zip(params, grads, strict=True):
+                p.grad = grad.flatten(0, 1)
+            optimizer.step()
+
+            first_moment.lerp_(grads, 1 - momentum)
+            proposals = grads.lerp(first_moment, momentum)
+            q, k, v = proposals.split(n_heads, dim=1)
+            matched = torch.cat((q, k), dim=-1)
+            q, k = polar(matched, 5, context.compute_dtype).chunk(2, dim=-1)
+            raw = torch.cat((q, k, _real_polar_express(v, 5, context.compute_dtype)), dim=1)
+            variance.lerp_(raw.square().mean(dim=-2, keepdim=True), 1 - beta)
+            update = raw * variance.clamp_min(1e-10).rsqrt()
+            update *= raw.norm(dim=(-2, -1), keepdim=True) / update.norm(dim=(-2, -1), keepdim=True)
+            weights -= lr * (update + decay * weights * (update * weights >= 0))
+            torch.testing.assert_close(torch.stack(params).reshape_as(weights), weights)
+
+            if step == 0:
+                path = tmp_path / "joint-qk.safetensors"
+                save_tensor_state(optimizer.state_dict(), path)
+                saved = load_tensor_state(path)
+                optimizer = configured_optimizer(params, arm)
+                optimizer.load_state_dict(saved)
+                other_arm = "joint-real" if arm == "joint-rope" else "joint-rope"
+                with pytest.raises(ValueError, match="different Muon Q/K pairing"):
+                    configured_optimizer(params, other_arm).load_state_dict(saved)
+
+    grouped_weight = torch.nn.Parameter(torch.zeros(4 * d_head, d_model))
+    with pytest.raises(ValueError, match="equal query and key head counts"):
+        configured_optimizer([grouped_weight], arm, n_kv_heads=1)
 
 
 @pytest.mark.parametrize("opt_name", ["muon", "normuon"])

@@ -1,4 +1,4 @@
-"""Install the experiment's paired map on stock per-head Muon Q/K matrices."""
+"""Configure the experiment's polar maps for per-head Muon Q/K matrices."""
 
 import random
 
@@ -49,8 +49,11 @@ class ExperimentMuonStrategy(MuonStrategy):
         kwargs = {}
         pairing = group.get("qkv_pairing")
         if pairing is not None:
-            _, qk_heads, rows = pairing
-            kwargs.update(paired_heads=qk_heads, pair_indices=self.indices.get(rows))
+            arm, qk_heads, rows = pairing
+            if arm in ("joint-real", "joint-rope"):
+                kwargs["joint_qk_heads"] = qk_heads // 2
+            if arm != "joint-real":
+                kwargs.update(paired_heads=qk_heads, pair_indices=self.indices.get(rows))
         if self.monitor and (sample := self.samples.get(group["params"][0])) is not None:
             kwargs["monitor_indices"] = sample[:2]
         return kwargs
@@ -87,6 +90,10 @@ def configure_experiment_muon(model, optimizer, *, pairing):
 
     strategy = ExperimentMuonStrategy(optimizer)
     attentions = [block.attention for block in model.blocks]
+    if pairing in ("joint-real", "joint-rope") and any(
+        attention.n_heads != attention.n_kv_heads for attention in attentions
+    ):
+        raise ValueError(f"{pairing} requires equal query and key head counts")
     attention_by_weight = {attention.qkv_proj.weight: attention for attention in attentions}
     samples_by_weight = {}
     for layer in sampled_indices(len(attentions)):
@@ -117,7 +124,10 @@ def configure_experiment_muon(model, optimizer, *, pairing):
             raise ValueError("The experiment requires per-head Muon with five Polar Express steps")
         configured.update(weights)
         if pairing != "real":
-            rows = pairing_order(d_head, pairing)
+            if pairing == "joint-real":
+                rows = ()
+            else:
+                rows = pairing_order(d_head, "rope" if pairing == "joint-rope" else pairing)
             group["qkv_pairing"] = (pairing, attention.n_heads + attention.n_kv_heads, rows)
             if pairing == "shuffled" and rows not in strategy.indices:
                 strategy.indices[rows] = pairing_indices(rows, weights[0].device)
@@ -136,3 +146,4 @@ def configure_experiment_muon(model, optimizer, *, pairing):
     if configured != attention_by_weight.keys():
         raise ValueError("Every fused QKV weight must be in a per-head Muon group")
     optimizer.backend.strategies["muon"] = strategy
+    return {"pairing": pairing}

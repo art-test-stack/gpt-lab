@@ -1,4 +1,4 @@
-"""Dashboard diagnostics for the three Muon arms."""
+"""Dashboard diagnostics for the Muon arms."""
 
 import json
 import math

@@ -150,6 +150,7 @@ def muon_step_fused(
     compute_dtype: torch.dtype,     # torch.float16, torch.bfloat16, or torch.float32
     *,
     paired_heads: int = 0,
+    joint_qk_heads: int = 0,
     pair_indices: tuple[Tensor, Tensor] | None = None,
     monitor_indices: tuple[Tensor, Tensor] | None = None,
 ) -> Tensor | None:
@@ -169,7 +170,13 @@ def muon_step_fused(
     if monitor_indices is not None:
         proposal_norm = _head_norm(g[monitor_indices])
 
-    if paired_heads:
+    if joint_qk_heads:
+        q, k, v = g.split(joint_qk_heads, dim=-3)
+        joint_qk = torch.cat((q, k), dim=-1)
+        polar = paired_polar_express if paired_heads else _real_polar_express
+        q, k = polar(joint_qk, ns_steps, compute_dtype).chunk(2, dim=-1)
+        X = torch.cat((q, k, _real_polar_express(v, ns_steps, compute_dtype)), dim=-3)
+    elif paired_heads:
         qk, v = g[..., :paired_heads, :, :], g[..., paired_heads:, :, :]
         qk = paired_polar_express(qk, ns_steps, compute_dtype, pair_indices)
         X = torch.cat((qk, _real_polar_express(v, ns_steps, compute_dtype)), dim=-3)

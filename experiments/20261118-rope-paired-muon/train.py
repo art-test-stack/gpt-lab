@@ -1,4 +1,4 @@
-"""Train the per-head real and paired Q/K Muon arms with dashboard diagnostics."""
+"""Train the Q/K Muon arms with per-head dashboard diagnostics."""
 
 from argparse import ArgumentParser
 from functools import partial
@@ -10,7 +10,7 @@ from gpt_lab.cli.commands.base import register, run
 def main():
     worker_start = perf_counter()
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--pairing", choices=("real", "rope", "shuffled"), required=True)
+    parser.add_argument("--pairing", choices=("real", "rope", "shuffled", "joint-real", "joint-rope"), required=True)
     parser.add_argument("--benchmark-timing", action="store_true", help="Print synchronized timings per rank.")
     parser.add_argument("--guard-mfu", action="store_true", help="Require median MFU above 40%% per 10 updates after startup.")
     register(parser)
