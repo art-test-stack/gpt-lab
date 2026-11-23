@@ -183,11 +183,9 @@ class KVCache:
     
     @property
     def seqlens(self) -> torch.Tensor:
-        # flash attention compatibility
-        # temporary fix for meta device
-        if self.device == torch.device("meta"):
-            return torch.tensor([self.cur_pos] * (self.batch_size if self.batch_size else 1))
-        return torch.tensor([self.cur_pos] * (self.batch_size if self.batch_size else 1), device=self.cache[0][0].device)
+        # FlashAttention expects int32 lengths on the cache device.
+        device = "cpu" if self.device.type == "meta" else self.device
+        return torch.full((self.batch_size or 1,), self.cur_pos, device=device, dtype=torch.int32)
     
     @torch.no_grad()
     def layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -198,44 +196,30 @@ class KVCache:
     @torch.no_grad()
     def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int):
         B, T, H, D = k.shape
-        if self.device != k.device:
-            self.cache = self.cache.to(k.device)
-        
         self.check_sizes(B, T, k.device, k.dtype)
         
         assert k.shape == v.shape, f"Key axnd Value tensors must have the same shape. Got k: {k.shape}, v: {v.shape}."
         assert layer_idx < self.shape[0], f"Layer index out of bounds: {layer_idx} >= {self.shape[0]}"
 
-        if k.dtype != self.cache.dtype:
-            self.cache = self.cache.to(dtype=k.dtype)
-        
         self.cache[layer_idx,0,:,self.cur_pos:self.cur_pos+T,:,:] = k
         self.cache[layer_idx,1,:,self.cur_pos:self.cur_pos+T,:,:] = v
         return self.cache[layer_idx,0,:,:self.cur_pos+T,:,:], self.cache[layer_idx,1,:,:self.cur_pos+T,:,:]
     
     def check_sizes(self, bs, seqlen, device, dtype) -> None:
-        # Initialize cache if not done yet
         if self.batch_size is None:
             self.batch_size = bs
-            self.cache = torch.empty((
-                self.n_layers, 
-                2, 
-                self.batch_size if self.batch_size is not None else 0,
-                seqlen,
-                self.n_heads,
-                self.d_head
-            ))
+            self.cache = torch.empty(
+                (self.n_layers, 2, bs, seqlen, self.n_heads, self.d_head),
+                device=device, dtype=dtype,
+            )
 
         assert self.batch_size == bs, f"Input batch size does not match cache's batch size. Got input: {bs} and cache {self.batch_size}."
 
-        if seqlen + self.cur_pos > self.shape[-3]:
-            self.cache = torch.cat([self.cache, 
-                                    torch.zeros(self.n_layers, 2, self.batch_size, seqlen, self.n_heads, self.d_head, 
-                                                            # device=device, dtype=dtype
-                                )], 
-                                   dim=-3)
-
-        self.cache.to(device=device, dtype=dtype)
+        self.cache = self.cache.to(device=device, dtype=dtype)
+        extra = self.cur_pos + seqlen - self.shape[-3]
+        if extra > 0:
+            new_slots = self.cache.new_zeros((self.n_layers, 2, bs, extra, self.n_heads, self.d_head))
+            self.cache = torch.cat((self.cache, new_slots), dim=-3)
 
 
     def advance(self):

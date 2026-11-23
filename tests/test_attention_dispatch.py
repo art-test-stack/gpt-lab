@@ -481,19 +481,21 @@ def test_public_availability_flag_initializes_on_first_read(monkeypatch, caplog,
 
 
 @pytest.mark.parametrize("backend", ["torch", "raw"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
-def test_legacy_attention_configs_support_cached_model_evaluation(backend):
+def test_legacy_attention_configs_support_cached_model_evaluation(backend, dtype):
     from gpt_lab.model.gpt import DenseTransformer
     from gpt_lab.model.utils import KVCache
     from gpt_lab.utils.schemas import TransformerConfig
 
     config = TransformerConfig(vocab_size=64, max_context=4, d_model=16, d_ffn=32,
         n_heads=2, d_head=8, n_layers=1, attn_impl=backend, window_pattern="L")
-    model = DenseTransformer(config).cpu().eval()
+    model = DenseTransformer(config).to(device="cpu", dtype=dtype).eval()
     model.init_weights()
     # Keep attention's contribution nonzero so incorrect cache contents affect logits.
     torch.nn.init.normal_(model.blocks[0].attention.o_proj.weight, std=0.1)
-    reference = DenseTransformer(config.model_copy(update={"attn_impl": "sdpa"})).cpu().eval()
+    reference = DenseTransformer(config.model_copy(update={"attn_impl": "sdpa"}))
+    reference.to(device="cpu", dtype=dtype).eval()
     reference.load_state_dict(model.state_dict())
     cache = KVCache(config=config)
     input_ids = torch.randint(0, config.vocab_size, (2, 4))
@@ -501,7 +503,10 @@ def test_legacy_attention_configs_support_cached_model_evaluation(backend):
     for chunk in (slice(0, 3), slice(3, 4)):
         actual = model(input_ids[:, chunk], past_key_values=cache)
         expected = reference(input_ids[:, :chunk.stop])
-        torch.testing.assert_close(actual.logits, expected.logits)
+        torch.testing.assert_close(actual.logits.to(dtype), expected.logits.to(dtype))
+        assert cache.cache.dtype == dtype
+        assert cache.device == cache.seqlens.device == input_ids.device
+        assert cache.seqlens.dtype == torch.int32
         cache.advance()
         assert cache.cur_pos == chunk.stop
 
