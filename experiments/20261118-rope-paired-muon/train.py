@@ -17,14 +17,17 @@ def main():
     worker_start = perf_counter()
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--pairing", choices=ARMS, required=True)
+    parser.add_argument("--monitor-qk-norms", action="store_true", help="Log sampled Q/K update norms.")
     parser.add_argument("--benchmark-timing", action="store_true", help="Print synchronized timings per rank.")
     parser.add_argument("--guard-mfu", action="store_true", help="Require median MFU above 40%% per 10 updates after startup.")
     register(parser)
     args = parser.parse_args()
     pairing = args.pairing
+    monitor_qk_norms = args.monitor_qk_norms
     benchmark_timing = args.benchmark_timing
     guard_mfu = args.guard_mfu
     del args.pairing
+    del args.monitor_qk_norms
     del args.benchmark_timing
     del args.guard_mfu
     if args.model_init == "auto":
@@ -38,16 +41,23 @@ def main():
             args.checkpoint_dir = None
 
         if args.model_name == STUDY_MODEL:
+            if os.environ.setdefault("GPTLAB_DTYPE", "bfloat16") != "bfloat16" or getattr(args, "fp8_ffn_forward", False):
+                raise ValueError("The study requires BF16 mixed precision with FP8 disabled")
+            if args.model_init == "auto":
+                if getattr(args, "attn_impl", "fa3") != "fa3":
+                    raise ValueError("The study requires --attn-impl fa3")
+                args.attn_impl = "fa3"
             args.full_eval_at_end = True
             os.environ["DEVELOPMENT"] = "0"
 
         trainer_factory = None
-        if args.model_name != STUDY_MODEL or benchmark_timing or guard_mfu:
+        if monitor_qk_norms or benchmark_timing or guard_mfu:
             from trainer import BenchmarkTrainer, ExperimentTrainer
 
-            trainer_factory = partial(ExperimentTrainer, guard_mfu=guard_mfu)
+            trainer = ExperimentTrainer
             if benchmark_timing:
-                trainer_factory = partial(BenchmarkTrainer, worker_start=worker_start, guard_mfu=guard_mfu)
+                trainer = partial(BenchmarkTrainer, worker_start=worker_start)
+            trainer_factory = partial(trainer, monitor_qk_norms=monitor_qk_norms, guard_mfu=guard_mfu)
 
         if args.model_name == STUDY_MODEL and args.model_init == "auto":
             cap = args.stop_after_step
@@ -73,7 +83,7 @@ def main():
 
         run(
             args,
-            configure_optimizer=partial(configure_experiment_muon, pairing=pairing),
+            configure_optimizer=partial(configure_experiment_muon, pairing=pairing, monitor_qk_norms=monitor_qk_norms),
             trainer_factory=trainer_factory,
         )
     except (ValueError, FileNotFoundError) as exc:

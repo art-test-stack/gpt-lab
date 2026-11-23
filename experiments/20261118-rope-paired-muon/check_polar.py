@@ -15,7 +15,7 @@ from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
 from optimizer import configure_experiment_muon, pairing_indices, pairing_order
 
 
-JOINT_L2_TOL = {torch.float32: 2e-4, torch.bfloat16: 0.05}
+FIVE_STEP_L2_TOL = {torch.float32: 2e-4, torch.bfloat16: 0.05}
 
 
 def complex_rows(proposal):
@@ -88,7 +88,7 @@ def report(check, actual, expected, *, max_relative_l2=None):
             raise AssertionError(f"{check} head {index}: relative L2 {relative_l2:.6g} exceeds {max_relative_l2}")
 
 
-def check_joint_dispatch(device, dtype, checkpoint_path):
+def check_dispatch(device, dtype, checkpoint_path):
     generator = torch.Generator().manual_seed(42)
     # [update, projection, head, output row, input column]
     grads = torch.randn(2, 3, 2, 16, 32, generator=generator).to(device)
@@ -115,18 +115,21 @@ def check_joint_dispatch(device, dtype, checkpoint_path):
         optimizer.step()
         return weight.detach().reshape_as(initial).clone()
 
-    # The references and all arms start with identical momentum.
+    # The references and all arms start with zero momentum and variance.
     proposal = grads[0].lerp(torch.zeros_like(initial).lerp_(grads[0], 1 - momentum), momentum)
     q, k = proposal[:2]
+    # Fixed 16-row fixture for seed 20261118, independent of optimizer row metadata.
+    shuffled_rows = (5, 2, 12, 3, 6, 8, 15, 11, 0, 13, 4, 1, 10, 9, 14, 7)
+    order = torch.tensor(shuffled_rows, device=device)
 
-    def joint_reference(polar, keys):
-        pair = polar(torch.cat((q, keys), dim=-1), dtype)
-        return torch.stack(pair.chunk(2, dim=-1), dim=1)
+    def split_qk(packed):
+        return torch.stack(packed.chunk(2, dim=-1))
+
+    def restore_rows(update):
+        return torch.empty_like(update).index_copy_(-2, order, update)
 
     def shuffled_reference(proposals, dtype):
-        update = torch.empty_like(proposals)
-        update.index_copy_(-2, order, complex_polar_express(proposals.index_select(-2, order), dtype))
-        return update
+        return restore_rows(complex_polar_express(proposals[..., order, :], dtype))
 
     def normalized_update(raw):
         # First update, with a zero initial variance buffer and column-wise reduction.
@@ -135,41 +138,45 @@ def check_joint_dispatch(device, dtype, checkpoint_path):
         norm = torch.linalg.matrix_norm(raw) / torch.linalg.matrix_norm(scaled).clamp_min(1e-10)
         return scaled * norm[..., None, None]
 
-    weight, optimizer = build_optimizer("real", initial)
-    real_update = -step(weight, optimizer, grads[0]) / lr
-    real_next_v = step(weight, optimizer, grads[1])[2]
-    weight, optimizer = build_optimizer("rope", initial)
-    rope_update = -step(weight, optimizer, grads[0]) / lr
-    weight, optimizer = build_optimizer("shuffled", initial)
-    shuffled_update = -step(weight, optimizer, grads[0]) / lr
-    shuffled_rows = optimizer.param_groups[0]["qkv_pairing"][2]
-    assert shuffled_rows == pairing_order(16, "shuffled")
-    order = torch.tensor(shuffled_rows, device=device)
-
-    tolerance = JOINT_L2_TOL[dtype]
-    for arm, baseline, baseline_update, polar in (
-        ("joint-real", "real", real_update, real_polar_express),
-        ("joint-rope", "rope", rope_update, complex_polar_express),
-        ("joint-shuffled", "shuffled", shuffled_update, shuffled_reference),
+    tolerance = FIVE_STEP_L2_TOL[dtype]
+    expected_v = normalized_update(real_polar_express(proposal[2], dtype))
+    for arm, polar in (
+        ("real", real_polar_express),
+        ("rope", complex_polar_express),
+        ("shuffled", shuffled_reference),
+        ("joint-real", real_polar_express),
+        ("joint-rope", complex_polar_express),
+        ("joint-shuffled", shuffled_reference),
     ):
         label = f"{arm}/{dtype}"
-        expected = normalized_update(joint_reference(polar, k))
-        wrong_q, wrong_k = joint_reference(polar, k.flip(0)).unbind(1)
-        swapped = normalized_update(torch.stack((wrong_q, wrong_k.flip(0)), dim=1))
-        swap_error = (swapped - expected).flatten(1).norm(dim=-1) / expected.flatten(1).norm(dim=-1)
-        if (swap_error <= tolerance).any():
-            raise AssertionError(f"{label}: swapped heads must exceed relative L2 tolerance: {swap_error.tolist()}")
-
+        joint = arm.startswith("joint-")
+        raw = split_qk(polar(torch.cat((q, k), dim=-1), dtype)) if joint else polar(proposal[:2], dtype)
+        expected = normalized_update(raw)
         weight, optimizer = build_optimizer(arm, initial)
-        if arm == "joint-shuffled":
+        if arm.endswith("shuffled"):
             assert optimizer.param_groups[0]["qkv_pairing"][2] == shuffled_rows
         first = step(weight, optimizer, grads[0])
         update = -first / lr
-        qk_update = update[:2].transpose(0, 1)
-        report(f"{label}/update_reference", qk_update, expected, max_relative_l2=tolerance)
-        # Without decay, variance reduction preserves each polar output's Frobenius norm.
-        report(f"{label}/vs_{baseline}", qk_update, baseline_update[:2].transpose(0, 1))
-        torch.testing.assert_close(update[2], real_update[2], rtol=0, atol=0)
+        for projection, actual, reference in zip(("q", "k", "v"), update, (*expected, expected_v), strict=True):
+            report(f"{label}/{projection}_update_reference", actual, reference, max_relative_l2=tolerance)
+
+        if not joint:
+            continue
+
+        # Confirm the fixture detects head mismatches as well as errors in row pairing or restoration.
+        wrong_q, wrong_k = split_qk(polar(torch.cat((q, k.flip(0)), dim=-1), dtype))
+        faults = {"swapped K heads": torch.stack((wrong_q, wrong_k.flip(0)))}
+        if arm == "joint-shuffled":
+            q_rows, k_rows = q[..., order, :], k[..., order, :]
+            mismatched_rows = complex_polar_express(torch.cat((q_rows, k), dim=-1), dtype)
+            packed_rows = complex_polar_express(torch.cat((q_rows, k_rows), dim=-1), dtype)
+            faults["unshuffled K rows"] = split_qk(restore_rows(mismatched_rows))
+            faults["unrestored rows"] = split_qk(packed_rows)
+        for fault, wrong in faults.items():
+            error = (normalized_update(wrong) - expected).flatten(-2).norm(dim=-1)
+            relative_l2 = error / expected.flatten(-2).norm(dim=-1)
+            if (relative_l2 <= tolerance).any():
+                raise AssertionError(f"{label}: {fault} must exceed relative L2 tolerance: {relative_l2.tolist()}")
 
         save_tensor_state({"weight": first, "optimizer": optimizer.state_dict()}, checkpoint_path)
         checkpoint = load_tensor_state(checkpoint_path, device=device)
@@ -177,11 +184,9 @@ def check_joint_dispatch(device, dtype, checkpoint_path):
         resumed.load_state_dict(checkpoint["optimizer"])
         continued = step(weight, optimizer, grads[1])
         replayed = step(resumed_weight, resumed, grads[1])
-        torch.testing.assert_close(continued[2], real_next_v, rtol=0, atol=0)
         torch.testing.assert_close(replayed, continued, rtol=0, atol=0)
         torch.testing.assert_close(resumed.state[resumed_weight], optimizer.state[weight], rtol=0, atol=0)
-        print(json.dumps({"check": label, "swapped_relative_l2": swap_error.tolist(),
-                          "v_matches_real": True, "resume_matches": True}))
+        print(json.dumps({"check": label, "detected_faults": list(faults), "resume_matches": True}))
 
 
 def main():
@@ -222,11 +227,11 @@ def main():
             report(f"{pairing}/exact_svd_fp64", *exact_polar_comparison(reordered))
             continue
         indices = pairing_indices(rows, proposals.device) if pairing == "shuffled" else None
-        for dtype in (torch.float32, torch.bfloat16):
+        for dtype, tolerance in FIVE_STEP_L2_TOL.items():
             actual = production(proposals, 5, dtype, indices)
             expected = torch.empty_like(actual, dtype=torch.float32)
             expected[..., list(rows), :] = complex_polar_express(reordered, dtype)
-            report(f"{pairing}/five_step_{dtype}", actual, expected)
+            report(f"{pairing}/five_step_{dtype}", actual, expected, max_relative_l2=tolerance)
 
     if not args.exact:
         scratch = Path(__file__).resolve().parents[2] / ".tmp" / "codex"
@@ -234,8 +239,8 @@ def main():
         with TemporaryDirectory(prefix="polar-dispatch-", dir=scratch) as directory:
             checkpoint_path = Path(directory) / "qkv.safetensors"
             with torch.compiler.set_stance("force_eager" if args.device == "cpu" else "default"):
-                for dtype in JOINT_L2_TOL:
-                    check_joint_dispatch(args.device, dtype, checkpoint_path)
+                for dtype in FIVE_STEP_L2_TOL:
+                    check_dispatch(args.device, dtype, checkpoint_path)
 
 
 if __name__ == "__main__":

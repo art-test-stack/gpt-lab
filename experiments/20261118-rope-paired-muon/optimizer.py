@@ -84,7 +84,7 @@ def sampled_indices(count):
     return sorted({0, (count - 1) // 2, count - 1})
 
 
-def configure_experiment_muon(model, optimizer, *, pairing):
+def configure_experiment_muon(model, optimizer, *, pairing, monitor_qk_norms=False):
     if model.config.positional_encoding != "rope":
         raise ValueError("The paired Muon experiment requires rotary positional encoding")
 
@@ -96,15 +96,16 @@ def configure_experiment_muon(model, optimizer, *, pairing):
         raise ValueError(f"{pairing} requires equal query and key head counts")
     attention_by_weight = {attention.qkv_proj.weight: attention for attention in attentions}
     samples_by_weight = {}
-    for layer in sampled_indices(len(attentions)):
-        attention = attentions[layer]
-        samples = []
-        for projection, count, offset in (("q", attention.n_heads, 0),
-                                           ("k", attention.n_kv_heads, attention.n_heads)):
-            for head in sampled_indices(count):
-                samples.append((offset + head, len(strategy.sample_names)))
-                strategy.sample_names.append(f"qk/{projection}/layer_{layer}/head_{head}")
-        samples_by_weight[attention.qkv_proj.weight] = samples
+    if monitor_qk_norms:
+        for layer in sampled_indices(len(attentions)):
+            attention = attentions[layer]
+            samples = []
+            for projection, count, offset in (("q", attention.n_heads, 0),
+                                               ("k", attention.n_kv_heads, attention.n_heads)):
+                for head in sampled_indices(count):
+                    samples.append((offset + head, len(strategy.sample_names)))
+                    strategy.sample_names.append(f"qk/{projection}/layer_{layer}/head_{head}")
+            samples_by_weight[attention.qkv_proj.weight] = samples
 
     context = optimizer.comp_info
     configured = set()
@@ -129,6 +130,8 @@ def configure_experiment_muon(model, optimizer, *, pairing):
         if basis == "shuffled" and rows not in strategy.indices:
             strategy.indices[rows] = pairing_indices(rows, weights[0].device)
 
+        if not monitor_qk_norms:
+            continue
         # Match PR #50's whole-matrix owner slots, including the final partial chunk.
         chunk = (len(weights) + context.world_size - 1) // context.world_size
         start = context.rank * chunk

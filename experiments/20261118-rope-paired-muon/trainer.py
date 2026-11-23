@@ -11,8 +11,9 @@ from gpt_lab.train.trainer import Trainer
 
 
 class ExperimentTrainer(Trainer):
-    def __init__(self, *, guard_mfu=False, **kwargs):
+    def __init__(self, *, monitor_qk_norms=False, guard_mfu=False, **kwargs):
         super().__init__(**kwargs)
+        self.monitor_qk_norms = monitor_qk_norms
         self.mfu_window = deque(maxlen=10) if guard_mfu else None
 
     def update_metrics(self, step_metrics, total_dt):
@@ -37,6 +38,9 @@ class ExperimentTrainer(Trainer):
         return metrics
 
     def optimizer_step(self, should_log_step):
+        if not self.monitor_qk_norms:
+            return super().optimizer_step(should_log_step)
+
         completed = self.state.step + 1
         endpoint = self.config.n_steps
         if self.config.stop_after_step is not None:

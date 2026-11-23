@@ -35,8 +35,9 @@ for matched comparisons on the current loader.
 
 Run one fresh process per arm from the repository root. This recipe uses
 `configs/llama3.yaml` at depth 16 and aspect ratio 96, giving width 1,536
-and 12 Q and 12 KV heads of dimension 128. It uses BF16, SDPA, GPT-2
-tokenization, and the prepared `climbmix-base` shards in the same order.
+and 12 Q and 12 KV heads of dimension 128. It uses BF16 mixed precision,
+FlashAttention 3, GPT-2 tokenization, and the prepared `climbmix-base`
+shards in the same order.
 The Torch and dataloader seeds are both 42. Context 2,048, device batch 16,
 and two accumulation steps give 524,288 tokens per update. The 15N
 schedule has 19,490 updates and 1,300 warmup updates.
@@ -48,14 +49,21 @@ GPTLAB_DTYPE=bfloat16 uv run --locked --extra gpu torchrun --standalone --nproc-
   "$exp/train.py" --pairing "$arm" auto --model-name rope-muon-d16-study \
   --device cuda --board wandb --architecture-config configs/llama3.yaml \
   --depth 16 --aspect-ratio 96 --tokenizer-model gpt2 --ds-name climbmix-base \
-  --random-seed 42 --attn-impl sdpa --max-seq-len 2048 --device-batch-size 16 \
+  --random-seed 42 --attn-impl fa3 --max-seq-len 2048 --device-batch-size 16 \
   --total-batch-size 524288 --target-param-data-ratio 15 --warmup-steps 1300 \
   --eval-bpb-every 400 --n-bpb-tokens 4194304 --eval-core-every 400 --n-core-tokens 500 --log-every 1
 ```
 
-Set `arm` to any table entry. With the local Modal runner, use
-`modal run "$exp/modal_trainbase.py" --arm "$arm"` for the same recipe
-and add `--stop-after-step N` for a capped run.
+Set `arm` to any table entry. Add `--stop-after-step N` to cap completed
+updates. Set `GPTLAB_CACHE_DIR` if the prepared shards are outside your usual
+cache, and use `--model-dir` to choose the checkpoint location.
+
+The local Modal runner uses the same recipe with the prepared `gpt-lab-cache`
+volume and writes checkpoints to `gpt-lab-runs`. With the runner present,
+`modal run "$exp/modal_trainbase.py" --arm "$arm"` starts one full arm and
+`--stop-after-step N` caps it. Use `--arm all` to run the six arms in table
+order, each with its own `torchrun` process. Each arm starts after the
+previous one finishes successfully.
 
 The W&B project is `trainbase_rope-muon-d16-study`. The run name, run ID,
 and checkpoint directory name are all `joint-shuffled-s42` for the full
@@ -123,18 +131,20 @@ tokenizer configuration as inputs for packaging the gpt-lab model.
 
 ## Dashboard metrics
 
-The study command uses the standard `Trainer`. In diagnostic runs, the
-experiment trainer logs FP32 Frobenius norms at update 1, every 50 updates,
-and the endpoint. For depth 16 it samples Q and K heads 0, 5, and 11 in
-layers 0, 7, and 15.
+The study command uses the standard `Trainer` with sampled Q/K norms,
+benchmark timing, and the MFU guard disabled. Enable `--monitor-qk-norms`
+before `auto` or `resume` to log FP32 Frobenius norms at update 1, every 50
+updates, and the endpoint. For depth 16 it samples Q and K heads 0, 5, and 11
+in layers 0, 7, and 15.
 Keys use `qk/{q,k}/layer_<layer>/head_<head>/...` with the one-based
 `qk/completed_update`. The norms cover the reduced gradient, Nesterov
 proposal, raw polar output, LR-scaled update, decay, and weight displacement
 (absolute and relative to the weight norm).
 
-`--guard-mfu` stops when the median MFU in a 10-update window after the
-first 10 updates is at or below 40%. It logs `train/mfu_window_median` and
-`train/mfu_guard_tripped`.
+`--benchmark-timing` enables synchronized phase timings. `--guard-mfu`
+stops when the median MFU in a 10-update window after the first 10 updates
+is at or below 40%. It logs `train/mfu_window_median` and
+`train/mfu_guard_tripped`. Both flags are independent of Q/K norm monitoring.
 
 ## Polar check
 
@@ -146,24 +156,26 @@ uv run --locked --extra gpu python "$exp/check_polar.py" --device cuda
 uv run --locked --extra cpu python "$exp/check_joint_qk.py"
 ```
 
-`check_polar.py` compares `rope` and `shuffled` on two seeded `[128, 1536]` proposals.
+`check_polar.py` checks `rope` and `shuffled` on two seeded `[128, 1536]` proposals.
 `--proposals PATH` supplies a tensor with trailing dimensions
 `[head rows, input columns]`. Use `--pairing rope` or `--pairing shuffled`
 to select one of those checks. `--exact` runs the separate FP64 real-block
 and complex SVD comparison. CUDA checks compile the kernels with TF32 disabled.
 
-The five-step check also dispatches the three joint arms through the training optimizer on
-two distinguishable `[16, 32]` heads, using real and independent complex
-references on identical Nesterov proposals. Relative L2 error must stay
-within `2e-4` in FP32 and `0.05` in BF16. Swapping K heads must exceed those
-limits. V must match `real`, and checkpoint resume must reproduce the next
-weights and optimizer buffers exactly.
+The five-step check also dispatches all six arms through the training
+optimizer on two distinguishable `[16, 32]` heads. It checks each Q and K
+head against an independent reference for its arm, and checks V against
+the real reference. Each check enforces relative L2 tolerances of `2e-4` in
+FP32 and `0.05` in BF16. The joint fixtures detect mismatched K heads. The
+`joint-shuffled` fixture also detects leaving K unshuffled or skipping
+restoration of the original row order. Checkpoint resume must reproduce
+the joint arms' next weights and optimizer buffers exactly.
 
-Below are the combined Q/K Frobenius norms and update cosines across the two
-matched heads on CPU. The check uses zero decay, and variance normalization
-preserves the five-step polar norm. For full-row-rank exact polars in the
-same representation, sharing gives `1/sqrt(2)` of the combined norm of two
-separate factors.
+The earlier CPU comparison below shows combined Q/K Frobenius norms and
+update cosines across the two matched heads. The fixture uses zero decay,
+and variance normalization preserves the five-step polar norm. For
+full-row-rank exact polars in the same representation, sharing gives
+`1/sqrt(2)` of the combined norm of two separate factors.
 
 | Comparison | Precision | Joint norm | Separate norm | Joint / separate | Cosine |
 | --- | --- | ---: | ---: | ---: | ---: |
