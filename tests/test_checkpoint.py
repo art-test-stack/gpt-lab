@@ -7,14 +7,16 @@ import numpy as np
 import random
 from gpt_lab.model.checkpoint import (
     CheckpointManager,
+    build_meta_model,
     capture_rng_state,
     load_checkpoint,
+    load_meta_config,
     load_optimizer_state,
     make_default_run_name,
     save_checkpoint,
     set_rng_state,
 )
-from gpt_lab.utils.schemas import CheckpointState, MetaConfig, TrainerConfig, TrainerState, TransformerConfig
+from gpt_lab.utils.schemas import CheckpointState, MetaConfig, TokenizerConfig, TrainerConfig, TrainerState, TransformerConfig
 from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
 
 def numpy_rng_equal(s1, s2):
@@ -350,6 +352,63 @@ def test_checkpoint_manager_migrates_legacy_stop_after_updates(tmp_path):
     save_tensor_state(raw, path)
 
     assert manager.load_training_config().stop_after_step == 7
+
+
+def test_eval_reload_from_relocated_run(tmp_path):
+    context = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
+    original = tmp_path / "original"
+    run_dir = original / "demo" / "run"
+    model_config = TransformerConfig(vocab_size=256, max_context=8, d_model=16, d_ffn=32,
+                                     n_heads=2, n_kv_heads=2, d_head=8, n_layers=1, window_pattern="L")
+    tokenizer_config = TokenizerConfig(name="dummy", source="dummy", vocab_size=256)
+    MetaConfig(name="demo", run_name="run", dirname=run_dir, model_cfg=model_config,
+               tokenizer_cfg=tokenizer_config, base_train={})
+    model = build_meta_model(model_config).to_empty(device=context.device)
+    model.init_weights()
+    manager = CheckpointManager("demo", "run", original, comp_info=context, optimizer_state_layout="sharded")
+    manager.save(7, model)
+
+    downloaded = original.rename(tmp_path / "downloaded")
+    meta = load_meta_config("demo", "run", downloaded)
+    assert meta.dirname == downloaded / "demo" / "run"
+    model_copy, tokenizer, _, _ = CheckpointManager("demo", "run", downloaded, comp_info=context).load(phase="eval")
+    assert not original.exists()
+    assert not model_copy.training
+    assert model_copy.config == model.config
+    assert tokenizer.config == tokenizer_config
+    for name, weight in model.state_dict().items():
+        torch.testing.assert_close(model_copy.state_dict()[name], weight, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("load_options", [{}, {"attn_impl": "sdpa"}], ids=["cpu-default", "explicit-sdpa"])
+def test_cpu_eval_loads_fa3_checkpoint(tmp_path, load_options):
+    context = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.bfloat16)
+    run_dir = tmp_path / "demo" / "run"
+    config = TransformerConfig(vocab_size=256, max_context=8, d_model=16, d_ffn=32,
+                               n_heads=2, d_head=8, n_layers=1, attn_impl="sdpa")
+    model = build_meta_model(config).to_empty(device=context.device)
+    model._enforce_precision(context.compute_dtype)
+    model.init_weights()
+    MetaConfig(name="demo", run_name="run", dirname=run_dir,
+               model_cfg=config.model_copy(update={"attn_impl": "fa3"}),
+               tokenizer_cfg=TokenizerConfig(name="dummy", source="dummy", vocab_size=config.vocab_size),
+               base_train={})
+    metadata_path = run_dir / "meta.json"
+    saved_metadata = metadata_path.read_bytes()
+    manager = CheckpointManager("demo", "run", tmp_path, comp_info=context)
+    step_dir = manager.save(7, model)
+
+    loaded, _, _, _ = manager.load(phase="eval", **load_options)
+
+    assert not loaded.training
+    assert loaded.config.attn_impl == "sdpa"
+    assert metadata_path.read_bytes() == saved_metadata
+    assert load_meta_config("demo", "run", tmp_path).model_cfg.attn_impl == "fa3"
+    torch.testing.assert_close(loaded.state_dict(), load_tensor_state(step_dir / "model.safetensors"), rtol=0, atol=0)
+    with torch.inference_mode():
+        logits = loaded(torch.tensor([[1, 2, 3]])).logits
+    assert logits.shape == (1, 1, config.vocab_size)
+    assert torch.isfinite(logits).all()
 
 
 def test_best_checkpoint_after_first_completed_update_resolves_index_zero(tmp_path):

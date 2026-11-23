@@ -409,7 +409,7 @@ class Trainer:
         else:
             log_dict(
                 "First dataloader_state",
-                dataloader_state.model_dump(),
+                dataloader_state.model_dump(exclude={"ordered_shard_ids"}),
                 logger=logger,
             )
 
@@ -678,7 +678,8 @@ class Trainer:
             loss_accum.add_(loss.detach().float())
 
             last_consumed_dataloader_metadata = (
-                dataloader_state.model_dump() if dataloader_state is not None else None
+                dataloader_state.model_dump(exclude={"ordered_shard_ids"})
+                if dataloader_state is not None else None
             )
             payload, dataloader_state, token_count = self.prepare_batch(next(train_iter))
 
