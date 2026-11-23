@@ -19,7 +19,7 @@ def register(subparsers) -> None:
     console.add_argument('--max-tokens', type=positive_int, default=64, help='Maximum new tokens per prompt.')
     console.set_defaults(_handler='gpt_lab.cli.commands.chat:run_console')
     app = children.add_parser('app', help='Launch the experimental Gradio web UI.',
-                              description='Launch the existing experimental web UI. Requires Gradio, OpenAI and dotenv dependencies. The benchmark tab queries Hugging Face; remote chat uses OPENAI_BASE_URL and HF_TOKEN. Local web completion remains unsupported.')
+                              description='Launch the existing experimental web UI. Requires Gradio, OpenAI and dotenv dependencies. Remote chat uses OPENAI_BASE_URL and HF_TOKEN. Local web completion remains unsupported.')
     app.set_defaults(_handler='gpt_lab.cli.commands.chat:run_app')
 
 

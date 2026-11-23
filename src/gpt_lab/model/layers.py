@@ -199,14 +199,13 @@ class CausalSelfAttention(Module):
         B, Tq, E = x.size()
         if not self.flash_attn.supports_attn_weights and (return_attn_weights or attn_mask is not None):
             raise ValueError("Explicit attention kernels do not support attention weights or arbitrary masks; use sdpa")
-        if kv_cache is not None:
-            kv_cache.check_sizes(B, Tq, x.device, x.dtype)
-
         Hq, Hk, D = self.n_heads, self.n_kv_heads, self.d_head
         qkv = self.qkv_proj(x)
 
         qkv = qkv.view(B, Tq, Hq + 2 * Hk, D)
         q, k, v = self._prepare_qkv(qkv, x, value_embeds, rope_cache)
+        if kv_cache is not None:
+            kv_cache.check_sizes(B, Tq, q.device, q.dtype)
 
         if self.use_packed_attn_kernel and self._packed_fa3 and self.training and kv_cache is None:
             qkv_ready = torch.cat((q, k, v), dim=-2)
@@ -232,10 +231,9 @@ class CausalSelfAttention(Module):
         # inference-efficient mode
         elif (not self.training) and (kv_cache is not None):
             k_cache, v_cache = kv_cache.layer(self.layer_idx)
-            k_cache, v_cache = k_cache.to(q.device, dtype=q.dtype), v_cache.to(v.device, dtype=q.dtype)
             
             x = self.flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache,
-                k, v,
+                k, v.to(q.dtype),
                 cache_seqlens=kv_cache.seqlens,
                 causal=True,
                 window_size=window_size if window_size is not None else (-1, -1),

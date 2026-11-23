@@ -33,6 +33,7 @@ from gpt_lab.utils.schemas import (
     COREMetrics,
     DataLoaderState,
     EvalMetrics, 
+    GenerationConfig,
     TrainerConfig, 
     TrainerMetrics, 
     TrainerState
@@ -833,7 +834,6 @@ class Trainer:
 
         Override this method to customize evaluation. Scheduling stays in train().
         """
-        self.model.eval()
         prompts = [
             "The capital of France is",
             "The chemical symbol of gold is",
@@ -843,11 +843,22 @@ class Trainer:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(self.model, self.tokenizer) # use orig_model to avoid recompilation
-        with self.val_context(self.model):
-            samples = engine.generate_batch(prompts, num_samples=1, max_tokens=16, temperature=0)
-        # print0(self.tokenizer.decode(samples[0]))
-        self.model.train()
+        engine = Engine(self.model, self.tokenizer)
+        max_context = engine.config.max_context
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with self.val_context(self.model):
+                for prompt in prompts:
+                    tokens = self.tokenizer.encode(prompt, prepend_bos=True)[:max_context]
+                    max_tokens = max(1, min(16, max_context - len(tokens)))
+                    sample = engine.generate(
+                        torch.tensor([tokens], dtype=torch.long, device=engine.device),
+                        generation_config=GenerationConfig(max_length=max_tokens, do_sample=False),
+                    )
+                    print0(f"{prompt} -> {self.tokenizer.decode(sample[0])}")
+        finally:
+            self.model.train(was_training)
 
     def prepare_batch(self, raw_batch) -> tuple[Any, Optional[DataLoaderState], int]:
         """Return (payload, optional loader state, local token count).

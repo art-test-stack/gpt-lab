@@ -71,9 +71,9 @@ Cache clearing prompts unless --force is set. Omitted/empty --subdirs or all
 deletes the whole cache; tokenizer maps to tokenizers, corpus to data/corpus.
 --cache-dir selects the root; home/filesystem roots and subdirectory symlinks
 are protected. Console chat is greedy local generation without a chat template.
-The experimental Gradio app may access Hugging Face; remote completion needs
-OPENAI_BASE_URL and HF_TOKEN. Local web completion is unimplemented. It also needs
-openai/python-dotenv and uses arguments incompatible with pinned Gradio 3.18.0.
+Remote completion in the experimental Gradio app needs OPENAI_BASE_URL and
+HF_TOKEN. Local web completion is unimplemented. The app needs openai/python-dotenv
+and uses arguments incompatible with pinned Gradio 3.18.0.
 
 Unused flags: tokenizer --fast; training --fp8, --truncate-tokenizer,
 --ds-config-path. Legacy scripts delegate to the CLI; app autoreload is unsupported.
