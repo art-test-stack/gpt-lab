@@ -1,16 +1,123 @@
 """Train and evaluate the Q/K Muon arms."""
 
+import json
 import os
+import shlex
 from argparse import ArgumentParser
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 from time import perf_counter
+
+from filelock import FileLock, Timeout
+from safetensors import SafetensorError, safe_open
 
 from gpt_lab.cli.commands.base import register, resolve_checkpoint, run
 
 
 ARMS = ("real", "rope", "shuffled", "joint-real", "joint-rope", "joint-shuffled")
 STUDY_MODEL = "rope-muon-d16-study"
+
+
+def _complete_checkpoint_file(path):
+    try:
+        if path.suffix == ".json":
+            data = json.loads(path.read_text())
+            if path.name == "meta.json":
+                if not isinstance(data, str):
+                    return False
+                data = json.loads(data)
+            return isinstance(data, dict)
+        # Validate the header and file length without loading tensors.
+        with safe_open(path, framework="pt", device="cpu"):
+            return True
+    except (OSError, ValueError, SafetensorError):
+        return False
+
+
+def _resumable_checkpoint(directory):
+    source = directory / "base"
+    required = (directory / "meta.json", source / "training_config.safetensors")
+    if not all(map(_complete_checkpoint_file, required)):
+        return None
+    run_state = source / "checkpoint_state.safetensors"
+    if run_state.exists() and not _complete_checkpoint_file(run_state):
+        return None
+    for checkpoint in sorted(source.glob("checkpoint_step_*"), reverse=True):
+        step = checkpoint.name.removeprefix("checkpoint_step_")
+        if not step.isdecimal() or checkpoint.name != f"checkpoint_step_{int(step):06d}":
+            continue
+        try:
+            layout = json.loads((checkpoint / "checkpoint_meta.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(layout, dict):
+            continue
+        world_size = layout.get("world_size")
+        if type(world_size) is not int or world_size < 1:
+            continue
+        if layout.get("optimizer_state_layout") == "full" and world_size == 1:
+            rank_files = ("optim.safetensors",)
+        elif layout.get("optimizer_state_layout") == "sharded":
+            rank_files = (
+                f"{stem}_rank{rank}.{extension}"
+                for rank in range(world_size)
+                for stem, extension in (("optim", "safetensors"), ("trainer_state", "json"), ("rng_state", "safetensors"))
+            )
+        else:
+            continue
+        shared_files = ("model.safetensors", "trainer_state.json", "rng_state.safetensors")
+        step_state = checkpoint / "checkpoint_state.safetensors"
+        if step_state.exists() and not _complete_checkpoint_file(step_state):
+            continue
+        if all(_complete_checkpoint_file(checkpoint / name) for name in shared_files) and all(
+            _complete_checkpoint_file(checkpoint / name) for name in rank_files
+        ):
+            return checkpoint
+    return None
+
+
+@contextmanager
+def _reserve_run(directory, board):
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise ValueError(f"Run path {directory} already exists.")
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_path = directory / ".launch.lock"
+    try:
+        reservation = FileLock(lock_path).acquire(timeout=0)
+    except Timeout as exc:
+        raise ValueError(f"A launch is already active for {directory}.") from exc
+    with reservation:
+        source = directory / "base"
+        metadata = directory / "meta.json"
+        setup = directory / ".setup-board"
+        training_config = source / "training_config.safetensors"
+        other_artifacts = set(directory.iterdir()) - {lock_path, metadata, source, setup}
+        checkpoint_artifacts = source.is_symlink() or (source.exists() and (
+            not source.is_dir() or bool(set(source.iterdir()) - {training_config})
+        ))
+        # Older launchers wrote the training config just before opening W&B.
+        may_have_wandb = training_config.is_file() and (
+            not setup.is_file() or (setup.read_text() == "wandb" and board != "wandb")
+        )
+        if other_artifacts or checkpoint_artifacts or metadata.is_dir() or training_config.is_dir() or may_have_wandb:
+            checkpoint = _resumable_checkpoint(directory)
+            hint = f" Use resume --checkpoint-dir {shlex.quote(str(checkpoint))}." if checkpoint else ""
+            raise ValueError(f"Run directory {directory} already contains run artifacts.{hint}")
+        training_config.unlink(missing_ok=True)
+        metadata.unlink(missing_ok=True)
+        setup.write_text(board)
+        yield
+
+
+def _start_wandb_trainer(directory, factory, **kwargs):
+    if not kwargs["board"].main.disabled:
+        (directory / ".wandb-run").touch()
+    if factory is None:
+        from gpt_lab.train.trainer import Trainer
+
+        factory = Trainer
+    return factory(**kwargs)
 
 
 def main():
@@ -59,6 +166,7 @@ def main():
                 trainer = partial(BenchmarkTrainer, worker_start=worker_start)
             trainer_factory = partial(trainer, monitor_qk_norms=monitor_qk_norms, guard_mfu=guard_mfu)
 
+        reservation = nullcontext()
         if args.model_name == STUDY_MODEL and args.model_init == "auto":
             cap = args.stop_after_step
             run_name = f"{pairing}-s{args.random_seed}"
@@ -74,18 +182,18 @@ def main():
                 os.environ["WANDB_RESUME"] = "never"
             if os.environ.get("RANK", "0") == "0":
                 directory = Path(args.model_dir) / args.model_name / run_name
-                try:
-                    directory.mkdir(parents=True)
-                except FileExistsError as exc:
-                    raise ValueError(f"Run directory {directory} already exists. Use resume to continue it.") from exc
+                reservation = _reserve_run(directory, args.board)
+                if args.board == "wandb":
+                    trainer_factory = partial(_start_wandb_trainer, directory, trainer_factory)
 
         from optimizer import configure_experiment_muon
 
-        run(
-            args,
-            configure_optimizer=partial(configure_experiment_muon, pairing=pairing, monitor_qk_norms=monitor_qk_norms),
-            trainer_factory=trainer_factory,
-        )
+        with reservation:
+            run(
+                args,
+                configure_optimizer=partial(configure_experiment_muon, pairing=pairing, monitor_qk_norms=monitor_qk_norms),
+                trainer_factory=trainer_factory,
+            )
     except (ValueError, FileNotFoundError) as exc:
         parser.error(str(exc))
 

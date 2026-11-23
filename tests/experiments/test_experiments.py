@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -136,3 +137,92 @@ def test_experiment_resume_forwards_saved_corpus_and_process_cap(tmp_path, monke
         assert json.loads((result_dir / 'meta.json').read_text()) == meta
     finally:
         sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize("save_checkpoint", [False, True], ids=["wandb-only", "checkpointed"])
+def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path, monkeypatch, capsys, save_checkpoint):
+    import json
+    import os
+    from shutil import copytree
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from gpt_lab.model.flash_attn import load_flash_attn
+    from gpt_lab.tokenizer import build_tokenizer
+    from gpt_lab.utils.schemas import TokenizerConfig, TrainerState
+
+    package = "experiments.20261118-rope-paired-muon"
+    launcher = importlib.import_module(f"{package}.train")
+    monkeypatch.setitem(sys.modules, "optimizer", importlib.import_module(f"{package}.optimizer"))
+    for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "WANDB_RESUME", "DEVELOPMENT", "PYTORCH_ALLOC_CONF"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GPTLAB_DTYPE", "bfloat16")
+    monkeypatch.setattr("gpt_lab.data.loader.DATA_DIR", tmp_path / "data")
+    tokenizer = build_tokenizer(TokenizerConfig(name="dummy", source="dummy", vocab_size=257,
+                                                dirname=tmp_path / "tokenizer", save_token_bytes=False))
+    monkeypatch.setattr("gpt_lab.model.auto.AutoGPTConfig.build_tokenizer", lambda self: tokenizer)
+    monkeypatch.setattr("gpt_lab.model.layers.load_flash_attn", lambda backend: load_flash_attn("sdpa"))
+
+    dataset = tmp_path / "data" / "prepared"
+    dataset.mkdir(parents=True)
+    (dataset / "meta.json").write_text(json.dumps({"name": "prepared", "base_url": "",
+                                                   "column_name": "text", "max_shards": 1}))
+    shard = pa.table({"text": ["A local prepared shard."]})
+    pq.write_table(shard, dataset / "shard_00001.parquet")
+    model_dir = tmp_path / "models"
+    run_dir = model_dir / launcher.STUDY_MODEL / "real-s42"
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.json").write_text('"abandoned setup"')
+    monkeypatch.setattr(sys, "argv", [str(Path(launcher.__file__)), "--pairing", "real", "auto",
+                                     "--model-name", launcher.STUDY_MODEL, "--model-dir", str(model_dir),
+                                     "--device", "cpu", "--ds-name", "prepared", "--board", "wandb",
+                                     "--depth", "1", "--aspect-ratio", "16", "--d-head", "8",
+                                     "--max-seq-len", "8", "--device-batch-size", "1", "--num-steps", "1",
+                                     "--total-batch-size", "8", "--n-acc-steps", "1"])
+
+    def reject_launch(message, *, resume_hint=False):
+        with pytest.raises(SystemExit) as error:
+            launcher.main()
+        assert error.value.code == 2
+        stderr = capsys.readouterr().err
+        assert message in stderr
+        assert ("Use resume --checkpoint-dir" in stderr) is resume_hint
+        return stderr
+
+    def open_wandb(**kwargs):
+        assert os.environ["WANDB_RESUME"] == "never"
+        return SimpleNamespace(disabled=False)
+
+    wandb = SimpleNamespace(init=Mock(side_effect=open_wandb), finish=Mock())
+    monkeypatch.setattr("gpt_lab.utils.board.wandb", wandb)
+
+    def build_trainer(*, checkpoint_manager, model, optimizer, **kwargs):
+        def train():
+            reject_launch("A launch is already active")
+            if save_checkpoint:
+                checkpoint_manager.save(0, model, optimizer=optimizer, trainer_state=TrainerState(
+                    step=0, completed_steps=1, train_loader_state=None,
+                ))
+
+        return SimpleNamespace(train=train)
+
+    monkeypatch.setattr("gpt_lab.train.trainer.Trainer", build_trainer)
+    reject_launch("Missing train shards")
+    wandb.init.assert_not_called()
+    assert not (run_dir / ".wandb-run").exists()
+
+    pq.write_table(shard, dataset / "shard_00000.parquet")
+    launcher.main()
+
+    assert (run_dir / ".wandb-run").is_file()
+    wandb.init.assert_called_once()
+    assert wandb.init.call_args.kwargs["id"] == "real-s42"
+    complete = run_dir / "base" / "checkpoint_step_000000"
+    if save_checkpoint:
+        partial = copytree(complete, complete.with_name("checkpoint_step_000001"))
+        (partial / "optim.safetensors").write_bytes(b"incomplete")
+    stderr = reject_launch("already contains run artifacts", resume_hint=save_checkpoint)
+    if save_checkpoint:
+        assert str(complete) in stderr
+    wandb.init.assert_called_once()

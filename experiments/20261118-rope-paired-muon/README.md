@@ -71,6 +71,11 @@ run, `joint-shuffled-s42-stop400` with `--stop-after-step 400`, and
 `joint-shuffled-s42-stop1949` with `--stop-after-step 1949`. A cap limits
 execution and leaves the 19,490-update schedule intact.
 
+If setup fails before saving a checkpoint or opening a W&B run, fix the
+error and rerun the same launch command. An active launch or existing run
+blocks a duplicate. The launcher suggests `resume` when it finds a complete
+training checkpoint.
+
 The dashboard config and optimizer checkpoint record the arm. The shuffled
 arms also save their permutation. To continue an existing run, use
 `train.py --pairing <saved-arm> resume --checkpoint-dir <saved-run-dir>`
