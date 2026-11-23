@@ -172,21 +172,6 @@ FP32 and `0.05` in BF16. The joint fixtures detect mismatched K heads. The
 restoration of the original row order. Checkpoint resume must reproduce
 the joint arms' next weights and optimizer buffers exactly.
 
-The earlier CPU comparison below shows combined Q/K Frobenius norms and
-update cosines across the two matched heads. The fixture uses zero decay,
-and variance normalization preserves the five-step polar norm. For
-full-row-rank exact polars in the same representation, sharing gives
-`1/sqrt(2)` of the combined norm of two separate factors.
-
-| Comparison | Precision | Joint norm | Separate norm | Joint / separate | Cosine |
-| --- | --- | ---: | ---: | ---: | ---: |
-| `joint-real` vs `real` | FP32 | 4.139–4.168 | 5.792–5.924 | 0.704–0.715 | 0.937–0.944 |
-| `joint-real` vs `real` | BF16 | 4.071–4.111 | 5.836–5.896 | 0.697–0.698 | 0.936–0.943 |
-| `joint-rope` vs `rope` | FP32 | 2.953–2.957 | 4.092–4.151 | 0.712–0.722 | 0.975–0.980 |
-| `joint-rope` vs `rope` | BF16 | 2.961–2.987 | 4.028–4.121 | 0.719–0.742 | 0.974–0.979 |
-| `joint-shuffled` vs `shuffled` | FP32 | 2.783–3.033 | 3.892–4.196 | 0.663–0.779 | 0.977–0.982 |
-| `joint-shuffled` vs `shuffled` | BF16 | 2.777–3.037 | 3.896–4.111 | 0.676–0.779 | 0.976–0.978 |
-
 `check_joint_qk.py` is a four-token key-selection example. It compares
 separate, aligned joint, and swapped-plane joint steps at a fixed combined
 displacement norm of 0.05 using raw gradients.
