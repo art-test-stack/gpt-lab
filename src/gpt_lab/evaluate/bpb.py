@@ -30,7 +30,7 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info
         - comp_info (Optional[ComputeContext]): Runtime device and data-parallel mesh.
     Returns:
         - bpb (float): The computed bits-per-byte metric.
-        - loss (float): The average loss per token, for debugging.
+        - loss (float): Mean next-token negative log-likelihood in nats over valid targets.
     """
     dist_is_init = comp_info.is_distributed if comp_info is not None else is_ddp_initialized()
     world_size = comp_info.world_size if comp_info is not None else (dist.get_world_size() if dist_is_init else 1)
@@ -40,7 +40,8 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info
     # Accumulators across steps (and later across ranks)
     total_nats  = torch.tensor(0.0, dtype=torch.float32, device=device)  # scalar
     total_bytes = torch.tensor(0,   dtype=torch.int64,   device=device)  # scalar
-    total_loss  = torch.tensor(0.0, dtype=torch.float32, device=device)  # scalar, for debugging
+    total_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+    total_targets = torch.tensor(0, dtype=torch.int64, device=device)
 
     token_bytes = token_bytes.to(device=device, dtype=torch.int64)     # (V,)
     
@@ -68,13 +69,14 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info
             logits = output.logits
         except:
             loss2d = output # Assume output is directly the logits tensor if not wrapped in a ModelOutput-like object. (B, Seq)
-        total_loss += loss2d.detach().mean() # For debugging
         loss2d = loss2d.reshape(-1) # (B*Seq,)
         y = y.reshape(-1) # (B*Seq,)
+        valid = y >= 0
+        total_loss += loss2d.masked_fill(~valid, 0).sum(dtype=torch.float32)
+        total_targets += valid.sum()
 
-        if (y.int() < 0).any():
+        if not valid.all():
             # Mask out ignore_index (<0) before indexing into token_bytes
-            valid = (y >= 0) # (B*Seq,)
             ysafe = torch.where(valid, y, torch.zeros_like(y)) # (B*Seq,)
             n_bytes2d = torch.where(
                 valid, 
@@ -93,14 +95,16 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info
         dist.all_reduce(total_nats,  op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_targets, op=dist.ReduceOp.SUM)
 
     total_nats = total_nats.item()
     total_bytes = total_bytes.item()
-    total_loss = total_loss.item() / (world_size * steps)  # Average loss per token, for debugging
+    target_count = total_targets.item()
+    loss = total_loss.item() / target_count if target_count else float("nan")
 
     # Guard against division by zero (e.g., all tokens were special/ignored)
     if total_bytes == 0:
-        return { "bpb": float("inf"), "loss": total_loss }
+        return { "bpb": float("inf"), "loss": loss }
 
     bpb = total_nats / (math.log(2.0) * total_bytes)
-    return { "bpb": bpb, "loss": total_loss }
+    return { "bpb": bpb, "loss": loss }
