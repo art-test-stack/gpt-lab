@@ -343,11 +343,16 @@ def test_evaluate_samples_decodes_unequal_prompts_and_restores_mode(tmp_path, ca
     def record_generation(model, args, kwargs, output):
         assert not model.training
         assert torch.is_autocast_enabled("cpu")
+        cache = kwargs["past_key_values"]
+        assert cache.cache.dtype == torch.bfloat16
         (tokens,) = kwargs["input_ids"].tolist()
         if len(tokens) > 1:
             assert tokens[0] == tokenizer.bos_token_id
+            assert cache.cur_pos == 0
             prefills.append(tokens)
             continuations.append([])
+        else:
+            assert cache.cur_pos == len(prefills[-1]) + len(continuations[-1]) - 1
         continuations[-1].append(output.logits[0, -1].argmax().item())
 
     model.register_forward_hook(record_generation, with_kwargs=True)

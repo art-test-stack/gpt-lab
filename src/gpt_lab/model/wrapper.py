@@ -262,6 +262,7 @@ class Engine:
             # TODO: add forced tokens support
 
             if kv_cache is not None:
+                kv_cache.advance()
                 input_ids = generated_ids
             else:
                 input_ids = torch.cat([input_ids, generated_ids], dim=-1)
