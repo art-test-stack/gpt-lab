@@ -104,8 +104,11 @@ modal volume get gpt-lab-runs "/rope-muon-d16-study/$run" study-download/rope-mu
 ```
 
 From the repository root, load the final weights and the GPT-2 tokenizer
-recorded in `meta.json` on a CPU. The first tokenizer load may fetch the
-public GPT-2 vocabulary and merge rules.
+recorded in `meta.json` on a CPU. Evaluation on CPU defaults to SDPA. The
+explicit override below selects SDPA for this load, and `meta.json` still
+records FA3 for training. Use the study's BF16 precision to retain the saved
+tensor dtypes. The first tokenizer load may fetch the public GPT-2 vocabulary
+and merge rules.
 
 ```bash
 uv run --locked --extra cpu python - <<'PY'
@@ -117,9 +120,9 @@ checkpoint = CheckpointManager(
     model_name="rope-muon-d16-study",
     model_run="joint-shuffled-s42",
     model_cachedir="study-download",
-    comp_info=ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32),
+    comp_info=ComputeContext(device=torch.device("cpu"), compute_dtype=torch.bfloat16),
 )
-model, tokenizer, _, _ = checkpoint.load(step="latest", phase="eval")
+model, tokenizer, _, _ = checkpoint.load(step="latest", phase="eval", attn_impl="sdpa")
 print(model.config)
 print(tokenizer.config)
 PY
