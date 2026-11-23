@@ -1,12 +1,21 @@
-"""Compare paired Polar Express with a complex reference on shared head proposals."""
+"""Check five-step Polar Express, including joint Q/K training updates."""
 
 import argparse
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import torch
 
+from gpt_lab.optim.factory import OptimizerFactory
 from gpt_lab.optim.kernels.muon import paired_polar_express, polar_express_coeffs
-from optimizer import pairing_indices, pairing_order
+from gpt_lab.utils.distributed import ComputeContext
+from gpt_lab.utils.tensor_io import load_tensor_state, save_tensor_state
+from optimizer import configure_experiment_muon, pairing_indices, pairing_order
+
+
+JOINT_L2_TOL = {torch.float32: 2e-4, torch.bfloat16: 0.05}
 
 
 def complex_rows(proposal):
@@ -33,6 +42,15 @@ def complex_polar_express(proposal, dtype):
     return interleave(z.real, z.imag)
 
 
+def real_polar_express(proposal, dtype):
+    x = proposal.to(dtype)
+    x = x / (torch.linalg.matrix_norm(x)[..., None, None] * 1.01 + 1e-6)
+    for a, b, c in polar_express_coeffs:
+        gram = x @ x.mT
+        x = a * x + (b * gram + c * (gram @ gram)) @ x
+    return x.float()
+
+
 def exact_polar_comparison(proposal):
     z = complex_rows(proposal.double())
     tolerance = max(z.shape[-2:]) * torch.finfo(z.real.dtype).eps
@@ -50,19 +68,107 @@ def exact_polar_comparison(proposal):
     return interleave(real, imag), interleave(complex_output.real, complex_output.imag)
 
 
-def report(check, actual, expected):
+def report(check, actual, expected, *, max_relative_l2=None):
     if not torch.isfinite(actual).all() or not torch.isfinite(expected).all():
         raise ValueError(f"{check} produced non-finite output")
     for index, (a, b) in enumerate(zip(actual.flatten(1).double(), expected.flatten(1).double(), strict=True)):
         a_norm, b_norm = a.norm().item(), b.norm().item()
         difference = (a - b).norm().item()
+        relative_l2 = difference / b_norm if b_norm else (0.0 if difference == 0 else float("inf"))
         print(json.dumps({
             "check": check,
             "proposal": index,
-            "relative_l2_error": difference / b_norm if b_norm else (0.0 if difference == 0 else None),
+            "relative_l2_error": relative_l2 if b_norm or difference == 0 else None,
             "cosine_similarity": a.dot(b).item() / (a_norm * b_norm) if a_norm and b_norm else None,
+            "output_frobenius_norm": a_norm,
+            "reference_frobenius_norm": b_norm,
             "output_norm_ratio": a_norm / b_norm if b_norm else None,
         }))
+        if max_relative_l2 is not None and relative_l2 > max_relative_l2:
+            raise AssertionError(f"{check} head {index}: relative L2 {relative_l2:.6g} exceeds {max_relative_l2}")
+
+
+def check_joint_dispatch(device, dtype, checkpoint_path):
+    generator = torch.Generator().manual_seed(42)
+    # [update, projection, head, output row, input column]
+    grads = torch.randn(2, 3, 2, 16, 32, generator=generator).to(device)
+    # The two Q/K head pairs emphasize different RoPE planes.
+    grads[:, :2, 0, :8] *= 4
+    grads[:, :2, 1, 8:] *= 4
+    initial = torch.zeros_like(grads[0])
+    lr, momentum, beta = 0.125, 0.9, 0.8
+    context = ComputeContext(device=torch.device(device), compute_dtype=dtype)
+
+    def build_optimizer(arm, weights):
+        weight = torch.nn.Parameter(weights.flatten(0, 2).clone())
+        attention = SimpleNamespace(n_heads=2, n_kv_heads=2, d_head=16, qkv_proj=SimpleNamespace(weight=weight))
+        model = SimpleNamespace(config=SimpleNamespace(positional_encoding="rope"),
+                                blocks=[SimpleNamespace(attention=attention)])
+        group = dict(params=[weight], opt="muon", lr=lr, momentum=momentum, beta=beta, ns_steps=5,
+                     weight_decay=0.0, qkv_split_sizes=(16,) * 6)
+        optimizer = OptimizerFactory([group], comp_info=context)
+        configure_experiment_muon(model, optimizer, pairing=arm)
+        return weight, optimizer
+
+    def step(weight, optimizer, grad):
+        weight.grad = grad.flatten(0, 2).clone()
+        optimizer.step()
+        return weight.detach().reshape_as(initial).clone()
+
+    # Both the references and the four dispatched arms start with identical momentum.
+    proposal = grads[0].lerp(torch.zeros_like(initial).lerp_(grads[0], 1 - momentum), momentum)
+    q, k = proposal[:2]
+
+    def joint_reference(polar, keys):
+        pair = polar(torch.cat((q, keys), dim=-1), dtype)
+        return torch.stack(pair.chunk(2, dim=-1), dim=1)
+
+    def normalized_update(raw):
+        # First update, with a zero initial variance buffer and column-wise reduction.
+        variance = (1 - beta) * raw.square().mean(dim=-2, keepdim=True)
+        scaled = raw * variance.clamp_min(1e-10).rsqrt()
+        norm = torch.linalg.matrix_norm(raw) / torch.linalg.matrix_norm(scaled).clamp_min(1e-10)
+        return scaled * norm[..., None, None]
+
+    weight, optimizer = build_optimizer("real", initial)
+    real_update = -step(weight, optimizer, grads[0]) / lr
+    real_next_v = step(weight, optimizer, grads[1])[2]
+    weight, optimizer = build_optimizer("rope", initial)
+    rope_update = -step(weight, optimizer, grads[0]) / lr
+
+    tolerance = JOINT_L2_TOL[dtype]
+    for arm, baseline, baseline_update, polar in (
+        ("joint-real", "real", real_update, real_polar_express),
+        ("joint-rope", "rope", rope_update, complex_polar_express),
+    ):
+        label = f"{arm}/{dtype}"
+        expected = normalized_update(joint_reference(polar, k))
+        wrong_q, wrong_k = joint_reference(polar, k.flip(0)).unbind(1)
+        swapped = normalized_update(torch.stack((wrong_q, wrong_k.flip(0)), dim=1))
+        swap_error = (swapped - expected).flatten(1).norm(dim=-1) / expected.flatten(1).norm(dim=-1)
+        if (swap_error <= tolerance).any():
+            raise AssertionError(f"{label}: swapped heads must exceed relative L2 tolerance: {swap_error.tolist()}")
+
+        weight, optimizer = build_optimizer(arm, initial)
+        first = step(weight, optimizer, grads[0])
+        update = -first / lr
+        qk_update = update[:2].transpose(0, 1)
+        report(f"{label}/update_reference", qk_update, expected, max_relative_l2=tolerance)
+        # Without decay, variance reduction preserves each polar output's Frobenius norm.
+        report(f"{label}/vs_{baseline}", qk_update, baseline_update[:2].transpose(0, 1))
+        torch.testing.assert_close(update[2], real_update[2], rtol=0, atol=0)
+
+        save_tensor_state({"weight": first, "optimizer": optimizer.state_dict()}, checkpoint_path)
+        checkpoint = load_tensor_state(checkpoint_path, device=device)
+        resumed_weight, resumed = build_optimizer(arm, checkpoint["weight"])
+        resumed.load_state_dict(checkpoint["optimizer"])
+        continued = step(weight, optimizer, grads[1])
+        replayed = step(resumed_weight, resumed, grads[1])
+        torch.testing.assert_close(continued[2], real_next_v, rtol=0, atol=0)
+        torch.testing.assert_close(replayed, continued, rtol=0, atol=0)
+        torch.testing.assert_close(resumed.state[resumed_weight], optimizer.state[weight], rtol=0, atol=0)
+        print(json.dumps({"check": label, "swapped_relative_l2": swap_error.tolist(),
+                          "v_matches_real": True, "resume_matches": True}))
 
 
 def main():
@@ -108,6 +214,15 @@ def main():
             expected = torch.empty_like(actual, dtype=torch.float32)
             expected[..., list(rows), :] = complex_polar_express(reordered, dtype)
             report(f"{pairing}/five_step_{dtype}", actual, expected)
+
+    if not args.exact:
+        scratch = Path(__file__).resolve().parents[2] / ".tmp" / "codex"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="polar-dispatch-", dir=scratch) as directory:
+            checkpoint_path = Path(directory) / "qkv.safetensors"
+            with torch.compiler.set_stance("force_eager" if args.device == "cpu" else "default"):
+                for dtype in JOINT_L2_TOL:
+                    check_joint_dispatch(args.device, dtype, checkpoint_path)
 
 
 if __name__ == "__main__":
