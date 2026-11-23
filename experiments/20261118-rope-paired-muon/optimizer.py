@@ -50,9 +50,9 @@ class ExperimentMuonStrategy(MuonStrategy):
         pairing = group.get("qkv_pairing")
         if pairing is not None:
             arm, qk_heads, rows = pairing
-            if arm in ("joint-real", "joint-rope"):
+            if arm.startswith("joint-"):
                 kwargs["joint_qk_heads"] = qk_heads // 2
-            if arm != "joint-real":
+            if rows:
                 kwargs.update(paired_heads=qk_heads, pair_indices=self.indices.get(rows))
         if self.monitor and (sample := self.samples.get(group["params"][0])) is not None:
             kwargs["monitor_indices"] = sample[:2]
@@ -90,7 +90,7 @@ def configure_experiment_muon(model, optimizer, *, pairing):
 
     strategy = ExperimentMuonStrategy(optimizer)
     attentions = [block.attention for block in model.blocks]
-    if pairing in ("joint-real", "joint-rope") and any(
+    if pairing.startswith("joint-") and any(
         attention.n_heads != attention.n_kv_heads for attention in attentions
     ):
         raise ValueError(f"{pairing} requires equal query and key head counts")
@@ -123,14 +123,11 @@ def configure_experiment_muon(model, optimizer, *, pairing):
         ):
             raise ValueError("The experiment requires per-head Muon with five Polar Express steps")
         configured.update(weights)
-        if pairing != "real":
-            if pairing == "joint-real":
-                rows = ()
-            else:
-                rows = pairing_order(d_head, "rope" if pairing == "joint-rope" else pairing)
-            group["qkv_pairing"] = (pairing, attention.n_heads + attention.n_kv_heads, rows)
-            if pairing == "shuffled" and rows not in strategy.indices:
-                strategy.indices[rows] = pairing_indices(rows, weights[0].device)
+        basis = pairing.removeprefix("joint-")
+        rows = () if basis == "real" else pairing_order(d_head, basis)
+        group["qkv_pairing"] = (pairing, attention.n_heads + attention.n_kv_heads, rows)
+        if basis == "shuffled" and rows not in strategy.indices:
+            strategy.indices[rows] = pairing_indices(rows, weights[0].device)
 
         # Match PR #50's whole-matrix owner slots, including the final partial chunk.
         chunk = (len(weights) + context.world_size - 1) // context.world_size

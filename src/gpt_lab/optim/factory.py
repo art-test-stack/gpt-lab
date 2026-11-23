@@ -111,14 +111,19 @@ class OptimizerFactory(torch.optim.Optimizer):
     
     def load_state_dict(self, state_dict: dict) -> None:
         """Load optimizer state dict."""
-        for current, saved in zip(self.param_groups, state_dict["param_groups"]):
+        saved_groups = [group.copy() for group in state_dict["param_groups"]]
+        for current, saved in zip(self.param_groups, saved_groups):
             if tuple(current.get("qkv_split_sizes", ())) != tuple(saved.get("qkv_split_sizes", ())):
                 raise ValueError("Cannot resume with a different Muon QKV split layout")
-            if current.get("qkv_pairing") != saved.get("qkv_pairing"):
+            pairing = current.get("qkv_pairing")
+            # The original real arm used the default per-head map without saving its name.
+            if pairing is not None and pairing[0] == "real":
+                saved.setdefault("qkv_pairing", pairing)
+            if pairing != saved.get("qkv_pairing"):
                 raise ValueError("Cannot resume with a different Muon Q/K pairing")
         if self.communication is not None:
             self.communication.reset()
-        super().load_state_dict(state_dict)
+        super().load_state_dict(state_dict | {"param_groups": saved_groups})
         # Older checkpoints predate the schedule baselines.
         for group in self.param_groups:
             group.setdefault("initial_lr", group["lr"])

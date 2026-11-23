@@ -115,13 +115,18 @@ def check_joint_dispatch(device, dtype, checkpoint_path):
         optimizer.step()
         return weight.detach().reshape_as(initial).clone()
 
-    # Both the references and the four dispatched arms start with identical momentum.
+    # The references and all arms start with identical momentum.
     proposal = grads[0].lerp(torch.zeros_like(initial).lerp_(grads[0], 1 - momentum), momentum)
     q, k = proposal[:2]
 
     def joint_reference(polar, keys):
         pair = polar(torch.cat((q, keys), dim=-1), dtype)
         return torch.stack(pair.chunk(2, dim=-1), dim=1)
+
+    def shuffled_reference(proposals, dtype):
+        update = torch.empty_like(proposals)
+        update.index_copy_(-2, order, complex_polar_express(proposals.index_select(-2, order), dtype))
+        return update
 
     def normalized_update(raw):
         # First update, with a zero initial variance buffer and column-wise reduction.
@@ -135,11 +140,17 @@ def check_joint_dispatch(device, dtype, checkpoint_path):
     real_next_v = step(weight, optimizer, grads[1])[2]
     weight, optimizer = build_optimizer("rope", initial)
     rope_update = -step(weight, optimizer, grads[0]) / lr
+    weight, optimizer = build_optimizer("shuffled", initial)
+    shuffled_update = -step(weight, optimizer, grads[0]) / lr
+    shuffled_rows = optimizer.param_groups[0]["qkv_pairing"][2]
+    assert shuffled_rows == pairing_order(16, "shuffled")
+    order = torch.tensor(shuffled_rows, device=device)
 
     tolerance = JOINT_L2_TOL[dtype]
     for arm, baseline, baseline_update, polar in (
         ("joint-real", "real", real_update, real_polar_express),
         ("joint-rope", "rope", rope_update, complex_polar_express),
+        ("joint-shuffled", "shuffled", shuffled_update, shuffled_reference),
     ):
         label = f"{arm}/{dtype}"
         expected = normalized_update(joint_reference(polar, k))
@@ -150,6 +161,8 @@ def check_joint_dispatch(device, dtype, checkpoint_path):
             raise AssertionError(f"{label}: swapped heads must exceed relative L2 tolerance: {swap_error.tolist()}")
 
         weight, optimizer = build_optimizer(arm, initial)
+        if arm == "joint-shuffled":
+            assert optimizer.param_groups[0]["qkv_pairing"][2] == shuffled_rows
         first = step(weight, optimizer, grads[0])
         update = -first / lr
         qk_update = update[:2].transpose(0, 1)

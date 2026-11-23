@@ -152,13 +152,13 @@ def test_split_qkv_matches_independent_matrices_after_resume(tmp_path, opt_name,
                         incompatible.load_state_dict(saved)
 
 
-@pytest.mark.parametrize("arm", ["joint-real", "joint-rope"])
+@pytest.mark.parametrize("arm", ["joint-real", "joint-rope", "joint-shuffled"])
 def test_matching_qk_heads_share_one_polar_map_after_resume(tmp_path, monkeypatch, arm):
     from gpt_lab.optim.kernels.muon import _real_polar_express, paired_polar_express
 
     experiment = Path(__file__).resolve().parents[1] / "experiments" / "20261118-rope-paired-muon"
     monkeypatch.syspath_prepend(str(experiment))
-    from optimizer import configure_experiment_muon
+    from optimizer import configure_experiment_muon, pairing_order
 
     generator = torch.Generator().manual_seed(35)
     context = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
@@ -185,7 +185,8 @@ def test_matching_qk_heads_share_one_polar_map_after_resume(tmp_path, monkeypatc
     first_moment = torch.zeros_like(weights)
     variance = torch.zeros_like(weights[:, :, :1, :])
     optimizer = configured_optimizer(params, arm)
-    polar = paired_polar_express if arm == "joint-rope" else _real_polar_express
+    polar = _real_polar_express if arm == "joint-real" else paired_polar_express
+    rows = torch.tensor(pairing_order(d_head, "shuffled")) if arm == "joint-shuffled" else torch.arange(d_head)
 
     with torch.compiler.set_stance("force_eager"):
         for step in range(2):
@@ -197,8 +198,8 @@ def test_matching_qk_heads_share_one_polar_map_after_resume(tmp_path, monkeypatc
             first_moment.lerp_(grads, 1 - momentum)
             proposals = grads.lerp(first_moment, momentum)
             q, k, v = proposals.split(n_heads, dim=1)
-            matched = torch.cat((q, k), dim=-1)
-            q, k = polar(matched, 5, context.compute_dtype).chunk(2, dim=-1)
+            matched = torch.cat((q[..., rows, :], k[..., rows, :]), dim=-1)
+            q, k = polar(matched, 5, context.compute_dtype)[..., rows.argsort(), :].chunk(2, dim=-1)
             raw = torch.cat((q, k, _real_polar_express(v, 5, context.compute_dtype)), dim=1)
             variance.lerp_(raw.square().mean(dim=-2, keepdim=True), 1 - beta)
             update = raw * variance.clamp_min(1e-10).rsqrt()

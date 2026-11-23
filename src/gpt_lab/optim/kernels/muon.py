@@ -173,8 +173,11 @@ def muon_step_fused(
     if joint_qk_heads:
         q, k, v = g.split(joint_qk_heads, dim=-3)
         joint_qk = torch.cat((q, k), dim=-1)
-        polar = paired_polar_express if paired_heads else _real_polar_express
-        q, k = polar(joint_qk, ns_steps, compute_dtype).chunk(2, dim=-1)
+        if paired_heads:
+            joint_qk = paired_polar_express(joint_qk, ns_steps, compute_dtype, pair_indices)
+        else:
+            joint_qk = _real_polar_express(joint_qk, ns_steps, compute_dtype)
+        q, k = joint_qk.chunk(2, dim=-1)
         X = torch.cat((q, k, _real_polar_express(v, ns_steps, compute_dtype)), dim=-3)
     elif paired_heads:
         qk, v = g[..., :paired_heads, :, :], g[..., paired_heads:, :, :]
