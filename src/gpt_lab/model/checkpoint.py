@@ -53,6 +53,7 @@ from gpt_lab.utils.schemas import (
 )
 from gpt_lab.utils.system import get_git_info
 from gpt_lab.utils.tensor_io import load_tensor_state, migrate_legacy_tensor_state, save_tensor_state
+from gpt_lab.utils.types import AttnImplTypes
 from gpt_lab.tokenizer import build_tokenizer, Tokenizer, TokenizerConfig
 from gpt_lab.model.gpt import DenseTransformer
 
@@ -664,6 +665,8 @@ def build_model(
         source: _ModelSources = "base",
         comp_info: Optional[ComputeContext] = None,
         optimizer_state_layout: Optional[_OptimizerStateLayout] = None,
+        *,
+        attn_impl: Optional[AttnImplTypes] = None,
      ) -> tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     if comp_info is None:
@@ -701,8 +704,13 @@ def build_model(
     model_config_kwargs = meta_config.model_cfg.model_dump()
     # TODO: maybe do it in load_meta_config instead?
     _patch_missing_config_keys(model_config_kwargs)
+    if attn_impl is None and phase == "eval" and device.type == "cpu":
+        attn_impl = "sdpa"
+    model_config = meta_config.model_cfg
+    if attn_impl is not None:
+        model_config_kwargs["attn_impl"] = attn_impl
+        model_config = TransformerConfig.model_validate(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = meta_config.model_cfg # TransformerConfig
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = DenseTransformer(model_config)
@@ -879,7 +887,14 @@ class CheckpointManager:
             load_scaler=load_scaler, optimizer_state_layout=self.optimizer_state_layout)
         return ckpt_data 
     
-    def load(self, step: _Step = "latest", phase: Literal["train", "eval"] = "train") -> Tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
+    def load(
+        self,
+        step: _Step = "latest",
+        phase: Literal["train", "eval"] = "train",
+        *,
+        attn_impl: Optional[AttnImplTypes] = None,
+    ) -> Tuple[DenseTransformer, Tokenizer, CheckpointData, Optional[TrainerConfig]]:
+        """Load with an optional backend override. CPU evaluation defaults to SDPA."""
         step = _get_checkpoint_step(self.source_dir, step)
         model, tokenizer, ckpt_data, trainer_config = build_model(
             model_name=self.model_name,
@@ -890,6 +905,7 @@ class CheckpointManager:
             source=self.source_dir.name,
             comp_info=self.comp_info,
             optimizer_state_layout=self.optimizer_state_layout,
+            attn_impl=attn_impl,
         )
         return model, tokenizer, ckpt_data, trainer_config
  

@@ -902,7 +902,7 @@ The framework provides a simple checkpointing system that is integrated with the
 └── models/
     └── <model_name>/                               # e.g., "ic1", "gpt2-small", "llama2"
         └── <run_name>/
-            ├── meta.pskl                           # immutable (model, tokenizer, git)
+            ├── meta.json                           # immutable (model, tokenizer, git)
             └── <source>/                           # base / sft / rl
                 ├── training_config.safetensors     # per-phase config
                 ├── checkpoint_state.safetensors    # best bpb/core steps and values
@@ -920,6 +920,18 @@ The framework provides a simple checkpointing system that is integrated with the
 ```
 
 Model, optimizer, RNG, scaler, and trainer configuration files use safetensors. Nested state is described by JSON metadata inside each file; model weights keep their original state-dict keys. Tokenizer tensor caches and diagnostic batches also use safetensors. On first load, legacy `.pt`, `.pth`, and checkpoint `.pkl` files are converted to safetensors beside the originals, then loaded through the new format. Conversion requires a writable directory; originals are retained, and existing safetensors files take precedence.
+
+`meta.json` records the training attention backend. CPU evaluation defaults to
+SDPA. Other loads default to the recorded backend. Pass `attn_impl` to
+`CheckpointManager.load` to select a backend for that load while preserving
+the saved metadata.
+
+```python
+from gpt_lab.model.checkpoint import CheckpointManager
+
+checkpoint = CheckpointManager("ic1", model_run="baseline")
+model, tokenizer, _, _ = checkpoint.load(phase="eval", attn_impl="sdpa")
+```
 
 ### Board 
 
