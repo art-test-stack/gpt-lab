@@ -1,9 +1,8 @@
 # RoPE-paired Muon
 
-The paired map follows sections B.2–B.4 of Michal's *RoPE-Paired Muon for Query
-and Key Optimizations*. Each head's adjacent real rows represent one complex
-row. Five Polar Express iterations operate on the Hermitian Gram matrix of
-the whole packed head. The result is unpacked to the real head shape.
+The RoPE-paired map treats each adjacent pair of output rows as the real and
+imaginary parts of one complex row. It uses the Hermitian Gram matrix in five
+Polar Express iterations, then unpacks the result into real rows.
 
 | Arm | Experiment CLI | Q/K polar map |
 | --- | --- | --- |
