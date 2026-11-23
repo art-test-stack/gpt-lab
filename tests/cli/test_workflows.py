@@ -371,18 +371,20 @@ def test_step_limit_rejects_old_keyword():
         train_base(stop_after_updates=4)
 
 
-def test_training_is_callable_without_argparse(training_dependencies, monkeypatch):
+@pytest.mark.parametrize('seed_kwargs,expected_data_seed', [({}, 123), ({'data_seed': 42}, 42)])
+def test_training_is_callable_without_argparse(training_dependencies, monkeypatch, seed_kwargs, expected_data_seed):
     from gpt_lab.workflows.train_base import train_base
     deps = training_dependencies
     monkeypatch.setattr('gpt_lab.cli.parser.build_parser', Mock(side_effect=AssertionError('Python training must not parse CLI arguments')))
     train_base(optim_config=deps.profile, depth=4, total_batch_size=128, num_steps=7, stop_after_step=5,
-               device='cpu', board='dummy', random_seed=123)
+               device='cpu', board='dummy', random_seed=123, **seed_kwargs)
     assert deps.auto.call_args.kwargs['depth'] == 4
     assert deps.auto.call_args.kwargs['total_batch_size'] == 128
     assert deps.auto.call_args.kwargs['n_steps'] == 7
     assert 'stop_after_step' not in deps.auto.call_args.kwargs
     assert deps.trainer_factory.call_args.kwargs['config'].stop_after_step == 5
     deps.init_dist.assert_called_once_with(device_type='cpu', random_seed=123)
+    assert deps.loader.call_args_list[0].kwargs['data_seed'] == expected_data_seed
     assert deps.model.build_optimizer.call_args.kwargs['optim_config'] is deps.profile
     deps.trainer.train.assert_called_once()
     deps.cleanup.assert_called_once()

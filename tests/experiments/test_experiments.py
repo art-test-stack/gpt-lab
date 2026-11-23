@@ -171,12 +171,13 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     shard = pa.table({"text": ["A local prepared shard."]})
     pq.write_table(shard, dataset / "shard_00001.parquet")
     model_dir = tmp_path / "models"
-    run_dir = model_dir / launcher.STUDY_MODEL / "real-s42"
+    run_dir = model_dir / launcher.STUDY_MODEL / "real-s7"
     run_dir.mkdir(parents=True)
     (run_dir / "meta.json").write_text('"abandoned setup"')
     monkeypatch.setattr(sys, "argv", [str(Path(launcher.__file__)), "--pairing", "real", "auto",
                                      "--model-name", launcher.STUDY_MODEL, "--model-dir", str(model_dir),
                                      "--device", "cpu", "--ds-name", "prepared", "--board", "wandb",
+                                     "--random-seed", "7",
                                      "--depth", "1", "--aspect-ratio", "16", "--d-head", "8",
                                      "--max-seq-len", "8", "--device-batch-size", "1", "--num-steps", "1",
                                      "--total-batch-size", "8", "--n-acc-steps", "1"])
@@ -217,7 +218,9 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
 
     assert (run_dir / ".wandb-run").is_file()
     wandb.init.assert_called_once()
-    assert wandb.init.call_args.kwargs["id"] == "real-s42"
+    assert wandb.init.call_args.kwargs["id"] == "real-s7"
+    assert wandb.init.call_args.kwargs["config"]["random_seed"] == 7
+    assert wandb.init.call_args.kwargs["config"]["data_seed"] == 42
     complete = run_dir / "base" / "checkpoint_step_000000"
     if save_checkpoint:
         partial = copytree(complete, complete.with_name("checkpoint_step_000001"))

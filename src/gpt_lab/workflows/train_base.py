@@ -50,6 +50,7 @@ def train_base(
     run_name=None,
     model_dir=None,
     random_seed=42,
+    data_seed=_UNSET,
     device='auto',
     board='wandb',
     board_dir=None,
@@ -112,6 +113,7 @@ def train_base(
     keywords. The profile supplies base values, which scaling laws adjust once.
     Experiments can configure the optimizer before state restore, return run
     metadata for the dashboard, and extend Trainer.
+    A separate data_seed overrides the training shard seed for fresh runs.
     """
     if model_init not in ("auto", "resume"):
         raise ValueError("model_init must be auto or resume")
@@ -253,7 +255,7 @@ def train_base(
             batch_size=base_training_config.get("device_batch_size", device_batch_size),
             comp_info=comp_info,
             use_nanochat=use_nanochat_dataloader,
-            data_seed=random_seed,
+            data_seed=parameters.get("data_seed", random_seed),
         )
         # TODO: add option to configure buffer size
         train_loader = build_dataloader(split="train", resume_state=resume_state, **loader_common_kwargs)

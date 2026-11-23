@@ -17,6 +17,7 @@ from gpt_lab.cli.commands.base import register, resolve_checkpoint, run
 
 ARMS = ("real", "rope", "shuffled", "joint-real", "joint-rope", "joint-shuffled")
 STUDY_MODEL = "rope-muon-d16-study"
+STUDY_DATA_SEED = 42
 
 
 def _complete_checkpoint_file(path):
@@ -148,6 +149,7 @@ def main():
             args.checkpoint_dir = None
 
         if args.model_name == STUDY_MODEL:
+            args.data_seed = STUDY_DATA_SEED
             if os.environ.setdefault("GPTLAB_DTYPE", "bfloat16") != "bfloat16" or getattr(args, "fp8_ffn_forward", False):
                 raise ValueError("The study requires BF16 mixed precision with FP8 disabled")
             if args.model_init == "auto":

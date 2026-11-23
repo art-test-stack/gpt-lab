@@ -38,9 +38,11 @@ Run one fresh process per arm from the repository root. This recipe uses
 and 12 Q and 12 KV heads of dimension 128. It uses BF16 mixed precision,
 FlashAttention 3, GPT-2 tokenization, and the prepared `climbmix-base`
 shards in the same order.
-The Torch and dataloader seeds are both 42. Context 2,048, device batch 16,
-and two accumulation steps give 524,288 tokens per update. The 15N
-schedule has 19,490 updates and 1,300 warmup updates.
+The study fixes the dataloader seed at 42, so every fresh run uses the same
+shard order. The example sets the Torch seed to 42. Change `--random-seed`
+to vary Torch initialization. Context 2,048, device batch 16, and two
+accumulation steps give 524,288 tokens per update. The 15N schedule has
+19,490 updates and 1,300 warmup updates.
 
 ```bash
 exp=experiments/20261118-rope-paired-muon
