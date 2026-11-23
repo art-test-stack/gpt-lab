@@ -284,15 +284,12 @@ def test_chat_app_builds_and_launches_only_when_executed(monkeypatch):
     blocks.return_value.__enter__.return_value = application
     load_dotenv = Mock()
     chat_interface = Mock()
-    benchmark_interface = Mock()
     monkeypatch.setitem(sys.modules, 'dotenv', SimpleNamespace(load_dotenv=load_dotenv))
     monkeypatch.setitem(sys.modules, 'gradio', SimpleNamespace(Blocks=blocks, Tab=MagicMock(), Markdown=Mock()))
     monkeypatch.setitem(sys.modules, 'gpt_lab.interface.chat', SimpleNamespace(chatapp_interface=chat_interface))
-    monkeypatch.setitem(sys.modules, 'gpt_lab.interface.benchmark', SimpleNamespace(benchmark_interface=benchmark_interface))
     app(parse('chat app'))
     load_dotenv.assert_called_once()
     chat_interface.assert_called_once()
-    benchmark_interface.assert_called_once()
     application.launch.assert_called_once_with()
 
 
