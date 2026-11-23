@@ -384,7 +384,7 @@ def load_meta_config(
     _meta_cfg = _load_json(run_dir, "meta.json")
     metadata = json.loads(_meta_cfg)
     _migrate_model_config(metadata["model_cfg"], metadata.get("version"))
-    meta_cfg = MetaConfig.model_validate(metadata)
+    meta_cfg = MetaConfig.model_validate(metadata | {"dirname": run_dir, "autosave": False})
     
     log0(f"Loaded meta config from {run_dir / 'meta.json'}", logger=logger)
     
