@@ -58,13 +58,6 @@ Set `arm` to any table entry. Add `--stop-after-step N` to cap completed
 updates. Set `GPTLAB_CACHE_DIR` if the prepared shards are outside your usual
 cache, and use `--model-dir` to choose the checkpoint location.
 
-The local Modal runner uses the same recipe with the prepared `gpt-lab-cache`
-volume and writes checkpoints to `gpt-lab-runs`. With the runner present,
-`modal run "$exp/modal_trainbase.py" --arm "$arm"` starts one full arm and
-`--stop-after-step N` caps it. Use `--arm all` to run the six arms in table
-order, each with its own `torchrun` process. Each arm starts after the
-previous one finishes successfully.
-
 The W&B project is `trainbase_rope-muon-d16-study`. The run name, run ID,
 and checkpoint directory name are all `joint-shuffled-s42` for the full
 run, `joint-shuffled-s42-stop400` with `--stop-after-step 400`, and
@@ -101,19 +94,12 @@ token NLL in `eval/loss`, `eval/scored_targets`, aggregate CORE scores, and
 per-task results under `core/<task>/`. `eval/full_endpoint_update` records the
 original update even if an older run already committed that history row.
 
-## Download and inspect a checkpoint
+## Inspect a checkpoint
 
-The command prints the final checkpoint path. On Modal, `/runs` is the
-mount for `gpt-lab-runs`. The full `joint-shuffled-s42` run saves
-`/runs/rope-muon-d16-study/joint-shuffled-s42/base/checkpoint_step_019489`.
-Download the run directory to keep its `meta.json`, trainer configuration,
-and checkpoint together.
-
-```bash
-run=joint-shuffled-s42
-mkdir -p study-download/rope-muon-d16-study
-modal volume get gpt-lab-runs "/rope-muon-d16-study/$run" study-download/rope-muon-d16-study
-```
+The training command prints the final checkpoint path. The example below
+uses a local copy of the full run at
+`study-download/rope-muon-d16-study/joint-shuffled-s42/`. Keep the run's
+`meta.json`, trainer configuration, and checkpoint together.
 
 From the repository root, load the final weights and the GPT-2 tokenizer
 recorded in `meta.json` on a CPU. Evaluation on CPU defaults to SDPA. The
@@ -140,7 +126,7 @@ print(tokenizer.config)
 PY
 ```
 
-For capped runs, use the run name with its `-stop<N>` suffix in both commands.
+For capped runs, use the run name with its `-stop<N>` suffix as `model_run`.
 For later Hub publication, keep `model.safetensors`, `meta.json`, and the
 tokenizer configuration as inputs for packaging the gpt-lab model.
 
