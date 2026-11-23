@@ -91,6 +91,18 @@ def load_tensor_state(path: str | Path, device="cpu"):
     return decode(payload["state"])
 
 
+def save_tensor_state_atomic(state, path: str | Path) -> None:
+    """Publish a complete safetensors file with a same-directory rename."""
+    target = Path(path)
+    with NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.", suffix=".safetensors", delete=False) as file:
+        temporary = Path(file.name)
+    try:
+        save_tensor_state(state, temporary)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def migrate_legacy_tensor_state(path: str | Path, *, weights_only=True) -> Path:
     """Convert once, retain the original, and publish a complete safetensors file."""
     path = Path(path)
@@ -101,11 +113,5 @@ def migrate_legacy_tensor_state(path: str | Path, *, weights_only=True) -> Path:
     if isinstance(state, BaseModel):
         state = state.model_dump()
     # Ranks can migrate shared files concurrently; readers must see a complete file.
-    with NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.", suffix=".safetensors", delete=False) as file:
-        temporary = Path(file.name)
-    try:
-        save_tensor_state(state, temporary)
-        temporary.replace(target)
-    finally:
-        temporary.unlink(missing_ok=True)
+    save_tensor_state_atomic(state, target)
     return target

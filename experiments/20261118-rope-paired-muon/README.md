@@ -85,9 +85,16 @@ a standard final checkpoint in its run directory.
 At update 19,490, Trainer saves the checkpoint first and runs one full
 evaluation in place of the routine endpoint pass. It scores every eligible
 target in the held-out split, including each rank's final partial batch,
-and evaluates every example of every CORE task. The same W&B run receives
-`eval/bpb`, mean token NLL in `eval/loss`, `eval/scored_targets`, aggregate
-CORE scores, and per-task results under `core/<task>/`.
+and evaluates every example of every CORE task. Each pass saves its results
+and any new best scores in the final checkpoint's `checkpoint_state.safetensors`.
+If evaluation stops, use the same resume command. It finishes any pending
+pass with zero additional optimizer steps. Once both passes finish, a resume
+reuses their results and leaves the saved weights untouched.
+
+The same W&B run receives one row at the final update with `eval/bpb`, mean
+token NLL in `eval/loss`, `eval/scored_targets`, aggregate CORE scores, and
+per-task results under `core/<task>/`. `eval/full_endpoint_update` records the
+original update even if an older run already committed that history row.
 
 ## Download and inspect a checkpoint
 

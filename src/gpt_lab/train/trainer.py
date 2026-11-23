@@ -245,6 +245,7 @@ class Trainer:
         self.optimizer = optimizer
         
         # State and metrics
+        self._resumed = resume_state is not None
         self.state = resume_state or TrainerState()
         if self.state.completed_steps is None:
             self.state.completed_steps = self.state.step + int(self.state.step > 0 or self.state.n_tokens > 0)
@@ -368,6 +369,13 @@ class Trainer:
         step_limit = min(n_steps, self.config.stop_after_step) if self.config.stop_after_step is not None else n_steps
         if step >= step_limit:
             self.compiled_model = None
+            if self._full_eval_due():
+                if self._resumed:
+                    self.ckpt_manager.sync_full_eval_best(self.ckpt_state)
+                else:
+                    self._save_final_checkpoint()
+                self._evaluate_full_endpoint()
+                return
             self._save_final_checkpoint()
             if self.config.full_eval_at_end and step == step_limit == 0:
                 self.evaluate_bpb()
@@ -529,9 +537,8 @@ class Trainer:
         # Final checkpoint
         self._save_final_checkpoint()
         if self._full_eval_due():
-            self.evaluate_bpb()
-            self.evaluate_core()
-        if self.config.stop_after_step is not None:
+            self._evaluate_full_endpoint()
+        elif self.config.stop_after_step is not None:
             self.board.log({"train/completed_steps": self.state.completed_steps}, step=self.state.step)
 
     def update_metrics(self, step_metrics, total_dt):
@@ -744,6 +751,22 @@ class Trainer:
     def _full_eval_due(self):
         return self.config.full_eval_at_end and self.state.completed_steps == self.config.n_steps
 
+    def _evaluate_full_endpoint(self):
+        pending = self.ckpt_state.full_eval_bpb is None or self.ckpt_state.full_eval_core is None
+        if self.ckpt_state.full_eval_bpb is None:
+            self.evaluate_bpb()
+        if self.ckpt_state.full_eval_core is None:
+            self.evaluate_core()
+        bpb = self.ckpt_state.full_eval_bpb
+        core = self.ckpt_state.full_eval_core
+        if bpb is None or core is None:
+            return
+        step = self.state.completed_steps
+        if isinstance(self.board, Board):
+            self.board.log_full_eval(bpb | core, step, replay=not pending)
+        elif pending:
+            self.board.log(bpb | core, step=step)
+
     def evaluate_bpb(self):
         """Run BPB validation, log metrics, and update the best checkpoint.
 
@@ -795,7 +818,11 @@ class Trainer:
             "eval/best_bpb": self.ckpt_state.best_eval_value,
             "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
         }
-        self.board.log(board_dict, step=step)
+        if full:
+            self.ckpt_state.full_eval_bpb = board_dict
+            self.ckpt_manager.save_full_eval_state(self.state.step, self.ckpt_state)
+        else:
+            self.board.log(board_dict, step=step)
         self.eval_metrics.append(board_dict, step=step)
         model.train()
 
@@ -839,7 +866,11 @@ class Trainer:
             self.ckpt_state.best_core_completed_steps = step
             if self.config.save_on_best and not full:
                 self.save_checkpoint()
-        self.board.log(board_dict, step=step)
+        if full:
+            self.ckpt_state.full_eval_core = board_dict
+            self.ckpt_manager.save_full_eval_state(self.state.step, self.ckpt_state)
+        else:
+            self.board.log(board_dict, step=step)
         self.core_metrics.append(results, step=step)
         self.model.train()
 

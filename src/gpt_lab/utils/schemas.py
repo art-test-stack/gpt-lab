@@ -830,6 +830,8 @@ class CheckpointState(BaseModel):
     best_core_completed_steps: Optional[int] = None
     best_eval_value: Optional[float] = None  # lower is better
     best_core_value: Optional[float] = None  # higher is better
+    full_eval_bpb: Optional[Dict[str, int | float]] = None
+    full_eval_core: Optional[Dict[str, int | float]] = None
 
 class _BaseMetrics(BaseModel):
     time: List[float] = Field(default_factory=list)
