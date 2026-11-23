@@ -568,6 +568,7 @@ class TrainerConfig(BaseModel):
     n_bpb_tokens: int = 80*524288 # Number of tokens to evaluate val loss on
     eval_core_every: int = 2000 # Evaluate CORE metric every N steps (-1 = disable)
     n_core_tokens: int = 500 # Examples per task for CORE metric
+    full_eval_at_end: bool = False # Run both evaluators without limits after saving at n_steps.
     sample_every: int = 2000 # Sample from model every N steps (-1 = disable)
     save_on_best: bool = True # Whether to save a checkpoint when a new best eval bpb is achieved
     

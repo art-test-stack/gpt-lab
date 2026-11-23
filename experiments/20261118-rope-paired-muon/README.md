@@ -69,11 +69,57 @@ arms also save their permutation. To continue an existing run, use
 at the same world size, with the same dataset and precision. Resume keeps
 the selected run ID and rejects a different optimizer arm.
 
-Trainer evaluates BPB/NLL and CORE every 400 updates and at the endpoint,
-using 4,194,304 validation tokens and up to 500 examples per CORE task.
-At update 19,490, evaluate the final checkpoint in a separate pass on the
-same split with up to 20,971,520 validation tokens and uncapped CORE
-(`max_per_task=-1`). The training CLI uses one budget per metric for the run.
+Trainer evaluates BPB/NLL on 4,194,304 held-out ClimbMix targets and CORE
+on up to 500 examples per task every 400 updates and at an early stop.
+An early stop on a scheduled update gets one evaluation. Every run saves
+a standard final checkpoint in its run directory.
+
+At update 19,490, Trainer saves the checkpoint first and runs one full
+evaluation in place of the routine endpoint pass. It scores every eligible
+target in the held-out split, including each rank's final partial batch,
+and evaluates every example of every CORE task. The same W&B run receives
+`eval/bpb`, mean token NLL in `eval/loss`, `eval/scored_targets`, aggregate
+CORE scores, and per-task results under `core/<task>/`.
+
+## Download and inspect a checkpoint
+
+The command prints the final checkpoint path. On Modal, `/runs` is the
+mount for `gpt-lab-runs`. The full `joint-shuffled-s42` run saves
+`/runs/rope-muon-d16-study/joint-shuffled-s42/base/checkpoint_step_019489`.
+Download the run directory to keep its `meta.json`, trainer configuration,
+and checkpoint together.
+
+```bash
+run=joint-shuffled-s42
+mkdir -p study-download/rope-muon-d16-study
+modal volume get gpt-lab-runs "/rope-muon-d16-study/$run" study-download/rope-muon-d16-study
+```
+
+From the repository root, load the final weights and the GPT-2 tokenizer
+recorded in `meta.json` on a CPU. The first tokenizer load may fetch the
+public GPT-2 vocabulary and merge rules.
+
+```bash
+uv run --locked --extra cpu python - <<'PY'
+import torch
+from gpt_lab.model.checkpoint import CheckpointManager
+from gpt_lab.utils.distributed import ComputeContext
+
+checkpoint = CheckpointManager(
+    model_name="rope-muon-d16-study",
+    model_run="joint-shuffled-s42",
+    model_cachedir="study-download",
+    comp_info=ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32),
+)
+model, tokenizer, _, _ = checkpoint.load(step="latest", phase="eval")
+print(model.config)
+print(tokenizer.config)
+PY
+```
+
+For capped runs, use the run name with its `-stop<N>` suffix in both commands.
+For later Hub publication, keep `model.safetensors`, `meta.json`, and the
+tokenizer configuration as inputs for packaging the gpt-lab model.
 
 ## Dashboard metrics
 

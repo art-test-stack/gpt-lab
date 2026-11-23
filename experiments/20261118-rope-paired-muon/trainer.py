@@ -95,4 +95,4 @@ class BenchmarkTrainer(ExperimentTrainer):
 
     def save_checkpoint(self):
         with self._measure("checkpoint", self.state.completed_steps):
-            super().save_checkpoint()
+            return super().save_checkpoint()

@@ -37,6 +37,10 @@ def main():
             args = resolve_checkpoint(args)
             args.checkpoint_dir = None
 
+        if args.model_name == STUDY_MODEL:
+            args.full_eval_at_end = True
+            os.environ["DEVELOPMENT"] = "0"
+
         trainer_factory = None
         if args.model_name != STUDY_MODEL or benchmark_timing or guard_mfu:
             from trainer import BenchmarkTrainer, ExperimentTrainer

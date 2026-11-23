@@ -15,7 +15,7 @@ from unittest.mock import Mock
 import itertools
 
 from gpt_lab.utils.schemas import DataLoaderState, TrainerConfig, TrainerState
-from gpt_lab.model.checkpoint import load_checkpoint, save_checkpoint
+from gpt_lab.model.checkpoint import CheckpointManager, load_checkpoint, save_checkpoint
 from datetime import timedelta
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -230,7 +230,7 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     def evaluate(*args, **kwargs):
         assert not trainer.compiled_model.training
         assert torch.is_autocast_enabled("cpu")
-        return {"bpb": 1.5, "loss": 2.0}
+        return {"bpb": 1.5, "loss": 2.0, "scored_targets": 12}
 
     evaluator = Mock(side_effect=evaluate)
     monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", evaluator)
@@ -253,6 +253,7 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     assert logged_step == step + 1
     assert trainer.ckpt_state.best_eval_completed_steps == (step + 1 if improved else None)
     assert values["eval/best_bpb"] == best
+    assert values["eval/scored_targets"] == 12
     assert trainer.eval_metrics.step == [step + 1]
     assert trainer.eval_metrics.bpb == [1.5]
     assert trainer.eval_metrics.loss == [2.0]
@@ -775,3 +776,63 @@ def test_evaluation_runs_after_completed_updates_and_includes_final(tmp_path, mo
         monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
     trainer.train()
     assert observations == {"bpb": expected, "core": expected, "samples": expected, "save": [2, 4, 5]}
+
+
+@pytest.mark.parametrize("horizon,cap,steps,full", [
+    (4, None, [2, 4], True),
+    (6, 4, [2, 4], False),
+    (6, 3, [2, 3], False),
+    (6, 0, [0], False),
+])
+def test_study_endpoint_saves_weights_and_uses_correct_eval_budget(tmp_path, monkeypatch, capsys, horizon, cap, steps, full):
+    trainer, model, board = _make_trainer(tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer)
+    trainer.config = trainer.config.model_copy(update=dict(
+        n_steps=horizon, stop_after_step=cap, full_eval_at_end=True, n_acc_steps=1, total_batch_size=3,
+        n_flops_per_token=100, eval_bpb_every=2, eval_core_every=2, n_bpb_tokens=8, n_core_tokens=500,
+        sample_every=0, save_every=-1, save_on_best=False, log_every=0))
+    trainer.train_loader = itertools.repeat(dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3, state=None))
+    trainer.optimizer.update_hyperparams = lambda **kwargs: None
+    model.config = SimpleNamespace(max_context=2)
+    trainer.tokenizer = SimpleNamespace(token_bytes=torch.ones(2))
+    trainer.val_loader = Mock(return_value=iter(()))
+    (tmp_path / "study" / "run").mkdir(parents=True)
+    trainer.ckpt_manager = CheckpointManager("study", "run", tmp_path, comp_info=trainer.config.comp_info)
+    step_index = max(steps[-1] - 1, 0)
+    source_dir = trainer.ckpt_manager.source_dir
+    final_path = source_dir / f"checkpoint_step_{step_index:06d}"
+    calls = []
+
+    def bpb(eval_model, batches, budget, **kwargs):
+        assert eval_model is model and not model.training
+        calls.append(("bpb", trainer.state.completed_steps, budget))
+        if budget is None:
+            saved = load_checkpoint(source_dir, step=step_index, comp_info=trainer.config.comp_info, load_scaler=False)
+            assert saved.trainer_state.completed_steps == horizon
+            torch.testing.assert_close(saved.model_state["weight"], model.weight)
+        return {"bpb": 1.5, "loss": 2.0, "scored_targets": 8 if budget else 11}
+
+    def core(eval_model, tokenizer, device, *, max_per_task):
+        calls.append(("core", trainer.state.completed_steps, max_per_task))
+        if max_per_task == -1:
+            assert final_path.is_dir()
+        return {"core/core": 0.6, "core/accuracy": 0.7, "core/max_per_task": max_per_task,
+                "all_core_results": {"task": {"accuracy": 0.8}}}
+
+    monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", bpb)
+    monkeypatch.setattr("gpt_lab.train.trainer.evaluate_core", core)
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+    for name in ("collect", "freeze", "disable"):
+        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
+    trainer.train()
+
+    expected = [(metric, step, budget) for step in steps for metric, budget in (
+        ("bpb", None if full and step == horizon else 2), ("core", -1 if full and step == horizon else 500),
+    )]
+    assert calls == expected
+    assert trainer.val_loader.call_args.kwargs == ({"include_partial": True} if full else {})
+    assert [(step, values["eval/scored_targets"]) for values, step in board.records if "eval/scored_targets" in values] == [
+        (step, 11 if full and step == horizon else 8) for step in steps
+    ]
+    assert [step for values, step in board.records if values.get("core/task/accuracy") == 0.8] == steps
+    assert (final_path / "model.safetensors").is_file()
+    assert f"Final checkpoint: {final_path}" in capsys.readouterr().out

@@ -59,6 +59,7 @@ def train_base(
     n_bpb_tokens=41943040,
     eval_core_every=2000,
     n_core_tokens=500,
+    full_eval_at_end=None,
     sample_every=0,
     save_every=-1,
     log_every=250,
@@ -266,6 +267,8 @@ def train_base(
             assert type(trainer_config) == TrainerConfig, "Trainer config loaded from checkpoint is not of type TrainerConfig. Please check the checkpoint data and trainer config."
             if stop_after_step is not None:
                 trainer_config = trainer_config.model_copy(update={"stop_after_step": stop_after_step})
+            if full_eval_at_end is not None:
+                trainer_config = trainer_config.model_copy(update={"full_eval_at_end": full_eval_at_end})
             if cuda_graph_mode is not None:
                 trainer_config = TrainerConfig.model_validate(
                     trainer_config.model_dump() | {"cuda_graph_mode": cuda_graph_mode, "comp_info": comp_info}
@@ -273,6 +276,8 @@ def train_base(
             # TODO: add option to override some trainer config parameters from CLI args even when resuming (eg: evaluation frequency, save frequency, etc.)
         else:
             trainer_config = build_trainer_config(parameters, comp_info, base_training_config)
+        if use_nanochat_dataloader and trainer_config.full_eval_at_end:
+            raise ValueError("Full endpoint evaluation requires the native validation loader")
         print0_dict("Trainer config", trainer_config.model_dump())
 
         # ------------------------------------------------------------------------------
@@ -285,7 +290,7 @@ def train_base(
         if is_resumed and ckpt_data and ckpt_data.optimizer_state is not None:
             log0("Loading optimizer state from checkpoint data.", logger=logger)
             optimizers.load_state_dict(ckpt_data.optimizer_state)
-        if not is_resumed or stop_after_step is not None or cuda_graph_mode is not None:
+        if not is_resumed or stop_after_step is not None or cuda_graph_mode is not None or full_eval_at_end is not None:
             ckpt_manager.save_training_config(trainer_config)
 
         # ------------------------------------------------------------------------------
@@ -418,6 +423,7 @@ def build_trainer_config(parameters: dict, comp_info: ComputeContext, base_train
         n_bpb_tokens=parameters["n_bpb_tokens"],
         eval_core_every=parameters["eval_core_every"],
         n_core_tokens=parameters["n_core_tokens"],
+        full_eval_at_end=bool(parameters.get("full_eval_at_end")),
         sample_every=parameters["sample_every"],
         save_every=parameters["save_every"],
         log_every=parameters["log_every"],

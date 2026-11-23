@@ -180,6 +180,19 @@ def test_resume_retains_or_overrides_absolute_execution_cap(training_dependencie
 
 
 @pytest.mark.parametrize('mode', ['auto', 'resume'])
+def test_full_endpoint_eval_uses_vanilla_workflow_and_persists_config(training_dependencies, mode):
+    from gpt_lab.cli.commands.base import run
+    deps = training_dependencies
+    args = parse(f'train {mode} --device cpu --board dummy')
+    args.full_eval_at_end = True
+    run(args)
+    config = deps.trainer_factory.call_args.kwargs['config']
+    assert config.full_eval_at_end
+    assert config.n_steps == 10
+    deps.manager.save_training_config.assert_called_once_with(config)
+
+
+@pytest.mark.parametrize('mode', ['auto', 'resume'])
 @pytest.mark.parametrize('backend', ['wandb', 'tensorboard', 'dummy'])
 def test_training_forwards_logging_backend(training_dependencies, mode, backend):
     from gpt_lab.cli.commands.base import run

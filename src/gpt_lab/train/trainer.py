@@ -368,7 +368,10 @@ class Trainer:
         step_limit = min(n_steps, self.config.stop_after_step) if self.config.stop_after_step is not None else n_steps
         if step >= step_limit:
             self.compiled_model = None
-            self.save_checkpoint()
+            self._save_final_checkpoint()
+            if self.config.full_eval_at_end and step == step_limit == 0:
+                self.evaluate_bpb()
+                self.evaluate_core()
             if self.config.stop_after_step is not None:
                 self.board.log({"train/completed_steps": step}, step=self.state.step)
             return
@@ -455,11 +458,12 @@ class Trainer:
                 self.log_metrics(metrics)
 
             completed = self.state.completed_steps
+            full_eval = self._full_eval_due()
             # ================================================================
             # Validation on 'val_loader' every 'eval_every' steps
             # ================================================================
 
-            if (
+            if not full_eval and (
                 (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
                 (self.config.eval_bpb_every > 0 and completed > 0 and # eval every eval_bpb_every steps except the first step
                 (last_step or completed % self.config.eval_bpb_every == 0))
@@ -470,7 +474,7 @@ class Trainer:
             # Validation on CORE metric every 'core_eval_every' steps
             # ================================================================
 
-            if (
+            if not full_eval and (
                 (self.config.eval_core_every == -1 and last_step) or
                 (self.config.eval_core_every > 0 and (
                 last_step or (completed > 0 and completed % self.config.eval_core_every == 0)))
@@ -492,7 +496,7 @@ class Trainer:
             # ================================================================
             # Checkpointing
             # ================================================================
-            if self.config.save_every > 0 and completed % self.config.save_every == 0:
+            if not full_eval and self.config.save_every > 0 and completed % self.config.save_every == 0:
                 self.save_checkpoint()
 
             if (sum(total_dt) > self.config.target_time * 60) and self.config.target_time > 0:
@@ -523,7 +527,10 @@ class Trainer:
         print0("=" * 70)
 
         # Final checkpoint
-        self.save_checkpoint()
+        self._save_final_checkpoint()
+        if self._full_eval_due():
+            self.evaluate_bpb()
+            self.evaluate_core()
         if self.config.stop_after_step is not None:
             self.board.log({"train/completed_steps": self.state.completed_steps}, step=self.state.step)
 
@@ -734,6 +741,9 @@ class Trainer:
 
         self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
 
+    def _full_eval_due(self):
+        return self.config.full_eval_at_end and self.state.completed_steps == self.config.n_steps
+
     def evaluate_bpb(self):
         """Run BPB validation, log metrics, and update the best checkpoint.
 
@@ -741,27 +751,30 @@ class Trainer:
         """
         step = self.state.completed_steps
         start_bpb_eval = time.time()
-        self.compiled_model.eval()
-        tokens_per_eval_step = (
-            self.config.device_batch_size
-            * self.model.config.max_context
-            * self.config.comp_info.world_size
-        )
-        eval_steps = max(
-            1,
-            math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
-        )
-        with self.val_context(self.compiled_model):
+        full = self._full_eval_due()
+        model = self.model if full or self.compiled_model is None else self.compiled_model
+        model.eval()
+        if full:
+            batches = self.val_loader(include_partial=True)
+            eval_steps = None
+        else:
+            batches = self.val_loader()
+            tokens_per_eval_step = (
+                self.config.device_batch_size * self.model.config.max_context * self.config.comp_info.world_size
+            )
+            eval_steps = max(1, math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step))
+        with self.val_context(model):
             val_res = compute_bpb(
-                self.compiled_model,
-                self.val_loader(),
+                model,
+                batches,
                 eval_steps,
                 comp_info=self.config.comp_info,
                 token_bytes=self.tokenizer.token_bytes
             )
         print0(f"Step {step:05d} | "\
                f"Validation bpb: {val_res['bpb']:.6f} | "\
-            f"Validation loss: {val_res['loss']:.6f}")
+               f"Validation loss: {val_res['loss']:.6f} | "\
+               f"Scored targets: {val_res['scored_targets']:,}")
 
         dt_bpb_eval = time.time() - start_bpb_eval
 
@@ -772,18 +785,19 @@ class Trainer:
             self.ckpt_state.best_eval_value = val_res['bpb']
             self.ckpt_state.best_eval_step = self.state.step
             self.ckpt_state.best_eval_completed_steps = step
-            if self.config.save_on_best:
+            if self.config.save_on_best and not full:
                 self.save_checkpoint()
 
         board_dict = {
             "eval/loss": val_res['loss'],
             "eval/bpb": val_res['bpb'],
+            "eval/scored_targets": val_res['scored_targets'],
             "eval/best_bpb": self.ckpt_state.best_eval_value,
             "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
         }
         self.board.log(board_dict, step=step)
         self.eval_metrics.append(board_dict, step=step)
-        self.compiled_model.train()
+        model.train()
 
     def evaluate_core(self):
         """Run CORE evaluation, log metrics, and track the best score.
@@ -792,21 +806,21 @@ class Trainer:
         """
         step = self.state.completed_steps
         n_steps = self.config.n_steps
+        full = self._full_eval_due()
         self.model.eval()
         with self.val_context(self.model):
             results = evaluate_core(
                 self.model,
                 self.tokenizer,
                 self.device,
-                max_per_task=self.config.n_core_tokens,
+                max_per_task=-1 if full else self.config.n_core_tokens,
             )
-        max_throughput = results.get("core/max_per_task", 0) * self.config.comp_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
+        limit = "all" if results["core/max_per_task"] < 0 else results["core/max_per_task"]
         print0(f"Step {step:05d}/{n_steps:05d} | "
                f"CORE: {results['core/core']:.4f} | "
                f"Accuracy: {results['core/accuracy']:.4f} | "
-               f"Max per task: {int(results['core/max_per_task'])} | "
-               f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
-               f"Max throughput: {max_throughput:,.0f} tok/s")
+               f"Max per task: {limit} | "
+               f"Step time: {results.get('core/step_time_ms', 0):.2f}ms")
         board_dict = {
             "core/core": results["core/core"],
             "core/accuracy": results["core/accuracy"],
@@ -823,7 +837,7 @@ class Trainer:
             self.ckpt_state.best_core_value = results["core/core"]
             self.ckpt_state.best_core_step = self.state.step
             self.ckpt_state.best_core_completed_steps = step
-            if self.config.save_on_best:
+            if self.config.save_on_best and not full:
                 self.save_checkpoint()
         self.board.log(board_dict, step=step)
         self.core_metrics.append(results, step=step)
@@ -911,14 +925,14 @@ class Trainer:
         self.optimizer.update_hyperparams(lrm=lrm, muon_momentum=muon_momentum, weight_decay=weight_decay)
         return lrm, muon_momentum, weight_decay
 
+    def _save_final_checkpoint(self):
+        path = self.save_checkpoint()
+        if path is not None:
+            print0(f"Final checkpoint: {path.resolve()}")
+
     def save_checkpoint(self):
-        """
-        Save checkpoint with model, optimizer, and state.
-        
-        Args:
-            tag: Identifier for this checkpoint (e.g., "latest", "best", "step_1000")
-        """
-        self.ckpt_manager.save(
+        """Save the model, optimizer, and trainer state and return the directory."""
+        return self.ckpt_manager.save(
             step=self.state.step,
             model=self.model,
             optimizer=self.optimizer,
