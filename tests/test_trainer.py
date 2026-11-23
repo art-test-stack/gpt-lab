@@ -525,7 +525,8 @@ def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
         "eval_core_every": 0, "sample_every": 0, "log_every": log_every,
     })
     batches = [dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3,
-                    state=DataLoaderState(epoch=i + 1, offset_in_row_group=i) if with_state else None)
+                    state=DataLoaderState(epoch=i + 1, offset_in_row_group=i, ordered_shard_ids=(4, 8))
+                    if with_state else None)
                for i in range(5)]
     trainer.train_loader = batches
     trainer.optimizer.update_hyperparams = Mock()
@@ -545,7 +546,7 @@ def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
         return compute_loss(payload)
 
     trainer.compute_loss = capture_loss
-    caplog.set_level("WARNING", logger="gpt_lab.train.trainer")
+    caplog.set_level("INFO", logger="gpt_lab.train.trainer")
 
     trainer.train()
 
@@ -556,8 +557,12 @@ def test_training_custom_payload_counts_tokens_and_checkpoints_optional_state(
     assert model.weight.grad is None
     warnings = [record for record in caplog.records if "No dataloader state provided" in record.message]
     assert len(warnings) == (0 if with_state else 1)
+    startup_logs = [record.message for record in caplog.records if record.message.startswith("First dataloader_state:")]
+    assert len(startup_logs) == int(with_state)
+    assert all("ordered_shard_ids" not in message for message in startup_logs)
     loaded = load_checkpoint(tmp_path, step=1, comp_info=trainer.config.comp_info, load_scaler=False)
     assert loaded.trainer_state.train_loader_state == batches[3]["state"]
+    assert "ordered_shard_ids" not in str(loaded.trainer_state)
     assert loaded.trainer_state.n_tokens == 12
     assert len(board.records) == (2 if log_every else 0)
 
@@ -659,7 +664,8 @@ def test_nonfinite_loss_completes_accumulation_reports_last_metadata_and_aborts(
     trainer.optimizer_step = Mock()
     initial_weight = model.weight.detach().clone()
     features, targets = torch.ones(2, 2), torch.zeros(2, 2)
-    states = [DataLoaderState(epoch=i + 1, offset_in_row_group=10 + i) if with_state else None
+    states = [DataLoaderState(epoch=i + 1, offset_in_row_group=10 + i, ordered_shard_ids=(4, 8))
+              if with_state else None
               for i in range(3)]
     fetched = []
 
@@ -676,7 +682,7 @@ def test_nonfinite_loss_completes_accumulation_reports_last_metadata_and_aborts(
         trainer.train_step(train_iter, batch, should_log_step=False)
 
     message = str(error.value)
-    metadata = states[1].model_dump() if with_state else None
+    metadata = states[1].model_dump(exclude={"ordered_shard_ids"}) if with_state else None
     assert "optimizer step=7" in message
     assert "microstep=" not in message
     assert f"Last consumed dataloader state: {metadata}." in message
