@@ -3,7 +3,7 @@
 import json
 import os
 import shlex
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
@@ -125,7 +125,10 @@ def main():
     worker_start = perf_counter()
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--pairing", choices=ARMS, required=True)
-    parser.add_argument("--monitor-qk-norms", action="store_true", help="Log sampled Q/K update norms.")
+    parser.add_argument(
+        "--monitor-qk-norms", action=BooleanOptionalAction, default=True,
+        help="Log sampled Q/K update norms (enabled by default).",
+    )
     parser.add_argument("--benchmark-timing", action="store_true", help="Print synchronized timings per rank.")
     parser.add_argument("--guard-mfu", action="store_true", help="Require median MFU above 40%% per 10 updates after startup.")
     register(parser)

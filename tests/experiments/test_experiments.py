@@ -155,6 +155,8 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     package = "experiments.20261118-rope-paired-muon"
     launcher = importlib.import_module(f"{package}.train")
     monkeypatch.setitem(sys.modules, "optimizer", importlib.import_module(f"{package}.optimizer"))
+    experiment_trainer = importlib.import_module(f"{package}.trainer")
+    monkeypatch.setitem(sys.modules, "trainer", experiment_trainer)
     for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "WANDB_RESUME", "DEVELOPMENT", "PYTORCH_ALLOC_CONF"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GPTLAB_DTYPE", "bfloat16")
@@ -198,7 +200,10 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     wandb = SimpleNamespace(init=Mock(side_effect=open_wandb), finish=Mock())
     monkeypatch.setattr("gpt_lab.utils.board.wandb", wandb)
 
-    def build_trainer(*, checkpoint_manager, model, optimizer, **kwargs):
+    def build_trainer(*, checkpoint_manager, model, optimizer, monitor_qk_norms, **kwargs):
+        assert monitor_qk_norms is True
+        assert optimizer.backend.strategies["muon"].sample_names
+
         def train():
             reject_launch("A launch is already active")
             if save_checkpoint:
@@ -208,7 +213,7 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
 
         return SimpleNamespace(train=train)
 
-    monkeypatch.setattr("gpt_lab.train.trainer.Trainer", build_trainer)
+    monkeypatch.setattr(experiment_trainer, "ExperimentTrainer", build_trainer)
     reject_launch("Missing train shards")
     wandb.init.assert_not_called()
     assert not (run_dir / ".wandb-run").exists()
