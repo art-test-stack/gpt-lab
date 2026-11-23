@@ -805,7 +805,7 @@ class DataLoaderState(BaseModel):
     offset_in_row_group: int = 0
     epoch: int = 1
     packing_signature: Optional[str] = None
-    ordered_shard_ids: Optional[tuple[int, ...]] = None
+    ordered_shard_ids: Optional[tuple[int, ...]] = Field(default=None, repr=False)
     lookahead_refs: tuple[DocumentRef, ...] = ()
     pending_document_ref: Optional[DocumentRef] = None
     document_token_offset: int = 0
