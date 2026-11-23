@@ -242,6 +242,7 @@ def train_base(
             batch_size=base_training_config.get("device_batch_size", device_batch_size),
             comp_info=comp_info,
             use_nanochat=use_nanochat_dataloader,
+            data_seed=random_seed,
         )
         # TODO: add option to configure buffer size
         train_loader = build_dataloader(split="train", resume_state=resume_state, **loader_common_kwargs)
