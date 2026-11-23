@@ -49,7 +49,7 @@ def test_compute_bpb_reports_mean_loss_per_token():
     assert result["bpb"] == pytest.approx(loss_per_token / math.log(2.0))
 
 
-def test_perplexity_weights_scored_targets_and_includes_zero_byte_tokens():
+def test_log_perplexity_weights_scored_targets_and_includes_zero_byte_tokens():
     x = torch.zeros((1, 3), dtype=torch.long)
     batches = [
         (x, torch.tensor([[0, 1, -1]]), None),
@@ -64,6 +64,6 @@ def test_perplexity_weights_scored_targets_and_includes_zero_byte_tokens():
         comp_info=ComputeContext(device=torch.device("cpu")),
     )
 
-    assert result["perplexity"] == pytest.approx(math.exp((1.0 + 2.0 + 3.0) / 3))
+    assert result["log_perplexity"] == pytest.approx((1.0 + 2.0 + 3.0) / 3)
     assert result["bpb"] == pytest.approx((2.0 + 3.0) / (4 * math.log(2.0)))
     assert result["loss"] == pytest.approx((1.0 + 2.0 + 3.0) / 6)

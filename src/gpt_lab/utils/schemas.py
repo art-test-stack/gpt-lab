@@ -845,8 +845,8 @@ class EvalMetrics(_BaseMetrics):
     best_bpb: float = float("inf")
     bpb: List[float] = Field(default_factory=list)
     loss: List[float] = Field(default_factory=list)
-    train_perplexity: List[float] = Field(default_factory=list)
-    val_perplexity: List[float] = Field(default_factory=list)
+    train_log_perplexity: List[float] = Field(default_factory=list)
+    val_log_perplexity: List[float] = Field(default_factory=list)
     
     step_time_ms: List[float] = Field(default_factory=list)
     
@@ -856,8 +856,8 @@ class EvalMetrics(_BaseMetrics):
         self.best_bpb = min(self.best_bpb, log_dict.get("eval/bpb", float("inf")))
         self.bpb.append(log_dict.get("eval/bpb", float("inf")))
         self.loss.append(log_dict.get("eval/loss", float("inf")))
-        self.train_perplexity.append(log_dict.get("train/perplexity", float("nan")))
-        self.val_perplexity.append(log_dict.get("eval/perplexity", float("nan")))
+        self.train_log_perplexity.append(log_dict.get("train/log_perplexity", float("nan")))
+        self.val_log_perplexity.append(log_dict.get("eval/log_perplexity", float("nan")))
 
 class COREMetrics(_BaseMetrics):
     accuracy: List[float] = Field(default_factory=list)

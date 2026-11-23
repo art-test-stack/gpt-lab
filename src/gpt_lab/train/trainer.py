@@ -738,7 +738,7 @@ class Trainer:
         self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
 
     def evaluate_bpb(self):
-        """Evaluate perplexity and validation BPB, then update the best checkpoint.
+        """Evaluate log perplexity and validation BPB, then update the best checkpoint.
 
         Override this method to customize evaluation. Scheduling stays in train().
         """
@@ -767,16 +767,16 @@ class Trainer:
                         token_bytes=self.tokenizer.token_bytes,
                     )
         val_res = results["val"]
-        perplexities = {"eval/perplexity": val_res["perplexity"]}
+        log_perplexities = {"eval/log_perplexity": val_res["log_perplexity"]}
         message = (
             f"Step {step:05d} | Validation bpb: {val_res['bpb']:.6f} | "
             f"Validation loss: {val_res['loss']:.6f} | "
-            f"Validation perplexity: {val_res['perplexity']:.6f}"
+            f"Validation log perplexity: {val_res['log_perplexity']:.6f}"
         )
         if "train" in results:
-            train_perplexity = results["train"]["perplexity"]
-            perplexities["train/perplexity"] = train_perplexity
-            message += f" | Train perplexity: {train_perplexity:.6f}"
+            train_log_perplexity = results["train"]["log_perplexity"]
+            log_perplexities["train/log_perplexity"] = train_log_perplexity
+            message += f" | Train log perplexity: {train_log_perplexity:.6f}"
         print0(message)
 
         dt_bpb_eval = time.time() - start_bpb_eval
@@ -792,7 +792,7 @@ class Trainer:
                 self.save_checkpoint()
 
         board_dict = {
-            **perplexities,
+            **log_perplexities,
             "eval/loss": val_res['loss'],
             "eval/bpb": val_res['bpb'],
             "eval/best_bpb": self.ckpt_state.best_eval_value,

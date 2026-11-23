@@ -234,9 +234,9 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
         assert not trainer.compiled_model.training
         assert torch.is_autocast_enabled("cpu")
         if batches is trainer.val_loader.return_value:
-            return {"bpb": 1.5, "loss": 2.0, "perplexity": 7.389}
+            return {"bpb": 1.5, "loss": 2.0, "log_perplexity": 2.5}
         assert batches is trainer.train_eval_loader.return_value
-        return {"bpb": 0.5, "loss": 1.0, "perplexity": 2.718}
+        return {"bpb": 0.5, "loss": 1.0, "log_perplexity": 1.25}
 
     evaluator = Mock(side_effect=evaluate)
     monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", evaluator)
@@ -264,13 +264,13 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     assert logged_step == step + 1
     assert trainer.ckpt_state.best_eval_completed_steps == (step + 1 if improved else None)
     assert values["eval/best_bpb"] == best
-    assert values["train/perplexity"] == 2.718
-    assert values["eval/perplexity"] == 7.389
+    assert values["train/log_perplexity"] == 1.25
+    assert values["eval/log_perplexity"] == 2.5
     assert trainer.eval_metrics.step == [step + 1]
     assert trainer.eval_metrics.bpb == [1.5]
     assert trainer.eval_metrics.loss == [2.0]
-    assert trainer.eval_metrics.train_perplexity == [2.718]
-    assert trainer.eval_metrics.val_perplexity == [7.389]
+    assert trainer.eval_metrics.train_log_perplexity == [1.25]
+    assert trainer.eval_metrics.val_log_perplexity == [2.5]
     assert trainer.eval_metrics.step_time_ms == [values["eval/step_time_ms"]]
 
 

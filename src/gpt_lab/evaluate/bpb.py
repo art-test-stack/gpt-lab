@@ -9,7 +9,7 @@ from gpt_lab.utils.distributed import ComputeContext, is_ddp_initialized
 @torch.no_grad()
 def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info: Optional[ComputeContext]) -> dict[str, float]:
     """
-    Compute bits-per-byte and token perplexity over the given batches.
+    Compute bits-per-byte and token log perplexity over the given batches.
     
     ## Shapes
         - B: batch size
@@ -31,7 +31,7 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info
     Returns:
         - bpb (float): The computed bits-per-byte metric.
         - loss (float): The average loss per token, for debugging.
-        - perplexity (float): Exponentiated mean loss over non-ignored targets, or NaN if none.
+        - log_perplexity (float): Mean loss in nats over non-ignored targets, or NaN if none.
     """
     dist_is_init = comp_info.is_distributed if comp_info is not None else is_ddp_initialized()
     world_size = comp_info.world_size if comp_info is not None else (dist.get_world_size() if dist_is_init else 1)
@@ -76,8 +76,8 @@ def compute_bpb(model, batches, steps: int, token_bytes: torch.Tensor, comp_info
     total_nats = total_nats.item()
     total_bytes = total_bytes.item()
     total_loss = total_loss.item() / (world_size * steps)  # Average loss per token, for debugging
-    perplexity = (total_token_nats / total_tokens).exp().item()
+    log_perplexity = (total_token_nats / total_tokens).item()
 
     # Guard against division by zero (e.g., all tokens were special/ignored)
     bpb = total_nats / (math.log(2.0) * total_bytes) if total_bytes else float("inf")
-    return {"bpb": bpb, "loss": total_loss, "perplexity": perplexity}
+    return {"bpb": bpb, "loss": total_loss, "log_perplexity": log_perplexity}
