@@ -114,22 +114,3 @@ EPSILON = 1e-8
 VALIDATION_STEP = 50
 
 RANDOM_SEED = 42
-
-
-plt_config = {
-    "text.usetex": True,
-    "text.latex.preamble": r"\usepackage{amsmath}\usepackage{amssymb}",
-    "font.family": "serif",
-    "font.serif": "Computer Modern",
-    "savefig.bbox": "tight",
-    "savefig.format": "pdf"
-}
-
-from matplotlib import pyplot as plt
-plt.style.use(plt_config)
-
-pt = 1./72.27
-golden = (1 + 5 ** 0.5) / 2
-
-width = 337.33545 * pt
-height = width / golden

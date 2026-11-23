@@ -46,14 +46,11 @@ def app(args):
     load_dotenv()
     import gradio as gr
     from gpt_lab.interface.chat import chatapp_interface
-    from gpt_lab.interface.benchmark import benchmark_interface
     from gpt_lab.utils.common import get_banner
 
     with gr.Blocks(title='GPT-lib') as application:
         with gr.Tab('Chat'):
             chatapp_interface()
-        with gr.Tab('Benchmark'):
-            benchmark_interface()
         with gr.Tab('Training'):
             gr.Markdown('# Training Interface 🏋️‍♂️')
     print('Launching GPT-lib Interface...')
