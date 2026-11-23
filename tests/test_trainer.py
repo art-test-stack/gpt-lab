@@ -1,7 +1,6 @@
 from gpt_lab.utils.distributed import ComputeContext
 import pytest
 import torch
-from gpt_lab.model.wrapper import Engine
 from gpt_lab.train.trainer import Trainer
 
 from gpt_lab.utils.schemas import (
@@ -308,29 +307,62 @@ def test_evaluate_core_tracks_metrics_and_best_score(tmp_path, monkeypatch, prev
 
 
 @pytest.mark.fast
-def test_evaluate_samples_uses_original_model_and_generation_settings(tmp_path, monkeypatch):
-    trainer, model, _ = _make_trainer(tmp_path)
+@pytest.mark.parametrize("training", [True, False])
+def test_evaluate_samples_decodes_unequal_prompts_and_restores_mode(tmp_path, capsys, training):
+    from gpt_lab.model.gpt import DenseTransformer
+    from gpt_lab.tokenizer import Tokenizer
+
+    tokenizer_config = TokenizerConfig(
+        name="sample-test", source="local", vocab_size=257, save_token_bytes=False,
+    )
+    tokenizer = Tokenizer(
+        mergeable_ranks={bytes([i]): i for i in range(256)},
+        special_tokens=tokenizer_config.special_tokens.list(), config=tokenizer_config,
+    )
+    model = DenseTransformer(TransformerConfig(
+        vocab_size=tokenizer.vocab_size, max_context=56, d_model=16, d_ffn=32,
+        n_heads=2, n_kv_heads=2, n_layers=1, d_head=8,
+        window_pattern="L", attn_impl="sdpa",
+    ), pad_vocab_size_to=1).to("cpu")
+    model.init_weights()
+    model.train(training)
+    trainer = Trainer(
+        model, tokenizer, None, None,
+        config=TrainerConfig(n_steps=1, comp_info=ComputeContext(
+            device=torch.device("cpu"), compute_dtype=torch.bfloat16,
+        )),
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
+        board=_CaptureBoard(),
+        checkpoint_manager=SimpleNamespace(source_dir=tmp_path),
+    )
     trainer.compiled_model = torch.nn.Linear(2, 2)
 
-    def generate(prompts, **kwargs):
+    prefills = []
+    continuations = []
+
+    def record_generation(model, args, kwargs, output):
         assert not model.training
         assert torch.is_autocast_enabled("cpu")
-        assert len(prompts) == 7
-        assert prompts[0] == "The capital of France is"
+        (tokens,) = kwargs["input_ids"].tolist()
+        if len(tokens) > 1:
+            assert tokens[0] == tokenizer.bos_token_id
+            prefills.append(tokens)
+            continuations.append([])
+        continuations[-1].append(output.logits[0, -1].argmax().item())
 
-    engine = Mock()
-    engine.generate_batch.side_effect = generate
-    engine_factory = Mock(return_value=engine)
-    monkeypatch.setattr("gpt_lab.train.trainer.Engine", engine_factory)
-
+    model.register_forward_hook(record_generation, with_kwargs=True)
+    capsys.readouterr()
     trainer.evaluate_samples()
 
-    engine_factory.assert_called_once_with(model, trainer.tokenizer)
-    engine.generate_batch.assert_called_once()
-    assert engine.generate_batch.call_args.kwargs == {
-        "num_samples": 1, "max_tokens": 16, "temperature": 0,
-    }
-    assert model.training
+    assert model.training is training
+    assert len(prefills) == 7
+    assert len({len(tokens) for tokens in prefills}) > 1
+    assert tokenizer.decode(prefills[0][1:]) == "The capital of France is"
+    assert [len(sample) for sample in continuations] == [min(16, 56 - len(tokens)) for tokens in prefills]
+    assert capsys.readouterr().out == "".join(
+        f"{tokenizer.decode(tokens[1:])} -> {tokenizer.decode(sample)}\n"
+        for tokens, sample in zip(prefills, continuations, strict=True)
+    )
 
 
 @pytest.mark.fast
@@ -720,20 +752,21 @@ def test_evaluation_runs_after_completed_updates_and_includes_final(tmp_path, mo
     trainer.config = trainer.config.model_copy(update=dict(
         n_steps=9, stop_after_step=5, n_acc_steps=1, total_batch_size=3,
         n_flops_per_token=100, eval_bpb_every=interval, eval_core_every=interval,
-        sample_every=0, save_every=2, log_every=0))
+        sample_every=interval, save_every=2, log_every=0))
     trainer.train_loader = itertools.repeat(dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3, state=None))
     trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     trainer.optimizer.update_hyperparams = lambda **kwargs: None
-    observations = {"bpb": [], "core": [], "save": []}
+    observations = {"bpb": [], "core": [], "samples": [], "save": []}
     def record(kind):
         observations[kind].append(trainer.state.completed_steps)
         assert trainer.state.step + 1 == trainer.state.completed_steps
         assert trainer.state.n_tokens == trainer.state.completed_steps * 3
     trainer.evaluate_bpb = lambda: record("bpb")
     trainer.evaluate_core = lambda: record("core")
+    trainer.evaluate_samples = lambda: record("samples")
     trainer.save_checkpoint = lambda: record("save")
     monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
     for name in ("collect", "freeze", "disable"):
         monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
     trainer.train()
-    assert observations == {"bpb": expected, "core": expected, "save": [2, 4, 5]}
+    assert observations == {"bpb": expected, "core": expected, "samples": expected, "save": [2, 4, 5]}

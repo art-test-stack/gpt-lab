@@ -199,7 +199,7 @@ class Engine:
             self,
             input_ids: torch.Tensor,
             ground_truth: Optional[torch.Tensor] = None,
-            generation_config: GenerationConfig | None = None,
+            generation_config: GenerationConfig | dict | None = None,
             assistant_model = None, # TODO: implement assistant model functionality
         ) -> ModelCompletionOutput | Iterator[ModelCompletionOutput]:
         if assistant_model is not None:
@@ -207,14 +207,14 @@ class Engine:
                  "Assistant model provided is just ignored.", 
                  level="warning", logger=logger)
         if generation_config is None:
-            log0("No generation config provided. Using default generation "
-                 "config with provided kwargs.", level="warning", logger=logger)
+            generation_config = GenerationConfig()
+            log0("No generation config provided. Using defaults.", level="warning", logger=logger)
+        elif isinstance(generation_config, dict):
+            generation_config = GenerationConfig.model_validate(generation_config)
         if not generation_config.use_cache:
             log0("GenerationConfig.use_cache is False. "
                  "Generation may be slow as prefill will be done for each step.", 
                  level="warning", logger=logger)
-        if isinstance(generation_config, dict):
-            generation_config = GenerationConfig.model_validate(**generation_config)
 
         device = self.device
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -274,36 +274,6 @@ class Engine:
         
         return results.tolist()
 
-    # TODO # PRIOTITY
-    def generate_batch(self, prompts, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """
-        Non-streaming batch generation that just returns the final token sequences.
-        Returns a list of token sequences (list of lists of ints).
-        Terminal tokens (assistant_end, bos) are not included in the results.
-        """
-        if isinstance(text, str):
-            text = [text]
-        tokens = self.tokenizer.encode_batch(text, prepend_bos=True)
-        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
-        generation_config = GenerationConfig(max_length=max_tokens, temperature=temperature,
-                                             use_cache=True, seed=seed, num_beams=num_samples, top_k=top_k)
-        bos = self.tokenizer.get_bos_token_id()
-        results = [tokens.copy() for _ in range(num_samples)]
-        masks = [[0] * len(tokens) for _ in range(num_samples)]
-        completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, generation_config=generation_config):
-            for i, (token, mask) in enumerate(zip(token_column, token_masks)):
-                if not completed[i]:
-                    if token == assistant_end or token == bos:
-                        completed[i] = True
-                    else:
-                        results[i].append(token)
-                        masks[i].append(mask)
-            # Stop if all rows are completed
-            if all(completed):
-                break
-        return results, masks
-
     @classmethod
     def from_huggingface(
             cls,
@@ -318,4 +288,3 @@ class Engine:
             tokenizer=tokenizer
         )
         return gpt
-    
