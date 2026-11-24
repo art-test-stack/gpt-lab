@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
 from time import perf_counter
@@ -13,7 +14,7 @@ FA4_REVISION = "a3944dc87df804a42f0248d16c780fed90f84508"  # Hub v0
 
 
 class NativeFA4:
-    def __init__(self, model, device):
+    def __init__(self, windows, device):
         import cutlass
         import cutlass.cute as cute
         from kernels import get_kernel
@@ -46,7 +47,7 @@ class NativeFA4:
         self.mask = branch_mask
         self.windows = {
             left: torch.tensor([left], dtype=torch.int32, device=device)
-            for left in {left for left, _ in model.window_sizes}
+            for left in {left for left, _ in windows}
         }
         self.coords = None
         self.compile_seconds = 0.0
@@ -74,13 +75,18 @@ class NativeFA4:
             aux_tensors=[*self.coords, self.windows[left]],
         )[0]
 
-    def packed_choices(self, model, packed, device):
-        row = torch.tensor([packed.tokens], device=device)
+    @contextmanager
+    def packed_layout(self, packed, device):
         positions = torch.tensor(packed.positions, dtype=torch.int32, device=device)
         branches = torch.tensor(packed.branches, dtype=torch.int32, device=device)
         self.coords = positions, branches
         try:
-            outputs = forward_rows(model, row, position_ids=positions.long())
+            yield positions, branches
         finally:
             self.coords = None
-        return packed_scores(outputs, row, packed)[0]
+
+    def packed_choices(self, model, packed, device, *, capture_logits=False):
+        row = torch.tensor([packed.tokens], device=device)
+        with self.packed_layout(packed, device) as (positions, _):
+            outputs = forward_rows(model, row, position_ids=positions.long())
+        return packed_scores(outputs, row, packed, capture_logits=capture_logits)

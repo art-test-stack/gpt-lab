@@ -16,11 +16,41 @@ from gpt_lab.model.checkpoint import build_model
 from gpt_lab.model.flash_attn import require_flash_attn3
 from gpt_lab.utils.distributed import cleanup_dist_groups, init_dist_groups
 from fa4 import FA4_REPO, FA4_REVISION, NativeFA4
-from scoring import pack_choices, separate_choices, separate_choices_with_prefix_scoring
+from parity import ByteTokenizer, check_sibling_isolation, cropped_sibling_examples, small_model
+from scoring import pack_choices, separate_choices, separate_choices_with_prefix_scoring, tree_masks
 
 
 ARMS = ("A", "B", "B-score", "C")
 BF16_NLL_ATOL = 0.05
+
+
+def check_native_fa4(model, fa4, device):
+    tokenizer = ByteTokenizer()
+    aligned, mutated = cropped_sibling_examples(tokenizer)
+    original = pack_choices(*aligned)
+    for block in model.blocks:
+        block.attention.flash_attn.flash_attn_func = fa4
+    reference, _ = separate_choices(model, *aligned, tokenizer.get_bos_token_id(), device)
+    packed, max_b_diff = check_sibling_isolation(
+        original, pack_choices(*mutated),
+        lambda layout: fa4.packed_choices(model, layout, device, capture_logits=True),
+    )
+    torch.testing.assert_close(torch.tensor(packed), torch.tensor(reference), atol=BF16_NLL_ATOL, rtol=0)
+    assert first_minimum(packed) == first_minimum(reference), (packed, reference)
+
+    # Uniform QK and one channel per key expose the native mask in the output.
+    length = len(original.tokens)
+    q = torch.zeros((1, length, 1, 64), device=device, dtype=torch.bfloat16)
+    v = torch.eye(length, 64, device=device, dtype=q.dtype).view_as(q)
+    max_window_diff = 0.0
+    with fa4.packed_layout(original, device) as (positions, branches):
+        for window, mask in zip(model.window_sizes, tree_masks(positions, branches, model.window_sizes)):
+            output = fa4(q, q, v, dropout_p=0, causal=True, window_size=window, use_packed=False)
+            actual = output[0, :, 0, :length].float()
+            expected = mask.float() / mask.sum(dim=-1, keepdim=True)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0.01)
+            max_window_diff = max(max_window_diff, (actual - expected).abs().max().item())
+    return {"branch_b_max_logit_abs": max_b_diff, "window_max_weight_abs": max_window_diff}
 
 
 def score_examples(mode, cases, model, tokenizer, device, fa4):
@@ -31,7 +61,7 @@ def score_examples(mode, cases, model, tokenizer, device, fa4):
         tokens, starts, ends = prepare_example(idx, tokenizer, data, meta, model.max_seq_len)
         packed = pack_choices(tokens, starts, ends) if mode == "C" else None
         if packed is not None:
-            nll = fa4.packed_choices(model, packed, device)
+            nll, _ = fa4.packed_choices(model, packed, device)
             packed_count += 1
         elif mode == "B-score":
             nll = separate_choices_with_prefix_scoring(model, tokens, starts, ends, pad, device)
@@ -142,13 +172,19 @@ def run(args, context):
     if packed_probe is None:
         raise RuntimeError("Each rank needs at least one eligible packed question for its kernel probe")
 
-    fa4 = NativeFA4(model, device)
+    fixture_model = small_model(device, head_dim=64)
+    fa4 = NativeFA4(model.window_sizes + fixture_model.window_sizes, device)
     dispatch = [block.attention.flash_attn for block in model.blocks]
     fa3_calls = [entry.flash_attn_func for entry in dispatch]
     fa3_kernel = require_flash_attn3()
     fa4.cute.compile = fa4.timed_compile
     records, scores = {}, {}
     try:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            preflight = check_native_fa4(fixture_model, fa4, device)
+        preflight.update(compilation_seconds=fa4.compile_seconds, compiles=fa4.compiles)
+        print(f"Rank {context.rank} FA4 preflight passed: {preflight}", flush=True)
+        del fixture_model
         with torch.autocast("cuda", dtype=torch.bfloat16):
             for mode in ARMS:
                 for entry, fa3_call in zip(dispatch, fa3_calls):
@@ -162,7 +198,7 @@ def run(args, context):
     parity = {f"{mode}_vs_A": compare(scores["A"], scores[mode]) for mode in ARMS[1:]}
     parity["C_vs_B-score"] = compare(scores["B-score"], scores["C"])
     per_rank = [None] * context.world_size
-    dist.all_gather_object(per_rank, dict(ids=list(scores["A"]), measurements=records, parity=parity))
+    dist.all_gather_object(per_rank, dict(ids=list(scores["A"]), measurements=records, parity=parity, preflight=preflight))
     ids = [example for rank in per_rank for example in rank["ids"]]
     if len(ids) != len(set(ids)) or len(ids) != unique_count:
         raise RuntimeError("CORE sharding did not cover each selected question exactly once")

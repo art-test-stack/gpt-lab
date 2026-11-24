@@ -74,6 +74,8 @@ CUDA_VISIBLE_DEVICES=0,1 GPTLAB_DTYPE=bfloat16 uv run --locked --extra gpu \
 
 FA4 uses Hub v0 at commit `a3944dc87df804a42f0248d16c780fed90f84508`. The public entry point in this build has no runtime metadata parameter. C calls the pinned native forward implementation with device tensors for token positions, branch IDs, and the layer window. A, B, B-score, and C each get a CUDA profiler probe and must show the expected Hopper attention kernel. [Pinned FA4 source](https://huggingface.co/kernels-community/flash-attn4/tree/a3944dc87df804a42f0248d16c780fed90f84508/build/torch-cuda)
 
+Before warming up real questions, each rank runs the same cropped sibling-mutation fixture through native FA4. The fixture requires exact equality of B's scored logits after mutating A and a matching separate-row winner. A direct attention probe exposes the native mask with one output channel per key. It checks the exact set of visible keys under the four-token and full windows. Preflight compilation is reported separately.
+
 Each rank warms up its full CORE shard before timing. The synchronized sweep includes prompt preparation, mask construction, forward, and scoring. The report includes CuTe compile time, unique questions divided by the slower rank's elapsed time, peak PyTorch-allocated bytes per GPU, and speedup over A. Every arm uses the same example IDs, few-shot selections, and context limit. Each forward handles one question.
 
 BF16 parity uses an absolute tolerance of `0.05` nats per choice with zero relative tolerance. The report includes the largest NLL difference, any decision flips with each arm's winner-to-runner-up margin, and a failure status for differences outside tolerance. H100 kernel execution, parity, and throughput are pending.

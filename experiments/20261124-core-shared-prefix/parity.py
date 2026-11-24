@@ -23,11 +23,11 @@ class ByteTokenizer:
         return [[prepend, *text.encode("utf-8")] for text in texts]
 
 
-def small_model(device):
+def small_model(device, *, head_dim=16):
     torch.manual_seed(29)
     model = DenseTransformer(TransformerConfig(
-        vocab_size=257, max_context=2048, n_layers=2, n_heads=2, d_head=16,
-        d_model=32, d_ffn=64, window_pattern="SL", window_size=4, attn_impl="sdpa",
+        vocab_size=257, max_context=2048, n_layers=2, n_heads=2, d_head=head_dim,
+        d_model=2 * head_dim, d_ffn=4 * head_dim, window_pattern="SL", window_size=4, attn_impl="sdpa",
     ))
     model.init_weights()
     # Training initialization zeros residual projections. Exercise both layers.
@@ -66,34 +66,49 @@ class Parity:
         return nll
 
 
+def prepare_choice_fixture(tokenizer, query, choices, limit=None):
+    data = [dict(query=query, choices=choices, gold=0)]
+    return prepare_example(0, tokenizer, data, MC, limit)
+
+
+def cropped_sibling_examples(tokenizer):
+    query = "0123456789abcdefghij"
+    aligned = prepare_choice_fixture(tokenizer, query, ["ABCDEF", "GHIJKL"], 16)
+    mutated = prepare_choice_fixture(tokenizer, query, ["AXYZEF", "GHIJKL"], 16)
+    return aligned, mutated
+
+
+def check_sibling_isolation(original, mutated, score):
+    assert original.positions == mutated.positions and original.branches == mutated.branches
+    assert original.tokens[:original.prefix] == mutated.tokens[:mutated.prefix]
+    assert original.tokens[original.offsets[1]:] == mutated.tokens[mutated.offsets[1]:]
+    nll, before = score(original)
+    _, after = score(mutated)
+    assert not torch.equal(before[0], after[0])
+    torch.testing.assert_close(before[1], after[1], atol=0, rtol=0)
+    return nll, (before[1] - after[1]).abs().max().item()
+
+
 def boundary_checks(model, tokenizer, device):
     parity = Parity()
     pad = tokenizer.get_bos_token_id()
 
-    def prepare(query, choices, limit=None):
-        data = [dict(query=query, choices=choices, gold=0)]
-        return prepare_example(0, tokenizer, data, MC, limit)
-
-    unequal = prepare("Question?", ["A", "BCDEFGHI"])
+    unequal = prepare_choice_fixture(tokenizer, "Question?", ["A", "BCDEFGHI"])
     assert [end - start for start, end in zip(unequal[1], unequal[2])] == [1, 8]
     nll = parity(model, *unequal, pad, device)
     control = separate_choices_with_prefix_scoring(model, *unequal, pad, device)
     torch.testing.assert_close(torch.tensor(control), torch.tensor(nll), atol=ATOL, rtol=0)
 
-    aligned = prepare("0123456789abcdefghij", ["ABCDEF", "GHIJKL"], 16)
+    aligned, mutated = cropped_sibling_examples(tokenizer)
     assert [row[0] for row in aligned[0]] == [ord("b")] * 2
     assert aligned[1] == [10, 10]
     parity(model, *aligned, pad, device)
-    misaligned = prepare("0123456789abcdefghij", ["ABCDEF", "GHIJKLM"], 16)
+    misaligned = prepare_choice_fixture(tokenizer, "0123456789abcdefghij", ["ABCDEF", "GHIJKLM"], 16)
     assert misaligned[1] == [10, 9]
     assert parity(model, *misaligned, pad, device) == separate_choices(model, *misaligned, pad, device)[0]
     assert (parity.packed, parity.fallback) == (2, 1)
 
     original = pack_choices(*aligned)
-    mutated = pack_choices(*prepare("0123456789abcdefghij", ["AXYZEF", "GHIJKL"], 16))
-    assert original.positions == mutated.positions and original.branches == mutated.branches
-    assert original.tokens[:original.prefix] == mutated.tokens[:mutated.prefix]
-    assert original.tokens[original.offsets[1]:] == mutated.tokens[mutated.offsets[1]:]
     positions = torch.tensor(original.positions, device=device)
     branches = torch.tensor(original.branches, device=device)
     short, full = tree_masks(positions, branches, model.window_sizes)
@@ -102,12 +117,12 @@ def boundary_checks(model, tokenizer, device):
     assert short[b, p - 4] and not short[b, p - 5] and full[b, p - 5]
     assert not full[b, a] and not full[a, b] and not full[p - 1, a]
     assert short[b + 4, b] and not short[b + 5, b]
-    _, before = packed_sdpa(model, original, device, capture_logits=True)
-    _, after = packed_sdpa(model, mutated, device, capture_logits=True)
-    assert not torch.equal(before[0], after[0])
-    torch.testing.assert_close(before[1], after[1], atol=0, rtol=0)
+    _, max_abs = check_sibling_isolation(
+        original, pack_choices(*mutated),
+        lambda layout: packed_sdpa(model, layout, device, capture_logits=True),
+    )
     assert first_minimum([2.0, 2.0, 3.0]) == 0
-    return {**vars(parity), "branch_b_max_logit_abs": (before[1] - after[1]).abs().max().item()}
+    return {**vars(parity), "branch_b_max_logit_abs": max_abs}
 
 
 def main():
