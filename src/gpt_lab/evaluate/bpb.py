@@ -32,7 +32,6 @@ def compute_bpb(model, batches, steps: int | None, token_bytes: torch.Tensor, co
     Returns:
         - bpb (float): The computed bits-per-byte metric.
         - loss (float): Mean next-token negative log-likelihood in nats over valid targets.
-        - scored_targets (int): Number of valid targets summed across ranks.
     """
     dist_is_init = comp_info.is_distributed if comp_info is not None else is_ddp_initialized()
     world_size = comp_info.world_size if comp_info is not None else (dist.get_world_size() if dist_is_init else 1)
@@ -93,4 +92,4 @@ def compute_bpb(model, batches, steps: int | None, token_bytes: torch.Tensor, co
     loss = total_loss.item() / target_count if target_count else float("nan")
 
     bpb = total_nats / (math.log(2.0) * total_bytes) if total_bytes else float("inf")
-    return {"bpb": bpb, "loss": loss, "scored_targets": target_count}
+    return {"bpb": bpb, "loss": loss}

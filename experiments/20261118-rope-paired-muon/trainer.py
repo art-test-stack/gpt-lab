@@ -3,36 +3,102 @@
 import json
 import math
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from statistics import median
 from time import perf_counter
 
+from gpt_lab.evaluate.bpb import compute_bpb
 from gpt_lab.train.trainer import Trainer
+from gpt_lab.utils.common import print0
+
+
+STUDY_EVAL_FILE = "study-eval.enabled"
 
 
 class ExperimentTrainer(Trainer):
-    def __init__(self, *, study_eval=False, monitor_qk_norms=False, guard_mfu=False, **kwargs):
+    def __init__(self, *, study_eval=None, monitor_qk_norms=False, guard_mfu=False, **kwargs):
         super().__init__(**kwargs)
-        self.study_eval = study_eval
         self.monitor_qk_norms = monitor_qk_norms
         self.mfu_window = deque(maxlen=10) if guard_mfu else None
 
-    def _evaluate_routine(self, last_step):
-        if not self.study_eval:
-            return super()._evaluate_routine(last_step)
+        run_dir = self.ckpt_manager.source_dir.parent
+        policy = run_dir / STUDY_EVAL_FILE
+        self.study_eval = study_eval is not None and (study_eval or policy.is_file())
+        self.endpoint_bpb_path = run_dir / "climbmix-full.json"
+        self.core_updates = ()
+        interval = self.config.eval_core_every
+        if study_eval is not None and (interval == -1 or interval > 0):
+            if self.config.n_core_tokens <= 0:
+                raise ValueError("Training CORE requires a positive --n-core-tokens for the study")
+            if self.study_eval:
+                horizon = self.config.n_steps
+                self.core_updates = tuple((quarter * horizon + 3) // 4 for quarter in (1, 2, 3))
+                # Let the base loop dispatch CORE; the override filters to the saved horizon's quarters.
+                self.config = self.config.model_copy(update={"eval_core_every": 1})
+        if study_eval and self.config.comp_info.rank == 0:
+            policy.touch()
 
-        completed = self.state.completed_steps
-        if completed == 0:
-            return
+    def train(self):
+        if not self.study_eval or self.state.completed_steps < self.config.n_steps:
+            super().train()
+            checkpoint = self.ckpt_manager.source_dir / f"checkpoint_step_{self.state.step:06d}"
+            print0(f"Final checkpoint: {checkpoint.resolve()}")
+
         interval = self.config.eval_bpb_every
-        if interval > 0 and completed % interval == 0:
-            self.evaluate_bpb()
-        horizon = self.config.n_steps
-        if completed in ((horizon + 3) // 4, (2 * horizon + 3) // 4, (3 * horizon + 3) // 4):
-            self.evaluate_core()
+        if (
+            self.study_eval and (interval == -1 or interval > 0)
+            and self.state.completed_steps == self.config.n_steps
+            and not self.endpoint_bpb_path.is_file()
+        ):
+            self._evaluate_full_bpb()
 
-    def _full_endpoint_includes_core(self):
-        return not self.study_eval
+    def evaluate_bpb(self):
+        if self.study_eval:
+            interval = self.config.eval_bpb_every
+            completed = self.state.completed_steps
+            if interval <= 0 or completed == self.config.n_steps or completed % interval:
+                return
+        with self._evaluation_timing("bpb"):
+            super().evaluate_bpb()
+
+    def evaluate_core(self):
+        completed = self.state.completed_steps
+        if not self.study_eval or (completed < self.config.n_steps and completed in self.core_updates):
+            with self._evaluation_timing("core"):
+                super().evaluate_core()
+
+    def _evaluate_full_bpb(self):
+        model = self.model
+        training = model.training
+        model.eval()
+        try:
+            with self._evaluation_timing("bpb"), self.val_context(model):
+                result = compute_bpb(
+                    model, self.val_loader(include_partial=True), None,
+                    comp_info=self.config.comp_info, token_bytes=self.tokenizer.token_bytes,
+                )
+        finally:
+            model.train(training)
+
+        step = self.state.completed_steps
+        metrics = {"eval/bpb": result["bpb"], "eval/loss": result["loss"], "eval/full_endpoint_update": step}
+        print0(f"Step {step:05d} | Full validation bpb: {result['bpb']:.6f} | Validation loss: {result['loss']:.6f}")
+        if self.config.comp_info.rank == 0:
+            tmp = self.endpoint_bpb_path.with_suffix(".tmp")
+            try:
+                tmp.write_text(json.dumps(metrics, allow_nan=False) + "\n")
+                tmp.replace(self.endpoint_bpb_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+        self.board.log(metrics, step=step)
+
+    def _evaluation_timing(self, phase):
+        return nullcontext()
+
+    def save_checkpoint(self):
+        if self.study_eval and self.state.completed_steps == self.config.n_steps and self.config.comp_info.rank == 0:
+            self.endpoint_bpb_path.unlink(missing_ok=True)
+        return super().save_checkpoint()
 
     def update_metrics(self, step_metrics, total_dt):
         metrics = super().update_metrics(step_metrics, total_dt)
@@ -107,13 +173,8 @@ class BenchmarkTrainer(ExperimentTrainer):
         with self._measure("optimizer", self.state.step + 1):
             super().optimizer_step(should_log_step)
 
-    def evaluate_bpb(self):
-        with self._measure("bpb", self.state.completed_steps):
-            super().evaluate_bpb()
-
-    def evaluate_core(self):
-        with self._measure("core", self.state.completed_steps):
-            super().evaluate_core()
+    def _evaluation_timing(self, phase):
+        return self._measure(phase, self.state.completed_steps)
 
     def save_checkpoint(self):
         with self._measure("checkpoint", self.state.completed_steps):

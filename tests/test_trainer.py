@@ -15,7 +15,7 @@ from unittest.mock import Mock
 import itertools
 
 from gpt_lab.utils.schemas import DataLoaderState, TrainerConfig, TrainerState
-from gpt_lab.model.checkpoint import CheckpointManager, load_checkpoint, save_checkpoint
+from gpt_lab.model.checkpoint import load_checkpoint, save_checkpoint
 from datetime import timedelta
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -230,7 +230,7 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     def evaluate(*args, **kwargs):
         assert not trainer.compiled_model.training
         assert torch.is_autocast_enabled("cpu")
-        return {"bpb": 1.5, "loss": 2.0, "scored_targets": 12}
+        return {"bpb": 1.5, "loss": 2.0}
 
     evaluator = Mock(side_effect=evaluate)
     monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", evaluator)
@@ -253,7 +253,6 @@ def test_evaluate_bpb_tracks_metrics_and_best_checkpoint(
     assert logged_step == step + 1
     assert trainer.ckpt_state.best_eval_completed_steps == (step + 1 if improved else None)
     assert values["eval/best_bpb"] == best
-    assert values["eval/scored_targets"] == 12
     assert trainer.eval_metrics.step == [step + 1]
     assert trainer.eval_metrics.bpb == [1.5]
     assert trainer.eval_metrics.loss == [2.0]
@@ -782,242 +781,3 @@ def test_evaluation_runs_after_completed_updates_and_includes_final(tmp_path, mo
         monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
     trainer.train()
     assert observations == {"bpb": expected, "core": expected, "samples": expected, "save": [2, 4, 5]}
-
-
-def test_rope_muon_study_evaluates_quarters_and_saves_before_full_bpb(tmp_path, monkeypatch):
-    from importlib import import_module
-
-    experiment = import_module("experiments.20261118-rope-paired-muon.trainer")
-    context = ComputeContext(
-        device=torch.device("cpu"), compute_dtype=torch.float32,
-        mesh=SimpleNamespace(size=lambda: 8, get_rank=lambda: 0),
-    )
-    config = TrainerConfig(
-        n_steps=19490, stop_after_step=9746, n_acc_steps=2, total_batch_size=524288,
-        device_batch_size=16, comp_info=context, full_eval_at_end=True,
-        eval_bpb_every=400, n_bpb_tokens=4194304, n_core_tokens=500, log_every=0,
-        sample_every=0, save_on_best=False,
-    )
-    model = torch.nn.Linear(2, 2)
-    model.config = SimpleNamespace(max_context=2048)
-    board = _CaptureBoard()
-    tokens = torch.ones(1, 2)
-    val_loader = Mock(return_value=())
-    manager = Mock(source_dir=tmp_path, save=Mock(return_value=None))
-    bpb_calls, core_calls = [], []
-
-    def bpb(model, batches, budget, *, comp_info, token_bytes):
-        assert comp_info.world_size == 8
-        bpb_calls.append((trainer.state.completed_steps, budget))
-        assert val_loader.call_args.kwargs == ({"include_partial": True} if budget is None else {})
-        if budget is None:
-            assert manager.save.call_args.kwargs["step"] == 19489
-        return {"bpb": 1.5, "loss": 2.0, "scored_targets": 4194304}
-
-    def core(model, tokenizer, device, *, max_per_task):
-        core_calls.append((trainer.state.completed_steps, max_per_task))
-        return {"core/core": 0.6, "core/accuracy": 0.7, "core/max_per_task": max_per_task}
-
-    def build_trainer(config, **kwargs):
-        trainer = experiment.ExperimentTrainer(
-            model=model, tokenizer=SimpleNamespace(token_bytes=torch.ones(2)),
-            train_loader=itertools.repeat((tokens, tokens)),
-            val_loader=val_loader, config=config, checkpoint_manager=manager,
-            optimizer=torch.optim.SGD(model.parameters(), lr=0.1), board=board, study_eval=True,
-            **kwargs,
-        )
-        trainer.train_step = lambda _, batch, __: (batch, {})
-        trainer.update_metrics = lambda *_: {}
-        return trainer
-
-    monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", bpb)
-    monkeypatch.setattr("gpt_lab.train.trainer.evaluate_core", core)
-    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
-    monkeypatch.setattr(dist, "barrier", lambda: None)
-    for name in ("collect", "freeze", "disable"):
-        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
-
-    trainer = build_trainer(config)
-    trainer.train()
-    assert trainer.state.completed_steps == 9746
-    assert manager.save.call_args.kwargs["step"] == 9745
-
-    config = config.model_copy(update={"stop_after_step": 19490})
-    trainer = build_trainer(config, resume_state=trainer.state, best_state=trainer.ckpt_state)
-    trainer.train()
-    assert trainer.state.completed_steps == 19490
-    assert trainer.ckpt_state.full_eval_bpb is not None
-    assert trainer.ckpt_state.full_eval_core is None
-    assert board.records[-1] == (trainer.ckpt_state.full_eval_bpb, 19490)
-
-    trainer = build_trainer(config, resume_state=trainer.state, best_state=trainer.ckpt_state)
-    trainer.train()
-    assert bpb_calls == [(step, 16) for step in range(400, 19490, 400)] + [(19490, None)]
-    assert core_calls == [(4873, 500), (9745, 500), (14618, 500)]
-    assert manager.save.call_count == 2
-
-
-@pytest.mark.parametrize("horizon,cap,steps,full", [
-    (4, None, [2, 4], True),
-    (6, 4, [2, 4], False),
-    (6, 3, [2, 3], False),
-    (6, 0, [0], False),
-])
-def test_study_endpoint_saves_weights_and_uses_correct_eval_budget(tmp_path, monkeypatch, capsys, horizon, cap, steps, full):
-    trainer, model, board = _make_trainer(tmp_path, compute_dtype=torch.float32, trainer_class=_PayloadTrainer)
-    trainer.config = trainer.config.model_copy(update=dict(
-        n_steps=horizon, stop_after_step=cap, full_eval_at_end=True, n_acc_steps=1, total_batch_size=3,
-        n_flops_per_token=100, eval_bpb_every=2, eval_core_every=2, n_bpb_tokens=8, n_core_tokens=500,
-        sample_every=0, save_every=-1, save_on_best=False, log_every=0))
-    trainer.train_loader = itertools.repeat(dict(features=torch.ones(2, 2), targets=torch.zeros(2, 2), tokens=3, state=None))
-    trainer.optimizer.update_hyperparams = lambda **kwargs: None
-    model.config = SimpleNamespace(max_context=2)
-    trainer.tokenizer = SimpleNamespace(token_bytes=torch.ones(2))
-    trainer.val_loader = Mock(return_value=iter(()))
-    (tmp_path / "study" / "run").mkdir(parents=True)
-    trainer.ckpt_manager = CheckpointManager("study", "run", tmp_path, comp_info=trainer.config.comp_info)
-    step_index = max(steps[-1] - 1, 0)
-    source_dir = trainer.ckpt_manager.source_dir
-    final_path = source_dir / f"checkpoint_step_{step_index:06d}"
-    calls = []
-
-    def bpb(eval_model, batches, budget, **kwargs):
-        assert eval_model is model and not model.training
-        calls.append(("bpb", trainer.state.completed_steps, budget))
-        if budget is None:
-            saved = load_checkpoint(source_dir, step=step_index, comp_info=trainer.config.comp_info, load_scaler=False)
-            assert saved.trainer_state.completed_steps == horizon
-            torch.testing.assert_close(saved.model_state["weight"], model.weight)
-        return {"bpb": 1.5, "loss": 2.0, "scored_targets": 8 if budget else 11}
-
-    def core(eval_model, tokenizer, device, *, max_per_task):
-        calls.append(("core", trainer.state.completed_steps, max_per_task))
-        if max_per_task == -1:
-            assert final_path.is_dir()
-        return {"core/core": 0.6, "core/accuracy": 0.7, "core/max_per_task": max_per_task,
-                "all_core_results": {"task": {"accuracy": 0.8}}}
-
-    monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", bpb)
-    monkeypatch.setattr("gpt_lab.train.trainer.evaluate_core", core)
-    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
-    for name in ("collect", "freeze", "disable"):
-        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
-    trainer.train()
-
-    expected = [(metric, step, budget) for step in steps for metric, budget in (
-        ("bpb", None if full and step == horizon else 2), ("core", -1 if full and step == horizon else 500),
-    )]
-    assert calls == expected
-    assert trainer.val_loader.call_args.kwargs == ({"include_partial": True} if full else {})
-    assert [(step, values["eval/scored_targets"]) for values, step in board.records if "eval/scored_targets" in values] == [
-        (step, 11 if full and step == horizon else 8) for step in steps
-    ]
-    assert [step for values, step in board.records if values.get("core/task/accuracy") == 0.8] == steps
-    assert (final_path / "model.safetensors").is_file()
-    assert f"Final checkpoint: {final_path}" in capsys.readouterr().out
-
-
-def test_study_endpoint_resumes_only_pending_core(tmp_path, monkeypatch):
-    from gpt_lab.model.checkpoint import build_meta_model
-    from gpt_lab.model.gpt import DenseTransformer
-    from gpt_lab.tokenizer import build_tokenizer
-    from gpt_lab.utils.board import Board
-    from gpt_lab.utils.schemas import MetaConfig
-    from gpt_lab.utils.tensor_io import load_tensor_state
-
-    context = ComputeContext(device=torch.device("cpu"), compute_dtype=torch.float32)
-    config = TrainerConfig(comp_info=context, n_steps=2, n_acc_steps=1, total_batch_size=4,
-                           device_batch_size=1, n_flops_per_token=100, log_every=0,
-                           eval_bpb_every=0, eval_core_every=0, sample_every=0, full_eval_at_end=True)
-    model_config = TransformerConfig(vocab_size=256, max_context=8, d_model=16, d_ffn=32,
-                                     n_heads=2, d_head=8, n_layers=1)
-    tokenizer_config = TokenizerConfig(name="dummy", source="dummy", vocab_size=256,
-                                       dirname=tmp_path / "tokenizer", save_token_bytes=False)
-    MetaConfig(name="study", run_name="run", dirname=tmp_path / "study" / "run",
-               model_cfg=model_config, tokenizer_cfg=tokenizer_config, base_train={})
-    manager = CheckpointManager("study", "run", tmp_path, comp_info=context)
-    manager.save_training_config(config)
-    model = build_meta_model(model_config).to_empty(device=context.device)
-    model.init_weights()
-
-    def build_optimizer(model, config):
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        optimizer.update_hyperparams = lambda **kwargs: None
-        return optimizer
-
-    run = SimpleNamespace(step=config.n_steps, summary={})
-
-    def publish(values, step, *, commit):
-        assert step >= run.step and commit
-        run.summary.update(values)
-        run.step = step + 1
-
-    run.log = Mock(side_effect=publish)
-    wandb = SimpleNamespace(init=Mock(return_value=run))
-    monkeypatch.setattr("gpt_lab.utils.board.wandb", wandb)
-    monkeypatch.setattr(DenseTransformer, "build_optimizer", build_optimizer)
-    monkeypatch.setattr(torch, "compile", lambda function, **kwargs: function)
-    for name in ("collect", "freeze", "disable"):
-        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
-    bpb = Mock(return_value={"bpb": 1.5, "loss": 2.0, "scored_targets": 11})
-    core = Mock(return_value={"core/core": 0.6, "core/accuracy": 0.7, "core/max_per_task": -1,
-                              "all_core_results": {"task": {"accuracy": 0.8}}})
-    monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", bpb)
-    monkeypatch.setattr("gpt_lab.train.trainer.evaluate_core", core)
-    tokens = torch.tensor([[1, 2, 3, 4]])
-    trainer = Trainer(
-        model, build_tokenizer(tokenizer_config), itertools.repeat((tokens, tokens)),
-        val_loader=Mock(return_value=iter(())), config=config, checkpoint_manager=manager,
-        board=Board("wandb", project="study", run="run"),
-    )
-    trainer.optimizer_step = Mock(wraps=trainer.optimizer_step)
-    trainer.evaluate_core = Mock(side_effect=KeyboardInterrupt)
-    with pytest.raises(KeyboardInterrupt):
-        trainer.train()
-
-    assert trainer.optimizer_step.call_count == config.n_steps
-    bpb.assert_called_once()
-    core.assert_not_called()
-    run.log.assert_not_called()
-    step = config.n_steps - 1
-    step_dir = manager.source_dir / f"checkpoint_step_{step:06d}"
-    state_path = step_dir / "checkpoint_state.safetensors"
-    state = load_tensor_state(state_path)
-    assert state["full_eval_bpb"]["eval/scored_targets"] == 11
-    assert state["full_eval_core"] is None
-    weights = step_dir / "model.safetensors"
-    saved_weights = weights.read_bytes()
-    saved_mtime = weights.stat().st_mtime_ns
-
-    def resume():
-        board = Board("wandb", project="study", run="run", resume=True)
-        resumed = Trainer.from_checkpoint("study", "run", cache_dir=tmp_path, board=board, comp_info=context)
-        resumed.optimizer_step = Mock(side_effect=AssertionError("optimizer step after training completed"))
-        resumed.train()
-        resumed.optimizer_step.assert_not_called()
-        assert resumed.state.completed_steps == config.n_steps
-
-    resume()
-    resume()
-
-    bpb.assert_called_once()
-    core.assert_called_once()
-    assert core.call_args.kwargs["max_per_task"] == -1
-    assert weights.read_bytes() == saved_weights
-    assert weights.stat().st_mtime_ns == saved_mtime
-    assert [(call.kwargs["id"], call.kwargs["resume"]) for call in wandb.init.call_args_list] == [
-        ("run", None), ("run", "must"), ("run", "must"),
-    ]
-    run.log.assert_called_once()
-    row, = run.log.call_args.args
-    assert run.log.call_args.kwargs == {"step": config.n_steps, "commit": True}
-    assert row["eval/full_endpoint_update"] == config.n_steps
-    state = load_tensor_state(state_path)
-    assert state["full_eval_bpb"]["eval/loss"] == row["eval/loss"] == 2.0
-    assert state["full_eval_core"]["core/task/accuracy"] == row["core/task/accuracy"] == 0.8
-    best = load_tensor_state(manager.source_dir / "checkpoint_state.safetensors")
-    for saved in (state, best):
-        assert saved["best_eval_value"] == row["eval/bpb"] == 1.5
-        assert saved["best_core_value"] == row["core/core"] == 0.6
-        assert saved["best_eval_step"] == saved["best_core_step"] == step
-        assert saved["best_eval_completed_steps"] == saved["best_core_completed_steps"] == config.n_steps

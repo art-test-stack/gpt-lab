@@ -76,27 +76,34 @@ training checkpoint.
 
 The dashboard config and optimizer checkpoint record the arm. The shuffled
 arms also save their permutation. To continue an existing run, use
-`train.py --pairing <saved-arm> --study-eval resume --checkpoint-dir <saved-run-dir>`
+`train.py --pairing <saved-arm> resume --checkpoint-dir <saved-run-dir>`
 at the same world size, with the same dataset and precision. Resume keeps
-the selected run ID and rejects a different optimizer arm. Repeat
-`--study-eval` on every resume of a protocol run. To continue a capped run
-to the full horizon, add `--stop-after-step 19490` to the resume command.
+the selected run ID and rejects a different optimizer arm. Keep
+`study-eval.enabled` with the run directory so resume selects the saved
+study schedule automatically. If you have a protocol checkpoint from an
+older launcher that did not save this file, pass `--study-eval` once on resume.
+To continue a capped run to the full horizon, add `--stop-after-step 19490`.
 
 The study runs routine BPB/NLL on 4,194,304 held-out ClimbMix targets every
 400 completed updates. A full run gets 48 passes, ending at update 19,200.
 Capped CORE uses up to 500 examples per task at updates 4,873, 9,745, and
 14,618, the first integer updates at or beyond 25%, 50%, and 75% of the
 full training horizon. A cap adds no off-schedule passes, and resume keeps
-the original milestones.
+the original milestones. The start command records each evaluation budget.
+With `--study-eval`, `--eval-bpb-every 0` disables both BPB passes and
+`--eval-bpb-every -1` selects full BPB at the endpoint only. CORE uses the
+quarter milestones when enabled. Set `--eval-core-every 0` to disable it
+independently and `--n-core-tokens` to set its per-task cap.
 
 At update 19,490, training saves `base/checkpoint_step_019489` in the run
 directory, then scores every eligible target in the held-out ClimbMix split,
 including each rank's final partial batch, on the eight training H100s.
-The pass saves its results in the final checkpoint's
-`checkpoint_state.safetensors` and logs `eval/bpb`, `eval/loss` (mean token
-NLL in nats), `eval/scored_targets`, and `eval/full_endpoint_update` to the
-training W&B run. Training then exits. If endpoint validation is interrupted,
-resume with `--study-eval` to finish it without an optimizer update.
+The pass writes `climbmix-full.json` in the run directory and logs
+`eval/bpb`, `eval/loss` (mean token NLL in nats), and
+`eval/full_endpoint_update` to the training W&B run. Training then exits.
+If endpoint validation is interrupted, resume from the saved checkpoint
+to finish it without an optimizer update. Keep `climbmix-full.json` with
+the run so a later resume can reuse the completed pass.
 
 For the 12-update smoke check, omit `--study-eval` and use
 `--stop-after-step 12 --eval-bpb-every -1 --n-bpb-tokens 262144 --eval-core-every -1 --n-core-tokens 1`

@@ -40,7 +40,6 @@ def test_compute_bpb_reports_mean_loss_per_token():
     )
 
     assert result["loss"] == 2.0
-    assert result["scored_targets"] == 3
     assert result["bpb"] == pytest.approx((2 + 3) / (2 * math.log(2.0)))
 
 
@@ -74,7 +73,6 @@ def _uneven_validation_worker(rank, rendezvous, cache):
         result = compute_bpb(RecordingModel(), batches(include_partial=True), None, token_bytes, context)
         assert targets == ([[1, 2]] if rank == 0 else [list(range(3, 11)), [11]])
         assert batch_shapes == ([(1, 4)] if rank == 0 else [(2, 4), (1, 4)])
-        assert result["scored_targets"] == 11
         assert result["loss"] == 6
         assert result["bpb"] == pytest.approx(1 / math.log(2))
     finally:

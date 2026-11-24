@@ -84,17 +84,6 @@ class Board:
     def log(self, data: dict, step: int | None = None) -> None:
         self.main.log(data, step)
 
-    def log_full_eval(self, data: dict, step: int, *, replay: bool = False) -> None:
-        if self.board_type != "wandb":
-            if not replay:
-                self.log(data, step)
-            return
-        update_key = "eval/full_endpoint_update"
-        if self.main.summary.get(update_key) == step:
-            return
-        # Older runs can already have committed the endpoint row.
-        self.main.log(data | {update_key: step}, step=max(self.main.step, step), commit=True)
-
     def close(self):
         if self.board_type == "tensorboard":
             self.main.flush()

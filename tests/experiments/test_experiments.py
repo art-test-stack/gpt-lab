@@ -234,3 +234,126 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     if save_checkpoint:
         assert str(complete) in stderr
     wandb.init.assert_called_once()
+
+
+@pytest.mark.parametrize("bpb_every,core_every", [(400, 2000), (0, 2000), (400, 0)])
+def test_study_evaluation_resumes_saved_schedule(tmp_path, monkeypatch, bpb_every, core_every):
+    import itertools
+    import json
+
+    import torch
+
+    from gpt_lab.model.checkpoint import CheckpointManager
+    from gpt_lab.utils.distributed import ComputeContext
+    from gpt_lab.utils.schemas import TrainerConfig
+
+    package = "experiments.20261118-rope-paired-muon"
+    launcher = importlib.import_module(f"{package}.train")
+    experiment = importlib.import_module(f"{package}.trainer")
+    monkeypatch.setitem(sys.modules, "trainer", experiment)
+    monkeypatch.setitem(sys.modules, "optimizer", importlib.import_module(f"{package}.optimizer"))
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("GPTLAB_DTYPE", "bfloat16")
+    monkeypatch.setenv("DEVELOPMENT", "0")
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    for name in ("collect", "freeze", "disable"):
+        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
+
+    context = ComputeContext(
+        device=torch.device("cpu"), compute_dtype=torch.float32,
+        mesh=SimpleNamespace(size=lambda: 8, get_rank=lambda: 0),
+    )
+    model = torch.nn.Linear(2, 2)
+    model.config = SimpleNamespace(max_context=2048)
+    tokens = torch.ones(1, 2)
+    board = Mock()
+    val_loader = Mock(return_value=())
+    calls = []
+    run_dir = tmp_path / launcher.STUDY_MODEL / "real-s42-stop9746"
+    endpoint = run_dir / "base" / "checkpoint_step_019489"
+    bpb_result = {"bpb": 1.5, "loss": 2.0}
+
+    def bounded_bpb(model, batches, budget, **kwargs):
+        val_loader.assert_called_with()
+        calls.append(("bpb", trainer.state.completed_steps, budget))
+        return bpb_result
+
+    def core(model, tokenizer, device, *, max_per_task):
+        calls.append(("core", trainer.state.completed_steps, max_per_task))
+        return {"core/core": 0.6, "core/accuracy": 0.7, "core/max_per_task": max_per_task}
+
+    def full_bpb(model, batches, budget, *, comp_info, token_bytes):
+        assert endpoint.joinpath("model.safetensors").is_file()
+        assert comp_info.world_size == 8 and budget is None and not model.training
+        val_loader.assert_called_with(include_partial=True)
+        calls.append(("full", trainer.state.completed_steps, budget))
+        return bpb_result
+
+    def execute(args, *, trainer_factory, configure_optimizer):
+        nonlocal trainer
+        manager = CheckpointManager(
+            args.model_name, args.run_name, args.model_dir, comp_info=context, optimizer_state_layout="sharded",
+        )
+        saved = None
+        if args.model_init == "auto":
+            config = TrainerConfig(
+                n_steps=19490, n_acc_steps=2, total_batch_size=524288, device_batch_size=16,
+                comp_info=context, stop_after_step=args.stop_after_step, eval_bpb_every=args.eval_bpb_every,
+                n_bpb_tokens=args.n_bpb_tokens, eval_core_every=args.eval_core_every, n_core_tokens=args.n_core_tokens,
+                log_every=0, sample_every=0, save_on_best=False,
+            )
+            manager.save_training_config(config)
+            (run_dir / "meta.json").touch()
+        else:
+            config = manager.load_training_config().model_copy(update={"stop_after_step": args.stop_after_step})
+            saved = manager.load_states(load_model=False, load_optim=False, load_rng=False, load_scaler=False)
+        trainer = trainer_factory(
+            model=model, tokenizer=SimpleNamespace(token_bytes=torch.ones(2)),
+            train_loader=itertools.repeat((tokens, tokens)), val_loader=val_loader, config=config,
+            checkpoint_manager=manager, optimizer=torch.optim.SGD(model.parameters(), lr=0.1), board=board,
+            resume_state=saved.trainer_state if saved else None, best_state=saved.checkpoint_state if saved else None,
+        )
+        trainer.train_step = lambda _, batch, __: (batch, {})
+        trainer.update_metrics = lambda *_: {}
+        trainer.train()
+
+    trainer = None
+    monkeypatch.setattr(launcher, "run", execute)
+    monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", bounded_bpb)
+    monkeypatch.setattr("gpt_lab.train.trainer.evaluate_core", core)
+    monkeypatch.setattr(experiment, "compute_bpb", full_bpb)
+    command = [launcher.__file__, "--pairing", "real", "--no-monitor-qk-norms"]
+    monkeypatch.setattr(sys, "argv", command + [
+        "--study-eval", "auto", "--model-name", launcher.STUDY_MODEL, "--model-dir", str(tmp_path),
+        "--board", "dummy", "--stop-after-step", "9746", "--eval-bpb-every", str(bpb_every),
+        "--n-bpb-tokens", "4194304", "--eval-core-every", str(core_every), "--n-core-tokens", "500",
+    ])
+    launcher.main()
+    assert trainer.state.completed_steps == 9746
+    assert (run_dir / experiment.STUDY_EVAL_FILE).is_file()
+    assert not trainer.endpoint_bpb_path.exists()
+
+    monkeypatch.setattr(sys, "argv", command + [
+        "resume", "--checkpoint-dir", str(run_dir), "--stop-after-step", "19490", "--board", "dummy",
+    ])
+    launcher.main()
+    if bpb_every:
+        assert json.loads(trainer.endpoint_bpb_path.read_text()) == {
+            "eval/full_endpoint_update": 19490, "eval/bpb": 1.5, "eval/loss": 2.0,
+        }
+    else:
+        assert not trainer.endpoint_bpb_path.exists()
+    weights = endpoint / "model.safetensors"
+    saved_mtime = weights.stat().st_mtime_ns
+    launcher.main()
+    assert weights.stat().st_mtime_ns == saved_mtime
+    bpb_steps = range(400, 19490, 400) if bpb_every else ()
+    core_steps = (4873, 9745, 14618) if core_every else ()
+    expected = sorted(
+        [("bpb", step, 16) for step in bpb_steps] + [("core", step, 500) for step in core_steps],
+        key=lambda call: call[1],
+    )
+    if bpb_every:
+        expected.append(("full", 19490, None))
+    assert calls == expected

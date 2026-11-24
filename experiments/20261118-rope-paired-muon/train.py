@@ -80,6 +80,8 @@ def _resumable_checkpoint(directory):
 
 @contextmanager
 def _reserve_run(directory, board):
+    from trainer import STUDY_EVAL_FILE
+
     if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
         raise ValueError(f"Run path {directory} already exists.")
     directory.mkdir(parents=True, exist_ok=True)
@@ -92,8 +94,9 @@ def _reserve_run(directory, board):
         source = directory / "base"
         metadata = directory / "meta.json"
         setup = directory / ".setup-board"
+        evaluation = directory / STUDY_EVAL_FILE
         training_config = source / "training_config.safetensors"
-        other_artifacts = set(directory.iterdir()) - {lock_path, metadata, source, setup}
+        other_artifacts = set(directory.iterdir()) - {lock_path, metadata, source, setup, evaluation}
         checkpoint_artifacts = source.is_symlink() or (source.exists() and (
             not source.is_dir() or bool(set(source.iterdir()) - {training_config})
         ))
@@ -107,6 +110,7 @@ def _reserve_run(directory, board):
             raise ValueError(f"Run directory {directory} already contains run artifacts.{hint}")
         training_config.unlink(missing_ok=True)
         metadata.unlink(missing_ok=True)
+        evaluation.unlink(missing_ok=True)
         setup.write_text(board)
         yield
 
@@ -127,7 +131,7 @@ def main():
     parser.add_argument("--pairing", choices=ARMS, required=True)
     parser.add_argument(
         "--study-eval", action="store_true",
-        help="Run capped CORE at quarter milestones and only full BPB at the endpoint. Repeat on resume.",
+        help="Save the study schedule for this run. Resume reads the saved schedule automatically.",
     )
     parser.add_argument(
         "--monitor-qk-norms", action=BooleanOptionalAction, default=True,
@@ -159,28 +163,33 @@ def main():
 
         if study_eval and args.model_name != STUDY_MODEL:
             raise ValueError(f"--study-eval requires --model-name {STUDY_MODEL}")
-        if args.model_name == STUDY_MODEL:
+        study_model = args.model_name == STUDY_MODEL
+        if study_model:
             args.data_seed = STUDY_DATA_SEED
             if os.environ.setdefault("GPTLAB_DTYPE", "bfloat16") != "bfloat16" or getattr(args, "fp8_ffn_forward", False):
                 raise ValueError("The study requires BF16 mixed precision with FP8 disabled")
+            if args.use_nanochat_dataloader:
+                raise ValueError("The study requires the native validation loader")
             if args.model_init == "auto":
                 if getattr(args, "attn_impl", "fa3") != "fa3":
                     raise ValueError("The study requires --attn-impl fa3")
                 args.attn_impl = "fa3"
-            args.full_eval_at_end = True
             os.environ["DEVELOPMENT"] = "0"
 
         trainer_factory = None
-        if study_eval or monitor_qk_norms or benchmark_timing or guard_mfu:
+        if study_model or monitor_qk_norms or benchmark_timing or guard_mfu:
             from trainer import BenchmarkTrainer, ExperimentTrainer
 
             trainer = ExperimentTrainer
             if benchmark_timing:
                 trainer = partial(BenchmarkTrainer, worker_start=worker_start)
-            trainer_factory = partial(trainer, study_eval=study_eval, monitor_qk_norms=monitor_qk_norms, guard_mfu=guard_mfu)
+            trainer_factory = partial(
+                trainer, study_eval=study_eval if study_model else None,
+                monitor_qk_norms=monitor_qk_norms, guard_mfu=guard_mfu,
+            )
 
         reservation = nullcontext()
-        if args.model_name == STUDY_MODEL and args.model_init == "auto":
+        if study_model and args.model_init == "auto":
             cap = args.stop_after_step
             run_name = f"{pairing}-s{args.random_seed}"
             if cap is not None:

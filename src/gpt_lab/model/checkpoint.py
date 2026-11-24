@@ -52,7 +52,7 @@ from gpt_lab.utils.schemas import (
     TransformerConfig, 
 )
 from gpt_lab.utils.system import get_git_info
-from gpt_lab.utils.tensor_io import load_tensor_state, migrate_legacy_tensor_state, save_tensor_state, save_tensor_state_atomic
+from gpt_lab.utils.tensor_io import load_tensor_state, migrate_legacy_tensor_state, save_tensor_state
 from gpt_lab.utils.types import AttnImplTypes
 from gpt_lab.tokenizer import build_tokenizer, Tokenizer, TokenizerConfig
 from gpt_lab.model.gpt import DenseTransformer
@@ -872,23 +872,6 @@ class CheckpointManager:
         if self._rank == 0:
             self._save_checkpoint_state()
         return step_dir
-
-    def save_full_eval_state(self, step: int, state: CheckpointState) -> None:
-        """Commit endpoint results with their best scores before refreshing the run index."""
-        if self._rank != 0:
-            return
-        path = self._step_dir(step) / "checkpoint_state.safetensors"
-        save_tensor_state_atomic(state.model_dump(), path)
-        self.sync_full_eval_best(state)
-
-    def sync_full_eval_best(self, state: CheckpointState) -> None:
-        """Restore the run-wide best index after an interruption between writes."""
-        if self._rank != 0 or (state.full_eval_bpb is None and state.full_eval_core is None):
-            return
-        best_state = state.model_copy(update={"full_eval_bpb": None, "full_eval_core": None})
-        if best_state != self._load_checkpoint_state():
-            save_tensor_state_atomic(best_state.model_dump(), self.source_dir / "checkpoint_state.safetensors")
-        self._ckpt_state = best_state
  
     def load_states(
         self,

@@ -115,7 +115,7 @@ class Trainer:
             Print, record, and send metrics to the board at train()'s logging
             interval. Override reporting without changing per-step state.
         evaluate_bpb(), evaluate_core(), evaluate_samples():
-            Replace evaluations independently of their schedule.
+            Replace evaluations independently; their scheduling stays in train().
             Each override owns model modes, evaluation contexts, and any logging,
             metrics, or best-score changes. Defaults restore training mode.
 
@@ -245,7 +245,6 @@ class Trainer:
         self.optimizer = optimizer
         
         # State and metrics
-        self._resumed = resume_state is not None
         self.state = resume_state or TrainerState()
         if self.state.completed_steps is None:
             self.state.completed_steps = self.state.step + int(self.state.step > 0 or self.state.n_tokens > 0)
@@ -369,16 +368,7 @@ class Trainer:
         step_limit = min(n_steps, self.config.stop_after_step) if self.config.stop_after_step is not None else n_steps
         if step >= step_limit:
             self.compiled_model = None
-            if self._full_eval_due():
-                if self._resumed:
-                    self.ckpt_manager.sync_full_eval_best(self.ckpt_state)
-                else:
-                    self._save_final_checkpoint()
-                self._evaluate_full_endpoint()
-                return
-            self._save_final_checkpoint()
-            if self.config.full_eval_at_end and step == step_limit == 0:
-                self._evaluate_routine(last_step=True)
+            self.save_checkpoint()
             if self.config.stop_after_step is not None:
                 self.board.log({"train/completed_steps": step}, step=self.state.step)
             return
@@ -465,9 +455,27 @@ class Trainer:
                 self.log_metrics(metrics)
 
             completed = self.state.completed_steps
-            full_eval = self._full_eval_due()
-            if not full_eval:
-                self._evaluate_routine(last_step)
+            # ================================================================
+            # Validation on 'val_loader' every 'eval_every' steps
+            # ================================================================
+
+            if (
+                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
+                (self.config.eval_bpb_every > 0 and completed > 0 and # eval every eval_bpb_every steps except the first step
+                (last_step or completed % self.config.eval_bpb_every == 0))
+            ):
+                self.evaluate_bpb()
+
+            # ================================================================
+            # Validation on CORE metric every 'core_eval_every' steps
+            # ================================================================
+
+            if (
+                (self.config.eval_core_every == -1 and last_step) or
+                (self.config.eval_core_every > 0 and (
+                last_step or (completed > 0 and completed % self.config.eval_core_every == 0)))
+            ):
+                self.evaluate_core()
 
             # ================================================================
             # Sample some outputs every 'sample_every' steps
@@ -484,7 +492,7 @@ class Trainer:
             # ================================================================
             # Checkpointing
             # ================================================================
-            if not full_eval and self.config.save_every > 0 and completed % self.config.save_every == 0:
+            if self.config.save_every > 0 and completed % self.config.save_every == 0:
                 self.save_checkpoint()
 
             if (sum(total_dt) > self.config.target_time * 60) and self.config.target_time > 0:
@@ -515,10 +523,8 @@ class Trainer:
         print0("=" * 70)
 
         # Final checkpoint
-        self._save_final_checkpoint()
-        if self._full_eval_due():
-            self._evaluate_full_endpoint()
-        elif self.config.stop_after_step is not None:
+        self.save_checkpoint()
+        if self.config.stop_after_step is not None:
             self.board.log({"train/completed_steps": self.state.completed_steps}, step=self.state.step)
 
     def update_metrics(self, step_metrics, total_dt):
@@ -729,73 +735,34 @@ class Trainer:
 
         self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
 
-    def _evaluate_routine(self, last_step):
-        completed = self.state.completed_steps
-        for interval, evaluate in (
-            (self.config.eval_bpb_every, self.evaluate_bpb),
-            (self.config.eval_core_every, self.evaluate_core),
-        ):
-            if completed == 0 or (interval == -1 and last_step) or (
-                interval > 0 and (last_step or completed % interval == 0)
-            ):
-                evaluate()
-
-    def _full_eval_due(self):
-        return self.config.full_eval_at_end and self.state.completed_steps == self.config.n_steps
-
-    def _full_endpoint_includes_core(self):
-        return True
-
-    def _evaluate_full_endpoint(self):
-        includes_core = self._full_endpoint_includes_core()
-        bpb_pending = self.ckpt_state.full_eval_bpb is None
-        core_pending = includes_core and self.ckpt_state.full_eval_core is None
-        if bpb_pending:
-            self.evaluate_bpb()
-        if core_pending:
-            self.evaluate_core()
-        bpb = self.ckpt_state.full_eval_bpb
-        core = self.ckpt_state.full_eval_core if includes_core else {}
-        if bpb is None or core is None:
-            return
-        pending = bpb_pending or core_pending
-        step = self.state.completed_steps
-        if isinstance(self.board, Board):
-            self.board.log_full_eval(bpb | core, step, replay=not pending)
-        elif pending:
-            self.board.log(bpb | core, step=step)
-
     def evaluate_bpb(self):
         """Run BPB validation, log metrics, and update the best checkpoint.
 
-        Override this method to customize the evaluation itself.
+        Override this method to customize evaluation. Scheduling stays in train().
         """
         step = self.state.completed_steps
         start_bpb_eval = time.time()
-        full = self._full_eval_due()
-        model = self.model if full or self.compiled_model is None else self.compiled_model
-        model.eval()
-        if full:
-            batches = self.val_loader(include_partial=True)
-            eval_steps = None
-        else:
-            batches = self.val_loader()
-            tokens_per_eval_step = (
-                self.config.device_batch_size * self.model.config.max_context * self.config.comp_info.world_size
-            )
-            eval_steps = max(1, math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step))
-        with self.val_context(model):
+        self.compiled_model.eval()
+        tokens_per_eval_step = (
+            self.config.device_batch_size
+            * self.model.config.max_context
+            * self.config.comp_info.world_size
+        )
+        eval_steps = max(
+            1,
+            math.ceil(self.config.n_bpb_tokens / tokens_per_eval_step),
+        )
+        with self.val_context(self.compiled_model):
             val_res = compute_bpb(
-                model,
-                batches,
+                self.compiled_model,
+                self.val_loader(),
                 eval_steps,
                 comp_info=self.config.comp_info,
                 token_bytes=self.tokenizer.token_bytes
             )
         print0(f"Step {step:05d} | "\
                f"Validation bpb: {val_res['bpb']:.6f} | "\
-               f"Validation loss: {val_res['loss']:.6f} | "\
-               f"Scored targets: {val_res['scored_targets']:,}")
+            f"Validation loss: {val_res['loss']:.6f}")
 
         dt_bpb_eval = time.time() - start_bpb_eval
 
@@ -806,46 +773,41 @@ class Trainer:
             self.ckpt_state.best_eval_value = val_res['bpb']
             self.ckpt_state.best_eval_step = self.state.step
             self.ckpt_state.best_eval_completed_steps = step
-            if self.config.save_on_best and not full:
+            if self.config.save_on_best:
                 self.save_checkpoint()
 
         board_dict = {
             "eval/loss": val_res['loss'],
             "eval/bpb": val_res['bpb'],
-            "eval/scored_targets": val_res['scored_targets'],
             "eval/best_bpb": self.ckpt_state.best_eval_value,
             "eval/step_time_ms": dt_bpb_eval * 1000,  # Convert to milliseconds
         }
-        if full:
-            self.ckpt_state.full_eval_bpb = board_dict
-            self.ckpt_manager.save_full_eval_state(self.state.step, self.ckpt_state)
-        else:
-            self.board.log(board_dict, step=step)
+        self.board.log(board_dict, step=step)
         self.eval_metrics.append(board_dict, step=step)
-        model.train()
+        self.compiled_model.train()
 
     def evaluate_core(self):
         """Run CORE evaluation, log metrics, and track the best score.
 
-        Override this method to customize the evaluation itself.
+        Override this method to customize evaluation. Scheduling stays in train().
         """
         step = self.state.completed_steps
         n_steps = self.config.n_steps
-        full = self._full_eval_due()
         self.model.eval()
         with self.val_context(self.model):
             results = evaluate_core(
                 self.model,
                 self.tokenizer,
                 self.device,
-                max_per_task=-1 if full else self.config.n_core_tokens,
+                max_per_task=self.config.n_core_tokens,
             )
-        limit = "all" if results["core/max_per_task"] < 0 else results["core/max_per_task"]
+        max_throughput = results.get("core/max_per_task", 0) * self.config.comp_info.world_size / results.get("core/step_time_ms", 1e-3) * 1000
         print0(f"Step {step:05d}/{n_steps:05d} | "
                f"CORE: {results['core/core']:.4f} | "
                f"Accuracy: {results['core/accuracy']:.4f} | "
-               f"Max per task: {limit} | "
-               f"Step time: {results.get('core/step_time_ms', 0):.2f}ms")
+               f"Max per task: {int(results['core/max_per_task'])} | "
+               f"Step time: {results.get('core/step_time_ms', 0):.2f}ms | "
+               f"Max throughput: {max_throughput:,.0f} tok/s")
         board_dict = {
             "core/core": results["core/core"],
             "core/accuracy": results["core/accuracy"],
@@ -862,13 +824,9 @@ class Trainer:
             self.ckpt_state.best_core_value = results["core/core"]
             self.ckpt_state.best_core_step = self.state.step
             self.ckpt_state.best_core_completed_steps = step
-            if self.config.save_on_best and not full:
+            if self.config.save_on_best:
                 self.save_checkpoint()
-        if full:
-            self.ckpt_state.full_eval_core = board_dict
-            self.ckpt_manager.save_full_eval_state(self.state.step, self.ckpt_state)
-        else:
-            self.board.log(board_dict, step=step)
+        self.board.log(board_dict, step=step)
         self.core_metrics.append(results, step=step)
         self.model.train()
 
@@ -954,14 +912,14 @@ class Trainer:
         self.optimizer.update_hyperparams(lrm=lrm, muon_momentum=muon_momentum, weight_decay=weight_decay)
         return lrm, muon_momentum, weight_decay
 
-    def _save_final_checkpoint(self):
-        path = self.save_checkpoint()
-        if path is not None:
-            print0(f"Final checkpoint: {path.resolve()}")
-
     def save_checkpoint(self):
-        """Save the model, optimizer, and trainer state and return the directory."""
-        return self.ckpt_manager.save(
+        """
+        Save checkpoint with model, optimizer, and state.
+        
+        Args:
+            tag: Identifier for this checkpoint (e.g., "latest", "best", "step_1000")
+        """
+        self.ckpt_manager.save(
             step=self.state.step,
             model=self.model,
             optimizer=self.optimizer,
