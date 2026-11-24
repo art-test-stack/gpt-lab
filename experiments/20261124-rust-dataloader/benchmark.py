@@ -12,6 +12,7 @@ import statistics
 import subprocess
 import sys
 import time
+from tempfile import TemporaryDirectory
 
 
 BASELINE = "61f066250420afbc121524037b996ee4a3524c0a"
@@ -32,6 +33,19 @@ def baseline_loader():
 
 
 def measure(args):
+    if args.corpus != "climbmix":
+        return _measure(args, None)
+    source = Path(args.shard)
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="dataset-", dir=SCRATCH) as temporary:
+        dataset = Path(temporary) / "dataset"
+        dataset.mkdir()
+        shard = dataset / source.name
+        shard.symlink_to(source.resolve(strict=True))
+        return _measure(args, shard)
+
+
+def _measure(args, shard):
     import numpy as np
     import pyarrow as pa
     import torch
@@ -48,15 +62,14 @@ def measure(args):
     pa.set_io_thread_count(1)
     module = baseline_loader() if args.backend == "baseline" else current
     kwargs = {} if args.backend == "baseline" else {"packing_backend": args.backend}
-    if args.corpus == "climbmix":
+    if shard is not None:
         tokenizer = Tokenizer.from_pretrained("gpt2", source="tiktoken")
         bos = tokenizer.get_bos_token_id()
-        source = Path(args.shard).resolve()
         start = time.perf_counter()
         factory = module.build_dataloader(
-            name=source.parent.name, cachedir=source.parent.parent,
+            name=shard.parent.name, cachedir=shard.parent.parent,
             batch_size=BATCH_SIZE, seq_len=CONTEXT, tokenizer=tokenizer,
-            split="val", max_shards=int(source.stem.split("_")[-1]),
+            split="val", max_shards=int(shard.stem.split("_")[-1]),
             comp_info=ComputeContext(device=torch.device("cpu")),
             tokenizer_threads=args.threads,
             **({"tokenizer_batch_size": 64} if args.backend != "baseline" else {}),

@@ -139,6 +139,9 @@ class Tokenizer(_BaseTokenizer):
         special_tokens (list[str]): The list of special tokens for the tokenizer
         config (gpt_lab.utils.schemas.TokenizerConfig): Configuration settings for the tokenizer
     """
+
+    supports_exact_batch_encoding = True
+
     def __init__(
             self, 
             # enc: Callable, 

@@ -23,8 +23,10 @@ def _contiguous_tokens(document) -> np.ndarray:
 class ShardedDataset:
     """Read documents alongside their cursors, optionally using tokenizer.encode_batch.
 
-    A batch encoder accepts a list of texts with prepend_bos and num_threads
-    keywords and returns one token sequence per text, in source order.
+    A tokenizer opts in by declaring supports_exact_batch_encoding = True on
+    its concrete class. Its encode_batch accepts prepend_bos and num_threads
+    and returns deterministic, unpadded sequences in source order, identical
+    to scalar encoding including BOS. Checkpoint restore encodes individually.
     """
 
     def __init__(
@@ -88,7 +90,8 @@ class ShardedDataset:
         return tokens
 
     def __iter__(self) -> Iterator[Tuple[list[int], DataLoaderState]]:
-        if self.tokenizer_batch_size > 1:
+        if (self.tokenizer_batch_size > 1
+                and vars(type(self.tokenizer)).get("supports_exact_batch_encoding") is True):
             encode_batch = getattr(self.tokenizer, "encode_batch", None)
             if callable(encode_batch):
                 yield from self._iter_tokenized_chunks(encode_batch)
@@ -112,7 +115,11 @@ class ShardedDataset:
 
 
 class DistDataLoader:
-    """Pack each row without discarding document tails, starting with BOS when available."""
+    """Pack each row without discarding document tails, starting with BOS when available.
+
+    If a refill error escapes, discard the iterator and rebuild the training
+    loader with resume_state from the last committed batch.
+    """
 
     def __init__(
         self,
@@ -264,8 +271,7 @@ class DistDataLoader:
                     self._rust_output, self.lookahead, self._fill_lookahead,
                     self.document, self.document_ref, self.offset, self.bos_token_id,
                 )
-            except BaseException:
-                # A failed refill happens after the pending document has drained.
+            except StopIteration:
                 self.document = self.document_ref = None
                 self.offset = 0
                 raise
@@ -491,8 +497,8 @@ def build_dataloader(
 ) -> DistDataLoader:
     """Build a training iterator or a factory for independent validation iterators.
 
-    For the native loader, tokenizer_batch_size controls read-ahead when the
-    tokenizer supports encode_batch. Packing lookahead is independent.
+    For the native loader, tokenizer_batch_size controls read-ahead for
+    tokenizers that opt in to exact batch encoding. Packing lookahead is independent.
     packing_backend="rust" selects the optional native extension. The
     buffer_size argument configures the nanochat backend.
     """

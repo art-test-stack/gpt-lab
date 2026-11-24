@@ -2,9 +2,11 @@
 
 Baseline is `61f066250420afbc121524037b996ee4a3524c0a`, fetched from `origin/master` before creating `experiment/rust-dataloader`.
 
-`build_dataloader(..., tokenizer_batch_size=64)` batches encoding for tokenizers with `encode_batch`. The adapter calls the existing tiktoken batch encoder with `num_threads=tokenizer_threads`. Scalar tokenizers and pretokenized input continue through the scalar path. Packing lookahead stays at 16 documents when BOS is available and one otherwise.
+`build_dataloader(..., tokenizer_batch_size=64)` batches encoding for adapters that declare `supports_exact_batch_encoding = True` on their concrete class. Their `encode_batch` must return deterministic, unpadded sequences in source order that match scalar encoding, including BOS. Checkpoint restore encodes buffered documents individually. The tiktoken adapter used for GPT-2 opts in and forwards `num_threads=tokenizer_threads`. Other adapters and pretokenized input use the scalar path. Packing lookahead stays at 16 documents when BOS is available and one otherwise.
 
 `build_dataloader(..., packing_backend="rust")` or `DistDataLoader(..., packing_backend="rust")` selects the optional extension. Rust selects documents and fills the existing CPU batch buffer from contiguous `int64` documents. Python owns the shard order, refill, and checkpoint. Cursors advance per admitted document, so unused encodings are recreated after resume. The default is scalar tokenization and Python packing, with the same checkpoint signature and validation exhaustion behavior as the baseline.
+
+If a refill error escapes during training, discard the iterator. Rebuild with `build_dataloader(..., resume_state=last_committed_state)` using the last committed `DataLoaderState`. The failed batch may already have consumed part of a document.
 
 ## Reproduce on macOS arm64
 
@@ -27,7 +29,8 @@ ln -sf "$scratch/target/release/libgpt_lab_rust_packer.dylib" \
 export PYTHONPATH="$scratch:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 "$PYO3_PYTHON" -m pytest -q -p no:cacheprovider --basetemp "$scratch/pytest-parity" \
-  experiments/20261124-rust-dataloader/test_parity.py
+  experiments/20261124-rust-dataloader/test_parity.py \
+  experiments/20261124-rust-dataloader/test_benchmark.py
 
 TIKTOKEN_CACHE_DIR=.tmp/codex/training-data-inspection/tiktoken \
   "$PYO3_PYTHON" experiments/20261124-rust-dataloader/benchmark.py \
@@ -37,11 +40,11 @@ TIKTOKEN_CACHE_DIR=.tmp/codex/training-data-inspection/tiktoken \
 
 The locked build also works with `--offline` when its crates are cached. The crate pins the locally available PyO3 0.22.2, a yanked release. The standard Python install does not use the crate.
 
-The ClimbMix input is the cached `shard_01061.parquet`, with SHA-256 `9025ed81d751886e7810238f2c71a4d68ee907860f3c506d1cd3e74bda135fd8`, 86,016 documents and 84 row groups. The harness reads it in full using finite validation iteration and loads GPT-2 from the existing tiktoken cache. `--shard` accepts a local shard in a dataset cache directory. The pretokenized run uses 10,000 documents from `experiments/dataloaders.py` and prepares contiguous token arrays before timing.
+The ClimbMix input is the cached `shard_01061.parquet`, with SHA-256 `9025ed81d751886e7810238f2c71a4d68ee907860f3c506d1cd3e74bda135fd8`, 86,016 documents and 84 row groups. The harness reads it in full using finite validation iteration and loads GPT-2 from the existing tiktoken cache. `--shard` accepts a local shard. The harness links it into a temporary dataset directory under its original shard ID so it can write benchmark metadata there. The pretokenized run uses 10,000 documents from `experiments/dataloaders.py` and prepares contiguous token arrays before timing.
 
 ## Parity
 
-Ten experiment cases passed. Training compares tensors and full checkpoint state after each of 350 batches on each of two logical CPU ranks, including row-group, shard, and epoch transitions. Both Python-to-Rust and Rust-to-Python resume use serialized checkpoints with buffered documents and a retained suffix, then compare against uninterrupted Python. Validation covers scalar tokenizers, batched tokenizers, and pretokenized input without BOS. Separate cases check that exhaustion drops an incomplete final batch as in the baseline and that retry after a refill error does not repeat a consumed suffix. The seven existing sharder and BPB cases also pass with the extension absent from the import path.
+Training compares tensors and full checkpoint state after each of 350 batches on each of two logical CPU ranks, including row-group, shard, and epoch transitions. Both Python-to-Rust and Rust-to-Python resume use serialized checkpoints with buffered documents and a retained suffix, then compare against uninterrupted Python. Validation covers scalar tokenizers, batched tokenizers, and pretokenized input without BOS. Separate cases cover a padding adapter, an incomplete validation batch, and checkpoint recovery after a refill error interrupts a batch with a partially consumed document. The benchmark tests verify source metadata with three shards and both present and absent metadata, then read from the original cache using its normal train and validation splits.
 
 ## Measurement
 

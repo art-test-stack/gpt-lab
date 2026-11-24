@@ -20,6 +20,8 @@ class ScalarTokenizer:
 
 
 class BatchTokenizer(ScalarTokenizer):
+    supports_exact_batch_encoding = True
+
     def __init__(self):
         self.batch_lengths = []
 
@@ -60,6 +62,21 @@ def equal(left, right):
     assert torch.equal(x, other_x)
     assert torch.equal(y, other_y)
     assert state == other_state
+
+
+def test_batch_padding_adapter_uses_scalar_encoding(shards):
+    class PaddingTokenizer(BatchTokenizer):
+        def encode_batch(self, texts, *, prepend_bos, num_threads):
+            documents = super().encode_batch(texts, prepend_bos=prepend_bos, num_threads=num_threads)
+            width = max(map(len, documents))
+            return [document + [99999] * (width - len(document)) for document in documents]
+
+    scalar = loader(shards, 1, tokenizer=PaddingTokenizer())
+    tokenizer = PaddingTokenizer()
+    requested_batching = loader(shards, 64, tokenizer=tokenizer)
+    for _ in range(3):
+        equal(next(scalar), next(requested_batching))
+    assert not tokenizer.batch_lengths
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -136,22 +153,42 @@ def test_validation_drops_incomplete_final_batch(tmp_path):
         assert next(iterator, None) is None
 
 
-def test_retry_after_refill_error_does_not_repeat_a_consumed_suffix():
-    class Documents:
-        def __iter__(self):
-            self.items = iter([torch.arange(6), None, torch.arange(10, 20)])
-            return self
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_checkpoint_recovery_after_refill_error(tmp_path, backend):
+    path = tmp_path / "recovery"
+    path.mkdir()
+    pq.write_table(pa.table({"tokens": [list(range(6)), list(range(10, 20))]}),
+                   path / "shard_00000.parquet")
+    context = SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu"))
 
-        def __next__(self):
-            document = next(self.items)
-            if document is None:
-                raise OSError("refill failed")
-            return document, DataLoaderState()
+    def make_loader(state=None):
+        return build_dataloader(
+            name="recovery", cachedir=tmp_path, max_shards=1, split="train",
+            tokenizer=None, column="tokens", batch_size=1, seq_len=3,
+            comp_info=context, packing_backend=backend, resume_state=state,
+        )
 
-    python, rust = [DistDataLoader(Documents(), 1, 3, device="cpu", packing_backend=backend)
-                    for backend in ("python", "rust")]
-    equal(next(python), next(rust))
-    for iterator in (python, rust):
-        with pytest.raises(OSError, match="refill failed"):
-            next(iterator)
-    equal(next(python), next(rust))
+    uninterrupted = make_loader()
+    failed = make_loader()
+    reference = next(uninterrupted)
+    committed = next(failed)
+    equal(reference, committed)
+    saved = DataLoaderState.model_validate_json(committed[2].model_dump_json())
+    assert saved.pending_document_ref == (0, 0, 0)
+    assert saved.document_token_offset == 4
+
+    def broken_source():
+        raise OSError("refill failed")
+        yield  # Keep this a document iterator whose error escapes next().
+
+    failed.iterator = broken_source()
+    with pytest.raises(OSError, match="refill failed"):
+        next(failed)
+    del failed
+
+    recovered = make_loader(saved)
+    expected = next(uninterrupted)
+    actual = next(recovered)
+    assert actual[0].tolist() == [[4, 5, 10]]
+    assert actual[1].tolist() == [[5, 10, 11]]
+    equal(expected, actual)
