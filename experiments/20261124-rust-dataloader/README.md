@@ -29,6 +29,11 @@ PYO3_BUILD_EXTENSION_MODULE=1 CARGO_HOME="$scratch/cargo" CARGO_NET_GIT_FETCH_WI
   cargo build --release --locked \
   --manifest-path experiments/20261124-rust-dataloader/rust/Cargo.toml \
   --target-dir "$scratch/target-native"
+env -u PYO3_BUILD_EXTENSION_MODULE CARGO_HOME="$scratch/cargo" \
+  MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_PROFILE_RELEASE_STRIP=none RUSTFLAGS="-C strip=none" \
+  cargo test --release --locked --lib \
+  --manifest-path experiments/20261124-rust-dataloader/rust/Cargo.toml \
+  --target-dir "$scratch/target-native"
 extension_suffix=$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
 ln -sf "$scratch/target-native/release/libgpt_lab_rust_packer.dylib" \
   "$scratch/gpt_lab_rust_packer$extension_suffix"
@@ -66,18 +71,20 @@ Rust unit tests inject typed row-group read failures to check reopening, cursor 
 
 ## Four-backend CPU benchmark
 
-At `21f33a4`, end-to-end Rust delivered **83.5% higher median throughput** than Rust packing alone on the same Apple M2 host. Median time per batch fell from 5.101 to 2.779 ms, and peak RSS fell by 43.1 MiB.
+At `7eb26da`, end-to-end Rust delivered **105.1% higher median throughput** than Rust packing alone on the same Apple M2 host. Median time per batch fell from 5.571 to 2.718 ms, and peak RSS fell by 48.7 MiB. Rust packing alone was 5.0% faster than batched Python at the median, with overlapping run ranges.
 
 | Backend | Median source tokens/s | Run-to-run range | Peak RSS (MiB) | Median ms/batch |
 | --- | ---: | ---: | ---: | ---: |
-| Scalar Python | 3,565,623 | 3,220,836–3,743,325 | 347.4 | 9.179 |
-| Batched Python | 5,872,712 | 5,274,571–6,087,133 | 430.8 | 5.573 |
-| Batched Python + Rust packing | 6,443,837 | 5,748,670–6,887,744 | 365.4 | 5.101 |
-| End-to-end Rust | 11,823,349 | 10,492,109–12,643,807 | 322.3 | 2.779 |
+| Scalar Python | 3,554,772 | 3,551,132–3,667,770 | 321.5 | 9.203 |
+| Batched Python | 5,595,782 | 5,220,132–5,677,075 | 383.6 | 5.847 |
+| Batched Python + Rust packing | 5,875,133 | 5,329,612–6,587,603 | 364.1 | 5.571 |
+| End-to-end Rust | 12,047,747 | 9,953,271–12,535,069 | 315.4 | 2.718 |
 
-All runs used cached ClimbMix shard `01061`, GPT-2, batch 16, context 2,048, a four-thread tokenizer budget, and 64-document chunks for batched paths. Torch and Arrow each used one thread. The four rounds used fresh CPU processes with a warm filesystem cache. Taking A through D in table order, the orders were `ABCD`, `BDAC`, `CADB`, and `DCBA`. Timing covered loader construction through exhaustion. Time per batch is each run’s elapsed time divided by its emitted batch count. Peak RSS is the highest process peak across the four runs.
+All runs used the Apple M2 CPU with 16 GiB RAM and macOS 27.2.1, cached ClimbMix shard `01061`, GPT-2, batch 16, context 2,048, a four-thread tokenizer budget, and 64-document chunks for batched paths. Torch and Arrow each used one thread. The four rounds used fresh CPU processes with a warm filesystem cache. Taking A through D in table order, the orders were `ABCD`, `BDAC`, `CADB`, and `DCBA`. Timing covered loader construction through exhaustion. Time per batch is each run’s elapsed time divided by its emitted batch count. Peak RSS is the highest process peak across the four runs.
 
 Separate untimed passes matched the full `x`, `y`, and `DataLoaderState` digest for 1,651 batches and 54,014,008 source tokens per backend. All eight real GPT-2 fixture cases passed with scalar and batched Python references on two logical CPU ranks. The cases covered row-group, shard, and epoch transitions, long-document continuation, finite validation exhaustion, and resume in both directions from lookahead plus a pending suffix. The fixture included empty text, Unicode, and literal `<|bos|>` and `<|endoftext|>` strings.
+
+In a separate in-memory check on the same host, one pretokenized document without BOS spanned 64 batches at the same shape. Median Rust packing iterator time fell from 45.1 ms to 2.45 ms after limiting the copy to the current batch. Each median uses five runs after a warmup.
 
 ## Original packing-only benchmark
 
