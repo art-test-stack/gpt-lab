@@ -1,0 +1,14 @@
+[package]
+name = "gpt-lab-rust-packer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gpt_lab_rust_packer"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "=0.22.2", features = ["extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = "=0.22.2"

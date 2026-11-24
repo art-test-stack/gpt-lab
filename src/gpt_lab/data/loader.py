@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 from gpt_lab.utils.default import DATA_DIR, RANDOM_SEED
@@ -13,8 +14,18 @@ from gpt_lab.data.sharder import ShardManager
 _LOOKAHEAD_DOCUMENTS = 16
 
 
+def _contiguous_tokens(document) -> np.ndarray:
+    if isinstance(document, torch.Tensor):
+        document = document.detach().to(device="cpu", dtype=torch.long).numpy()
+    return np.ascontiguousarray(document, dtype=np.int64)
+
+
 class ShardedDataset:
-    """Read and tokenize documents alongside the cursor immediately after each one."""
+    """Read documents alongside their cursors, optionally using tokenizer.encode_batch.
+
+    A batch encoder accepts a list of texts with prepend_bos and num_threads
+    keywords and returns one token sequence per text, in source order.
+    """
 
     def __init__(
         self,
@@ -30,7 +41,11 @@ class ShardedDataset:
         comp_info: Optional[ComputeContext] = None,
         tokenizer_threads: int = 4,
         data_seed: int = RANDOM_SEED,
+        *,
+        tokenizer_batch_size: int = 1,
     ):
+        if tokenizer_batch_size < 1:
+            raise ValueError("Tokenizer batch size must be positive")
         if split == "train" and start_state is not None and start_state.ordered_shard_ids is None:
             raise ValueError("Training data checkpoint predates saved shard order and document references")
         self.sm = ShardManager(
@@ -51,6 +66,7 @@ class ShardedDataset:
         self.split = split
         self.start_state = start_state
         self.tokenizer_threads = tokenizer_threads
+        self.tokenizer_batch_size = tokenizer_batch_size
 
     def tokenize(self, text) -> list[int]:
         tokens = (
@@ -58,6 +74,9 @@ class ShardedDataset:
             if self.tokenizer is not None
             else text
         )
+        return self._normalize_tokens(tokens)
+
+    def _normalize_tokens(self, tokens) -> list[int]:
         if isinstance(tokens, torch.Tensor):
             if tokens.ndim != 1:
                 raise ValueError("Source document must be a 1-D token sequence")
@@ -69,10 +88,27 @@ class ShardedDataset:
         return tokens
 
     def __iter__(self) -> Iterator[Tuple[list[int], DataLoaderState]]:
+        if self.tokenizer_batch_size > 1:
+            encode_batch = getattr(self.tokenizer, "encode_batch", None)
+            if callable(encode_batch):
+                yield from self._iter_tokenized_chunks(encode_batch)
+                return
         for (text,), cursor in self.sm.iterate(start_state=self.start_state, batch_size=1):
             tokens = self.tokenize(text)
             if tokens:
                 yield tokens, cursor
+
+    def _iter_tokenized_chunks(self, encode_batch) -> Iterator[Tuple[list[int], DataLoaderState]]:
+        for texts, cursor in self.sm.iterate(start_state=self.start_state, batch_size=self.tokenizer_batch_size):
+            documents = encode_batch(texts, prepend_bos=True, num_threads=self.tokenizer_threads)
+            if len(documents) != len(texts):
+                raise ValueError("Batch tokenizer must return one token sequence per source document")
+            # A checkpoint advances only past documents admitted to packing.
+            first_offset = cursor.offset_in_row_group - len(texts) + 1
+            for offset, document in enumerate(documents, start=first_offset):
+                tokens = self._normalize_tokens(document)
+                if tokens:
+                    yield tokens, cursor.model_copy(update={"offset_in_row_group": offset})
 
 
 class DistDataLoader:
@@ -86,9 +122,20 @@ class DistDataLoader:
         device: str = "cuda",
         buffer_size: Optional[int] = None,
         eos_token_id: Optional[int] = None,
+        *,
+        packing_backend: str = "python",
     ):
         if batch_size < 1 or seq_len < 1:
             raise ValueError("Batch size and sequence length must be positive")
+        self._rust_pack = None
+        if packing_backend == "rust":
+            try:
+                from gpt_lab_rust_packer import pack
+            except ImportError as exc:
+                raise ImportError("Rust packing requires the optional gpt_lab_rust_packer extension") from exc
+            self._rust_pack = pack
+        elif packing_backend != "python":
+            raise ValueError(f"Unknown packing backend {packing_backend!r}")
         self.B = batch_size
         self.T = seq_len
         self.device = torch.device(device)
@@ -136,10 +183,17 @@ class DistDataLoader:
                     or (self.document is not None and not 0 < self.offset < len(self.document))):
                 raise ValueError("Invalid packing buffer in data checkpoint")
 
-        self.document_tensor = torch.tensor(self.document, dtype=torch.long) if self.document is not None else None
+        self.document_tensor = None
+        if self._rust_pack is not None:
+            self.lookahead = [(_contiguous_tokens(doc), ref) for doc, ref in self.lookahead]
+            if self.document is not None:
+                self.document = _contiguous_tokens(self.document)
+        elif self.document is not None:
+            self.document_tensor = torch.tensor(self.document, dtype=torch.long)
         self.iterator = iter(dataset)
         self.next_epoch_document = None
         self.cpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, pin_memory=self.device.type == "cuda")
+        self._rust_output = self.cpu.numpy() if self._rust_pack is not None else None
         self.gpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, device=self.device)
         self.inputs = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
         self.targets = torch.empty_like(self.inputs)
@@ -147,7 +201,7 @@ class DistDataLoader:
     def __iter__(self):
         return self
 
-    def _take_document(self, space: int) -> tuple[list[int] | torch.Tensor, Optional[DocumentRef]]:
+    def _fill_lookahead(self) -> None:
         while len(self.lookahead) < self.lookahead_size:
             if self.next_epoch_document is None:
                 self.next_epoch_document = next(self.iterator, None)
@@ -160,10 +214,14 @@ class DistDataLoader:
             ref = None
             if self.signature is not None:
                 ref = (cursor.global_shard_idx, cursor.row_group_idx, cursor.offset_in_row_group - 1)
+            if self._rust_pack is not None:
+                document = _contiguous_tokens(document)
             self.lookahead.append((document, ref))
             self.cursor = cursor
             self.next_epoch_document = None
 
+    def _take_document(self, space: int) -> tuple[list[int] | torch.Tensor, Optional[DocumentRef]]:
+        self._fill_lookahead()
         if not self.lookahead:
             raise StopIteration
         best = None
@@ -175,7 +233,7 @@ class DistDataLoader:
             best = min(range(len(self.lookahead)), key=lambda index: len(self.lookahead[index][0]))
         return self.lookahead.pop(best)
 
-    def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
+    def _pack_python(self) -> None:
         capacity = self.T + 1
         for row in self.cpu:
             pos = 0
@@ -197,6 +255,20 @@ class DistDataLoader:
                     self.document_tensor = None
                     self.offset = 0
 
+    def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
+        if self._rust_pack is None:
+            self._pack_python()
+        else:
+            try:
+                self.document, self.document_ref, self.offset = self._rust_pack(
+                    self._rust_output, self.lookahead, self._fill_lookahead,
+                    self.document, self.document_ref, self.offset, self.bos_token_id,
+                )
+            except BaseException:
+                # A failed refill happens after the pending document has drained.
+                self.document = self.document_ref = None
+                self.offset = 0
+                raise
         self.gpu.copy_(self.cpu)
         self.inputs.copy_(self.gpu[:, :-1])
         self.targets.copy_(self.gpu[:, 1:])
@@ -413,15 +485,22 @@ def build_dataloader(
     tokenizer_threads: int = 4,
     use_nanochat: bool = False,
     data_seed: int = RANDOM_SEED,
+    *,
+    tokenizer_batch_size: int = 1,
+    packing_backend: str = "python",
 ) -> DistDataLoader:
     """Build a training iterator or a factory for independent validation iterators.
 
-    Native tokenized input uses a fixed 16-document lookahead. The buffer_size
-    argument configures the nanochat backend.
+    For the native loader, tokenizer_batch_size controls read-ahead when the
+    tokenizer supports encode_batch. Packing lookahead is independent.
+    packing_backend="rust" selects the optional native extension. The
+    buffer_size argument configures the nanochat backend.
     """
     if comp_info is None:
         comp_info = get_comp_info()
     if use_nanochat:
+        if packing_backend != "python":
+            raise ValueError("packing_backend applies only to the gpt-lab loader")
         if resume_state is not None and resume_state.packing_signature is not None:
             raise ValueError("Cannot resume a native dataloader checkpoint with nanochat")
         # This is the original dataloader from nanochat, from which I derived the pipeline for gpt-lab.
@@ -460,6 +539,7 @@ def build_dataloader(
             comp_info=comp_info,
             tokenizer_threads=tokenizer_threads,
             data_seed=data_seed,
+            tokenizer_batch_size=tokenizer_batch_size,
         )
         dataloader = lambda: DistDataLoader(
             ds,
@@ -467,6 +547,7 @@ def build_dataloader(
             seq_len=seq_len,
             device=comp_info.device,
             buffer_size=buffer_size,
+            packing_backend=packing_backend,
         )
     if split == "val":
         return dataloader

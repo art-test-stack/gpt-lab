@@ -489,6 +489,11 @@ class Tokenizer(_BaseTokenizer):
 
         return token_ids
 
+    def encode_batch(
+        self, texts: List[str], *, prepend_bos: bool = False, num_threads: int = 8
+    ) -> List[List[int]]:
+        return self.encode(texts, prepend_bos=prepend_bos, num_threads=num_threads)
+
     def decode(self, token_ids: List[int]) -> str:
         return self.main.decode(token_ids)
     
