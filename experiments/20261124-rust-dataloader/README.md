@@ -40,6 +40,7 @@ export TIKTOKEN_CACHE_DIR=.tmp/codex/training-data-inspection/tiktoken
   experiments/20261124-rust-dataloader/test_benchmark.py \
   experiments/20261124-rust-dataloader/test_native_text.py
 
+# Run the packing-only comparison.
 "$PYO3_PYTHON" experiments/20261124-rust-dataloader/benchmark.py \
   --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet \
   --threads 4 --repeats 4
@@ -53,11 +54,26 @@ The ClimbMix input is the cached `shard_01061.parquet`, with SHA-256 `9025ed81d7
 
 Training compares tensors and full checkpoint state after each of 350 batches on each of two logical CPU ranks, including row-group, shard, and epoch transitions. Both Python-to-Rust and Rust-to-Python resume use serialized checkpoints with buffered documents and a retained suffix, then compare against uninterrupted Python. Validation covers scalar tokenizers, batched tokenizers, and pretokenized input without BOS. Separate cases cover a padding adapter, an incomplete validation batch, and checkpoint recovery after a refill error interrupts a batch with a partially consumed document. The benchmark tests verify source metadata with three shards and both present and absent metadata, then read from the original cache using its normal train and validation splits.
 
-The native text tests use GPT-2 to compare all three backends across both CPU ranks and resume in both directions. The fixture includes empty documents, Unicode, literal special-token strings, and rank-strided validation row groups. On the full cached ClimbMix shard, all three backends matched the original tensor and state digest over 1,651 batches and 54,014,008 source tokens.
+The native text tests use GPT-2 to compare all three backends across both CPU ranks and resume in both directions. The fixture includes empty documents, Unicode, literal special-token strings, and rank-strided validation row groups.
 
-## Measurement
+## Four-backend CPU benchmark
 
-These measurements cover the original packing-only experiment before the PyO3 upgrade. The end-to-end backend has a full-shard parity check.
+At `21f33a4`, end-to-end Rust delivered **83.5% higher median throughput** than Rust packing alone on the same Apple M2 host. Median time per batch fell from 5.101 to 2.779 ms, and peak RSS fell by 43.1 MiB.
+
+| Backend | Median source tokens/s | Run-to-run range | Peak RSS (MiB) | Median ms/batch |
+| --- | ---: | ---: | ---: | ---: |
+| Scalar Python | 3,565,623 | 3,220,836–3,743,325 | 347.4 | 9.179 |
+| Batched Python | 5,872,712 | 5,274,571–6,087,133 | 430.8 | 5.573 |
+| Batched Python + Rust packing | 6,443,837 | 5,748,670–6,887,744 | 365.4 | 5.101 |
+| End-to-end Rust | 11,823,349 | 10,492,109–12,643,807 | 322.3 | 2.779 |
+
+All runs used cached ClimbMix shard `01061`, GPT-2, batch 16, context 2,048, a four-thread tokenizer budget, and 64-document chunks for batched paths. Torch and Arrow each used one thread. The four rounds used fresh CPU processes with a warm filesystem cache. Taking A through D in table order, the orders were `ABCD`, `BDAC`, `CADB`, and `DCBA`. Timing covered loader construction through exhaustion. Time per batch is each run’s elapsed time divided by its emitted batch count. Peak RSS is the highest process peak across the four runs.
+
+Separate untimed passes matched the full `x`, `y`, and `DataLoaderState` digest for 1,651 batches and 54,014,008 source tokens per backend. All eight real GPT-2 fixture cases passed with scalar and batched Python references on two logical CPU ranks. The cases covered row-group, shard, and epoch transitions, long-document continuation, finite validation exhaustion, and resume in both directions from lookahead plus a pending suffix. The fixture included empty text, Unicode, and literal `<|bos|>` and `<|endoftext|>` strings.
+
+## Original packing-only benchmark
+
+These measurements predate the PyO3 upgrade and the end-to-end backend. The earlier Rust packing result was 6.82M source tokens/s on Apple M2.
 
 Apple M2 CPU, 16 GiB RAM, macOS 27.2.1, Python 3.12.12, Torch 2.11.0, Arrow 22.0.0, and tiktoken 0.12.0. Batch size 16, context length 2,048, and one rank. The tokenizer has a four-thread budget and Torch and Arrow each use one thread. Each measurement uses a fresh process. Four rounds alternate forward and reverse backend order.
 
