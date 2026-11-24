@@ -182,10 +182,10 @@ tokenizer configuration as inputs for packaging the gpt-lab model.
 
 ## Dashboard metrics
 
-The study command logs sampled Q/K Frobenius norms in FP32 at update 1,
-every 50 updates, and the endpoint. For depth 16 it samples Q and K heads
-0, 5, and 11 in layers 0, 7, and 15. Pass `--no-monitor-qk-norms` before
-`auto` or `resume` to disable these diagnostics.
+By default, the study command logs sampled Q/K Frobenius norms in FP32 at
+update 1, every 10 completed updates, and the endpoint. For depth 16 it
+samples Q and K heads 0, 5, and 11 in layers 0, 7, and 15. Pass
+`--no-monitor-qk-norms` before `auto` or `resume` to disable these diagnostics.
 Keys use `qk/{q,k}/layer_<layer>/head_<head>/...` with the one-based
 `qk/completed_update`. The norms cover the reduced gradient, Nesterov
 proposal, raw polar output, LR-scaled update, decay, and weight displacement

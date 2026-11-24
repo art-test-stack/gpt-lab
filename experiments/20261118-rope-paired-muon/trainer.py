@@ -65,7 +65,7 @@ class ExperimentTrainer(Trainer):
             endpoint = min(endpoint, self.config.stop_after_step)
 
         strategy = self.optimizer.backend.strategies["muon"]
-        strategy.monitor = completed in (1, endpoint) or completed % 50 == 0
+        strategy.monitor = completed in (1, endpoint) or completed % 10 == 0
         super().optimizer_step(should_log_step)
         if strategy.monitor:
             metrics = strategy.collect_norms()

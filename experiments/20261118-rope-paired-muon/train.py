@@ -131,7 +131,7 @@ def main():
     )
     parser.add_argument(
         "--monitor-qk-norms", action=BooleanOptionalAction, default=True,
-        help="Log sampled Q/K update norms (enabled by default).",
+        help="Log sampled Q/K update norms at the first update, every 10 updates, and the endpoint (default).",
     )
     parser.add_argument("--benchmark-timing", action="store_true", help="Print synchronized timings per rank.")
     parser.add_argument("--guard-mfu", action="store_true", help="Require median MFU above 40%% per 10 updates after startup.")
