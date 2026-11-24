@@ -147,7 +147,9 @@ if state.trainer_state.completed_steps != 19490:
     raise ValueError("Expected the checkpoint after 19,490 completed updates")
 with torch.autocast("cuda", dtype=torch.bfloat16):
     results = evaluate_core(model, tokenizer, device, max_per_task=-1)
-print(json.dumps(results, indent=2))
+results_json = json.dumps(results, indent=2)
+(checkpoint.source_dir.parent / "core-full.json").write_text(results_json + "\n", encoding="utf-8")
+print(results_json)
 PY
 ```
 
