@@ -126,6 +126,10 @@ def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--pairing", choices=ARMS, required=True)
     parser.add_argument(
+        "--study-eval", action="store_true",
+        help="Run capped CORE at quarter milestones and only full BPB at the endpoint. Repeat on resume.",
+    )
+    parser.add_argument(
         "--monitor-qk-norms", action=BooleanOptionalAction, default=True,
         help="Log sampled Q/K update norms (enabled by default).",
     )
@@ -134,10 +138,12 @@ def main():
     register(parser)
     args = parser.parse_args()
     pairing = args.pairing
+    study_eval = args.study_eval
     monitor_qk_norms = args.monitor_qk_norms
     benchmark_timing = args.benchmark_timing
     guard_mfu = args.guard_mfu
     del args.pairing
+    del args.study_eval
     del args.monitor_qk_norms
     del args.benchmark_timing
     del args.guard_mfu
@@ -151,6 +157,8 @@ def main():
             args = resolve_checkpoint(args)
             args.checkpoint_dir = None
 
+        if study_eval and args.model_name != STUDY_MODEL:
+            raise ValueError(f"--study-eval requires --model-name {STUDY_MODEL}")
         if args.model_name == STUDY_MODEL:
             args.data_seed = STUDY_DATA_SEED
             if os.environ.setdefault("GPTLAB_DTYPE", "bfloat16") != "bfloat16" or getattr(args, "fp8_ffn_forward", False):
@@ -163,13 +171,13 @@ def main():
             os.environ["DEVELOPMENT"] = "0"
 
         trainer_factory = None
-        if monitor_qk_norms or benchmark_timing or guard_mfu:
+        if study_eval or monitor_qk_norms or benchmark_timing or guard_mfu:
             from trainer import BenchmarkTrainer, ExperimentTrainer
 
             trainer = ExperimentTrainer
             if benchmark_timing:
                 trainer = partial(BenchmarkTrainer, worker_start=worker_start)
-            trainer_factory = partial(trainer, monitor_qk_norms=monitor_qk_norms, guard_mfu=guard_mfu)
+            trainer_factory = partial(trainer, study_eval=study_eval, monitor_qk_norms=monitor_qk_norms, guard_mfu=guard_mfu)
 
         reservation = nullcontext()
         if args.model_name == STUDY_MODEL and args.model_init == "auto":

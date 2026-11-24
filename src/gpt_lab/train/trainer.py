@@ -115,7 +115,7 @@ class Trainer:
             Print, record, and send metrics to the board at train()'s logging
             interval. Override reporting without changing per-step state.
         evaluate_bpb(), evaluate_core(), evaluate_samples():
-            Replace evaluations independently; their scheduling stays in train().
+            Replace evaluations independently of their schedule.
             Each override owns model modes, evaluation contexts, and any logging,
             metrics, or best-score changes. Defaults restore training mode.
 
@@ -378,8 +378,7 @@ class Trainer:
                 return
             self._save_final_checkpoint()
             if self.config.full_eval_at_end and step == step_limit == 0:
-                self.evaluate_bpb()
-                self.evaluate_core()
+                self._evaluate_routine(last_step=True)
             if self.config.stop_after_step is not None:
                 self.board.log({"train/completed_steps": step}, step=self.state.step)
             return
@@ -467,27 +466,8 @@ class Trainer:
 
             completed = self.state.completed_steps
             full_eval = self._full_eval_due()
-            # ================================================================
-            # Validation on 'val_loader' every 'eval_every' steps
-            # ================================================================
-
-            if not full_eval and (
-                (self.config.eval_bpb_every == -1 and last_step) or # always eval at last step
-                (self.config.eval_bpb_every > 0 and completed > 0 and # eval every eval_bpb_every steps except the first step
-                (last_step or completed % self.config.eval_bpb_every == 0))
-            ):
-                self.evaluate_bpb()
-
-            # ================================================================
-            # Validation on CORE metric every 'core_eval_every' steps
-            # ================================================================
-
-            if not full_eval and (
-                (self.config.eval_core_every == -1 and last_step) or
-                (self.config.eval_core_every > 0 and (
-                last_step or (completed > 0 and completed % self.config.eval_core_every == 0)))
-            ):
-                self.evaluate_core()
+            if not full_eval:
+                self._evaluate_routine(last_step)
 
             # ================================================================
             # Sample some outputs every 'sample_every' steps
@@ -749,19 +729,36 @@ class Trainer:
 
         self.compiled_model.zero_grad(set_to_none=self._forward_backward_graph is None)
 
+    def _evaluate_routine(self, last_step):
+        completed = self.state.completed_steps
+        for interval, evaluate in (
+            (self.config.eval_bpb_every, self.evaluate_bpb),
+            (self.config.eval_core_every, self.evaluate_core),
+        ):
+            if completed == 0 or (interval == -1 and last_step) or (
+                interval > 0 and (last_step or completed % interval == 0)
+            ):
+                evaluate()
+
     def _full_eval_due(self):
         return self.config.full_eval_at_end and self.state.completed_steps == self.config.n_steps
 
+    def _full_endpoint_includes_core(self):
+        return True
+
     def _evaluate_full_endpoint(self):
-        pending = self.ckpt_state.full_eval_bpb is None or self.ckpt_state.full_eval_core is None
-        if self.ckpt_state.full_eval_bpb is None:
+        includes_core = self._full_endpoint_includes_core()
+        bpb_pending = self.ckpt_state.full_eval_bpb is None
+        core_pending = includes_core and self.ckpt_state.full_eval_core is None
+        if bpb_pending:
             self.evaluate_bpb()
-        if self.ckpt_state.full_eval_core is None:
+        if core_pending:
             self.evaluate_core()
         bpb = self.ckpt_state.full_eval_bpb
-        core = self.ckpt_state.full_eval_core
+        core = self.ckpt_state.full_eval_core if includes_core else {}
         if bpb is None or core is None:
             return
+        pending = bpb_pending or core_pending
         step = self.state.completed_steps
         if isinstance(self.board, Board):
             self.board.log_full_eval(bpb | core, step, replay=not pending)
@@ -771,7 +768,7 @@ class Trainer:
     def evaluate_bpb(self):
         """Run BPB validation, log metrics, and update the best checkpoint.
 
-        Override this method to customize evaluation. Scheduling stays in train().
+        Override this method to customize the evaluation itself.
         """
         step = self.state.completed_steps
         start_bpb_eval = time.time()
@@ -830,7 +827,7 @@ class Trainer:
     def evaluate_core(self):
         """Run CORE evaluation, log metrics, and track the best score.
 
-        Override this method to customize evaluation. Scheduling stays in train().
+        Override this method to customize the evaluation itself.
         """
         step = self.state.completed_steps
         n_steps = self.config.n_steps

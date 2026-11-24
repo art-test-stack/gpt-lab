@@ -33,27 +33,30 @@ for matched comparisons on the current loader.
 
 ## Launch on eight H100s
 
-Run one fresh process per arm from the repository root. This recipe uses
+Launch one training job per arm from the repository root. This recipe uses
 `configs/llama3.yaml` at depth 16 and aspect ratio 96, giving width 1,536
 and 12 Q and 12 KV heads of dimension 128. It uses BF16 mixed precision,
 FlashAttention 3, GPT-2 tokenization, and the prepared `climbmix-base`
 shards in the same order.
 The study fixes the dataloader seed at 42, so every fresh run uses the same
-shard order. The example sets the Torch seed to 42. Change `--random-seed`
-to vary Torch initialization. Context 2,048, device batch 16, and two
+shard order. The example sets the Torch seed to 42. Change `seed` to vary
+Torch initialization. Context 2,048, device batch 16, and two
 accumulation steps give 524,288 tokens per update. The 15N schedule has
 19,490 updates and 1,300 warmup updates.
 
 ```bash
 exp=experiments/20261118-rope-paired-muon
 arm=joint-shuffled
+seed=42
+model_dir=./study-runs
 GPTLAB_DTYPE=bfloat16 uv run --locked --extra gpu torchrun --standalone --nproc-per-node=8 \
-  "$exp/train.py" --pairing "$arm" auto --model-name rope-muon-d16-study \
+  "$exp/train.py" --pairing "$arm" --study-eval auto \
+  --model-name rope-muon-d16-study --model-dir "$model_dir" \
   --device cuda --board wandb --architecture-config configs/llama3.yaml \
   --depth 16 --aspect-ratio 96 --tokenizer-model gpt2 --ds-name climbmix-base \
-  --random-seed 42 --attn-impl fa3 --max-seq-len 2048 --device-batch-size 16 \
+  --random-seed "$seed" --attn-impl fa3 --max-seq-len 2048 --device-batch-size 16 \
   --total-batch-size 524288 --target-param-data-ratio 15 --warmup-steps 1300 \
-  --eval-bpb-every 400 --n-bpb-tokens 4194304 --eval-core-every 400 --n-core-tokens 500 --log-every 1
+  --eval-bpb-every 400 --n-bpb-tokens 4194304 --n-core-tokens 500 --log-every 1
 ```
 
 Set `arm` to any table entry. Add `--stop-after-step N` to cap completed
@@ -73,28 +76,73 @@ training checkpoint.
 
 The dashboard config and optimizer checkpoint record the arm. The shuffled
 arms also save their permutation. To continue an existing run, use
-`train.py --pairing <saved-arm> resume --checkpoint-dir <saved-run-dir>`
+`train.py --pairing <saved-arm> --study-eval resume --checkpoint-dir <saved-run-dir>`
 at the same world size, with the same dataset and precision. Resume keeps
-the selected run ID and rejects a different optimizer arm.
+the selected run ID and rejects a different optimizer arm. Repeat
+`--study-eval` on every resume of a protocol run. To continue a capped run
+to the full horizon, add `--stop-after-step 19490` to the resume command.
 
-Trainer evaluates BPB/NLL on 4,194,304 held-out ClimbMix targets and CORE
-on up to 500 examples per task every 400 updates and at an early stop.
-An early stop on a scheduled update gets one evaluation. Every run saves
-a standard final checkpoint in its run directory.
+The study runs routine BPB/NLL on 4,194,304 held-out ClimbMix targets every
+400 completed updates. A full run gets 48 passes, ending at update 19,200.
+Capped CORE uses up to 500 examples per task at updates 4,873, 9,745, and
+14,618, the first integer updates at or beyond 25%, 50%, and 75% of the
+full training horizon. A cap adds no off-schedule passes, and resume keeps
+the original milestones.
 
-At update 19,490, Trainer saves the checkpoint first and runs one full
-evaluation in place of the routine endpoint pass. It scores every eligible
-target in the held-out split, including each rank's final partial batch,
-and evaluates every example of every CORE task. Each pass saves its results
-and any new best scores in the final checkpoint's `checkpoint_state.safetensors`.
-If evaluation stops, use the same resume command. It finishes any pending
-pass with zero additional optimizer steps. Once both passes finish, a resume
-reuses their results and leaves the saved weights untouched.
+At update 19,490, training saves `base/checkpoint_step_019489` in the run
+directory, then scores every eligible target in the held-out ClimbMix split,
+including each rank's final partial batch, on the eight training H100s.
+The pass saves its results in the final checkpoint's
+`checkpoint_state.safetensors` and logs `eval/bpb`, `eval/loss` (mean token
+NLL in nats), `eval/scored_targets`, and `eval/full_endpoint_update` to the
+training W&B run. Training then exits. If endpoint validation is interrupted,
+resume with `--study-eval` to finish it without an optimizer update.
 
-The same W&B run receives one row at the final update with `eval/bpb`, mean
-token NLL in `eval/loss`, `eval/scored_targets`, aggregate CORE scores, and
-per-task results under `core/<task>/`. `eval/full_endpoint_update` records the
-original update even if an older run already committed that history row.
+For the 12-update smoke check, omit `--study-eval` and use
+`--stop-after-step 12 --eval-bpb-every -1 --n-bpb-tokens 262144 --eval-core-every -1 --n-core-tokens 1`
+in place of the evaluation flags above. This runs one validation batch
+across all eight ranks and up to one CORE example per task at the cap.
+
+## Run endpoint CORE on one H100
+
+After training exits, run this from the repository root in a separate job
+with one H100. Set `model_dir` to the shared checkpoint root or a local copy
+of it, and use the same `arm` and `seed` as training. These select the run
+directory `<model_dir>/rope-muon-d16-study/<arm>-s<seed>/`. If the run
+started with a cap and was resumed to completion, set `run_name` to its
+original name with the `-stop<N>` suffix. Keep the run's `meta.json` and
+endpoint checkpoint directory together. Step 19,489 is the zero-based
+checkpoint index for 19,490 completed updates.
+The evaluation load uses the saved tokenizer and model without restoring
+the eight-rank optimizer. The job prints aggregate and per-task CORE results.
+
+```bash
+arm=joint-shuffled
+seed=42
+model_dir=./study-runs
+run_name="${arm}-s${seed}"
+GPTLAB_DTYPE=bfloat16 DEVELOPMENT=0 uv run --locked --extra gpu python - "$model_dir" "$run_name" <<'PY'
+import json
+import sys
+
+import torch
+
+from gpt_lab.evaluate.core import evaluate_core
+from gpt_lab.model.checkpoint import CheckpointManager
+from gpt_lab.utils.distributed import ComputeContext
+
+model_dir, run_name = sys.argv[1:]
+device = torch.device("cuda:0")
+context = ComputeContext(device=device, compute_dtype=torch.bfloat16)
+checkpoint = CheckpointManager("rope-muon-d16-study", run_name, model_dir, comp_info=context)
+model, tokenizer, state, _ = checkpoint.load(step=19489, phase="eval")
+if state.trainer_state.completed_steps != 19490:
+    raise ValueError("Expected the checkpoint after 19,490 completed updates")
+with torch.autocast("cuda", dtype=torch.bfloat16):
+    results = evaluate_core(model, tokenizer, device, max_per_task=-1)
+print(json.dumps(results, indent=2))
+PY
+```
 
 ## Inspect a checkpoint
 

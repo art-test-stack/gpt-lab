@@ -784,6 +784,79 @@ def test_evaluation_runs_after_completed_updates_and_includes_final(tmp_path, mo
     assert observations == {"bpb": expected, "core": expected, "samples": expected, "save": [2, 4, 5]}
 
 
+def test_rope_muon_study_evaluates_quarters_and_saves_before_full_bpb(tmp_path, monkeypatch):
+    from importlib import import_module
+
+    experiment = import_module("experiments.20261118-rope-paired-muon.trainer")
+    context = ComputeContext(
+        device=torch.device("cpu"), compute_dtype=torch.float32,
+        mesh=SimpleNamespace(size=lambda: 8, get_rank=lambda: 0),
+    )
+    config = TrainerConfig(
+        n_steps=19490, stop_after_step=9746, n_acc_steps=2, total_batch_size=524288,
+        device_batch_size=16, comp_info=context, full_eval_at_end=True,
+        eval_bpb_every=400, n_bpb_tokens=4194304, n_core_tokens=500, log_every=0,
+        sample_every=0, save_on_best=False,
+    )
+    model = torch.nn.Linear(2, 2)
+    model.config = SimpleNamespace(max_context=2048)
+    board = _CaptureBoard()
+    tokens = torch.ones(1, 2)
+    val_loader = Mock(return_value=())
+    manager = Mock(source_dir=tmp_path, save=Mock(return_value=None))
+    bpb_calls, core_calls = [], []
+
+    def bpb(model, batches, budget, *, comp_info, token_bytes):
+        assert comp_info.world_size == 8
+        bpb_calls.append((trainer.state.completed_steps, budget))
+        assert val_loader.call_args.kwargs == ({"include_partial": True} if budget is None else {})
+        if budget is None:
+            assert manager.save.call_args.kwargs["step"] == 19489
+        return {"bpb": 1.5, "loss": 2.0, "scored_targets": 4194304}
+
+    def core(model, tokenizer, device, *, max_per_task):
+        core_calls.append((trainer.state.completed_steps, max_per_task))
+        return {"core/core": 0.6, "core/accuracy": 0.7, "core/max_per_task": max_per_task}
+
+    def build_trainer(config, **kwargs):
+        trainer = experiment.ExperimentTrainer(
+            model=model, tokenizer=SimpleNamespace(token_bytes=torch.ones(2)),
+            train_loader=itertools.repeat((tokens, tokens)),
+            val_loader=val_loader, config=config, checkpoint_manager=manager,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.1), board=board, study_eval=True,
+            **kwargs,
+        )
+        trainer.train_step = lambda _, batch, __: (batch, {})
+        trainer.update_metrics = lambda *_: {}
+        return trainer
+
+    monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", bpb)
+    monkeypatch.setattr("gpt_lab.train.trainer.evaluate_core", core)
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+    for name in ("collect", "freeze", "disable"):
+        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
+
+    trainer = build_trainer(config)
+    trainer.train()
+    assert trainer.state.completed_steps == 9746
+    assert manager.save.call_args.kwargs["step"] == 9745
+
+    config = config.model_copy(update={"stop_after_step": 19490})
+    trainer = build_trainer(config, resume_state=trainer.state, best_state=trainer.ckpt_state)
+    trainer.train()
+    assert trainer.state.completed_steps == 19490
+    assert trainer.ckpt_state.full_eval_bpb is not None
+    assert trainer.ckpt_state.full_eval_core is None
+    assert board.records[-1] == (trainer.ckpt_state.full_eval_bpb, 19490)
+
+    trainer = build_trainer(config, resume_state=trainer.state, best_state=trainer.ckpt_state)
+    trainer.train()
+    assert bpb_calls == [(step, 16) for step in range(400, 19490, 400)] + [(19490, None)]
+    assert core_calls == [(4873, 500), (9745, 500), (14618, 500)]
+    assert manager.save.call_count == 2
+
+
 @pytest.mark.parametrize("horizon,cap,steps,full", [
     (4, None, [2, 4], True),
     (6, 4, [2, 4], False),
