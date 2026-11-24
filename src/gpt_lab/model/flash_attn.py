@@ -160,7 +160,7 @@ def scaled_dot_product_attention(
 def _sdpa_fallback(q, k, v, 
                    dropout_p=0.0, softmax_scale=None, window_size=(-1, -1), 
                    alibi_slopes=None, deterministic=False, use_gqa=False,
-                   causal=False):
+                   causal=False, *, attn_mask=None):
     """
     Args:
         q: (B, Tq, H, D)
@@ -181,7 +181,12 @@ def _sdpa_fallback(q, k, v,
     v = v.transpose(1, 2)  # B, H, Tk, D
 
     has_local_window = window_left >= 0 or (not causal and window_right >= 0)
-    if causal and Tq == Tk and not has_local_window:
+    if attn_mask is not None:
+        output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
+            is_causal=False, scale=softmax_scale, enable_gqa=use_gqa
+        )
+    elif causal and Tq == Tk and not has_local_window:
         output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=dropout_p,
             is_causal=True, scale=softmax_scale, enable_gqa=use_gqa
@@ -221,10 +226,12 @@ def _cast_qkv(q, k, v):
 
 
 def _sdpa_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
-               window_size=(-1, -1), alibi_slopes=None, deterministic=False, use_packed=False):
+               window_size=(-1, -1), alibi_slopes=None, deterministic=False, use_packed=False,
+               *, attn_mask=None):
     return _sdpa_fallback(q, k, v, dropout_p=dropout_p, softmax_scale=softmax_scale,
                           causal=causal, window_size=window_size, alibi_slopes=alibi_slopes,
-                          deterministic=deterministic, use_gqa=q.size(-2) != k.size(-2))
+                          deterministic=deterministic, use_gqa=q.size(-2) != k.size(-2),
+                          attn_mask=attn_mask)
 
 
 def _sdpa_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,

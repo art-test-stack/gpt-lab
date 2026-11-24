@@ -150,24 +150,20 @@ def batch_sequences_lm(tokenizer, prompts):
 
 
 @torch.no_grad()
+def forward_rows(model, input_ids, **model_kwargs):
+    """Return full logits and autoregressive token losses for CORE rows."""
+    target_ids = torch.roll(input_ids, shifts=-1, dims=1)
+    return model(input_ids, target_ids, reduction='none', **model_kwargs)
+
+
+@torch.no_grad()
 def forward_model(model, input_ids):
     """
     Take BxT tensor of token ids, return BxT tensor of losses and argmax predictions.
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
-    batch_size, seq_len = input_ids.size()
-    # Roll the tensor to the left by one position to get the (autoregressive) target ids
-    target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    # outputs = model(input_ids, target_ids, reduction='none').logits # (B, Seq, V)
-    # 
-    # # Calculate cross entropy at all positions
-    # losses = torch.nn.functional.cross_entropy(
-    #     outputs.view(batch_size * seq_len, -1),
-    #     target_ids.view(batch_size * seq_len),
-    #     reduction='none'
-    # ).view(batch_size, seq_len)
-    outputs = model(input_ids, target_ids, reduction='none') # (B, Seq) NATs
-    losses = outputs.loss.view(batch_size, seq_len) # (B, Seq, V)
+    outputs = forward_rows(model, input_ids)
+    losses = outputs.loss.view_as(input_ids)
 
     # Set the last column to be nan because there is no autoregressive loss there
     losses[:, -1] = float('nan')
@@ -176,9 +172,8 @@ def forward_model(model, input_ids):
     return losses, predictions
 
 
-@torch.no_grad()
-def evaluate_example(idx, model, tokenizer, data, device, task_meta):
-    """Evaluate a single example, return True if correct, False otherwise"""
+def prepare_example(idx, tokenizer, data, task_meta, max_tokens=None):
+    """Render, tokenize and crop each row, returning its scored token span."""
     item = data[idx]
     task_type = task_meta['task_type']
     num_fewshot = task_meta['num_fewshot']
@@ -207,8 +202,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
 
     # Some models can't forward sequences beyond a certain length (e.g. GPT-2)
     # In these cases, we have to truncate sequences to max length and adjust the indices
-    if hasattr(model, 'max_seq_len') and model.max_seq_len is not None:
-        max_tokens = model.max_seq_len
+    if max_tokens is not None:
         new_tokens, new_start_idxs, new_end_idxs = [], [], []
         for t, s, e in zip(tokens, start_idxs, end_idxs):
             if len(t) > max_tokens:
@@ -224,8 +218,32 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
                 new_end_idxs.append(e)
         tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
 
-    # Stack up all the sequences into a batch
+    return tokens, start_idxs, end_idxs
+
+
+def choice_nll(losses, start_idxs, end_idxs):
+    return [losses[i, si-1:ei-1].mean().item()
+            for i, (si, ei) in enumerate(zip(start_idxs, end_idxs))]
+
+
+def first_minimum(mean_losses):
+    return mean_losses.index(min(mean_losses))
+
+
+@torch.no_grad()
+def evaluate_example(idx, model, tokenizer, data, device, task_meta, *, score_multiple_choice=None):
+    """Evaluate a single example, return True if correct, False otherwise."""
+    tokens, start_idxs, end_idxs = prepare_example(
+        idx, tokenizer, data, task_meta, getattr(model, 'max_seq_len', None),
+    )
+    task_type = task_meta['task_type']
+    item = data[idx]
     pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
+    if task_type == 'multiple_choice' and score_multiple_choice is not None:
+        mean_losses = score_multiple_choice(model, tokens, start_idxs, end_idxs, pad_token_id, device)
+        return first_minimum(mean_losses) == item['gold']
+
+    # Stack up all the sequences into a batch
     input_ids = stack_sequences(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 
@@ -243,9 +261,8 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         is_correct = torch.all(predicted_tokens == actual_tokens).item()
     elif task_type in ['multiple_choice', 'schema']:
         # For MC/schema: find the option with lowest average loss
-        mean_losses = [losses[i, si-1:ei-1].mean().item()
-                        for i, (si, ei) in enumerate(zip(start_idxs, end_idxs))]
-        pred_idx = mean_losses.index(min(mean_losses))
+        mean_losses = choice_nll(losses, start_idxs, end_idxs)
+        pred_idx = first_minimum(mean_losses)
         is_correct = pred_idx == item['gold']
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
@@ -253,20 +270,26 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     return is_correct
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta):
+def rank_example_indices(num_examples):
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    return range(rank, num_examples, world_size)
+
+
+def evaluate_task(model, tokenizer, data, device, task_meta, *, score_multiple_choice=None):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
     """
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
-    # stride the examples to each rank
-    for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+    for idx in rank_example_indices(len(data)):
+        is_correct = evaluate_example(
+            idx, model, tokenizer, data, device, task_meta,
+            score_multiple_choice=score_multiple_choice,
+        )
         correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed
-    if world_size > 1:
+    if dist.is_initialized() and dist.get_world_size() > 1:
         dist.barrier()
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
     # compute the mean
@@ -307,11 +330,7 @@ def place_eval_bundle(file_path):
         shutil.move(extracted_bundle_dir, eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
-def evaluate_core(model, tokenizer, device, max_per_task=-1):
-    """
-    Evaluate a base model on the CORE benchmark.
-    Returns dict with results, centered_results, and core_metric.
-    """
+def load_core_bundle():
     base_dir = DATA_DIR / "core"
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
     # Download the eval bundle if needed
@@ -335,7 +354,30 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             random_baseline = row['Random baseline']
             random_baselines[task_name] = float(random_baseline)
 
-    # Evaluate each task
+    return data_base_path, tasks, random_baselines
+
+
+def load_core_task(data_base_path, task, max_per_task):
+    task_meta = {
+        'task_type': task['icl_task_type'],
+        'dataset_uri': task['dataset_uri'],
+        'num_fewshot': task['num_fewshot'][0],
+        'continuation_delimiter': task.get('continuation_delimiter', ' ')
+    }
+    data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
+    with open(data_path, 'r', encoding='utf-8') as f:
+        data = [json.loads(line.strip()) for line in f]
+
+    # Shuffle for consistent subsampling when using max_per_task
+    random.Random(1337).shuffle(data)
+    if max_per_task > 0:
+        data = data[:max_per_task]
+    return data, task_meta
+
+
+def evaluate_core(model, tokenizer, device, max_per_task=-1, *, score_multiple_choice=None):
+    """Evaluate a base model on CORE, with an optional multiple-choice scorer."""
+    data_base_path, tasks, random_baselines = load_core_bundle()
     results = {}
     centered_results = {}
     print0(f"Evaluating CORE benchmark with {len(tasks)} tasks...")
@@ -344,12 +386,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     for i, task in enumerate(tasks):
         start_time = time.time()
         label = task['label']
-        task_meta = {
-            'task_type': task['icl_task_type'],
-            'dataset_uri': task['dataset_uri'],
-            'num_fewshot': task['num_fewshot'][0],
-            'continuation_delimiter': task.get('continuation_delimiter', ' ')
-        }
+        data, task_meta = load_core_task(data_base_path, task, max_per_task)
         print0(
             f"{i:^{COLS['id']}} | "
             f"{label:^{COLS['task']}} | "
@@ -358,17 +395,9 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             end=""
         )
 
-        data_path = os.path.join(data_base_path, task_meta['dataset_uri'])
-        with open(data_path, 'r', encoding='utf-8') as f:
-            data = [json.loads(line.strip()) for line in f]
-
-        # Shuffle for consistent subsampling when using max_per_task
-        shuffle_rng = random.Random(1337)
-        shuffle_rng.shuffle(data)
-        if max_per_task > 0:
-            data = data[:max_per_task]
-
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(
+            model, tokenizer, data, device, task_meta, score_multiple_choice=score_multiple_choice,
+        )
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result

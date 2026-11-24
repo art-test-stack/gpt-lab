@@ -199,6 +199,11 @@ class CausalSelfAttention(Module):
         B, Tq, E = x.size()
         if not self.flash_attn.supports_attn_weights and (return_attn_weights or attn_mask is not None):
             raise ValueError("Explicit attention kernels do not support attention weights or arbitrary masks; use sdpa")
+        if attn_mask is not None and not return_attn_weights:
+            if self.attn_impl != "sdpa" or kv_cache is not None:
+                raise ValueError("Complete attention masks require sdpa with no KV cache")
+            if attn_mask.dtype != torch.bool:
+                raise ValueError("Complete attention masks must be boolean")
         Hq, Hk, D = self.n_heads, self.n_kv_heads, self.d_head
         qkv = self.qkv_proj(x)
 
@@ -228,6 +233,11 @@ class CausalSelfAttention(Module):
                 return_attn_weights=return_attn_weights
             )
         
+        elif attn_mask is not None:
+            x = self.flash_attn.flash_attn_func(
+                q, k, v, attn_mask=attn_mask, causal=False,
+                dropout_p=self.dropout_rate if self.training else 0.0,
+            )
         # inference-efficient mode
         elif (not self.training) and (kv_cache is not None):
             k_cache, v_cache = kv_cache.layer(self.layer_idx)
