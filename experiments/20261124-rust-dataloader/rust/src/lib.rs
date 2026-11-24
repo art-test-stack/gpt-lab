@@ -3,14 +3,41 @@ use pyo3::exceptions::{PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
-fn document_buffer(document: &Bound<'_, PyAny>) -> PyResult<PyBuffer<i64>> {
-    let buffer = PyBuffer::<i64>::get_bound(document)?;
+mod parquet_source;
+mod text_loader;
+
+fn read_document(
+    py: Python<'_>,
+    document: &Bound<'_, PyAny>,
+    tokens: &mut Vec<i64>,
+) -> PyResult<()> {
+    let buffer = PyBuffer::<i64>::get(document)?;
     if buffer.dimensions() != 1 || !buffer.is_c_contiguous() {
         return Err(PyValueError::new_err(
             "Document must be a contiguous int64 vector",
         ));
     }
-    Ok(buffer)
+    tokens.resize(buffer.item_count(), 0);
+    buffer.copy_to_slice(py, tokens)
+}
+
+fn select_document<E>(
+    count: usize,
+    space: usize,
+    mut length_at: impl FnMut(usize) -> Result<usize, E>,
+) -> Result<Option<usize>, E> {
+    let mut best_fit = None;
+    let mut shortest = None;
+    for index in 0..count {
+        let length = length_at(index)?;
+        if length <= space && best_fit.is_none_or(|(_, best)| length > best) {
+            best_fit = Some((index, length));
+        }
+        if shortest.is_none_or(|(_, best)| length < best) {
+            shortest = Some((index, length));
+        }
+    }
+    Ok(best_fit.or(shortest).map(|(index, _)| index))
 }
 
 #[pyfunction]
@@ -25,7 +52,7 @@ fn pack<'py>(
     mut offset: usize,
     bos: Option<i64>,
 ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, usize)> {
-    let output = PyBuffer::<i64>::get_bound(out)?;
+    let output = PyBuffer::<i64>::get(out)?;
     if output.dimensions() != 2
         || !output.is_c_contiguous()
         || output.readonly()
@@ -37,78 +64,59 @@ fn pack<'py>(
         ));
     }
     let capacity = output.shape()[1];
-    let values = output
-        .as_mut_slice(py)
-        .ok_or_else(|| PyValueError::new_err("Invalid output buffer"))?;
-    let mut source = if document.is_none() {
-        None
-    } else {
-        Some(document_buffer(&document)?)
-    };
-    if (source.is_none() && offset != 0)
-        || source
-            .as_ref()
-            .is_some_and(|buffer| offset >= buffer.item_count())
-    {
+    let mut values = vec![0; output.item_count()];
+    let mut tokens = Vec::new();
+    if !document.is_none() {
+        read_document(py, &document, &mut tokens)?;
+    }
+    if (document.is_none() && offset != 0) || (!document.is_none() && offset >= tokens.len()) {
         return Err(PyValueError::new_err("Invalid pending document offset"));
     }
     for row in 0..output.shape()[0] {
         let mut pos = 0;
         if offset > 0 {
             if let Some(token) = bos {
-                values[row * capacity].set(token);
+                values[row * capacity] = token;
                 pos = 1;
             }
         }
         while pos < capacity {
-            if source.is_none() {
+            if document.is_none() {
                 refill.call0()?;
-                let mut best_fit = None;
-                let mut shortest = None;
-                for (index, item) in lookahead.iter().enumerate() {
-                    let item = item.downcast::<PyTuple>()?;
-                    let length = item.get_item(0)?.len()?;
-                    if length <= capacity - pos && best_fit.is_none_or(|(_, best)| length > best) {
-                        best_fit = Some((index, length));
-                    }
-                    if shortest.is_none_or(|(_, best)| length < best) {
-                        shortest = Some((index, length));
-                    }
-                }
-                let index = best_fit
-                    .or(shortest)
-                    .ok_or_else(|| PyStopIteration::new_err(()))?
-                    .0;
+                let index = select_document(lookahead.len(), capacity - pos, |index| {
+                    lookahead
+                        .get_item(index)?
+                        .cast::<PyTuple>()?
+                        .get_item(0)?
+                        .len()
+                })?
+                .ok_or_else(|| PyStopIteration::new_err(()))?;
                 let item = lookahead.get_item(index)?;
-                let pair = item.downcast::<PyTuple>()?;
+                let pair = item.cast::<PyTuple>()?;
                 document = pair.get_item(0)?;
                 document_ref = pair.get_item(1)?;
-                source = Some(document_buffer(&document)?);
+                read_document(py, &document, &mut tokens)?;
                 lookahead.del_item(index)?;
             }
-            let buffer = source.as_ref().unwrap();
-            let tokens = buffer
-                .as_slice(py)
-                .ok_or_else(|| PyValueError::new_err("Invalid document buffer"))?;
             let take = (tokens.len() - offset).min(capacity - pos);
-            for index in 0..take {
-                values[row * capacity + pos + index].set(tokens[offset + index].get());
-            }
+            let start = row * capacity + pos;
+            values[start..start + take].copy_from_slice(&tokens[offset..offset + take]);
             pos += take;
             offset += take;
             if offset == tokens.len() {
-                source = None;
                 document = py.None().into_bound(py);
                 document_ref = py.None().into_bound(py);
                 offset = 0;
             }
         }
     }
+    output.copy_from_slice(py, &values)?;
     Ok((document, document_ref, offset))
 }
 
 #[pymodule]
 fn gpt_lab_rust_packer(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(pack, module)?)?;
+    module.add_class::<text_loader::TextLoader>()?;
     Ok(())
 }

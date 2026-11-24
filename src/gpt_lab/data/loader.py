@@ -131,9 +131,16 @@ class DistDataLoader:
         eos_token_id: Optional[int] = None,
         *,
         packing_backend: str = "python",
+        dataloader_backend: str = "python",
     ):
         if batch_size < 1 or seq_len < 1:
             raise ValueError("Batch size and sequence length must be positive")
+        if dataloader_backend == "rust-packing" and packing_backend == "python":
+            packing_backend = "rust"
+        elif dataloader_backend == "rust" and packing_backend != "python":
+            raise ValueError("The Rust dataloader includes its own packing backend")
+        elif dataloader_backend not in ("python", "rust-packing", "rust"):
+            raise ValueError(f"Unknown dataloader backend {dataloader_backend!r}")
         self._rust_pack = None
         if packing_backend == "rust":
             try:
@@ -182,13 +189,14 @@ class DistDataLoader:
                 refs += (self.document_ref,)
             if len(self.cursor.lookahead_refs) >= self.lookahead_size or len(set(refs)) != len(refs):
                 raise ValueError("Invalid packing buffer in data checkpoint")
-            documents = {ref: dataset.tokenize(text) for ref, text in dataset.sm.read_documents(refs)}
-            self.lookahead = [(documents[ref], ref) for ref in self.cursor.lookahead_refs]
-            self.document = documents.get(self.document_ref)
-            if (any(not doc for doc in documents.values())
-                    or (self.document is None and self.offset != 0)
-                    or (self.document is not None and not 0 < self.offset < len(self.document))):
-                raise ValueError("Invalid packing buffer in data checkpoint")
+            if dataloader_backend != "rust":
+                documents = {ref: dataset.tokenize(text) for ref, text in dataset.sm.read_documents(refs)}
+                self.lookahead = [(documents[ref], ref) for ref in self.cursor.lookahead_refs]
+                self.document = documents.get(self.document_ref)
+                if (any(not doc for doc in documents.values())
+                        or (self.document is None and self.offset != 0)
+                        or (self.document is not None and not 0 < self.offset < len(self.document))):
+                    raise ValueError("Invalid packing buffer in data checkpoint")
 
         self.document_tensor = None
         if self._rust_pack is not None:
@@ -197,13 +205,49 @@ class DistDataLoader:
                 self.document = _contiguous_tokens(self.document)
         elif self.document is not None:
             self.document_tensor = torch.tensor(self.document, dtype=torch.long)
-        self.iterator = iter(dataset)
+        self._rust_text_loader = (
+            self._build_rust_text_loader(dataset) if dataloader_backend == "rust" else None
+        )
+        self.iterator = iter(dataset) if self._rust_text_loader is None else None
         self.next_epoch_document = None
         self.cpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, pin_memory=self.device.type == "cuda")
-        self._rust_output = self.cpu.numpy() if self._rust_pack is not None else None
+        self._rust_output = (
+            self.cpu.numpy() if self._rust_pack is not None or self._rust_text_loader is not None else None
+        )
         self.gpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, device=self.device)
         self.inputs = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
         self.targets = torch.empty_like(self.inputs)
+
+    def _build_rust_text_loader(self, dataset):
+        from gpt_lab.tokenizer import Tokenizer
+
+        if not isinstance(dataset, ShardedDataset) or type(dataset.tokenizer) is not Tokenizer:
+            raise TypeError("The Rust dataloader requires cached text and the repository's tiktoken Tokenizer")
+        try:
+            from gpt_lab_rust_packer import TextLoader
+        except ImportError as exc:
+            raise ImportError("The Rust dataloader requires the updated gpt_lab_rust_packer extension") from exc
+
+        sm = dataset.sm
+        if sm.base_url:
+            missing = next((path for path in sm.shard_paths if not path.is_file()), None)
+            if missing is not None:
+                raise FileNotFoundError(f"The Rust dataloader requires a cached shard at {missing}")
+        encoding = dataset.tokenizer.main
+        resume = None
+        if dataset.start_state is not None:
+            state = dataset.start_state
+            resume = (
+                (state.shard_idx, state.global_shard_idx, state.row_group_idx, state.offset_in_row_group, state.epoch),
+                state.lookahead_refs, state.pending_document_ref, state.document_token_offset,
+            )
+        return TextLoader(
+            list(zip(sm.shard_idx, sm.shard_paths, strict=True)), sm.column_name,
+            dataset.split == "train", sm.ddp_rank, sm.world_size, (self.B, self.T + 1),
+            dataset.tokenizer_threads, dataset.tokenizer_batch_size,
+            (encoding._mergeable_ranks, encoding._pat_str, encoding._special_tokens, self.bos_token_id),
+            resume,
+        )
 
     def __iter__(self):
         return self
@@ -263,7 +307,14 @@ class DistDataLoader:
                     self.offset = 0
 
     def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
-        if self._rust_pack is None:
+        if self._rust_text_loader is not None:
+            cursor, lookahead_refs, self.document_ref, self.offset = self._rust_text_loader.fill(self._rust_output)
+            shard_idx, global_shard_idx, row_group_idx, offset_in_row_group, epoch = cursor
+            self.cursor = DataLoaderState(
+                shard_idx=shard_idx, global_shard_idx=global_shard_idx, row_group_idx=row_group_idx,
+                offset_in_row_group=offset_in_row_group, epoch=epoch,
+            )
+        elif self._rust_pack is None:
             self._pack_python()
         else:
             try:
@@ -283,7 +334,8 @@ class DistDataLoader:
             state = state.model_copy(update=dict(
                 packing_signature=self.signature,
                 ordered_shard_ids=self.ordered_shard_ids,
-                lookahead_refs=tuple(ref for _, ref in self.lookahead),
+                lookahead_refs=(tuple(lookahead_refs) if self._rust_text_loader is not None
+                                else tuple(ref for _, ref in self.lookahead)),
                 pending_document_ref=self.document_ref,
                 document_token_offset=self.offset,
             ))
@@ -492,21 +544,24 @@ def build_dataloader(
     use_nanochat: bool = False,
     data_seed: int = RANDOM_SEED,
     *,
-    tokenizer_batch_size: int = 1,
+    tokenizer_batch_size: Optional[int] = None,
     packing_backend: str = "python",
+    dataloader_backend: str = "python",
 ) -> DistDataLoader:
     """Build a training iterator or a factory for independent validation iterators.
 
     For the native loader, tokenizer_batch_size controls read-ahead for
     tokenizers that opt in to exact batch encoding. Packing lookahead is independent.
-    packing_backend="rust" selects the optional native extension. The
+    dataloader_backend selects Python, Rust packing, or end-to-end Rust for
+    cached text. The Rust choices default to encoding 64 documents at a time.
+    packing_backend="rust" also selects packing-only acceleration. The
     buffer_size argument configures the nanochat backend.
     """
     if comp_info is None:
         comp_info = get_comp_info()
     if use_nanochat:
-        if packing_backend != "python":
-            raise ValueError("packing_backend applies only to the gpt-lab loader")
+        if packing_backend != "python" or dataloader_backend != "python":
+            raise ValueError("Rust backends apply only to the gpt-lab loader")
         if resume_state is not None and resume_state.packing_signature is not None:
             raise ValueError("Cannot resume a native dataloader checkpoint with nanochat")
         # This is the original dataloader from nanochat, from which I derived the pipeline for gpt-lab.
@@ -532,6 +587,8 @@ def build_dataloader(
             base_path=Path(datadir or cachedir or DATA_DIR) / name
         )
     else:
+        if tokenizer_batch_size is None:
+            tokenizer_batch_size = 1 if dataloader_backend == "python" else 64
         ds = ShardedDataset(
             name=name,
             tokenizer=tokenizer,
@@ -554,6 +611,7 @@ def build_dataloader(
             device=comp_info.device,
             buffer_size=buffer_size,
             packing_backend=packing_backend,
+            dataloader_backend=dataloader_backend,
         )
     if split == "val":
         return dataloader
