@@ -13,5 +13,8 @@ pyo3 = "=0.30.1"
 rayon = "1.11"
 tiktoken = { git = "https://github.com/openai/tiktoken.git", rev = "97e49cbadd500b5cc9dbb51a486f0b42e6701bee", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 pyo3-build-config = "=0.30.1"

@@ -4,11 +4,11 @@ Baseline is `61f066250420afbc121524037b996ee4a3524c0a`, fetched from `origin/mas
 
 `build_dataloader(..., tokenizer_batch_size=64)` batches encoding for adapters that declare `supports_exact_batch_encoding = True` on their concrete class. Their `encode_batch` must return deterministic, unpadded sequences in source order that match scalar encoding, including BOS. Checkpoint restore encodes buffered documents individually. The tiktoken adapter used for GPT-2 opts in and forwards `num_threads=tokenizer_threads`. Other adapters and pretokenized input use the scalar path. Packing lookahead stays at 16 documents when BOS is available and one otherwise.
 
-`build_dataloader(..., packing_backend="rust")` or `DistDataLoader(..., packing_backend="rust")` selects the optional extension. Rust selects documents and fills the existing CPU batch buffer from contiguous `int64` documents. Python owns the shard order, refill, and checkpoint. Cursors advance per admitted document, so unused encodings are recreated after resume. The default is scalar tokenization and Python packing, with the same checkpoint signature and validation exhaustion behavior as the baseline.
+`build_dataloader(..., packing_backend="rust")` or `DistDataLoader(..., packing_backend="rust")` selects the optional extension. Rust selects documents and fills the existing CPU batch buffer from contiguous `int64` documents. For a document that spans batches, it copies only the tokens the current batch consumes. Python owns the shard order, refill, and checkpoint. Cursors advance per admitted document, so unused encodings are recreated after resume. The default is scalar tokenization and Python packing, with the same checkpoint signature and validation exhaustion behavior as the baseline.
 
 `build_dataloader(..., dataloader_backend="rust")` selects the end-to-end CPU path for cached Parquet text with the repository’s tiktoken tokenizer. Python supplies the rank-owned shard order, actual tokenizer parameters, batch shape, thread budget, and checkpoint. Rust reads and tokenizes the text, packs the next batch, and copies it into the existing CPU tensor in one extension call. PyTorch transfers that tensor to the training device. CoreBPE is initialized once per iterator from [tiktoken 0.12.0](https://github.com/openai/tiktoken/tree/97e49cbadd500b5cc9dbb51a486f0b42e6701bee). It encodes literal special-token strings as ordinary text and prepends the configured BOS.
 
-`gpt-lab train auto` and `gpt-lab train resume` accept `--dataloader-backend {python,rust-packing,rust}` for both training and validation. `python` is the default. The two Rust selections default to tokenization chunks of 64 documents and accept the same training checkpoints as Python. The end-to-end path requires local shards and non-null UTF-8 text. Its reads report errors for checkpoint recovery.
+`gpt-lab train auto` and `gpt-lab train resume` accept `--dataloader-backend {python,rust-packing,rust}` for both training and validation. `python` is the default. The two Rust selections default to tokenization chunks of 64 documents and accept the same training checkpoints as Python. Pass `--tokenizer-batch-size 64` to compare `python` and `rust-packing` with the same tokenization chunk size for training and validation. The end-to-end path requires local shards and non-null UTF-8 text. On Unix, an `EIO` while reading a row group causes Rust to reopen the shard before retrying the same group. It makes up to five attempts with 1, 2, 4, and 8 second delays.
 
 If a refill error escapes during training, discard the iterator. Rebuild with `build_dataloader(..., resume_state=last_committed_state)` using the last committed `DataLoaderState`. The failed batch may already have consumed part of a document.
 
@@ -40,6 +40,10 @@ export TIKTOKEN_CACHE_DIR=.tmp/codex/training-data-inspection/tiktoken
   experiments/20261124-rust-dataloader/test_benchmark.py \
   experiments/20261124-rust-dataloader/test_native_text.py
 
+# Run the four-backend comparison with untimed parity passes.
+"$PYO3_PYTHON" experiments/20261124-rust-dataloader/benchmark_four.py \
+  --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet
+
 # Run the packing-only comparison.
 "$PYO3_PYTHON" experiments/20261124-rust-dataloader/benchmark.py \
   --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet \
@@ -50,11 +54,15 @@ The locked build works with `--offline` when its Cargo dependencies are cached. 
 
 The ClimbMix input is the cached `shard_01061.parquet`, with SHA-256 `9025ed81d751886e7810238f2c71a4d68ee907860f3c506d1cd3e74bda135fd8`, 86,016 documents and 84 row groups. The harness reads it in full using finite validation iteration and loads GPT-2 from the existing tiktoken cache. `--shard` accepts a local shard. The harness links it into a temporary dataset directory under its original shard ID so it can write benchmark metadata there. The pretokenized run uses 10,000 documents from `experiments/dataloaders.py` and prepares contiguous token arrays before timing.
 
+`benchmark_four.py` records untimed verification and all 16 timed observations in `.tmp/codex/rust-dataloader/four-backend/benchmarks.json`. In the original `benchmark.py`, `--backend rust` selects Rust packing.
+
 ## Parity
 
 Training compares tensors and full checkpoint state after each of 350 batches on each of two logical CPU ranks, including row-group, shard, and epoch transitions. Both Python-to-Rust and Rust-to-Python resume use serialized checkpoints with buffered documents and a retained suffix, then compare against uninterrupted Python. Validation covers scalar tokenizers, batched tokenizers, and pretokenized input without BOS. Separate cases cover a padding adapter, an incomplete validation batch, and checkpoint recovery after a refill error interrupts a batch with a partially consumed document. The benchmark tests verify source metadata with three shards and both present and absent metadata, then read from the original cache using its normal train and validation splits.
 
 The native text tests use GPT-2 to compare all three backends across both CPU ranks and resume in both directions. The fixture includes empty documents, Unicode, literal special-token strings, and rank-strided validation row groups.
+
+Rust unit tests inject typed row-group read failures to check reopening, cursor stability, the five-attempt limit, and immediate propagation of other errors.
 
 ## Four-backend CPU benchmark
 

@@ -161,6 +161,15 @@ def test_step_limit_flag():
     assert not hasattr(args, 'stop_after_updates')
 
 
+@pytest.mark.parametrize('mode', ['auto', 'resume'])
+def test_tokenizer_batch_size_flag(mode):
+    parser = build_parser()
+    assert parser.parse_args(['train', mode]).tokenizer_batch_size is None
+    assert parser.parse_args(['train', mode, '--tokenizer-batch-size', '64']).tokenizer_batch_size == 64
+    with pytest.raises(SystemExit):
+        parser.parse_args(['train', mode, '--tokenizer-batch-size', '0'])
+
+
 def test_step_limit_rejects_old_flag():
     with pytest.raises(SystemExit):
         build_parser().parse_args(['train', '--stop-after-updates', '5'])

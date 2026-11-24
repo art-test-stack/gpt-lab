@@ -1,7 +1,7 @@
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyStopIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyList, PyMemoryView, PySlice, PyTuple};
 
 mod parquet_source;
 mod text_loader;
@@ -10,15 +10,29 @@ fn read_document(
     py: Python<'_>,
     document: &Bound<'_, PyAny>,
     tokens: &mut Vec<i64>,
-) -> PyResult<()> {
+    offset: usize,
+    capacity: usize,
+) -> PyResult<usize> {
     let buffer = PyBuffer::<i64>::get(document)?;
     if buffer.dimensions() != 1 || !buffer.is_c_contiguous() {
         return Err(PyValueError::new_err(
             "Document must be a contiguous int64 vector",
         ));
     }
-    tokens.resize(buffer.item_count(), 0);
-    buffer.copy_to_slice(py, tokens)
+    let length = buffer.item_count();
+    if offset > length {
+        return Err(PyValueError::new_err("Invalid pending document offset"));
+    }
+    let end = offset.saturating_add(capacity).min(length);
+    tokens.resize(end - offset, 0);
+    if offset == 0 && end == length {
+        buffer.copy_to_slice(py, tokens)?;
+    } else {
+        let view = PyMemoryView::from(document)?;
+        let slice = view.get_item(PySlice::new(py, offset as isize, end as isize, 1))?;
+        PyBuffer::<i64>::get(&slice)?.copy_to_slice(py, tokens)?;
+    }
+    Ok(length)
 }
 
 fn select_document<E>(
@@ -66,10 +80,20 @@ fn pack<'py>(
     let capacity = output.shape()[1];
     let mut values = vec![0; output.item_count()];
     let mut tokens = Vec::new();
+    let mut slice_start = offset;
+    let mut document_length = 0;
     if !document.is_none() {
-        read_document(py, &document, &mut tokens)?;
+        let continuation_bos =
+            usize::from(bos.is_some()) * (output.shape()[0] - 1 + usize::from(offset > 0));
+        document_length = read_document(
+            py,
+            &document,
+            &mut tokens,
+            offset,
+            output.item_count() - continuation_bos,
+        )?;
     }
-    if (document.is_none() && offset != 0) || (!document.is_none() && offset >= tokens.len()) {
+    if (document.is_none() && offset != 0) || (!document.is_none() && offset >= document_length) {
         return Err(PyValueError::new_err("Invalid pending document offset"));
     }
     for row in 0..output.shape()[0] {
@@ -95,15 +119,20 @@ fn pack<'py>(
                 let pair = item.cast::<PyTuple>()?;
                 document = pair.get_item(0)?;
                 document_ref = pair.get_item(1)?;
-                read_document(py, &document, &mut tokens)?;
+                slice_start = 0;
+                let remaining_rows = output.shape()[0] - row - 1;
+                let available =
+                    capacity - pos + remaining_rows * (capacity - usize::from(bos.is_some()));
+                document_length = read_document(py, &document, &mut tokens, 0, available)?;
                 lookahead.del_item(index)?;
             }
-            let take = (tokens.len() - offset).min(capacity - pos);
+            let take = (document_length - offset).min(capacity - pos);
             let start = row * capacity + pos;
-            values[start..start + take].copy_from_slice(&tokens[offset..offset + take]);
+            let token_start = offset - slice_start;
+            values[start..start + take].copy_from_slice(&tokens[token_start..token_start + take]);
             pos += take;
             offset += take;
-            if offset == tokens.len() {
+            if offset == document_length {
                 document = py.None().into_bound(py);
                 document_ref = py.None().into_bound(py);
                 offset = 0;

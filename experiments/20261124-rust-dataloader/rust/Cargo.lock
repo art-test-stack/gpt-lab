@@ -227,6 +227,7 @@ dependencies = [
 name = "gpt-lab-rust-packer"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "parquet",
  "pyo3",
  "pyo3-build-config",
