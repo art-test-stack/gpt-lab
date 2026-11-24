@@ -4,6 +4,8 @@ CORE keeps separate choice rows as its default. A question is eligible for packi
 
 The packed row contains the prefix followed by each choice in order. A branch starts at the prefix length in RoPE positions and can see the prefix and its own causal history. Each layer applies its left window to the difference in logical positions. The final prefix logit supplies all first-token losses. Each later token uses the loss from its own predecessor. The score is mean continuation NLL, with ties going to the first minimum.
 
+Packed SDPA uses the model's explicit `complete_attn_masks` input to supply these visibility rules. Ordinary `attn_mask` tensors restrict the model's usual causal and sliding-window rules.
+
 ## Apple MPS parity
 
 Apple M2, macOS 27.2.1, PyTorch 2.11.0. The same seeded two-layer GPT-Lab model ran both paths in FP32 eval mode with SDPA. It has width 32, two heads of width 16, a 2,048-token context, a four-token left window in the first layer, and full causal attention in the final layer. The tokenizer uses UTF-8 bytes and a separate BOS.
@@ -35,6 +37,17 @@ DEVELOPMENT=0 PYTORCH_ENABLE_MPS_FALLBACK=0 uv run --locked --extra cpu \
 ```
 
 The measured archive has SHA-256 `90a7c19e28ee7a52b4f6e1f87658deb9fde7f63deba2379045bdb1fe9ea5d200`.
+
+### Paired SDPA timing
+
+With the same bundle staged, run the prepared-token timing harness on the M2.
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 uv run --locked --extra cpu \
+  python experiments/20261124-core-shared-prefix/timing.py --repeats 3
+```
+
+Each eligible question runs through the reference, the separate-row scoring control, and the packed scorer in a rotated order. The control applies the packed scorer's first-token calculation to separate rows and skips the unused argmax. The benchmark warms up the entire sample and reports trial totals and medians. It synchronizes each scorer call and includes packing, mask construction, model forward, and scoring. Prompt preparation and parity assertions run outside the timed sections. Each trial measures the fallback scorer once per ineligible question and shares its cost across the three full-sample totals.
 
 ## Two-H100 follow-up
 
