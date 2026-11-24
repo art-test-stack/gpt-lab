@@ -194,16 +194,25 @@ class CausalSelfAttention(Module):
         return q, k, v
 
     def forward(self, x: torch.Tensor, value_embeds=None, rope_cache=None,  window_size=None, 
-                kv_cache=None, attn_mask=None, return_attn_weights: bool = False
+                kv_cache=None, attn_mask=None, return_attn_weights: bool = False, *, complete_attn_mask=None,
         ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         B, Tq, E = x.size()
         if not self.flash_attn.supports_attn_weights and (return_attn_weights or attn_mask is not None):
             raise ValueError("Explicit attention kernels do not support attention weights or arbitrary masks; use sdpa")
-        if attn_mask is not None and not return_attn_weights:
+        if complete_attn_mask is not None:
+            if attn_mask is not None or return_attn_weights:
+                raise ValueError("Complete attention masks cannot be combined with ordinary masks or attention weights")
             if self.attn_impl != "sdpa" or kv_cache is not None:
                 raise ValueError("Complete attention masks require sdpa with no KV cache")
-            if attn_mask.dtype != torch.bool:
+            if complete_attn_mask.dtype != torch.bool:
                 raise ValueError("Complete attention masks must be boolean")
+        elif attn_mask is not None and not return_attn_weights:
+            if self.attn_impl != "sdpa" or kv_cache is not None:
+                raise ValueError("Attention masks require sdpa with no KV cache")
+            if attn_mask.ndim == 2 and attn_mask.shape == (B, Tq):
+                attn_mask = attn_mask[:, None, None, :]
+            elif attn_mask.ndim == 3:
+                attn_mask = attn_mask[:, None, :, :]
         Hq, Hk, D = self.n_heads, self.n_kv_heads, self.d_head
         qkv = self.qkv_proj(x)
 
@@ -233,9 +242,14 @@ class CausalSelfAttention(Module):
                 return_attn_weights=return_attn_weights
             )
         
+        elif complete_attn_mask is not None:
+            x = self.flash_attn.flash_attn_func(
+                q, k, v, attn_mask=complete_attn_mask, causal=False,
+                dropout_p=self.dropout_rate if self.training else 0.0,
+            )
         elif attn_mask is not None:
             x = self.flash_attn.flash_attn_func(
-                q, k, v, attn_mask=attn_mask, causal=False,
+                q, k, v, attn_mask=attn_mask, causal=True, window_size=window_size,
                 dropout_p=self.dropout_rate if self.training else 0.0,
             )
         # inference-efficient mode
@@ -349,7 +363,8 @@ class DecoderLayer(Module):
 
         self.norm = build_norm(config.normalization, eps=1e-8, torch_impl=True)
 
-    def forward(self, x, value_embeds=None, kv_cache=None, rope_cache=None, attn_mask=None, window_size=None, return_attn_weights=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x, value_embeds=None, kv_cache=None, rope_cache=None, attn_mask=None, window_size=None,
+                return_attn_weights=False, *, complete_attn_mask=None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         
         if self.norm_before_attn:
             norm_x = self.norm(x)
@@ -357,7 +372,8 @@ class DecoderLayer(Module):
             norm_x = x
         h, attn_weights = self.attention(norm_x, 
             value_embeds=value_embeds, rope_cache=rope_cache, window_size=window_size, 
-            kv_cache=kv_cache, attn_mask=attn_mask, return_attn_weights=return_attn_weights)
+            kv_cache=kv_cache, attn_mask=attn_mask, return_attn_weights=return_attn_weights,
+            complete_attn_mask=complete_attn_mask)
         
         if self.training and self.dropout_rate > 0.0:
             h = F.dropout(h, p=self.dropout_rate, training=True)

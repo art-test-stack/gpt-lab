@@ -385,24 +385,27 @@ class DenseTransformer(BaseTransformer):
             self, 
             input_ids: torch.Tensor,
             labels: Optional[torch.Tensor] = None,
-            attn_mask: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+            attn_mask: torch.Tensor | None = None,
             past_key_values: Any = None,
             return_attentions: bool = False,
             return_hidden_states: bool = False,
             reduction: str = "mean",
             *,
+            complete_attn_masks: tuple[torch.Tensor, ...] | None = None,
             position_ids: torch.Tensor | None = None,
         ) -> ModelOutput:
-        """Run the model with optional complete SDPA masks and shared RoPE position IDs.
+        """Run the model with optional attention masks and shared RoPE position IDs.
 
-        A mask tensor applies to every layer. A tuple supplies one mask per
-        layer, including causality and any sliding window. Position IDs have
-        shape (sequence_length,) and apply to every row.
+        An ordinary mask further restricts each layer's causal window. A mask
+        shaped (batch_size, sequence_length) masks keys. For packed SDPA,
+        complete_attn_masks supplies one boolean mask per layer with all
+        visibility rules included. Position IDs have shape (sequence_length,)
+        and apply to every row.
         """
         return self._forward(
             input_ids, labels, attn_mask, past_key_values,
             return_attentions, return_hidden_states, reduction,
-            position_ids=position_ids,
+            complete_attn_masks=complete_attn_masks, position_ids=position_ids,
         )
 
     def training_loss(self, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -415,13 +418,14 @@ class DenseTransformer(BaseTransformer):
             self,
             input_ids: torch.Tensor,
             labels: Optional[torch.Tensor] = None,
-            attn_mask: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+            attn_mask: torch.Tensor | None = None,
             past_key_values: Any = None,
             return_attentions: bool = False,
             return_hidden_states: bool = False,
             reduction: str = "mean",
             loss_only: bool = False,
             *,
+            complete_attn_masks: tuple[torch.Tensor, ...] | None = None,
             position_ids: torch.Tensor | None = None,
         ) -> ModelOutput | torch.Tensor:
         assert (past_key_values is None) or (not self.training), "KV cache can not be used during training."
@@ -438,8 +442,11 @@ class DenseTransformer(BaseTransformer):
             input_ids = input_ids.unsqueeze(0)
 
         B, T = input_ids.size()
-        if isinstance(attn_mask, tuple) and len(attn_mask) != len(self.blocks):
-            raise ValueError("Expected one attention mask per layer")
+        if complete_attn_masks is not None:
+            if attn_mask is not None:
+                raise ValueError("Choose either attn_mask or complete_attn_masks")
+            if len(complete_attn_masks) != len(self.blocks) or any(mask is None for mask in complete_attn_masks):
+                raise ValueError("Expected one complete attention mask per layer")
         if position_ids is not None:
             if past_key_values is not None or self.config.positional_encoding != "rope":
                 raise ValueError("Explicit RoPE positions require RoPE and no KV cache")
@@ -483,9 +490,10 @@ class DenseTransformer(BaseTransformer):
             ve = None
             if str(i) in self.value_embeds:
                 ve = self.value_embeds[str(i)](input_ids).to(x.dtype)
-            layer_mask = attn_mask[i] if isinstance(attn_mask, tuple) else attn_mask
+            complete_mask = complete_attn_masks[i] if complete_attn_masks is not None else None
             x, attn = layer(x, value_embeds=ve, rope_cache=rope_cache, window_size=self.window_sizes[i],
-                            kv_cache=past_key_values, attn_mask=layer_mask, return_attn_weights=return_attn)
+                            kv_cache=past_key_values, attn_mask=attn_mask, return_attn_weights=return_attn,
+                            complete_attn_mask=complete_mask)
             if return_attn:
                 attentions.append(attn)
             if return_hidden_states:

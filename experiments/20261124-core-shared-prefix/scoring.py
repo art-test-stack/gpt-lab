@@ -99,5 +99,5 @@ def packed_sdpa(model, packed, device, *, capture_logits=False):
     positions = torch.tensor(packed.positions, device=device)
     branches = torch.tensor(packed.branches, device=device)
     masks = tree_masks(positions, branches, model.window_sizes)
-    outputs = forward_rows(model, row, position_ids=positions, attn_mask=masks)
+    outputs = forward_rows(model, row, position_ids=positions, complete_attn_masks=masks)
     return packed_scores(outputs, row, packed, capture_logits=capture_logits)
