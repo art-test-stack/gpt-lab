@@ -132,6 +132,7 @@ class DistDataLoader:
         *,
         packing_backend: str = "python",
         dataloader_backend: str = "python",
+        packing_strategy: str = "rolling-16",
     ):
         if batch_size < 1 or seq_len < 1:
             raise ValueError("Batch size and sequence length must be positive")
@@ -141,6 +142,12 @@ class DistDataLoader:
             raise ValueError("The Rust dataloader includes its own packing backend")
         elif dataloader_backend not in ("python", "rust-packing", "rust"):
             raise ValueError(f"Unknown dataloader backend {dataloader_backend!r}")
+        if packing_strategy not in ("rolling-16", "block-best-fit"):
+            raise ValueError(f"Unknown packing strategy {packing_strategy!r}")
+        split = getattr(dataset, "split", None)
+        block_best_fit = packing_strategy == "block-best-fit"
+        if block_best_fit and (dataloader_backend != "rust" or split != "train"):
+            raise ValueError("block-best-fit requires the end-to-end Rust training loader")
         self._rust_pack = None
         if packing_backend == "rust":
             try:
@@ -155,7 +162,8 @@ class DistDataLoader:
         self.device = torch.device(device)
         self.bos_token_id = getattr(dataset, "bos_token_id", getattr(dataset, "bos_id", None))
         self.lookahead_size = _LOOKAHEAD_DOCUMENTS if self.bos_token_id is not None else 1
-        split = getattr(dataset, "split", None)
+        if block_best_fit:
+            self.lookahead_size = 64
         start_state = getattr(dataset, "start_state", None)
 
         self.signature = None
@@ -174,6 +182,8 @@ class DistDataLoader:
                 config.model_dump(mode="json", exclude={"dirname", "trainer", "save_token_bytes"})
                 if isinstance(config, TokenizerConfig) else None,
             )
+            if block_best_fit:
+                signature_data += ("block-best-fit",)
             self.signature = hashlib.sha256(json.dumps(signature_data, sort_keys=True).encode()).hexdigest()
 
         self.cursor = start_state or DataLoaderState()
@@ -206,7 +216,7 @@ class DistDataLoader:
         elif self.document is not None:
             self.document_tensor = torch.tensor(self.document, dtype=torch.long)
         self._rust_text_loader = (
-            self._build_rust_text_loader(dataset) if dataloader_backend == "rust" else None
+            self._build_rust_text_loader(dataset, block_best_fit) if dataloader_backend == "rust" else None
         )
         self.iterator = iter(dataset) if self._rust_text_loader is None else None
         self.next_epoch_document = None
@@ -218,7 +228,7 @@ class DistDataLoader:
         self.inputs = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
         self.targets = torch.empty_like(self.inputs)
 
-    def _build_rust_text_loader(self, dataset):
+    def _build_rust_text_loader(self, dataset, block_best_fit: bool):
         from gpt_lab.tokenizer import Tokenizer
 
         if not isinstance(dataset, ShardedDataset) or type(dataset.tokenizer) is not Tokenizer:
@@ -241,12 +251,13 @@ class DistDataLoader:
                 (state.shard_idx, state.global_shard_idx, state.row_group_idx, state.offset_in_row_group, state.epoch),
                 state.lookahead_refs, state.pending_document_ref, state.document_token_offset,
             )
+        options = {"block_best_fit": True} if block_best_fit else {}
         return TextLoader(
             list(zip(sm.shard_idx, sm.shard_paths, strict=True)), sm.column_name,
             dataset.split == "train", sm.ddp_rank, sm.world_size, (self.B, self.T + 1),
             dataset.tokenizer_threads, dataset.tokenizer_batch_size,
             (encoding._mergeable_ranks, encoding._pat_str, encoding._special_tokens, self.bos_token_id),
-            resume,
+            resume, **options,
         )
 
     def __iter__(self):
@@ -547,6 +558,7 @@ def build_dataloader(
     tokenizer_batch_size: Optional[int] = None,
     packing_backend: str = "python",
     dataloader_backend: str = "python",
+    packing_strategy: str = "rolling-16",
 ) -> DistDataLoader:
     """Build a training iterator or a factory for independent validation iterators.
 
@@ -554,12 +566,16 @@ def build_dataloader(
     tokenizers that opt in to exact batch encoding. Packing lookahead is independent.
     dataloader_backend selects Python, Rust packing, or end-to-end Rust for
     cached text. The Rust choices default to encoding 64 documents at a time.
+    packing_strategy="block-best-fit" selects fixed 64-document blocks for
+    end-to-end Rust training. Validation uses rolling-16.
     packing_backend="rust" also selects packing-only acceleration. The
     buffer_size argument configures the nanochat backend.
     """
     if comp_info is None:
         comp_info = get_comp_info()
     if use_nanochat:
+        if packing_strategy != "rolling-16":
+            raise ValueError("Packing strategies apply only to the gpt-lab loader")
         if packing_backend != "python" or dataloader_backend != "python":
             raise ValueError("Rust backends apply only to the gpt-lab loader")
         if resume_state is not None and resume_state.packing_signature is not None:
@@ -612,6 +628,7 @@ def build_dataloader(
             buffer_size=buffer_size,
             packing_backend=packing_backend,
             dataloader_backend=dataloader_backend,
+            packing_strategy=packing_strategy,
         )
     if split == "val":
         return dataloader

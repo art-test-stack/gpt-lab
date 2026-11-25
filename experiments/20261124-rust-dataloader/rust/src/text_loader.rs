@@ -27,6 +27,7 @@ pub struct TextLoader {
     batch_size: usize,
     capacity: usize,
     encoding_batch_size: usize,
+    block_best_fit: bool,
     training: bool,
     cursor: Cursor,
     encoded: VecDeque<(Vec<u32>, Cursor)>,
@@ -53,7 +54,11 @@ impl TextLoader {
     }
 
     fn refill(&mut self) -> Result<(), FillError> {
-        while self.lookahead.len() < 16 {
+        if self.block_best_fit && !self.lookahead.is_empty() {
+            return Ok(());
+        }
+        let lookahead_size = if self.block_best_fit { 64 } else { 16 };
+        while self.lookahead.len() < lookahead_size {
             if self.encoded.is_empty() {
                 let Some((texts, cursor)) = self
                     .source
@@ -151,7 +156,7 @@ impl TextLoader {
 impl TextLoader {
     #[new]
     #[pyo3(signature = (shards, column, training, rank, world_size, batch_shape, tokenizer_threads,
-                       tokenizer_batch_size, tokenizer, resume=None))]
+                       tokenizer_batch_size, tokenizer, resume=None, block_best_fit=false))]
     fn new(
         py: Python<'_>,
         shards: Vec<(usize, PathBuf)>,
@@ -164,7 +169,13 @@ impl TextLoader {
         tokenizer_batch_size: usize,
         tokenizer: TokenizerConfig,
         resume: Option<State>,
+        block_best_fit: bool,
     ) -> PyResult<Self> {
+        if block_best_fit && !training {
+            return Err(PyValueError::new_err(
+                "Block best-fit applies only to training",
+            ));
+        }
         let (batch_size, capacity) = batch_shape;
         let elements = batch_size
             .checked_mul(capacity)
@@ -204,6 +215,7 @@ impl TextLoader {
                 batch_size,
                 capacity,
                 encoding_batch_size: tokenizer_batch_size,
+                block_best_fit,
                 training,
                 cursor: source_cursor.unwrap_or_default(),
                 encoded: VecDeque::new(),
@@ -217,7 +229,8 @@ impl TextLoader {
             if let Some((_, lookahead_refs, pending, offset)) = resume {
                 let mut refs = lookahead_refs.clone();
                 refs.extend(pending);
-                if lookahead_refs.len() >= 16
+                let lookahead_size = if block_best_fit { 64 } else { 16 };
+                if lookahead_refs.len() >= lookahead_size
                     || refs.iter().collect::<HashSet<_>>().len() != refs.len()
                     || (pending.is_none() && offset != 0)
                 {

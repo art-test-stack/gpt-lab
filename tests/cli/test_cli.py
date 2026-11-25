@@ -170,6 +170,14 @@ def test_tokenizer_batch_size_flag(mode):
         parser.parse_args(['train', mode, '--tokenizer-batch-size', '0'])
 
 
+@pytest.mark.parametrize('mode', ['auto', 'resume'])
+def test_packing_strategy_flag(mode):
+    parser = build_parser()
+    assert parser.parse_args(['train', mode]).packing_strategy == 'rolling-16'
+    args = parser.parse_args(['train', mode, '--dataloader-backend', 'rust', '--packing-strategy', 'block-best-fit'])
+    assert args.packing_strategy == 'block-best-fit'
+
+
 def test_step_limit_rejects_old_flag():
     with pytest.raises(SystemExit):
         build_parser().parse_args(['train', '--stop-after-updates', '5'])

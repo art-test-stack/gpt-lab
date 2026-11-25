@@ -2,7 +2,7 @@
 
 Baseline is `61f066250420afbc121524037b996ee4a3524c0a`, fetched from `origin/master` before creating `experiment/rust-dataloader`.
 
-`build_dataloader(..., tokenizer_batch_size=64)` batches encoding for adapters that declare `supports_exact_batch_encoding = True` on their concrete class. Their `encode_batch` must return deterministic, unpadded sequences in source order that match scalar encoding, including BOS. Checkpoint restore encodes buffered documents individually. The tiktoken adapter used for GPT-2 opts in and forwards `num_threads=tokenizer_threads`. Other adapters and pretokenized input use the scalar path. Packing lookahead stays at 16 documents when BOS is available and one otherwise.
+`build_dataloader(..., tokenizer_batch_size=64)` batches encoding for adapters that declare `supports_exact_batch_encoding = True` on their concrete class. Their `encode_batch` must return deterministic, unpadded sequences in source order that match scalar encoding, including BOS. Checkpoint restore encodes buffered documents individually. The tiktoken adapter used for GPT-2 opts in and forwards `num_threads=tokenizer_threads`. Other adapters and pretokenized input use the scalar path. The default packing lookahead is 16 documents when BOS is available and one otherwise.
 
 `build_dataloader(..., packing_backend="rust")` or `DistDataLoader(..., packing_backend="rust")` selects the optional extension. Rust selects documents and fills the existing CPU batch buffer from contiguous `int64` documents. For a document that spans batches, it copies only the tokens the current batch consumes. Python owns the shard order, refill, and checkpoint. Cursors advance per admitted document, so unused encodings are recreated after resume. The default is scalar tokenization and Python packing, with the same checkpoint signature and validation exhaustion behavior as the baseline.
 
@@ -11,6 +11,10 @@ Baseline is `61f066250420afbc121524037b996ee4a3524c0a`, fetched from `origin/mas
 `gpt-lab train auto` and `gpt-lab train resume` accept `--dataloader-backend {python,rust-packing,rust}` for both training and validation. `python` is the default. The two Rust selections default to tokenization chunks of 64 documents and accept the same training checkpoints as Python. Pass `--tokenizer-batch-size 64` to compare `python` and `rust-packing` with the same tokenization chunk size for training and validation. The end-to-end path requires local shards and non-null UTF-8 text. On Unix, an `EIO` while reading a row group causes Rust to reopen the shard before retrying the same group. It makes up to five attempts with 1, 2, 4, and 8 second delays.
 
 If a refill error escapes during training, discard the iterator. Rebuild with `build_dataloader(..., resume_state=last_committed_state)` using the last committed `DataLoaderState`. The failed batch may already have consumed part of a document.
+
+`--dataloader-backend rust --packing-strategy block-best-fit` admits 64 consecutive training documents and drains that block before admitting more. Blocks can cross row-group and shard boundaries within an epoch. The final block of each epoch can be shorter. Within a block, the packer selects the largest fitting document or splits the shortest when none fits, breaking ties by source order and retaining document suffixes.
+
+Rolling-16 remains the default and keeps its existing checkpoint signature. Block best-fit has a separate signature. Use the same packing strategy when resuming a run. Validation uses rolling-16 in both configurations so loss comparisons can use the same held-out batches.
 
 ## Reproduce on macOS arm64
 
@@ -61,11 +65,25 @@ The ClimbMix input is the cached `shard_01061.parquet`, with SHA-256 `9025ed81d7
 
 `benchmark_four.py` records untimed verification and all 16 timed observations in `.tmp/codex/rust-dataloader/four-backend/benchmarks.json`. In the original `benchmark.py`, `--backend rust` selects Rust packing.
 
+Run both sweep regimes in the same environment using the cached shard.
+
+```sh
+runner=experiments/20261124-rust-dataloader/benchmark_four.py
+shard=.tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet
+for shape in 16:2048 16:512 16:1024 16:4096 16:8192 64:512 32:1024 8:4096 4:8192; do
+  "$PYO3_PYTHON" "$runner" --shard "$shard" --batch-size "${shape%:*}" --context "${shape#*:}"
+done
+```
+
+For each nondefault shape, the runner writes `benchmarks-b<B>-t<T>.json` in the same directory.
+
 ## Parity
 
 Training compares tensors and full checkpoint state after each of 350 batches on each of two logical CPU ranks, including row-group, shard, and epoch transitions. Both Python-to-Rust and Rust-to-Python resume use serialized checkpoints with buffered documents and a retained suffix, then compare against uninterrupted Python. Validation covers scalar tokenizers, batched tokenizers, and pretokenized input without BOS. Separate cases cover a padding adapter, an incomplete validation batch, and checkpoint recovery after a refill error interrupts a batch with a partially consumed document. The benchmark tests verify source metadata with three shards and both present and absent metadata, then read from the original cache using its normal train and validation splits.
 
 The native text tests use GPT-2 to compare all three backends across both CPU ranks and resume in both directions. The fixture includes empty documents, Unicode, literal special-token strings, and rank-strided validation row groups.
+
+Block best-fit matched a Python reference for 1,100 batches on each of two logical CPU ranks. Resumes from a partially consumed document and buffered block references matched exact tensors and state across row-group, shard, and epoch transitions. Each strategy rejects a checkpoint from the other. An older rolling-16 checkpoint from `8d24e93` resumed for 100 identical batches on each rank. The two training configurations produced identical tensors and state for all 47 held-out batches per rank.
 
 Rust unit tests inject typed row-group read failures to check reopening, cursor stability, the five-attempt limit, and immediate propagation of other errors.
 
@@ -85,6 +103,24 @@ All runs used the Apple M2 CPU with 16 GiB RAM and macOS 27.2.1, cached ClimbMix
 Separate untimed passes matched the full `x`, `y`, and `DataLoaderState` digest for 1,651 batches and 54,014,008 source tokens per backend. All eight real GPT-2 fixture cases passed with scalar and batched Python references on two logical CPU ranks. The cases covered row-group, shard, and epoch transitions, long-document continuation, finite validation exhaustion, and resume in both directions from lookahead plus a pending suffix. The fixture included empty text, Unicode, and literal `<|bos|>` and `<|endoftext|>` strings.
 
 In a separate in-memory check on the same host, one pretokenized document without BOS spanned 64 batches at the same shape. Median Rust packing iterator time fell from 45.1 ms to 2.45 ms after limiting the copy to the current batch. Each median uses five runs after a warmup.
+
+## M2 context sweep
+
+The rolling-16 sweep used the original ClimbMix shard and the code at `8d24e93` on the same M2. Each shape had four counterbalanced runs per backend and a separate untimed pass per backend. Context 2,048 at batch 16 serves both the batch-16 and fixed-32,768-target regimes. Throughput is in millions of emitted source tokens per second. Parentheses show the minimum and maximum run.
+
+| Batch | Context | Matched batches | Scalar Python | Batched Python | Rust packing | End-to-end Rust |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 512 | 6,605 | 3.664 (3.564–3.671) | 5.732 (5.226–5.822) | 6.935 (6.054–6.997) | 12.241 (9.868–12.739) |
+| 64 | 512 | 1,651 | 3.476 (3.416–3.515) | 5.517 (5.241–5.522) | 6.533 (6.195–6.589) | 12.560 (12.485–12.718) |
+| 16 | 1,024 | 3,302 | 3.717 (3.566–3.757) | 5.844 (4.619–6.069) | 6.870 (5.819–7.152) | 12.930 (12.156–13.147) |
+| 32 | 1,024 | 1,651 | 3.530 (3.492–3.552) | 5.558 (5.466–5.611) | 6.473 (6.323–6.587) | 12.341 (11.970–12.467) |
+| 16 | 2,048 | 1,651 | 3.601 (3.501–3.685) | 5.988 (5.650–6.191) | 6.403 (6.321–6.679) | 12.995 (12.579–13.190) |
+| 16 | 4,096 | 825 | 3.456 (2.545–3.607) | 5.609 (3.754–5.735) | 6.152 (5.822–6.519) | 10.294 (8.189–12.256) |
+| 8 | 4,096 | 1,651 | 3.461 (2.572–3.519) | 5.116 (4.118–5.627) | 6.322 (6.182–6.588) | 11.337 (9.077–12.538) |
+| 16 | 8,192 | 412 | 3.569 (3.180–3.623) | 5.646 (5.488–5.745) | 6.456 (6.303–6.552) | 12.057 (11.485–12.546) |
+| 4 | 8,192 | 1,651 | 3.203 (3.039–3.460) | 5.279 (4.677–5.324) | 5.259 (3.897–6.105) | 10.340 (7.579–11.049) |
+
+End-to-end Rust had 1.67–2.03× the median throughput of Rust packing across the nine shapes. Within each shape, every backend produced the same full digest of `x`, `y`, and validation `DataLoaderState` through exhaustion.
 
 ## Original packing-only benchmark
 

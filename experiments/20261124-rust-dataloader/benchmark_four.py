@@ -26,7 +26,7 @@ ORDERS = ("ABCD", "BDAC", "CADB", "DCBA")
 BATCH, CONTEXT, THREADS = 16, 2048, 4
 
 
-def worker(mode, key, source):
+def worker(mode, key, source, batch_size=BATCH, context_length=CONTEXT):
     import pyarrow as pa
     import torch
 
@@ -50,7 +50,7 @@ def worker(mode, key, source):
         (dataset / source.name).symlink_to(source)
         start = time.perf_counter()
         loader = build_dataloader(
-            dataset.name, BATCH, CONTEXT, tokenizer, split="val", cachedir=dataset.parent,
+            dataset.name, batch_size, context_length, tokenizer, split="val", cachedir=dataset.parent,
             max_shards=shard_id, comp_info=context, tokenizer_threads=THREADS,
             tokenizer_batch_size=encode_batch, dataloader_backend=backend,
         )()
@@ -65,7 +65,7 @@ def worker(mode, key, source):
         batches = content_tokens = 0
         digest = hashlib.sha256()
         for x, y, state in loader:
-            assert x.shape == y.shape == (BATCH, CONTEXT)
+            assert x.shape == y.shape == (batch_size, context_length)
             digest.update(x.numpy().tobytes())
             digest.update(y.numpy().tobytes())
             digest.update(state.model_dump_json().encode())
@@ -74,12 +74,15 @@ def worker(mode, key, source):
         return dict(batches=batches, content_tokens=content_tokens, sha256=digest.hexdigest())
 
 
-def run(source):
+def run(source, batch_size=BATCH, context_length=CONTEXT):
     env = os.environ.copy()
     env.update(OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", VECLIB_MAXIMUM_THREADS="1")
 
     def fresh(mode, key):
-        invocation = [sys.executable, str(Path(__file__).resolve()), "--shard", str(source), "--worker", mode, key]
+        invocation = [
+            sys.executable, str(Path(__file__).resolve()), "--shard", str(source),
+            "--batch-size", str(batch_size), "--context", str(context_length), "--worker", mode, key,
+        ]
         result = subprocess.run(invocation, env=env, capture_output=True, text=True)
         if result.returncode:
             print(result.stdout + result.stderr, file=sys.stderr)
@@ -99,11 +102,12 @@ def run(source):
 
     results = {
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "platform": platform.platform(), "shard": str(source), "batch_size": BATCH,
-        "context": CONTEXT, "tokenizer_threads": THREADS, "orders": ORDERS,
+        "platform": platform.platform(), "shard": str(source), "batch_size": batch_size,
+        "context": context_length, "tokenizer_threads": THREADS, "orders": ORDERS,
         "verification": verified, "runs": [],
     }
-    output = SCRATCH / "benchmarks.json"
+    filename = "benchmarks.json" if (batch_size, context_length) == (BATCH, CONTEXT) else f"benchmarks-b{batch_size}-t{context_length}.json"
+    output = SCRATCH / filename
     for repeat, order in enumerate(ORDERS, 1):
         for position, key in enumerate(order, 1):
             values = fresh("time", key)
@@ -130,12 +134,16 @@ def run(source):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shard", type=Path, default=SOURCE)
+    parser.add_argument("--batch-size", type=int, default=BATCH)
+    parser.add_argument("--context", type=int, default=CONTEXT)
     parser.add_argument("--worker", nargs=2)
     args = parser.parse_args()
     source = args.shard.absolute()
     if not source.is_file():
         parser.error(f"Shard is missing: {source}")
+    if args.batch_size < 1 or args.context < 1:
+        parser.error("Batch size and context must be positive")
     if args.worker:
-        print(json.dumps(worker(*args.worker, source)))
+        print(json.dumps(worker(*args.worker, source, args.batch_size, args.context)))
     else:
-        run(source)
+        run(source, args.batch_size, args.context)

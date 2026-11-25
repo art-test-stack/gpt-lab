@@ -36,11 +36,13 @@ def text_shards(tmp_path):
     return tmp_path
 
 
-def make_loader(root, tokenizer, backend, rank, *, split="train", state=None):
+def make_loader(root, tokenizer, backend, rank, *, split="train", state=None,
+                packing_strategy="rolling-16"):
     return build_dataloader(
         name="native-text", cachedir=root, max_shards=4, tokenizer=tokenizer,
         batch_size=2, seq_len=17, tokenizer_threads=2, tokenizer_batch_size=64,
         dataloader_backend=backend, split=split, resume_state=state, data_seed=19,
+        packing_strategy=packing_strategy,
         comp_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu")),
     )
 
@@ -92,3 +94,66 @@ def test_native_text_finite_validation(text_shards, tokenizer, rank):
         assert_equal(reference, native)
         groups.add(reference[2].row_group_idx)
     assert groups == {rank, rank + 2}
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_block_best_fit_matches_drained_python_blocks_and_resume(text_shards, tokenizer, rank):
+    native = make_loader(text_shards, tokenizer, "rust", rank, packing_strategy="block-best-fit")
+    reference = make_loader(text_shards, tokenizer, "python", rank)
+    reference.lookahead_size = 64
+    reference.signature = native.signature
+    fill = reference._fill_lookahead
+
+    def fill_empty_block():
+        if not reference.lookahead:
+            fill()
+
+    reference._fill_lookahead = fill_empty_block
+    resumed = []
+    seen = set()
+    previous = None
+    drained_without_refill = False
+    block_crossed_group = block_crossed_shard = False
+    saved_epochs = set()
+    for _ in range(1100):
+        expected, actual = next(reference), next(native)
+        assert_equal(expected, actual)
+        for restored in resumed:
+            assert_equal(expected, next(restored))
+        state = actual[2]
+        seen.add((state.epoch, state.global_shard_idx, state.row_group_idx))
+        refs = state.lookahead_refs + ((state.pending_document_ref,) if state.pending_document_ref else ())
+        block_crossed_group |= len({ref[:2] for ref in refs}) > 1
+        block_crossed_shard |= len({ref[0] for ref in refs}) > 1
+        if previous is not None and state.lookahead_refs:
+            same_cursor = all(getattr(state, field) == getattr(previous, field) for field in (
+                "epoch", "global_shard_idx", "row_group_idx", "offset_in_row_group"))
+            drained_without_refill |= same_cursor and len(state.lookahead_refs) < len(previous.lookahead_refs)
+        if (len(state.lookahead_refs) > 15 and state.pending_document_ref
+                and state.document_token_offset > 0 and state.epoch not in saved_epochs
+                and len(saved_epochs) < 2):
+            saved = DataLoaderState.model_validate_json(state.model_dump_json())
+            resumed.append(make_loader(text_shards, tokenizer, "rust", rank, state=saved,
+                                       packing_strategy="block-best-fit"))
+            saved_epochs.add(state.epoch)
+        previous = state
+    assert len(saved_epochs) == 2
+    assert drained_without_refill
+    assert block_crossed_group and block_crossed_shard
+    assert len({entry[0] for entry in seen}) > 1
+    assert len({entry[1] for entry in seen}) == 2
+    assert len({entry[2] for entry in seen}) == 2
+
+
+@pytest.mark.parametrize("source,target", [("rolling-16", "block-best-fit"),
+                                           ("block-best-fit", "rolling-16")])
+def test_block_best_fit_rejects_other_strategy_checkpoint(text_shards, tokenizer, source, target):
+    loader = make_loader(text_shards, tokenizer, "rust", 0, packing_strategy=source)
+    saved = DataLoaderState.model_validate_json(next(loader)[2].model_dump_json())
+    with pytest.raises(ValueError, match="Incompatible training data checkpoint"):
+        make_loader(text_shards, tokenizer, "rust", 0, state=saved, packing_strategy=target)
+
+
+def test_block_best_fit_is_training_only(text_shards, tokenizer):
+    with pytest.raises(ValueError, match="train"):
+        make_loader(text_shards, tokenizer, "rust", 0, split="val", packing_strategy="block-best-fit")()
