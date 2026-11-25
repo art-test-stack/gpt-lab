@@ -140,10 +140,11 @@ The dashboard config and optimizer checkpoint record the arm. The shuffled
 arms also save their permutation. To continue an existing run, use
 `train.py --pairing <saved-arm> resume --checkpoint-dir <saved-run-dir>`
 at the same world size, with the same dataset and precision. Resume keeps
-the selected run ID and rejects a different optimizer arm. Keep
-`study-eval.enabled` with the run directory so resume selects the saved
-study schedule automatically. If you have a protocol checkpoint from an
-older launcher that did not save this file, pass `--study-eval` once on resume.
+the selected run ID and rejects a different optimizer arm. The checkpoint
+restores the shard order and cursor, and W&B keeps the data seed recorded
+at launch. Keep `study-eval.enabled` with the run directory so resume
+selects the saved study schedule automatically. If an older protocol
+checkpoint lacks this file, pass `--study-eval` once on resume.
 To continue a capped run to the full horizon, set `--stop-after-step` to
 the original horizon.
 

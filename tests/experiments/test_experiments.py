@@ -163,6 +163,7 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     monkeypatch.setattr("gpt_lab.data.loader.DATA_DIR", tmp_path / "data")
     tokenizer = build_tokenizer(TokenizerConfig(name="dummy", source="dummy", vocab_size=257,
                                                 dirname=tmp_path / "tokenizer", save_token_bytes=False))
+    monkeypatch.setattr(type(tokenizer), "encode", lambda self, text, **kwargs: list(text.encode()))
     monkeypatch.setattr("gpt_lab.model.auto.AutoGPTConfig.build_tokenizer", lambda self: tokenizer)
     monkeypatch.setattr("gpt_lab.model.layers.load_flash_attn", lambda backend: load_flash_attn("sdpa"))
 
@@ -196,22 +197,28 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
         return stderr
 
     def open_wandb(**kwargs):
-        assert os.environ["WANDB_RESUME"] == "never"
+        if kwargs["resume"] is None:
+            assert os.environ["WANDB_RESUME"] == "never"
         return SimpleNamespace(disabled=False)
 
     wandb = SimpleNamespace(init=Mock(side_effect=open_wandb), finish=Mock())
     monkeypatch.setattr("gpt_lab.utils.board.wandb", wandb)
 
-    def build_trainer(*, checkpoint_manager, model, optimizer, train_loader, monitor_qk_norms, **kwargs):
+    def build_trainer(*, checkpoint_manager, model, optimizer, train_loader, monitor_qk_norms, resume_state, **kwargs):
         assert monitor_qk_norms is True
         assert optimizer.backend.strategies["muon"].sample_names
         assert train_loader.ordered_shard_ids == (1, 0, 2)
+        if resume_state is not None:
+            assert train_loader.cursor == resume_state.train_loader_state
 
         def train():
+            if resume_state is not None:
+                return
             reject_launch("A launch is already active")
             if save_checkpoint:
+                _, _, cursor = next(train_loader)
                 checkpoint_manager.save(0, model, optimizer=optimizer, trainer_state=TrainerState(
-                    step=0, completed_steps=1, train_loader_state=None,
+                    step=0, completed_steps=1, train_loader_state=cursor,
                 ))
 
         return SimpleNamespace(train=train)
@@ -238,6 +245,15 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     if save_checkpoint:
         assert str(complete) in stderr
     wandb.init.assert_called_once()
+    if save_checkpoint:
+        monkeypatch.delenv("WANDB_RESUME")
+        monkeypatch.setattr(sys, "argv", [launcher.__file__, "--pairing", "real", "resume",
+                                         "--checkpoint-dir", str(complete), "--device", "cpu", "--ds-name", "prepared"])
+        launcher.main()
+        assert wandb.init.call_count == 2
+        resume_call = wandb.init.call_args.kwargs
+        assert resume_call["id"] == run_name and resume_call["resume"] == "must"
+        assert "data_seed" not in resume_call["config"]
 
 
 @pytest.mark.parametrize("bpb_every,core_every", [(400, 2000), (0, 2000), (400, 0)])
@@ -301,6 +317,7 @@ def test_study_evaluation_resumes_saved_schedule(tmp_path, monkeypatch, bpb_ever
         )
         saved = None
         if args.model_init == "auto":
+            assert args.data_seed == 42
             config = TrainerConfig(
                 n_steps=19490, n_acc_steps=2, total_batch_size=524288, device_batch_size=16,
                 comp_info=context, stop_after_step=args.stop_after_step, eval_bpb_every=args.eval_bpb_every,

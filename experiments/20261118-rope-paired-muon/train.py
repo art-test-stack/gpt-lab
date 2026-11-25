@@ -171,12 +171,12 @@ def main():
         if data_seed is not None and (not study_model or args.model_init != "auto"):
             raise ValueError(f"--data-seed is for fresh runs with --model-name {STUDY_MODEL}")
         if study_model:
-            args.data_seed = STUDY_DATA_SEED if data_seed is None else data_seed
             if os.environ.setdefault("GPTLAB_DTYPE", "bfloat16") != "bfloat16" or getattr(args, "fp8_ffn_forward", False):
                 raise ValueError("The study requires BF16 mixed precision with FP8 disabled")
             if args.use_nanochat_dataloader:
                 raise ValueError("The study requires the native validation loader")
             if args.model_init == "auto":
+                args.data_seed = STUDY_DATA_SEED if data_seed is None else data_seed
                 if getattr(args, "attn_impl", "fa3") != "fa3":
                     raise ValueError("The study requires --attn-impl fa3")
                 args.attn_impl = "fa3"
