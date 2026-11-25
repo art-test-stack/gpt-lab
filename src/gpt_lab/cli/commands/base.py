@@ -72,7 +72,7 @@ def add_resume_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--checkpoint-dir', type=str, default=None, help='Explicit run directory (with meta.json), base directory, or checkpoint_step_N directory. Overrides model-dir/model-name/run-name; a step directory selects that exact step.')
 
 
-def register(parser) -> None:
+def register(parser: ArgumentParser) -> ArgumentParser:
     modes = parser.add_subparsers(dest='model_init', required=True, title='initialization modes')
     auto = modes.add_parser('auto', help='Train from scratch with depth-based scaling laws.',
                             prog=parser.prog,
@@ -86,6 +86,7 @@ def register(parser) -> None:
     add_common_arguments(resume)
     add_resume_arguments(resume)
     resume.set_defaults(_handler='gpt_lab.cli.commands.base:run')
+    return auto
 
 
 def resolve_checkpoint(args: Namespace) -> Namespace:

@@ -81,6 +81,7 @@ Context 2,048, device batch 16, and two accumulation steps give 524,288
 tokens per update. `--random-seed` sets the initialization seed and
 `--data-seed` sets the training shard order. W&B records both for fresh
 runs, and the training checkpoint saves the dataloader's order and cursor.
+The experiment launcher defaults to 130 warmup updates for fresh runs.
 
 ```bash
 exp=experiments/20261118-rope-paired-muon

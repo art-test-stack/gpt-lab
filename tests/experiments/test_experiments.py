@@ -229,6 +229,7 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     assert wandb.init.call_args.kwargs["id"] == run_name
     assert wandb.init.call_args.kwargs["config"]["random_seed"] == 7
     assert wandb.init.call_args.kwargs["config"]["data_seed"] == 19
+    assert wandb.init.call_args.kwargs["config"]["training_config"]["lr_warmup_steps"] == 130
     complete = run_dir / "base" / "checkpoint_step_000000"
     if save_checkpoint:
         partial = copytree(complete, complete.with_name("checkpoint_step_000001"))

@@ -141,7 +141,7 @@ def main():
     )
     parser.add_argument("--benchmark-timing", action="store_true", help="Print synchronized timings per rank.")
     parser.add_argument("--guard-mfu", action="store_true", help="Require median MFU above 40%% per 10 updates after startup.")
-    register(parser)
+    register(parser).set_defaults(warmup_steps=130)
     args = parser.parse_args()
     pairing = args.pairing
     data_seed = args.data_seed
