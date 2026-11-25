@@ -35,40 +35,41 @@ for matched comparisons on the current loader.
 
 ## Warmup and training budget
 
-Choose the training horizon before the warmup checks. The reference horizon
+Choose the training horizon before the warmup check. The reference horizon
 is 19,490 updates, about 10.22B training tokens per arm at 524,288 tokens per
 update. If compute is tight, lower `--num-steps` equally across the pilot
 arms and keep depth 16 and width 1,536. Set `--num-steps` to the actual
-horizon. Keep both warmup candidates in the schedule when budgeting the
-shorter horizon and check where the 65% LR warmdown begins.
+horizon and recalculate the 65% LR warmdown, evaluation milestones, and
+training budget for that horizon.
 
-Start with two matched `real` runs at the first seed pair. Compare 130 and
-1,300 warmup updates, with both runs capped after 400 updates using
-`--stop-after-step 400`. This observes 270 updates after the shorter warmup
-while the longer schedule is still warming up. Compare training loss and
-its stability after update 130, the sampled Q/K update norms, and routine
-ClimbMix NLL at update 400. Choose one warmup from the observed behavior
-and use it for all three fresh pilot runs.
+Run one `real` check with seeds `(42, 42)`, the intended pilot horizon,
+and `--stop-after-step 400`. Inspect training loss and sampled applied Q/K
+update norms over the 270 updates after warmup, plus held-out ClimbMix NLL
+at update 400. If training is stable, launch fresh `real`, `rope`, and
+`shuffled` pilot runs with the same 130-update warmup.
 
-| Stage | Runs | Initialization / data seeds | Updates per run | Total training tokens | Estimated H100-hours |
+| Stage | Runs | Initialization / data seeds | Updates per run | Total training tokens | Estimated training H100-hours |
 | --- | ---: | --- | ---: | ---: | ---: |
-| Warmup checks | 2 | `(42, 42)` for both | 400 | 419,430,400 | 4.4 |
-| Three-arm pilot | 3 | `(42, 42)` for all arms | 19,490 | 30,655,119,360 | 324.8 |
-| Two additional replicates, optional | 6 | `(43, 43)` and `(44, 44)`, three arms each | 19,490 | 61,310,238,720 | 649.7 |
+| Warmup check | 1 | `(42, 42)` | 400 | 209,715,200 | 0.55 |
+| Three-arm pilot | 3 | `(42, 42)` for all arms | 19,490 | 30,655,119,360 | 81.1 |
+| Two additional replicates, optional | 6 | `(43, 43)` and `(44, 44)`, three arms each | 19,490 | 61,310,238,720 | 162.2 |
 
-The estimate uses eight H100s and 2.5 seconds per update for planning,
-based on the historical 400-update jobs. Re-estimate with timings from the
-warmup checks and budget startup, checkpointing, and evaluation separately.
-Each completed pilot or replicate arm adds one full ClimbMix pass on eight
-H100s and one uncapped CORE job on one H100. [Historical timings](https://github.com/art-test-stack/gpt-lab/pull/53#issuecomment-6992210577)
+The estimates use 49.80% MFU, the lowest measured arm median, with
+approximately `4.69e9` FLOPs per token and GPT-Lab's BF16 peak of
+989 TFLOP/s per H100. [Historical MFU](https://github.com/art-test-stack/gpt-lab/pull/53#issuecomment-6992210577)
+
+Budget startup, checkpointing, and evaluation separately. The warmup check
+adds one bounded ClimbMix pass at update 400. Each pilot or replicate arm
+adds the routine evaluations below, one full ClimbMix pass on eight H100s,
+and a separate uncapped CORE job on one H100.
 
 For a chosen horizon `H`, use `H × 524,288` tokens per arm and
-`runs × H × 8 × seconds_per_update / 3600` for training H100-hours. For
-example, 4,000 updates give 2,097,152,000 tokens per arm, 2,600 warmdown
-updates, nine routine ClimbMix passes through update 3,600, and capped
-CORE at 1,000, 2,000, and 3,000. Full evaluation moves to 4,000. The pilot
-then budgets 6.29B tokens and 66.7 H100-hours, and the optional replicates
-budget 12.58B tokens and 133.3 H100-hours, plus evaluation and other overhead.
+`total training tokens × 4.69e9 / (0.498 × 989e12 × 3600)` for training
+H100-hours. For example, 4,000 updates give 2,097,152,000 tokens per arm,
+2,600 warmdown updates, nine routine ClimbMix passes through update 3,600,
+and capped CORE at 1,000, 2,000, and 3,000. Full evaluation moves to 4,000.
+The pilot then budgets 6.29B tokens and 16.6 training H100-hours, and the
+optional replicates budget 12.58B tokens and 33.3 training H100-hours.
 
 ## Launch on eight H100s
 
@@ -89,8 +90,8 @@ horizon=19490
 model_dir=./study-runs
 
 run_study() {
-  local arm="$1" warmup="$2"
-  shift 2
+  local arm="$1"
+  shift
   GPTLAB_DTYPE=bfloat16 uv run --locked --extra gpu torchrun --standalone --nproc-per-node=8 \
     "$exp/train.py" --pairing "$arm" --data-seed "$data_seed" --study-eval auto \
     --model-name rope-muon-d16-study --model-dir "$model_dir" \
@@ -98,29 +99,26 @@ run_study() {
     --depth 16 --aspect-ratio 96 --tokenizer-model gpt2 --ds-name climbmix-base \
     --random-seed "$init_seed" --attn-impl fa3 --max-seq-len 2048 --device-batch-size 16 \
     --total-batch-size 524288 --target-param-data-ratio 15 --num-steps "$horizon" \
-    --warmup-steps "$warmup" --eval-bpb-every 400 --n-bpb-tokens 4194304 \
+    --warmup-steps 130 --eval-bpb-every 400 --n-bpb-tokens 4194304 \
     --n-core-tokens 500 --log-every 1 "$@"
 }
 ```
 
-Run each warmup check as a separate job with the same settings above.
+Run the warmup check with the settings above and the intended pilot horizon.
 
 ```bash
-run_study real 130 --stop-after-step 400 --eval-core-every 0 \
+run_study real --stop-after-step 400 --eval-core-every 0 \
   --run-name "real-s${init_seed}-d${data_seed}-h${horizon}-warmup130-stop400"
-run_study real 1300 --stop-after-step 400 --eval-core-every 0 \
-  --run-name "real-s${init_seed}-d${data_seed}-h${horizon}-warmup1300-stop400"
 ```
 
-After choosing `WARMUP_STEPS`, submit each pilot invocation as a separate
-job using the same horizon and seed pair. For an optional replicate, change
+If the check is stable, submit each fresh pilot invocation as a separate job
+using the same horizon and seed pair. For an optional replicate, change
 both seed variables in the common settings and repeat the three invocations.
 
 ```bash
-warmup=${WARMUP_STEPS:?Set WARMUP_STEPS to the selected warmup}
-run_study real "$warmup"
-run_study rope "$warmup"
-run_study shuffled "$warmup"
+run_study real
+run_study rope
+run_study shuffled
 ```
 
 Set `GPTLAB_CACHE_DIR` if the prepared shards are outside your usual cache.
@@ -129,7 +127,7 @@ Use `model_dir` to choose the checkpoint location.
 The W&B project is `trainbase_rope-muon-d16-study`. The run name, run ID,
 and checkpoint directory name default to `<arm>-s<init_seed>`, with
 `-stop<N>` appended for a capped run. An explicit `--run-name` sets all
-three, as in the warmup checks. A cap limits execution and preserves the
+three, as in the warmup check. A cap limits execution and preserves the
 chosen scheduling horizon.
 
 If setup fails before saving a checkpoint or opening a W&B run, fix the
