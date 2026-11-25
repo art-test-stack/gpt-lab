@@ -86,12 +86,15 @@ class DistDataLoader:
         device: str = "cuda",
         buffer_size: Optional[int] = None,
         eos_token_id: Optional[int] = None,
+        *,
+        include_partial: bool = False,
     ):
         if batch_size < 1 or seq_len < 1:
             raise ValueError("Batch size and sequence length must be positive")
         self.B = batch_size
         self.T = seq_len
         self.device = torch.device(device)
+        self.include_partial = include_partial
         self.bos_token_id = getattr(dataset, "bos_token_id", getattr(dataset, "bos_id", None))
         self.lookahead_size = _LOOKAHEAD_DOCUMENTS if self.bos_token_id is not None else 1
         split = getattr(dataset, "split", None)
@@ -177,7 +180,8 @@ class DistDataLoader:
 
     def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
         capacity = self.T + 1
-        for row in self.cpu:
+        rows = self.B
+        for index, row in enumerate(self.cpu):
             pos = 0
             if self.offset and self.bos_token_id is not None:
                 row[0] = self.bos_token_id
@@ -185,7 +189,12 @@ class DistDataLoader:
 
             while pos < capacity:
                 if self.document is None:
-                    self.document, self.document_ref = self._take_document(capacity - pos)
+                    try:
+                        self.document, self.document_ref = self._take_document(capacity - pos)
+                    except StopIteration:
+                        if not self.include_partial:
+                            raise
+                        break
                     self.document_tensor = torch.as_tensor(self.document, dtype=torch.long)
                 take = min(len(self.document) - self.offset, capacity - pos)
                 row[pos:pos + take].copy_(self.document_tensor[self.offset:self.offset + take])
@@ -197,9 +206,23 @@ class DistDataLoader:
                     self.document_tensor = None
                     self.offset = 0
 
-        self.gpu.copy_(self.cpu)
-        self.inputs.copy_(self.gpu[:, :-1])
-        self.targets.copy_(self.gpu[:, 1:])
+            if pos < capacity:
+                rows = index + int(pos > 1)
+                if not rows:
+                    raise StopIteration
+                if pos > 1:
+                    # Targets use ignore_index; embedding inputs need a valid ID.
+                    row[pos:].fill_(-1)
+                break
+
+        cpu, gpu, inputs, targets = self.cpu, self.gpu, self.inputs, self.targets
+        if rows < self.B:
+            cpu, gpu, inputs, targets = cpu[:rows], gpu[:rows], inputs[:rows], targets[:rows]
+        gpu.copy_(cpu)
+        inputs.copy_(gpu[:, :-1])
+        targets.copy_(gpu[:, 1:])
+        if 1 < pos < capacity:
+            inputs[-1, pos:].zero_()
         state = self.cursor
         if self.signature is not None:
             state = state.model_copy(update=dict(
@@ -209,7 +232,7 @@ class DistDataLoader:
                 pending_document_ref=self.document_ref,
                 document_token_offset=self.offset,
             ))
-        return self.inputs, self.targets, state
+        return inputs, targets, state
 
 
 # just to compare
@@ -416,8 +439,9 @@ def build_dataloader(
 ) -> DistDataLoader:
     """Build a training iterator or a factory for independent validation iterators.
 
-    Native tokenized input uses a fixed 16-document lookahead. The buffer_size
-    argument configures the nanochat backend.
+    The native validation factory accepts include_partial=True to retain its
+    final batch with ignored target padding. The buffer_size argument configures
+    the nanochat backend.
     """
     if comp_info is None:
         comp_info = get_comp_info()
@@ -461,12 +485,13 @@ def build_dataloader(
             tokenizer_threads=tokenizer_threads,
             data_seed=data_seed,
         )
-        dataloader = lambda: DistDataLoader(
+        dataloader = lambda *, include_partial=False: DistDataLoader(
             ds,
             batch_size=batch_size,
             seq_len=seq_len,
             device=comp_info.device,
             buffer_size=buffer_size,
+            include_partial=include_partial,
         )
     if split == "val":
         return dataloader

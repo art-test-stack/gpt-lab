@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -136,3 +137,244 @@ def test_experiment_resume_forwards_saved_corpus_and_process_cap(tmp_path, monke
         assert json.loads((result_dir / 'meta.json').read_text()) == meta
     finally:
         sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize("save_checkpoint", [False, True], ids=["wandb-only", "checkpointed"])
+def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path, monkeypatch, capsys, save_checkpoint):
+    import json
+    import os
+    from shutil import copytree
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from gpt_lab.model.flash_attn import load_flash_attn
+    from gpt_lab.tokenizer import build_tokenizer
+    from gpt_lab.utils.schemas import TokenizerConfig, TrainerState
+
+    package = "experiments.20261118-rope-paired-muon"
+    launcher = importlib.import_module(f"{package}.train")
+    monkeypatch.setitem(sys.modules, "optimizer", importlib.import_module(f"{package}.optimizer"))
+    experiment_trainer = importlib.import_module(f"{package}.trainer")
+    monkeypatch.setitem(sys.modules, "trainer", experiment_trainer)
+    for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "WANDB_RESUME", "DEVELOPMENT", "PYTORCH_ALLOC_CONF"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GPTLAB_DTYPE", "bfloat16")
+    monkeypatch.setattr("gpt_lab.data.loader.DATA_DIR", tmp_path / "data")
+    tokenizer = build_tokenizer(TokenizerConfig(name="dummy", source="dummy", vocab_size=257,
+                                                dirname=tmp_path / "tokenizer", save_token_bytes=False))
+    monkeypatch.setattr(type(tokenizer), "encode", lambda self, text, **kwargs: list(text.encode()))
+    monkeypatch.setattr("gpt_lab.model.auto.AutoGPTConfig.build_tokenizer", lambda self: tokenizer)
+    monkeypatch.setattr("gpt_lab.model.layers.load_flash_attn", lambda backend: load_flash_attn("sdpa"))
+
+    dataset = tmp_path / "data" / "prepared"
+    dataset.mkdir(parents=True)
+    (dataset / "meta.json").write_text(json.dumps({"name": "prepared", "base_url": "",
+                                                   "column_name": "text", "max_shards": 3}))
+    shard = pa.table({"text": ["A local prepared shard."]})
+    for index in (1, 2, 3):
+        pq.write_table(shard, dataset / f"shard_{index:05d}.parquet")
+    model_dir = tmp_path / "models"
+    run_name = "real-s7-d19-check"
+    run_dir = model_dir / launcher.STUDY_MODEL / run_name
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.json").write_text('"abandoned setup"')
+    monkeypatch.setattr(sys, "argv", [str(Path(launcher.__file__)), "--pairing", "real", "--data-seed", "19", "auto",
+                                     "--model-name", launcher.STUDY_MODEL, "--model-dir", str(model_dir),
+                                     "--device", "cpu", "--ds-name", "prepared", "--board", "wandb",
+                                     "--random-seed", "7", "--run-name", run_name,
+                                     "--depth", "1", "--aspect-ratio", "16", "--d-head", "8",
+                                     "--max-seq-len", "8", "--device-batch-size", "1", "--num-steps", "1",
+                                     "--total-batch-size", "8", "--n-acc-steps", "1"])
+
+    def reject_launch(message, *, resume_hint=False):
+        with pytest.raises(SystemExit) as error:
+            launcher.main()
+        assert error.value.code == 2
+        stderr = capsys.readouterr().err
+        assert message in stderr
+        assert ("Use resume --checkpoint-dir" in stderr) is resume_hint
+        return stderr
+
+    def open_wandb(**kwargs):
+        if kwargs["resume"] is None:
+            assert os.environ["WANDB_RESUME"] == "never"
+        return SimpleNamespace(disabled=False)
+
+    wandb = SimpleNamespace(init=Mock(side_effect=open_wandb), finish=Mock())
+    monkeypatch.setattr("gpt_lab.utils.board.wandb", wandb)
+
+    def build_trainer(*, checkpoint_manager, model, optimizer, train_loader, monitor_qk_norms, resume_state, **kwargs):
+        assert monitor_qk_norms is True
+        assert optimizer.backend.strategies["muon"].sample_names
+        assert train_loader.ordered_shard_ids == (1, 0, 2)
+        if resume_state is not None:
+            assert train_loader.cursor == resume_state.train_loader_state
+
+        def train():
+            if resume_state is not None:
+                return
+            reject_launch("A launch is already active")
+            if save_checkpoint:
+                _, _, cursor = next(train_loader)
+                checkpoint_manager.save(0, model, optimizer=optimizer, trainer_state=TrainerState(
+                    step=0, completed_steps=1, train_loader_state=cursor,
+                ))
+
+        return SimpleNamespace(train=train)
+
+    monkeypatch.setattr(experiment_trainer, "ExperimentTrainer", build_trainer)
+    reject_launch("Missing train shards")
+    wandb.init.assert_not_called()
+    assert not (run_dir / ".wandb-run").exists()
+
+    pq.write_table(shard, dataset / "shard_00000.parquet")
+    launcher.main()
+
+    assert (run_dir / ".wandb-run").is_file()
+    wandb.init.assert_called_once()
+    assert wandb.init.call_args.kwargs["id"] == run_name
+    assert wandb.init.call_args.kwargs["config"]["random_seed"] == 7
+    assert wandb.init.call_args.kwargs["config"]["data_seed"] == 19
+    assert wandb.init.call_args.kwargs["config"]["training_config"]["lr_warmup_steps"] == 130
+    complete = run_dir / "base" / "checkpoint_step_000000"
+    if save_checkpoint:
+        partial = copytree(complete, complete.with_name("checkpoint_step_000001"))
+        (partial / "optim.safetensors").write_bytes(b"incomplete")
+    stderr = reject_launch("already contains run artifacts", resume_hint=save_checkpoint)
+    if save_checkpoint:
+        assert str(complete) in stderr
+    wandb.init.assert_called_once()
+    if save_checkpoint:
+        monkeypatch.delenv("WANDB_RESUME")
+        monkeypatch.setattr(sys, "argv", [launcher.__file__, "--pairing", "real", "resume",
+                                         "--checkpoint-dir", str(complete), "--device", "cpu", "--ds-name", "prepared"])
+        launcher.main()
+        assert wandb.init.call_count == 2
+        resume_call = wandb.init.call_args.kwargs
+        assert resume_call["id"] == run_name and resume_call["resume"] == "must"
+        assert "data_seed" not in resume_call["config"]
+
+
+@pytest.mark.parametrize("bpb_every,core_every", [(400, 2000), (0, 2000), (400, 0)])
+def test_study_evaluation_resumes_saved_schedule(tmp_path, monkeypatch, bpb_every, core_every):
+    import itertools
+    import json
+
+    import torch
+
+    from gpt_lab.model.checkpoint import CheckpointManager
+    from gpt_lab.utils.distributed import ComputeContext
+    from gpt_lab.utils.schemas import TrainerConfig
+
+    package = "experiments.20261118-rope-paired-muon"
+    launcher = importlib.import_module(f"{package}.train")
+    experiment = importlib.import_module(f"{package}.trainer")
+    monkeypatch.setitem(sys.modules, "trainer", experiment)
+    monkeypatch.setitem(sys.modules, "optimizer", importlib.import_module(f"{package}.optimizer"))
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("GPTLAB_DTYPE", "bfloat16")
+    monkeypatch.setenv("DEVELOPMENT", "0")
+    monkeypatch.setattr(torch, "compile", lambda model, **kwargs: model)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    for name in ("collect", "freeze", "disable"):
+        monkeypatch.setattr(f"gpt_lab.train.trainer.gc.{name}", lambda: None)
+
+    context = ComputeContext(
+        device=torch.device("cpu"), compute_dtype=torch.float32,
+        mesh=SimpleNamespace(size=lambda: 8, get_rank=lambda: 0),
+    )
+    model = torch.nn.Linear(2, 2)
+    model.config = SimpleNamespace(max_context=2048)
+    tokens = torch.ones(1, 2)
+    board = Mock()
+    val_loader = Mock(return_value=())
+    calls = []
+    run_dir = tmp_path / launcher.STUDY_MODEL / "real-s42-stop9746"
+    endpoint = run_dir / "base" / "checkpoint_step_019489"
+    bpb_result = {"bpb": 1.5, "loss": 2.0}
+
+    def bounded_bpb(model, batches, budget, **kwargs):
+        val_loader.assert_called_with()
+        calls.append(("bpb", trainer.state.completed_steps, budget))
+        return bpb_result
+
+    def core(model, tokenizer, device, *, max_per_task):
+        calls.append(("core", trainer.state.completed_steps, max_per_task))
+        return {"core/core": 0.6, "core/accuracy": 0.7, "core/max_per_task": max_per_task}
+
+    def full_bpb(model, batches, budget, *, comp_info, token_bytes):
+        assert endpoint.joinpath("model.safetensors").is_file()
+        assert comp_info.world_size == 8 and budget is None and not model.training
+        val_loader.assert_called_with(include_partial=True)
+        calls.append(("full", trainer.state.completed_steps, budget))
+        return bpb_result
+
+    def execute(args, *, trainer_factory, configure_optimizer):
+        nonlocal trainer
+        manager = CheckpointManager(
+            args.model_name, args.run_name, args.model_dir, comp_info=context, optimizer_state_layout="sharded",
+        )
+        saved = None
+        if args.model_init == "auto":
+            assert args.data_seed == 42
+            config = TrainerConfig(
+                n_steps=19490, n_acc_steps=2, total_batch_size=524288, device_batch_size=16,
+                comp_info=context, stop_after_step=args.stop_after_step, eval_bpb_every=args.eval_bpb_every,
+                n_bpb_tokens=args.n_bpb_tokens, eval_core_every=args.eval_core_every, n_core_tokens=args.n_core_tokens,
+                log_every=0, sample_every=0, save_on_best=False,
+            )
+            manager.save_training_config(config)
+            (run_dir / "meta.json").touch()
+        else:
+            config = manager.load_training_config().model_copy(update={"stop_after_step": args.stop_after_step})
+            saved = manager.load_states(load_model=False, load_optim=False, load_rng=False, load_scaler=False)
+        trainer = trainer_factory(
+            model=model, tokenizer=SimpleNamespace(token_bytes=torch.ones(2)),
+            train_loader=itertools.repeat((tokens, tokens)), val_loader=val_loader, config=config,
+            checkpoint_manager=manager, optimizer=torch.optim.SGD(model.parameters(), lr=0.1), board=board,
+            resume_state=saved.trainer_state if saved else None, best_state=saved.checkpoint_state if saved else None,
+        )
+        trainer.train_step = lambda _, batch, __: (batch, {})
+        trainer.update_metrics = lambda *_: {}
+        trainer.train()
+
+    trainer = None
+    monkeypatch.setattr(launcher, "run", execute)
+    monkeypatch.setattr("gpt_lab.train.trainer.compute_bpb", bounded_bpb)
+    monkeypatch.setattr("gpt_lab.train.trainer.evaluate_core", core)
+    monkeypatch.setattr(experiment, "compute_bpb", full_bpb)
+    command = [launcher.__file__, "--pairing", "real", "--no-monitor-qk-norms"]
+    monkeypatch.setattr(sys, "argv", command + [
+        "--study-eval", "auto", "--model-name", launcher.STUDY_MODEL, "--model-dir", str(tmp_path),
+        "--board", "dummy", "--stop-after-step", "9746", "--eval-bpb-every", str(bpb_every),
+        "--n-bpb-tokens", "4194304", "--eval-core-every", str(core_every), "--n-core-tokens", "500",
+    ])
+    launcher.main()
+    assert trainer.state.completed_steps == 9746
+    assert (run_dir / experiment.STUDY_EVAL_FILE).is_file()
+    assert not trainer.endpoint_bpb_path.exists()
+
+    monkeypatch.setattr(sys, "argv", command + [
+        "resume", "--checkpoint-dir", str(run_dir), "--stop-after-step", "19490", "--board", "dummy",
+    ])
+    launcher.main()
+    if bpb_every:
+        assert json.loads(trainer.endpoint_bpb_path.read_text()) == {
+            "eval/full_endpoint_update": 19490, "eval/bpb": 1.5, "eval/loss": 2.0,
+        }
+    else:
+        assert not trainer.endpoint_bpb_path.exists()
+    weights = endpoint / "model.safetensors"
+    saved_mtime = weights.stat().st_mtime_ns
+    launcher.main()
+    assert weights.stat().st_mtime_ns == saved_mtime
+    bpb_steps = range(400, 19490, 400) if bpb_every else ()
+    core_steps = (4873, 9745, 14618) if core_every else ()
+    expected = sorted(
+        [("bpb", step, 16) for step in bpb_steps] + [("core", step, 500) for step in core_steps],
+        key=lambda call: call[1],
+    )
+    if bpb_every:
+        expected.append(("full", 19490, None))
+    assert calls == expected
