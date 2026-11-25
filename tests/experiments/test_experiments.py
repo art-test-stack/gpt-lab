@@ -169,17 +169,19 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     dataset = tmp_path / "data" / "prepared"
     dataset.mkdir(parents=True)
     (dataset / "meta.json").write_text(json.dumps({"name": "prepared", "base_url": "",
-                                                   "column_name": "text", "max_shards": 1}))
+                                                   "column_name": "text", "max_shards": 3}))
     shard = pa.table({"text": ["A local prepared shard."]})
-    pq.write_table(shard, dataset / "shard_00001.parquet")
+    for index in (1, 2, 3):
+        pq.write_table(shard, dataset / f"shard_{index:05d}.parquet")
     model_dir = tmp_path / "models"
-    run_dir = model_dir / launcher.STUDY_MODEL / "real-s7"
+    run_name = "real-s7-d19-check"
+    run_dir = model_dir / launcher.STUDY_MODEL / run_name
     run_dir.mkdir(parents=True)
     (run_dir / "meta.json").write_text('"abandoned setup"')
-    monkeypatch.setattr(sys, "argv", [str(Path(launcher.__file__)), "--pairing", "real", "auto",
+    monkeypatch.setattr(sys, "argv", [str(Path(launcher.__file__)), "--pairing", "real", "--data-seed", "19", "auto",
                                      "--model-name", launcher.STUDY_MODEL, "--model-dir", str(model_dir),
                                      "--device", "cpu", "--ds-name", "prepared", "--board", "wandb",
-                                     "--random-seed", "7",
+                                     "--random-seed", "7", "--run-name", run_name,
                                      "--depth", "1", "--aspect-ratio", "16", "--d-head", "8",
                                      "--max-seq-len", "8", "--device-batch-size", "1", "--num-steps", "1",
                                      "--total-batch-size", "8", "--n-acc-steps", "1"])
@@ -200,9 +202,10 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
     wandb = SimpleNamespace(init=Mock(side_effect=open_wandb), finish=Mock())
     monkeypatch.setattr("gpt_lab.utils.board.wandb", wandb)
 
-    def build_trainer(*, checkpoint_manager, model, optimizer, monitor_qk_norms, **kwargs):
+    def build_trainer(*, checkpoint_manager, model, optimizer, train_loader, monitor_qk_norms, **kwargs):
         assert monitor_qk_norms is True
         assert optimizer.backend.strategies["muon"].sample_names
+        assert train_loader.ordered_shard_ids == (1, 0, 2)
 
         def train():
             reject_launch("A launch is already active")
@@ -223,9 +226,9 @@ def test_study_launch_retries_missing_shards_and_protects_existing_run(tmp_path,
 
     assert (run_dir / ".wandb-run").is_file()
     wandb.init.assert_called_once()
-    assert wandb.init.call_args.kwargs["id"] == "real-s7"
+    assert wandb.init.call_args.kwargs["id"] == run_name
     assert wandb.init.call_args.kwargs["config"]["random_seed"] == 7
-    assert wandb.init.call_args.kwargs["config"]["data_seed"] == 42
+    assert wandb.init.call_args.kwargs["config"]["data_seed"] == 19
     complete = run_dir / "base" / "checkpoint_step_000000"
     if save_checkpoint:
         partial = copytree(complete, complete.with_name("checkpoint_step_000001"))

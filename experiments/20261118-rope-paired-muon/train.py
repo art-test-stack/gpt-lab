@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shlex
 from argparse import ArgumentParser, BooleanOptionalAction
 from contextlib import contextmanager, nullcontext
@@ -129,6 +130,7 @@ def main():
     worker_start = perf_counter()
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--pairing", choices=ARMS, required=True)
+    parser.add_argument("--data-seed", type=int, help="Training shard seed for a fresh study run (default: 42).")
     parser.add_argument(
         "--study-eval", action="store_true",
         help="Save the study schedule for this run. Resume reads the saved schedule automatically.",
@@ -142,11 +144,13 @@ def main():
     register(parser)
     args = parser.parse_args()
     pairing = args.pairing
+    data_seed = args.data_seed
     study_eval = args.study_eval
     monitor_qk_norms = args.monitor_qk_norms
     benchmark_timing = args.benchmark_timing
     guard_mfu = args.guard_mfu
     del args.pairing
+    del args.data_seed
     del args.study_eval
     del args.monitor_qk_norms
     del args.benchmark_timing
@@ -164,8 +168,10 @@ def main():
         if study_eval and args.model_name != STUDY_MODEL:
             raise ValueError(f"--study-eval requires --model-name {STUDY_MODEL}")
         study_model = args.model_name == STUDY_MODEL
+        if data_seed is not None and (not study_model or args.model_init != "auto"):
+            raise ValueError(f"--data-seed is for fresh runs with --model-name {STUDY_MODEL}")
         if study_model:
-            args.data_seed = STUDY_DATA_SEED
+            args.data_seed = STUDY_DATA_SEED if data_seed is None else data_seed
             if os.environ.setdefault("GPTLAB_DTYPE", "bfloat16") != "bfloat16" or getattr(args, "fp8_ffn_forward", False):
                 raise ValueError("The study requires BF16 mixed precision with FP8 disabled")
             if args.use_nanochat_dataloader:
@@ -196,8 +202,13 @@ def main():
                 if cap < 0:
                     raise ValueError("--stop-after-step must be nonnegative")
                 run_name += f"-stop{cap}"
-            if args.run_name not in (None, run_name):
-                raise ValueError(f"This study run must use the name {run_name!r}")
+            if args.run_name is not None:
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.run_name):
+                    raise ValueError(
+                        "--run-name must start with a letter or digit and contain only "
+                        "letters, digits, dots, underscores, or hyphens"
+                    )
+                run_name = args.run_name
             args.run_name = run_name
             # W&B must also reject duplicates when checkpoints are stored elsewhere.
             if args.board == "wandb":
