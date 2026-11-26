@@ -84,7 +84,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 uv run --locked --extra cpu \
   --report .tmp/codex/core-question-batching/packing-pair.json --repeats 3
 ```
 
-Append `--batch-sizes 4 8 16 32` to measure both scorers at each question batch size. Each size reports the eligible and full cohorts separately, plus the fastest observed size for each scorer and cohort. The MPS process uses Metal's recommended working-set limit and records allocation failures per scorer and size. Sampled peak memory covers standalone evaluation tensors.
+Append `--batch-sizes 4 8 16 32` to measure both scorers at each question batch size. Each size reports the eligible and full cohorts separately, plus the fastest observed size for each scorer and cohort. The MPS process uses PyTorch's default allocator high-watermark ratio of 1.7 unless overridden by the environment. It records allocation failures per scorer and size. Sampled peak memory covers standalone evaluation tensors. [PyTorch MPS allocator settings](https://docs.pytorch.org/docs/2.15/mps_environment_variables.html)
 
 ## Two-H100 follow-up
 
