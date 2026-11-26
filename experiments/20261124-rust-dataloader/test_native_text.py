@@ -1,4 +1,5 @@
 """Native text parity using GPT-2 from an explicitly configured local cache."""
+import hashlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -109,6 +110,21 @@ def test_block_best_fit_matches_drained_python_blocks_and_resume(text_shards, to
             fill()
 
     reference._fill_lookahead = fill_empty_block
+    greedy_take = reference._take_document
+
+    def take_exact_fit(space):
+        fill_empty_block()
+        lengths = [len(document) for document, _ in reference.lookahead]
+        for index, length in enumerate(lengths):
+            if length == space:
+                return reference.lookahead.pop(index)
+        for first, length in enumerate(lengths):
+            for other in lengths[first + 1:]:
+                if length + other == space:
+                    return reference.lookahead.pop(first)
+        return greedy_take(space)
+
+    reference._take_document = take_exact_fit
     resumed = []
     seen = set()
     previous = None
@@ -152,6 +168,26 @@ def test_block_best_fit_rejects_other_strategy_checkpoint(text_shards, tokenizer
     saved = DataLoaderState.model_validate_json(next(loader)[2].model_dump_json())
     with pytest.raises(ValueError, match="Incompatible training data checkpoint"):
         make_loader(text_shards, tokenizer, "rust", 0, state=saved, packing_strategy=target)
+
+
+def test_exact_pair_rejects_greedy_block_checkpoint(text_shards, tokenizer, monkeypatch):
+    old_signatures = []
+    sha256 = hashlib.sha256
+
+    def capture_greedy_signature(payload=b""):
+        if b'"block-best-fit-exact-pair"' in payload:
+            old_signatures.append(sha256(payload.replace(
+                b'"block-best-fit-exact-pair"', b'"block-best-fit"',
+            )).hexdigest())
+        return sha256(payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("gpt_lab.data.loader.hashlib.sha256", capture_greedy_signature)
+        loader = make_loader(text_shards, tokenizer, "rust", 0, packing_strategy="block-best-fit")
+    assert len(old_signatures) == 1
+    saved = next(loader)[2].model_copy(update={"packing_signature": old_signatures[0]})
+    with pytest.raises(ValueError, match="Incompatible training data checkpoint"):
+        make_loader(text_shards, tokenizer, "rust", 0, state=saved, packing_strategy="block-best-fit")
 
 
 def test_block_best_fit_is_training_only(text_shards, tokenizer):

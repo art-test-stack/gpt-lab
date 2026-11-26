@@ -183,7 +183,7 @@ class DistDataLoader:
                 if isinstance(config, TokenizerConfig) else None,
             )
             if block_best_fit:
-                signature_data += ("block-best-fit",)
+                signature_data += ("block-best-fit-exact-pair",)
             self.signature = hashlib.sha256(json.dumps(signature_data, sort_keys=True).encode()).hexdigest()
 
         self.cursor = start_state or DataLoaderState()
@@ -251,7 +251,7 @@ class DistDataLoader:
                 (state.shard_idx, state.global_shard_idx, state.row_group_idx, state.offset_in_row_group, state.epoch),
                 state.lookahead_refs, state.pending_document_ref, state.document_token_offset,
             )
-        options = {"block_best_fit": True} if block_best_fit else {}
+        options = {"block_exact_pair": True} if block_best_fit else {}
         return TextLoader(
             list(zip(sm.shard_idx, sm.shard_paths, strict=True)), sm.column_name,
             dataset.split == "train", sm.ddp_rank, sm.world_size, (self.B, self.T + 1),

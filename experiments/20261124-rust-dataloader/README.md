@@ -12,9 +12,9 @@ Baseline is `61f066250420afbc121524037b996ee4a3524c0a`, fetched from `origin/mas
 
 If a refill error escapes during training, discard the iterator. Rebuild with `build_dataloader(..., resume_state=last_committed_state)` using the last committed `DataLoaderState`. The failed batch may already have consumed part of a document.
 
-`--dataloader-backend rust --packing-strategy block-best-fit` admits 64 consecutive training documents and drains that block before admitting more. Blocks can cross row-group and shard boundaries within an epoch. The final block of each epoch can be shorter. Within a block, the packer selects the largest fitting document or splits the shortest when none fits, breaking ties by source order and retaining document suffixes.
+`--dataloader-backend rust --packing-strategy block-best-fit` admits 64 consecutive training documents and drains each block before admitting more. Blocks can cross row-group and shard boundaries within an epoch. The final block of each epoch can be shorter. The packer first tries an exact single-document fit, then an exact pair. The fallback selects the largest fitting document or splits the shortest when none fits. Ties follow source order and document suffixes are retained.
 
-Rolling-16 remains the default and keeps its existing checkpoint signature. Block best-fit has a separate signature. Use the same packing strategy when resuming a run. Validation uses rolling-16 in both configurations so loss comparisons can use the same held-out batches.
+Rolling-16 remains the default and keeps its existing checkpoint signature. Exact-pair blocks have a distinct signature from the greedy blocks at `f008399`. Rebuild the optional extension for exact-pair runs and resume greedy-block checkpoints on the greedy implementation. Validation uses rolling-16 in both configurations so loss comparisons can use the same held-out batches.
 
 ## Reproduce on macOS arm64
 

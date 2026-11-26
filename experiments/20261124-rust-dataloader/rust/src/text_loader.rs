@@ -13,6 +13,27 @@ type TokenizerConfig = (HashMap<Vec<u8>, u32>, String, HashMap<String, u32>, u32
 type State = (CursorTuple, Vec<DocumentRef>, Option<DocumentRef>, usize);
 type Document = (Vec<u32>, Option<DocumentRef>);
 
+fn select_exact(documents: &[Document], space: usize) -> Option<usize> {
+    if let Some(index) = documents
+        .iter()
+        .position(|document| document.0.len() == space)
+    {
+        return Some(index);
+    }
+    for (index, document) in documents.iter().enumerate() {
+        if let Some(remainder) = space.checked_sub(document.0.len()) {
+            if documents[index + 1..]
+                .iter()
+                .any(|other| other.0.len() == remainder)
+            {
+                // After consuming this member, the remainder is an exact single fit.
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
 enum FillError {
     Exhausted,
     Source(String),
@@ -27,7 +48,7 @@ pub struct TextLoader {
     batch_size: usize,
     capacity: usize,
     encoding_batch_size: usize,
-    block_best_fit: bool,
+    block_exact_pair: bool,
     training: bool,
     cursor: Cursor,
     encoded: VecDeque<(Vec<u32>, Cursor)>,
@@ -54,10 +75,10 @@ impl TextLoader {
     }
 
     fn refill(&mut self) -> Result<(), FillError> {
-        if self.block_best_fit && !self.lookahead.is_empty() {
+        if self.block_exact_pair && !self.lookahead.is_empty() {
             return Ok(());
         }
-        let lookahead_size = if self.block_best_fit { 64 } else { 16 };
+        let lookahead_size = if self.block_exact_pair { 64 } else { 16 };
         while self.lookahead.len() < lookahead_size {
             if self.encoded.is_empty() {
                 let Some((texts, cursor)) = self
@@ -108,15 +129,20 @@ impl TextLoader {
             while position < self.capacity {
                 if self.document.is_none() {
                     self.refill()?;
-                    let best = crate::select_document(
-                        self.lookahead.len(),
-                        self.capacity - position,
-                        |index| {
-                            Ok::<usize, std::convert::Infallible>(self.lookahead[index].0.len())
-                        },
-                    )
-                    .unwrap()
-                    .ok_or(FillError::Exhausted)?;
+                    let space = self.capacity - position;
+                    let exact = if self.block_exact_pair {
+                        select_exact(&self.lookahead, space)
+                    } else {
+                        None
+                    };
+                    let best = exact
+                        .or_else(|| {
+                            crate::select_document(self.lookahead.len(), space, |index| {
+                                Ok::<usize, std::convert::Infallible>(self.lookahead[index].0.len())
+                            })
+                            .unwrap()
+                        })
+                        .ok_or(FillError::Exhausted)?;
                     self.document = Some(self.lookahead.remove(best));
                 }
                 let tokens = &self.document.as_ref().unwrap().0;
@@ -156,7 +182,7 @@ impl TextLoader {
 impl TextLoader {
     #[new]
     #[pyo3(signature = (shards, column, training, rank, world_size, batch_shape, tokenizer_threads,
-                       tokenizer_batch_size, tokenizer, resume=None, block_best_fit=false))]
+                       tokenizer_batch_size, tokenizer, resume=None, block_exact_pair=false))]
     fn new(
         py: Python<'_>,
         shards: Vec<(usize, PathBuf)>,
@@ -169,9 +195,9 @@ impl TextLoader {
         tokenizer_batch_size: usize,
         tokenizer: TokenizerConfig,
         resume: Option<State>,
-        block_best_fit: bool,
+        block_exact_pair: bool,
     ) -> PyResult<Self> {
-        if block_best_fit && !training {
+        if block_exact_pair && !training {
             return Err(PyValueError::new_err(
                 "Block best-fit applies only to training",
             ));
@@ -215,7 +241,7 @@ impl TextLoader {
                 batch_size,
                 capacity,
                 encoding_batch_size: tokenizer_batch_size,
-                block_best_fit,
+                block_exact_pair,
                 training,
                 cursor: source_cursor.unwrap_or_default(),
                 encoded: VecDeque::new(),
@@ -229,7 +255,7 @@ impl TextLoader {
             if let Some((_, lookahead_refs, pending, offset)) = resume {
                 let mut refs = lookahead_refs.clone();
                 refs.extend(pending);
-                let lookahead_size = if block_best_fit { 64 } else { 16 };
+                let lookahead_size = if block_exact_pair { 64 } else { 16 };
                 if lookahead_refs.len() >= lookahead_size
                     || refs.iter().collect::<HashSet<_>>().len() != refs.len()
                     || (pending.is_none() && offset != 0)
@@ -298,5 +324,35 @@ impl TextLoader {
         output.copy_from_slice(py, &self.output)?;
         self.failed = false;
         Ok(self.state())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn documents(lengths: &[usize]) -> Vec<Document> {
+        lengths
+            .iter()
+            .map(|length| (vec![0; *length], None))
+            .collect()
+    }
+
+    #[test]
+    fn exact_pair_avoids_splitting_nine_six_four() {
+        let mut block = documents(&[9, 6, 4]);
+        let first = select_exact(&block, 10).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(block.remove(first).0.len(), 6);
+        let second = select_exact(&block, 4).unwrap();
+        assert_eq!(block.remove(second).0.len(), 4);
+        assert_eq!(block[0].0.len(), 9);
+    }
+
+    #[test]
+    fn exact_single_and_pair_ties_follow_source_order() {
+        assert_eq!(select_exact(&documents(&[6, 4, 10, 10]), 10), Some(2));
+        assert_eq!(select_exact(&documents(&[6, 3, 7, 4]), 10), Some(0));
+        assert_eq!(select_exact(&documents(&[9, 6, 2]), 10), None);
     }
 }
