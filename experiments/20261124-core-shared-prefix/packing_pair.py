@@ -2,7 +2,6 @@
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 from statistics import median
 from threading import Event, Thread
@@ -209,9 +208,6 @@ def main():
         parser.error("batch sizes must be distinct positive integers")
     torch.set_num_threads(1)
     device = torch.device("mps")
-    # GPT-Lab disables the cap at import. Use PyTorch's default for the sweep.
-    memory_fraction = float(os.getenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.7"))
-    torch.mps.set_per_process_memory_fraction(memory_fraction)
     model, tokenizer = load_frozen_checkpoint(args.checkpoint, device), ByteTokenizer()
     pad_id = tokenizer.get_bos_token_id()
     fixture = check_wide_fixture(model, pad_id, device)
@@ -233,7 +229,6 @@ def main():
     report = {
         "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
         "device": "mps", "torch": torch.__version__, "prefetch": False,
-        "mps_high_watermark_ratio": memory_fraction,
         "fixture": fixture, "batch_sizes": sizes,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
