@@ -83,7 +83,7 @@ Training compares tensors and full checkpoint state after each of 350 batches on
 
 The native text tests use GPT-2 to compare all three backends across both CPU ranks and resume in both directions. The fixture includes empty documents, Unicode, literal special-token strings, and rank-strided validation row groups.
 
-Block best-fit matched a Python reference for 1,100 batches on each of two logical CPU ranks. Resumes from a partially consumed document and buffered block references matched exact tensors and state across row-group, shard, and epoch transitions. Each strategy rejects a checkpoint from the other. An older rolling-16 checkpoint from `8d24e93` resumed for 100 identical batches on each rank. The two training configurations produced identical tensors and state for all 47 held-out batches per rank.
+Exact-pair blocks matched a Python reference for 1,100 batches on each of two logical CPU ranks. Resumes from a partially consumed document and buffered block references matched exact tensors and state across row-group, shard, and epoch transitions. Tests reject greedy-block checkpoints under exact-pair packing and reject checkpoints across rolling and block packing. An older rolling-16 checkpoint from `8d24e93` resumed for 100 identical batches on each rank. The previous rolling and greedy comparison used identical tensors and state for all 47 held-out batches per rank.
 
 Rust unit tests inject typed row-group read failures to check reopening, cursor stability, the five-attempt limit, and immediate propagation of other errors.
 
@@ -121,6 +121,43 @@ The rolling-16 sweep used the original ClimbMix shard and the code at `8d24e93` 
 | 4 | 8,192 | 1,651 | 3.203 (3.039–3.460) | 5.279 (4.677–5.324) | 5.259 (3.897–6.105) | 10.340 (7.579–11.049) |
 
 End-to-end Rust had 1.67–2.03× the median throughput of Rust packing across the nine shapes. Within each shape, every backend produced the same full digest of `x`, `y`, and validation `DataLoaderState` through exhaustion.
+
+## Training-mode packing benchmark
+
+`benchmark_training.py` compares full Rust rolling-16 and greedy blocks at `f008399` with exact-pair blocks at the candidate commit. It builds each revision from Git into a temporary directory and runs `split="train"` through one epoch. The timing builds add only the epoch stop. Separate builds count splits and verify their emitted tensors and state against the timing builds.
+
+```sh
+.venv/bin/python experiments/20261124-rust-dataloader/benchmark_training.py \
+  --candidate fe0f648 --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet
+```
+
+Use the GPT-2 cache from the setup above. Add `--offline` when the locked Cargo dependencies are cached. The runner saves individual observations to `.tmp/codex/rust-dataloader/training-comparison/comparison.json` by default.
+
+Throughput counts non-BOS tokens at unique positions in emitted full batches, using the first column of `x` and all of `y`. Row-fit eligibility uses the encoded document length including BOS and the packed row width of `context + 1`. A split is counted once at the first cut. The untimed counts cover all source documents, and the JSON records the counts added during the final incomplete batch separately.
+
+On Apple M2, all arms used cached ClimbMix shard `01061`, batch 16, GPT-2, a four-thread tokenizer budget, and 64-document tokenization chunks. Each arm ran in a fresh process in every one of the six run orders. Timing covered loader construction through exhaustion. The [per-run JSON](benchmark_training_m2.json) includes all 90 samples, the shard hash, tensor and state digests, and the emitted source-token count used in every rate.
+
+Median millions of emitted source tokens/s with the observed run range in parentheses.
+
+| Context | Rolling-16 | Greedy blocks | Exact-pair blocks | Exact-pair vs greedy |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 9.968 (9.410–10.605) | 9.305 (6.383–10.327) | 9.503 (7.918–11.276) | +2.1% |
+| 1,024 | 11.589 (9.412–12.045) | 11.827 (11.268–12.385) | 11.532 (11.187–11.842) | -2.5% |
+| 2,048 | 10.352 (9.090–12.014) | 10.755 (10.247–12.206) | 10.116 (8.985–10.857) | -5.9% |
+| 4,096 | 10.604 (4.854–11.453) | 10.901 (4.714–12.010) | 10.753 (10.154–11.978) | -1.4% |
+| 8,192 | 6.964 (5.639–9.133) | 7.942 (7.470–8.051) | 7.767 (7.241–8.424) | -2.2% |
+
+Row-fit documents split in one epoch. Each percentage uses the row-fit count for its context.
+
+| Context | Row-fit documents | Rolling-16 splits | Greedy block splits | Exact-pair splits |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 60,233 | 21,800 (36.19%) | 19,982 (33.17%) | 12,417 (20.61%) |
+| 1,024 | 72,291 | 19,472 (26.94%) | 18,120 (25.07%) | 9,336 (12.91%) |
+| 2,048 | 80,978 | 15,667 (19.35%) | 14,487 (17.89%) | 6,801 (8.40%) |
+| 4,096 | 84,608 | 10,310 (12.19%) | 9,384 (11.09%) | 3,858 (4.56%) |
+| 8,192 | 85,672 | 5,861 (6.84%) | 5,265 (6.15%) | 1,820 (2.12%) |
+
+Exact-pair selection reduced row-fit splits by 38–65% versus greedy blocks. Median throughput changed by −5.9% to +2.1% and run ranges overlapped at every context. Greedy and exact-pair counts include six and one final-tail splits at context 4,096, and eight and four at context 8,192.
 
 ## Original packing-only benchmark
 
