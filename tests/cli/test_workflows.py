@@ -152,6 +152,7 @@ def test_resume_restores_all_states_through_existing_pipeline(training_dependenc
     deps.auto.assert_not_called()
     assert deps.factory.call_args.kwargs['optimizer_state_layout'] == 'sharded'
     assert deps.loader.call_args_list[0].kwargs['resume_state'] is deps.state.train_loader_state
+    assert [call.kwargs['dataloader_backend'] for call in deps.loader.call_args_list] == ['auto', 'auto']
     deps.model.build_optimizer.return_value.load_state_dict.assert_called_once_with(deps.checkpoint.optimizer_state)
     assert deps.trainer_factory.call_args.kwargs['config'] is deps.saved_config
     assert deps.trainer_factory.call_args.kwargs['resume_state'] is deps.state
@@ -214,6 +215,7 @@ def test_auto_preserves_configuration_and_cleanup_on_failure(training_dependenci
     with pytest.raises(RuntimeError, match='simulated failure'):
         run(args)
     cfg = deps.auto.call_args.kwargs
+    assert [call.kwargs['dataloader_backend'] for call in deps.loader.call_args_list] == ['auto', 'auto']
     assert (cfg['depth'], cfg['vocab_size'], cfg['n_kv_heads'], cfg['tokenizer_model']) == (4, 512, 2, 'auto')
     assert cfg['tie_embeddings'] == 'embs,head,value_embs:'
     deps.manager.load.assert_not_called()

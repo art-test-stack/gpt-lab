@@ -3,7 +3,7 @@
 from importlib import import_module
 
 
-DATALOADER_BACKENDS = ("python", "rust-packing", "rust")
+DATALOADER_BACKENDS = ("auto", "python", "rust-packing", "rust")
 PACKING_STRATEGIES = ("rolling-16", "block-best-fit")
 
 
@@ -18,16 +18,20 @@ def resolve_packing_backend(dataloader_backend, packing_backend, packing_strateg
         raise ValueError("The Rust dataloader includes its own packing backend")
     if packing_strategy not in PACKING_STRATEGIES:
         raise ValueError(f"Unknown packing strategy {packing_strategy!r}")
-    if packing_strategy == "block-best-fit" and (dataloader_backend != "rust" or split != "train"):
+    if packing_strategy == "block-best-fit" and (
+        dataloader_backend not in ("auto", "rust") or packing_backend != "python" or split != "train"
+    ):
         raise ValueError("block-best-fit requires the end-to-end Rust training loader")
     return packing_backend
 
 
-def native_extension():
+def native_extension(*, required=True):
     try:
         return import_module("gpt_lab_rust_packer")
     except ImportError as exc:
+        if not required and isinstance(exc, ModuleNotFoundError) and exc.name == "gpt_lab_rust_packer":
+            return None
         raise ImportError(
-            "Rust dataloaders require the optional extension. From the repository root, run "
-            "`uv sync --locked --extra cpu --extra rust-dataloader`."
+            "Rust dataloaders require the native extension. Run `uv sync --locked --extra rust-dataloader` "
+            "with your existing device extra (--extra cpu or --extra gpu)."
         ) from exc

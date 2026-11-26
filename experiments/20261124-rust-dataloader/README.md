@@ -4,11 +4,11 @@ Baseline is `61f066250420afbc121524037b996ee4a3524c0a`, fetched from `origin/mas
 
 `build_dataloader(..., tokenizer_batch_size=64)` batches encoding for adapters that declare `supports_exact_batch_encoding = True` on their concrete class. Their `encode_batch` must return deterministic, unpadded sequences in source order that match scalar encoding, including BOS. Checkpoint restore encodes buffered documents individually. The tiktoken adapter used for GPT-2 opts in and forwards `num_threads=tokenizer_threads`. Other adapters and pretokenized input use the scalar path. The default packing lookahead is 16 documents when BOS is available and one otherwise.
 
-`build_dataloader(..., packing_backend="rust")` or `DistDataLoader(..., packing_backend="rust")` selects the optional extension. Rust selects documents and fills the existing CPU batch buffer from contiguous `int64` documents. For a document that spans batches, it copies only the tokens the current batch consumes. Python owns the shard order, refill, and checkpoint. Cursors advance per admitted document, so unused encodings are recreated after resume. The default is scalar tokenization and Python packing, with the same checkpoint signature and validation exhaustion behavior as the baseline.
+`build_dataloader(..., packing_backend="rust")` or `DistDataLoader(..., packing_backend="rust")` selects the optional extension. Rust selects documents and fills the existing CPU batch buffer from contiguous `int64` documents. For a document that spans batches, it copies only the tokens the current batch consumes. Python owns the shard order, refill, and checkpoint. Cursors advance per admitted document, so unused encodings are recreated after resume. The scalar Python baseline is selected explicitly by the benchmark.
 
 `build_dataloader(..., dataloader_backend="rust")` selects the end-to-end CPU path for cached Parquet text with the repository’s tiktoken tokenizer. Python supplies the rank-owned shard order, actual tokenizer parameters, batch shape, thread budget, and checkpoint. Rust reads and tokenizes the text, packs the next batch, and copies it into the existing CPU tensor in one extension call. PyTorch transfers that tensor to the training device. CoreBPE is initialized once per iterator from [tiktoken 0.12.0](https://github.com/openai/tiktoken/tree/97e49cbadd500b5cc9dbb51a486f0b42e6701bee). It encodes literal special-token strings as ordinary text and prepends the configured BOS.
 
-`gpt-lab train auto` and `gpt-lab train resume` accept `--dataloader-backend {python,rust-packing,rust}` for both training and validation. `python` is the default. The two Rust selections default to tokenization chunks of 64 documents and accept the same training checkpoints as Python. Pass `--tokenizer-batch-size 64` to compare `python` and `rust-packing` with the same tokenization chunk size for training and validation. The end-to-end path requires local shards and non-null UTF-8 text. On Unix, an `EIO` while reading a row group causes Rust to reopen the shard before retrying the same group. It makes up to five attempts with 1, 2, 4, and 8 second delays.
+`gpt-lab train auto` and `gpt-lab train resume` accept `--dataloader-backend {auto,python,rust-packing,rust}` for both training and validation. The default, `auto`, uses end-to-end Rust for supported cached inputs when the extension is installed and Python otherwise. The two Rust selections default to tokenization chunks of 64 documents and accept the same training checkpoints as Python. Pass `--tokenizer-batch-size 64` to compare `python` and `rust-packing` with the same tokenization chunk size for training and validation. The end-to-end path requires local shards and non-null UTF-8 text. On Unix, an `EIO` while reading a row group causes Rust to reopen the shard before retrying the same group. It makes up to five attempts with 1, 2, 4, and 8 second delays.
 
 If a refill error escapes during training, discard the iterator. Rebuild with `build_dataloader(..., resume_state=last_committed_state)` using the last committed `DataLoaderState`. The failed batch may already have consumed part of a document.
 
@@ -18,13 +18,13 @@ Rolling-16 remains the default and keeps its existing checkpoint signature. Exac
 
 ## Reproduce on macOS arm64
 
-From the repository root, install the optional production package in the project’s Python 3.12 CPU environment. The PyO3 crate lives in `packages/rust-dataloader` and uses PyO3 0.30.1. The measurements below used Rust 1.91.
+From the repository root, install the project’s standard Python 3.12 CPU environment with Cargo available. The PyO3 crate lives in `packages/rust-dataloader` and uses PyO3 0.30.1. The measurements below used Rust 1.91.
 
 ```sh
 scratch="$PWD/.tmp/codex/rust-dataloader"
 mkdir -p "$scratch"
 export PYTHONDONTWRITEBYTECODE=1
-uv sync --locked --extra cpu --extra rust-dataloader --group dev
+uv sync --locked --extra cpu --group dev
 
 export TIKTOKEN_CACHE_DIR=.tmp/codex/training-data-inspection/tiktoken
 .venv/bin/python -c 'from gpt_lab.tokenizer import Tokenizer; Tokenizer.from_pretrained("gpt2", source="tiktoken")'
@@ -166,4 +166,4 @@ Timing includes loader initialization and every batch request through exhaustion
 
 Each ClimbMix run emitted 54,014,008 source tokens across 1,651 full batches. Each pretokenized run emitted 5,232,954 source tokens across 160 full batches. The tensor and state digests matched across backends and repetitions for each input.
 
-Batched Python raised median ClimbMix throughput by 62.9%. Rust added 16.5% over batched Python at about 6 MiB higher peak RSS. It reached 3.59× Python throughput on pretokenized input. Use batched Python as the first optimization and keep Rust opt-in for runs where loader time is a bottleneck. These measurements cover local CPU loader throughput.
+Batched Python raised median ClimbMix throughput by 62.9%. Rust added 16.5% over batched Python at about 6 MiB higher peak RSS. It reached 3.59× Python throughput on pretokenized input. These historical results compare the explicitly selected Python and Rust-packing backends. These measurements cover local CPU loader throughput.

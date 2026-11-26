@@ -61,7 +61,7 @@ def train_base(
     monitor_grad_norms=False,
     device_batch_size=32,
     use_nanochat_dataloader=False,
-    dataloader_backend='python',
+    dataloader_backend='auto',
     tokenizer_batch_size=None,
     packing_strategy='rolling-16',
     architecture_config=None,

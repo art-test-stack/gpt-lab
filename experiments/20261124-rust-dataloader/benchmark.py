@@ -61,7 +61,9 @@ def _measure(args, shard):
     pa.set_cpu_count(1)
     pa.set_io_thread_count(1)
     module = baseline_loader() if args.backend == "baseline" else current
-    kwargs = {} if args.backend == "baseline" else {"packing_backend": args.backend}
+    kwargs = {}
+    if args.backend != "baseline":
+        kwargs["dataloader_backend"] = "rust-packing" if args.backend == "rust" else "python"
     if shard is not None:
         tokenizer = Tokenizer.from_pretrained("gpt2", source="tiktoken")
         bos = tokenizer.get_bos_token_id()

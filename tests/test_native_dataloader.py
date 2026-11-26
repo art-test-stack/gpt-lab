@@ -1,6 +1,7 @@
 """Native text parity using GPT-2 from an explicitly configured local cache."""
 import hashlib
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,7 @@ import torch
 
 from gpt_lab.data import build_dataloader
 from gpt_lab.tokenizer import Tokenizer
-from gpt_lab.utils.schemas import DataLoaderState
+from gpt_lab.utils.schemas import DataLoaderState, TokenizerConfig
 
 
 @pytest.fixture(scope="module")
@@ -23,6 +24,12 @@ def tokenizer(native_extension):
             pytest.fail("Preload GPT-2 into TIKTOKEN_CACHE_DIR before running native tests")
         pytest.skip("Set TIKTOKEN_CACHE_DIR to an existing GPT-2 cache")
     return Tokenizer.from_pretrained("gpt2", source="tiktoken")
+
+
+@pytest.fixture
+def byte_tokenizer():
+    config = TokenizerConfig(name="byte-test", vocab_size=257, pat_str="gpt2")
+    return Tokenizer({bytes([i]): i for i in range(256)}, config.special_tokens.list(), config)
 
 
 @pytest.fixture
@@ -54,6 +61,54 @@ def assert_equal(expected, actual):
     assert torch.equal(expected[0], actual[0])
     assert torch.equal(expected[1], actual[1])
     assert expected[2] == actual[2]
+
+
+@pytest.mark.parametrize("compression", ["gzip", "brotli", "lz4"])
+def test_default_native_loader_reads_cached_parquet_codecs(tmp_path, byte_tokenizer, native_extension, compression):
+    path = tmp_path / "codec"
+    path.mkdir()
+    pq.write_table(pa.table({"text": ["café", "長い文", "short", "tail"] * 4}),
+                   path / "shard_00000.parquet", compression=compression, row_group_size=4)
+    args = dict(name=path.name, cachedir=tmp_path, max_shards=0, split="val",
+                batch_size=1, seq_len=7, tokenizer=byte_tokenizer,
+                comp_info=SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu")))
+    default = build_dataloader(**args)()
+    python = build_dataloader(**args, dataloader_backend="python")()
+    assert default._rust_text_loader is not None and python._rust_text_loader is None
+    batches = 0
+    for actual, expected in zip(default, python, strict=True):
+        assert_equal(expected, actual)
+        batches += 1
+    assert batches > 0
+
+
+def test_missing_extension_preserves_python_default_and_strict_native_requests(text_shards, byte_tokenizer, monkeypatch):
+    monkeypatch.setitem(sys.modules, "gpt_lab_rust_packer", None)
+    args = dict(name="native-text", cachedir=text_shards, max_shards=4, split="train",
+                batch_size=2, seq_len=17, tokenizer=byte_tokenizer,
+                comp_info=SimpleNamespace(rank=0, world_size=2, device=torch.device("cpu")))
+    default = build_dataloader(**args)
+    assert default._rust_text_loader is default._rust_pack is None
+    assert_equal(next(default), next(build_dataloader(**args, dataloader_backend="python")))
+    for selector in ({"dataloader_backend": "rust"}, {"dataloader_backend": "rust-packing"},
+                     {"packing_strategy": "block-best-fit"}):
+        with pytest.raises(ImportError, match="rust-dataloader"):
+            build_dataloader(**args, **selector)
+
+
+def test_default_uses_only_rank_owned_cached_shards(tmp_path, byte_tokenizer, native_extension):
+    path = tmp_path / "partial"
+    path.mkdir()
+    # Seed 0 gives train order (0, 1). Rank 1's shard still needs downloading.
+    pq.write_table(pa.table({"text": ["cached"] * 8}), path / "shard_00000.parquet")
+    args = dict(name=path.name, cachedir=tmp_path, max_shards=2, base_url="https://example.invalid",
+                data_seed=0, split="train", batch_size=1, seq_len=3, tokenizer=byte_tokenizer)
+    for rank in (0, 1):
+        context = SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"))
+        default = build_dataloader(**args, comp_info=context)
+        assert (default._rust_text_loader is not None) == (rank == 0)
+    with pytest.raises(FileNotFoundError, match="shard_00001"):
+        build_dataloader(**args, comp_info=context, dataloader_backend="rust")
 
 
 @pytest.mark.parametrize("rank", [0, 1])

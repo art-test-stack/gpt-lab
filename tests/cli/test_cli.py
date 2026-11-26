@@ -173,7 +173,8 @@ def test_tokenizer_batch_size_flag(mode):
 @pytest.mark.parametrize('mode', ['auto', 'resume'])
 def test_packing_strategy_flag(mode):
     parser = build_parser()
-    assert parser.parse_args(['train', mode]).packing_strategy == 'rolling-16'
+    defaults = parser.parse_args(['train', mode])
+    assert (defaults.dataloader_backend, defaults.packing_strategy) == ('auto', 'rolling-16')
     args = parser.parse_args(['train', mode, '--dataloader-backend', 'rust', '--packing-strategy', 'block-best-fit'])
     assert args.packing_strategy == 'block-best-fit'
 

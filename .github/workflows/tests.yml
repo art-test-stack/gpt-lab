@@ -26,12 +26,12 @@ jobs:
         with:
           version: "0.11.28"
 
-      - name: Install dependencies
-        run: |
-          uv sync --locked --group dev --extra cpu
+      - name: Install Python-only dependencies
+        run: uv sync --locked --extra cpu --group dev --no-group rust-dataloader
 
       - name: Run tests
         run: |
+          .venv/bin/python -I -c 'import importlib.util; assert importlib.util.find_spec("gpt_lab_rust_packer") is None'
           .venv/bin/python -m pytest -m "not slow"
 
   native:
@@ -53,8 +53,8 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.28"
-      - name: Install framework with native dataloader
-        run: uv sync --locked --extra cpu --extra rust-dataloader --group dev --no-editable
+      - name: Install framework with default dataloader
+        run: uv sync --locked --extra cpu --group dev --no-editable
       - name: Cache GPT-2 tokenizer
         run: .venv/bin/python -c 'from gpt_lab.tokenizer import Tokenizer; Tokenizer.from_pretrained("gpt2", source="tiktoken")'
       - name: Run installed backend parity and resume tests

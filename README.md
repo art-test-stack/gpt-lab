@@ -116,7 +116,7 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
    git clone git@github.com:art-test-stack/gpt-lab.git
    ```
 
-- Install dependencies for CUDA device:
+- Install a Rust toolchain with Cargo for the default native dataloader, then install dependencies for your device. For CUDA:
   ```bash
   uv sync --extra gpu
   ```
@@ -133,11 +133,10 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
   uv sync --group=notebook
   ```
 
-The standard install uses the Python dataloader. To install the optional native
-dataloader, install a Rust toolchain with Cargo and run this from the repository root.
+Repository-root `uv sync` installs the Rust dataloader by default. For a Python-only environment without a Rust toolchain, exclude the native dependency group:
 
 ```sh
-uv sync --locked --extra cpu --extra rust-dataloader
+uv sync --locked --extra cpu --no-group rust-dataloader
 ```
 
 Use `--extra gpu` in place of `--extra cpu` for a CUDA environment.
@@ -227,9 +226,10 @@ Use `gpt_lab.data.build_dataloader` with the `dataloader_backend` and
 
 | Backend | Training packing | Validation packing | Requirements |
 | --- | --- | --- | --- |
-| `python` (default) | `rolling-16` | `rolling-16` | Standard Python install |
-| `rust-packing` | `rolling-16` | `rolling-16` | `rust-dataloader` extra. Python handles input and tokenization. |
-| `rust` | `rolling-16` or `block-best-fit` | `rolling-16` | `rust-dataloader` extra, cached text Parquet shards, and the gpt-lab tiktoken tokenizer |
+| `auto` (default) | `rolling-16` or `block-best-fit` with full Rust | `rolling-16` | Uses end-to-end Rust for cached text Parquet with the gpt-lab tiktoken tokenizer. Uses Python for other tokenizers, pretokenized input, shards that still need downloading, or a Python-only install. |
+| `python` | `rolling-16` | `rolling-16` | Selects the Python loader explicitly. |
+| `rust-packing` | `rolling-16` | `rolling-16` | Native package installed. Python handles input and tokenization. |
+| `rust` | `rolling-16` or `block-best-fit` | `rolling-16` | Requires the native package, cached text Parquet shards, and the gpt-lab tiktoken tokenizer. |
 
 `block-best-fit` uses up to 64 documents at a time and tries an exact single,
 then an exact pair, then a greedy fit. It has a distinct training checkpoint

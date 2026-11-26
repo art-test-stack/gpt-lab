@@ -54,6 +54,9 @@ rust-dataloader = [
 ]
 
 [dependency-groups]
+rust-dataloader = [
+    "gpt-lab-rust-packer==0.1.0",
+]
 dev = [
     "pytest==8.0",
     "huggingface-hub==1.33.0",
@@ -85,7 +88,7 @@ where = ["src"]
 [tool.uv]
 managed = true
 package = true
-default-groups = []
+default-groups = ["rust-dataloader"]
 
 conflicts = [
     [

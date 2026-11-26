@@ -740,6 +740,9 @@ notebook = [
     { name = "ipykernel" },
     { name = "jupyter" },
 ]
+rust-dataloader = [
+    { name = "gpt-lab-rust-packer" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -779,6 +782,7 @@ notebook = [
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "jupyter", specifier = ">=1.1.1" },
 ]
+rust-dataloader = [{ name = "gpt-lab-rust-packer", directory = "packages/rust-dataloader" }]
 
 [[package]]
 name = "gpt-lab-rust-packer"

@@ -45,9 +45,9 @@ class ShardedDataset:
         tokenizer_threads: int = 4,
         data_seed: int = RANDOM_SEED,
         *,
-        tokenizer_batch_size: int = 1,
+        tokenizer_batch_size: Optional[int] = None,
     ):
-        if tokenizer_batch_size < 1:
+        if tokenizer_batch_size is not None and tokenizer_batch_size < 1:
             raise ValueError("Tokenizer batch size must be positive")
         if split == "train" and start_state is not None and start_state.ordered_shard_ids is None:
             raise ValueError("Training data checkpoint predates saved shard order and document references")
@@ -91,7 +91,7 @@ class ShardedDataset:
         return tokens
 
     def __iter__(self) -> Iterator[Tuple[list[int], DataLoaderState]]:
-        if (self.tokenizer_batch_size > 1
+        if (self.tokenizer_batch_size is not None and self.tokenizer_batch_size > 1
                 and vars(type(self.tokenizer)).get("supports_exact_batch_encoding") is True):
             encode_batch = getattr(self.tokenizer, "encode_batch", None)
             if callable(encode_batch):
@@ -115,6 +115,25 @@ class ShardedDataset:
                     yield tokens, cursor.model_copy(update={"offset_in_row_group": offset})
 
 
+def _select_dataloader_backend(dataset, backend, packing_backend, packing_strategy):
+    if backend != "auto":
+        return backend
+    if packing_backend == "rust":
+        # Legacy packing-only callers keep Python's tokenizer and chunk-size default.
+        return "python"
+    if packing_strategy == "block-best-fit":
+        return "rust"
+    if type(dataset) is not ShardedDataset:
+        return "python"
+    from gpt_lab.tokenizer import Tokenizer
+
+    if type(dataset.tokenizer) is not Tokenizer:
+        return "python"
+    if dataset.sm.base_url and any(not path.is_file() for path in dataset.sm.shard_paths):
+        return "python"
+    return "rust" if native_extension(required=False) is not None else "python"
+
+
 class DistDataLoader:
     """Pack each row without discarding document tails, starting with BOS when available.
 
@@ -132,12 +151,13 @@ class DistDataLoader:
         eos_token_id: Optional[int] = None,
         *,
         packing_backend: str = "python",
-        dataloader_backend: str = "python",
+        dataloader_backend: str = "auto",
         packing_strategy: str = "rolling-16",
     ):
         if batch_size < 1 or seq_len < 1:
             raise ValueError("Batch size and sequence length must be positive")
         split = getattr(dataset, "split", None)
+        dataloader_backend = _select_dataloader_backend(dataset, dataloader_backend, packing_backend, packing_strategy)
         packing_backend = resolve_packing_backend(dataloader_backend, packing_backend, packing_strategy, split)
         block_best_fit = packing_strategy == "block-best-fit"
         self._rust_pack = None
@@ -238,7 +258,7 @@ class DistDataLoader:
         return TextLoader(
             list(zip(sm.shard_idx, sm.shard_paths, strict=True)), sm.column_name,
             dataset.split == "train", sm.ddp_rank, sm.world_size, (self.B, self.T + 1),
-            dataset.tokenizer_threads, dataset.tokenizer_batch_size,
+            dataset.tokenizer_threads, dataset.tokenizer_batch_size or 64,
             (encoding._mergeable_ranks, encoding._pat_str, encoding._special_tokens, self.bos_token_id),
             resume, **options,
         )
@@ -540,15 +560,16 @@ def build_dataloader(
     *,
     tokenizer_batch_size: Optional[int] = None,
     packing_backend: str = "python",
-    dataloader_backend: str = "python",
+    dataloader_backend: str = "auto",
     packing_strategy: str = "rolling-16",
 ) -> DistDataLoader:
     """Build a training iterator or a factory for independent validation iterators.
 
     For the native loader, tokenizer_batch_size controls read-ahead for
     tokenizers that opt in to exact batch encoding. Packing lookahead is independent.
-    dataloader_backend selects Python, Rust packing, or end-to-end Rust for
-    cached text. The Rust choices default to encoding 64 documents at a time.
+    dataloader_backend="auto" selects end-to-end Rust for cached text with the
+    repository's tiktoken tokenizer and an installed native extension. Other
+    inputs use Python. The Rust backends encode 64 documents at a time by default.
     packing_strategy="block-best-fit" selects fixed 64-document blocks for
     end-to-end Rust training. Validation uses rolling-16.
     packing_backend="rust" also selects packing-only acceleration. The
@@ -560,7 +581,7 @@ def build_dataloader(
     if use_nanochat:
         if packing_strategy != "rolling-16":
             raise ValueError("Packing strategies apply only to the gpt-lab loader")
-        if packing_backend != "python" or dataloader_backend != "python":
+        if packing_backend != "python" or dataloader_backend not in ("auto", "python"):
             raise ValueError("Rust backends apply only to the gpt-lab loader")
         if resume_state is not None and resume_state.packing_signature is not None:
             raise ValueError("Cannot resume a native dataloader checkpoint with nanochat")
@@ -587,8 +608,8 @@ def build_dataloader(
             base_path=Path(datadir or cachedir or DATA_DIR) / name
         )
     else:
-        if tokenizer_batch_size is None:
-            tokenizer_batch_size = 1 if dataloader_backend == "python" else 64
+        if tokenizer_batch_size is None and dataloader_backend == "rust-packing":
+            tokenizer_batch_size = 64
         ds = ShardedDataset(
             name=name,
             tokenizer=tokenizer,
