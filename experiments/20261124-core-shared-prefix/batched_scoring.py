@@ -21,10 +21,42 @@ class PackedBatch:
     first_targets: torch.Tensor
 
 
-def collate_packed(choices, pad_id):
+@dataclass
+class SeparateBatch:
+    tokens: torch.Tensor
+    keys: torch.Tensor
+    sources: torch.Tensor
+    valid: torch.Tensor
+
+
+def collate_separate(examples, pad_id):
+    rows = [row for tokens, _, _ in examples for row in tokens]
+    tokens = stack_sequences(rows, pad_id)
+    width = tokens.size(1)
+    keys = torch.arange(width) < torch.tensor(list(map(len, rows)))[:, None]
+    spans = []
+    row_index = 0
+    for _, starts, ends in examples:
+        spans.append([])
+        for start, end in zip(starts, ends):
+            left, right, _ = slice(start - 1, end - 1).indices(width)
+            spans[-1].append(range(row_index * width + left, row_index * width + right))
+            row_index += 1
+    max_answer = max(1, max(len(span) for question in spans for span in question))
+    sources = torch.zeros((len(examples), max(map(len, spans)), max_answer), dtype=torch.long)
+    valid = torch.zeros_like(sources, dtype=torch.bool)
+    for i, question in enumerate(spans):
+        for j, span in enumerate(question):
+            if span:
+                sources[i, j, :len(span)] = torch.arange(span.start, span.stop)
+                valid[i, j, :len(span)] = True
+    return SeparateBatch(tokens, keys, sources, valid)
+
+
+def collate_packed(choices, pad_id, *, max_context=CONTEXT):
     """Build the CPU tensors for a batch of already eligible questions."""
-    if any(max(question.positions) >= CONTEXT or min(question.positions) < 0 for question in choices):
-        raise ValueError("A packed path exceeds the 2,048-token context")
+    if any(max(question.positions) >= max_context or min(question.positions) < 0 for question in choices):
+        raise ValueError(f"A packed path exceeds the model context ({max_context} tokens)")
     tokens = stack_sequences([question.tokens for question in choices], pad_id)
     positions = stack_sequences([question.positions for question in choices], 0)
     branches = stack_sequences([question.branches for question in choices], -1)
@@ -44,20 +76,42 @@ def collate_packed(choices, pad_id):
     return PackedBatch(tokens, positions, branches, sources, valid, prefix_ends, first_targets)
 
 
-def score_packed_batch(model, batch, device, *, capture_logits=False):
+def shifted_labels(tokens, keys):
+    return tokens.roll(-1, dims=1).masked_fill(~(keys & keys.roll(-1, dims=1)), -1)
+
+
+def reduce_options(losses, sources, valid, first_nll=None):
+    nll = losses.flatten().index_select(0, sources.flatten()).view_as(sources)
+    if first_nll is not None:
+        nll[..., 0] = first_nll
+    lengths = valid.sum(-1)
+    means = nll.masked_fill(~valid, 0).sum(-1) / lengths
+    # Python min retains a NaN first option and ignores later NaNs.
+    ranked = means.masked_fill(means.isnan(), torch.inf)
+    winners = ranked.argmin(-1).masked_fill(means[:, 0].isnan(), 0)
+    return means, winners
+
+
+def score_separate_batch(model, batch, device):
+    tokens, keys = batch.tokens.to(device), batch.keys.to(device)
+    outputs = model(tokens, shifted_labels(tokens, keys), reduction="none")
+    return reduce_options(outputs.loss, batch.sources.to(device), batch.valid.to(device))
+
+
+def score_packed_batch(model, batch, device, *, capture_logits=False, fa4=None):
     tokens, positions, branches = (x.to(device) for x in (batch.tokens, batch.positions, batch.branches))
     sources, valid = batch.sources.to(device), batch.valid.to(device)
-    masks = tree_masks(positions.to(torch.int32), branches, model.window_sizes)
     # Score the first branch targets separately from the shared prefix distribution.
-    pads = branches < 0
-    labels = tokens.roll(-1, dims=1).masked_fill(pads | pads.roll(-1, dims=1), -1)
-    outputs = model(tokens, labels, reduction="none", position_ids=positions, complete_attn_masks=masks)
+    labels = shifted_labels(tokens, branches >= 0)
+    if fa4 is None:
+        masks = tree_masks(positions.to(torch.int32), branches, model.window_sizes)
+        outputs = model(tokens, labels, reduction="none", position_ids=positions, complete_attn_masks=masks)
+    else:
+        with fa4.batched_layout(positions.to(torch.int32), branches.to(torch.int32)):
+            outputs = model(tokens, labels, reduction="none", position_ids=positions)
     first_logits = outputs.logits[torch.arange(tokens.size(0), device=device), batch.prefix_ends.to(device)]
     first_nll = -first_logits.float().log_softmax(-1).gather(1, batch.first_targets.to(device))
-    nll = outputs.loss.flatten().index_select(0, sources.flatten()).view_as(sources)
-    nll[..., 0] = first_nll
-    lengths = valid.sum(-1)
-    means = (nll.masked_fill(~valid, 0).sum(-1) / lengths.clamp_min(1)).masked_fill(lengths == 0, torch.inf)
+    means, winners = reduce_options(outputs.loss, sources, valid, first_nll)
     logits = None
     if capture_logits:
         flat = outputs.logits.flatten(0, 1)
@@ -66,11 +120,11 @@ def score_packed_batch(model, batch, device, *, capture_logits=False):
              if keep[0]]
             for row_sources, row_valid in zip(batch.sources, batch.valid)
         ]
-    return means, means.argmin(dim=-1), logits
+    return means, winners, logits
 
 
 @torch.no_grad()
-def check_wide_fixture(model, pad_id, device):
+def check_wide_fixture(model, pad_id, device, *, fa4=None):
     wide, short = wide_fixture(pad_id)
     questions = [pack_choices(*wide), pack_choices(*short)]
     batch = collate_packed(questions, pad_id)
@@ -80,11 +134,11 @@ def check_wide_fixture(model, pad_id, device):
     observed = []
     hook = model.register_forward_hook(lambda _, args, output: observed.append(output.logits.cpu()))
     try:
-        score_packed_batch(model, batch, device)
+        score_packed_batch(model, batch, device, fa4=fa4)
         batch.tokens[0, questions[0].offsets[0] + 1] = 90
-        score_packed_batch(model, batch, device)
+        score_packed_batch(model, batch, device, fa4=fa4)
         batch.tokens[1, len(questions[1].tokens):] = 91
-        score_packed_batch(model, batch, device)
+        score_packed_batch(model, batch, device, fa4=fa4)
     finally:
         hook.remove()
 

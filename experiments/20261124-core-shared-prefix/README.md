@@ -69,6 +69,21 @@ On Apple M2 with PyTorch 2.11.0, all three packed paths matched pinned master on
 
 The measured frozen checkpoint has SHA-256 `c8102efd75dfd7f2cfcba814916a53eb0db43e41cc86c0ab3b9c29b63cca595f`.
 
+### Packing with four questions in both arms
+
+The separate-row arm groups up to four questions and forwards one full row per answer. The wide arm uses one packed row per question. Both arms use the same device option-NLL reducer, first-minimum selection, and one combined readback per forward. Prefetch is off. Prompt rendering and tokenization run before timing. [Separate-row batching in nanochat #526](https://github.com/karpathy/nanochat/pull/526)
+
+The eligible comparison uses identical length-sorted question groups. The full comparison also lets the separate-row arm batch questions that require a separate forward as packed fallbacks. Both arms run the parity sweep before timing to warm those shapes. Timed trials alternate arm order. MPS peak memory is the highest sampled live tensor allocation in a separate pass.
+
+With the bundle staged and the frozen checkpoint from the earlier run, use
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 uv run --locked --extra cpu \
+  python experiments/20261124-core-shared-prefix/packing_pair.py \
+  --checkpoint .tmp/codex/core-question-batching/frozen.pt \
+  --report .tmp/codex/core-question-batching/packing-pair.json --repeats 3
+```
+
 ## Two-H100 follow-up
 
 Use the same CORE bundle and a single GPT-Lab RoPE checkpoint with its tokenizer. Set `GPTLAB_BENCH_MODEL_DIR` to the checkpoint cache root, `GPTLAB_BENCH_MODEL` and `GPTLAB_BENCH_RUN` to its model and run names, and `GPTLAB_BENCH_STEP` to the explicit checkpoint step. Point `GPTLAB_CACHE_DIR` at the staged CORE bundle and tokenizer cache on the node.
@@ -99,3 +114,19 @@ Before warming up real questions, each rank runs the same cropped sibling-mutati
 Each rank warms up its full CORE shard before timing. The synchronized sweep includes prompt preparation, mask construction, forward, and scoring. The report includes CuTe compile time, unique questions divided by the slower rank's elapsed time, peak PyTorch-allocated bytes per GPU, and speedup over A. Every arm uses the same example IDs, few-shot selections, and context limit. Each forward handles one question.
 
 BF16 parity uses an absolute tolerance of `0.05` nats per choice with zero relative tolerance. The report includes the largest NLL difference, any decision flips with each arm's winner-to-runner-up margin, and a failure status for differences outside tolerance. H100 kernel execution, parity, and throughput are pending.
+
+### Paired four-question FA4
+
+The opt-in comparison uses the same eligible and full-sample plans as the MPS harness. Both arms call native BF16 FA4. The packed mask reads its position and branch metadata using the batch row and token indices and excludes padding keys. The preflight covers the 2,160-token cross-row fixture. Each rank checks the native kernel symbols, option NLL tolerance, and decision margins before the timed sweeps. Each trial uses the slower rank's wall time and records the actual CUDA peak allocated tensor bytes per rank.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 GPTLAB_DTYPE=bfloat16 uv run --locked --extra gpu \
+  --with 'nvidia-cutlass-dsl==4.4.2' --with 'apache-tvm-ffi>=0.1.5,<0.2' \
+  --with einops --with torch-c-dlpack-ext \
+  torchrun --standalone --nproc-per-node=2 \
+  experiments/20261124-core-shared-prefix/benchmark.py --compare-four-question \
+  --model-dir "${GPTLAB_BENCH_MODEL_DIR:?set the checkpoint cache root}" \
+  --model-name "${GPTLAB_BENCH_MODEL:?set the model name}" \
+  --run-name "${GPTLAB_BENCH_RUN:?set the run name}" \
+  --step "${GPTLAB_BENCH_STEP:?set the checkpoint step}" --max-per-task 64
+```

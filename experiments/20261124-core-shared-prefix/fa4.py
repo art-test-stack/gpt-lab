@@ -31,16 +31,17 @@ class NativeFA4:
         @cute.jit
         def branch_mask(batch, head, q, k, seqlen_info, aux):
             positions, branches, window = aux
+            row = batch[0]
             q_idx = cutlass.min(q[0], seqlen_info.seqlen_q - 1)
             k_idx = cutlass.min(k[0], seqlen_info.seqlen_k - 1)
-            q_pos = scalar_to_ssa(positions[q_idx], cutlass.Int32)
-            k_pos = scalar_to_ssa(positions[k_idx], cutlass.Int32)
-            q_branch = scalar_to_ssa(branches[q_idx], cutlass.Int32)
-            k_branch = scalar_to_ssa(branches[k_idx], cutlass.Int32)
+            q_pos = scalar_to_ssa(positions[row, q_idx], cutlass.Int32)
+            k_pos = scalar_to_ssa(positions[row, k_idx], cutlass.Int32)
+            q_branch = scalar_to_ssa(branches[row, q_idx], cutlass.Int32)
+            k_branch = scalar_to_ssa(branches[row, k_idx], cutlass.Int32)
             left = scalar_to_ssa(window[0], cutlass.Int32)
             zero = scalar_to_ssa(0, cutlass.Int32)
             distance = q_pos - k_pos
-            return (distance >= zero) & ((k_branch == zero) | (k_branch == q_branch)) & (
+            return (k_branch >= zero) & (distance >= zero) & ((k_branch == zero) | (k_branch == q_branch)) & (
                 (left < zero) | (distance <= left)
             )
 
@@ -76,14 +77,19 @@ class NativeFA4:
         )[0]
 
     @contextmanager
+    def batched_layout(self, positions, branches):
+        self.coords = positions, branches
+        try:
+            yield
+        finally:
+            self.coords = None
+
+    @contextmanager
     def packed_layout(self, packed, device):
         positions = torch.tensor(packed.positions, dtype=torch.int32, device=device)
         branches = torch.tensor(packed.branches, dtype=torch.int32, device=device)
-        self.coords = positions, branches
-        try:
+        with self.batched_layout(positions[None], branches[None]):
             yield positions, branches
-        finally:
-            self.coords = None
 
     def packed_choices(self, model, packed, device, *, capture_logits=False):
         row = torch.tensor([packed.tokens], device=device)

@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+from statistics import median
 from time import perf_counter
 
 import torch
@@ -15,7 +16,10 @@ from gpt_lab.evaluate.core import (
 from gpt_lab.model.checkpoint import build_model
 from gpt_lab.model.flash_attn import require_flash_attn3
 from gpt_lab.utils.distributed import cleanup_dist_groups, init_dist_groups
+from batching import Example
+from batched_scoring import check_wide_fixture
 from fa4 import FA4_REPO, FA4_REVISION, NativeFA4
+from packing_pair import ARMS as PAIRED_ARMS, comparison_plans, plan_counts, score_plan
 from parity import ByteTokenizer, check_sibling_isolation, cropped_sibling_examples, small_model
 from scoring import pack_choices, separate_choices, separate_choices_with_prefix_scoring, tree_masks
 
@@ -72,16 +76,23 @@ def score_examples(mode, cases, model, tokenizer, device, fa4):
 
 
 def probe_kernel(mode, case, model, tokenizer, device, fa4):
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as trace:
+    def run_probe():
         _, packed = score_examples(mode, [case], model, tokenizer, device, fa4)
-        torch.cuda.synchronize(device)
-    if mode == "C" and packed != 1:
-        raise RuntimeError("The FA4 mask_mod profiler probe must run a packed example")
+        if mode == "C" and packed != 1:
+            raise RuntimeError("The FA4 mask_mod profiler probe must run a packed example")
+
     symbols = ("flashattnfwdsm90", "flash_fwd_kernel") if mode == "A" else ("flashattentionforwardsm90",)
+    return probe_kernels(run_probe, device, symbols)
+
+
+def probe_kernels(run_probe, device, symbols):
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as trace:
+        run_probe()
+        torch.cuda.synchronize(device)
     names = sorted({event.name for event in trace.events() if event.device_type == DeviceType.CUDA})
     matched = [name for name in names if any(symbol in name.lower() for symbol in symbols)]
     if not matched:
-        raise RuntimeError(f"No expected native attention kernel for {mode}. CUDA events: {names}")
+        raise RuntimeError(f"No expected native attention kernel {symbols}. CUDA events: {names}")
     return matched
 
 
@@ -146,6 +157,145 @@ def compare(reference, candidate):
                 reference_margin=margin(ref_nll), candidate_margin=margin(nll),
             ))
     return result
+
+
+def measure_pair(arms, examples, model, pad_id, device, fa4):
+    scores, warmup = {}, {}
+    for arm, plan in arms.items():
+        before_compiles, before_seconds = fa4.compiles, fa4.compile_seconds
+        dist.barrier()
+        torch.cuda.synchronize(device)
+        start = perf_counter()
+        scores[arm] = score_plan(plan, examples, model, pad_id, device, fa4=fa4)
+        torch.cuda.synchronize(device)
+        elapsed = perf_counter() - start
+        if arm == "packed" and not plan[0][0]:
+            raise RuntimeError("The paired FA4 profiler probe must run packed questions")
+        kernels = probe_kernels(
+            lambda: score_plan(plan[:1], examples, model, pad_id, device, fa4=fa4),
+            device, ("flashattentionforwardsm90",),
+        )
+        warmup[arm] = {
+            "warmup_seconds": elapsed, "kernel_symbols": kernels,
+            "compiles": fa4.compiles - before_compiles,
+            "compilation_seconds": fa4.compile_seconds - before_seconds,
+        }
+    parity = compare(scores["separate"], scores["packed"])
+    outside_tolerance = torch.tensor(parity["outside_tolerance"], device=device)
+    dist.all_reduce(outside_tolerance)
+    if outside_tolerance.item():
+        print(json.dumps({"rank": dist.get_rank(), "bf16_parity": parity}), flush=True)
+        raise SystemExit("Per-option BF16 NLL exceeded 0.05 nats before timing")
+
+    trials = {arm: [] for arm in arms}
+    before_compiles = fa4.compiles
+    for trial in range(3):
+        for arm in (PAIRED_ARMS if trial % 2 == 0 else PAIRED_ARMS[::-1]):
+            dist.barrier()
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            start = perf_counter()
+            score_plan(arms[arm], examples, model, pad_id, device, fa4=fa4)
+            torch.cuda.synchronize(device)
+            trials[arm].append({
+                "seconds": perf_counter() - start,
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+            })
+    if fa4.compiles != before_compiles:
+        raise RuntimeError("FA4 compiled during the timed paired sweep")
+    return {
+        "ids": list(scores["separate"]), "parity": parity,
+        "arms": {arm: {**plan_counts(plan, arm), **warmup[arm], "trials": trials[arm]} for arm, plan in arms.items()},
+    }
+
+
+def aggregate_pair(per_rank, scopes, unique_count):
+    comparisons = {}
+    for scope in scopes:
+        results = [record["comparisons"][scope] for record in per_rank]
+        ids = [example for result in results for example in result["ids"]]
+        if len(set(ids)) != len(ids) or (scope == "all" and len(ids) != unique_count):
+            raise RuntimeError("CORE sharding did not cover each selected question exactly once")
+        times = {}
+        arms_report = {}
+        for arm in PAIRED_ARMS:
+            records = [result["arms"][arm] for result in results]
+            times[arm] = [max(record["trials"][i]["seconds"] for record in records) for i in range(3)]
+            seconds = median(times[arm])
+            counts = {key: sum(record[key] for record in records)
+                      for key in ("forwards", "packed_forwards", "fallback_forwards", "fallback_questions")}
+            arms_report[arm] = {
+                **counts, "median_seconds": seconds, "questions_per_second": len(ids) / seconds,
+                "peak_allocated_bytes_by_rank": [
+                    max(trial["peak_allocated_bytes"] for trial in record["trials"]) for record in records
+                ],
+            }
+        comparisons[scope] = {
+            **arms_report, "questions": len(ids),
+            "paired_speedup": median(a / b for a, b in zip(times["separate"], times["packed"])),
+        }
+    return comparisons
+
+
+@torch.inference_mode()
+def run_paired(args, context):
+    device = context.device
+    model, tokenizer, checkpoint_data, _ = build_model(
+        model_name=args.model_name, run_name=args.run_name, step=args.step,
+        model_cachedir=args.model_dir, phase="eval", comp_info=context, attn_impl="sdpa",
+    )
+    del checkpoint_data
+    if model.config.positional_encoding != "rope":
+        raise ValueError("The benchmark requires a RoPE checkpoint")
+    pad_id = tokenizer.get_bos_token_id()
+    examples, unique_count = [], 0
+    data_path, tasks, _ = load_core_bundle()
+    for task in tasks:
+        if task["icl_task_type"] != "multiple_choice":
+            continue
+        data, meta = load_core_task(data_path, task, args.max_per_task)
+        unique_count += len(data)
+        for index in rank_example_indices(len(data)):
+            prepared = prepare_example(index, tokenizer, data, meta, model.max_seq_len)
+            examples.append(Example(task["label"], index, meta["task_type"], data[index]["gold"],
+                                    prepared, pack_choices(*prepared)))
+    plans = comparison_plans(examples)
+    if not plans["eligible"]["packed"]:
+        raise RuntimeError("Each rank needs an eligible four-question group for the native probe")
+
+    fixture_model = small_model(device, head_dim=64)
+    fa4 = NativeFA4(model.window_sizes + fixture_model.window_sizes, device)
+    dispatch = [block.attention.flash_attn for block in model.blocks]
+    original_calls = [entry.flash_attn_func for entry in dispatch]
+    fa4.cute.compile = fa4.timed_compile
+    try:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            preflight = check_native_fa4(fixture_model, fa4, device)
+            preflight.update(check_wide_fixture(fixture_model, 256, device, fa4=fa4))
+        preflight.update(compilation_seconds=fa4.compile_seconds, compiles=fa4.compiles)
+        print(json.dumps({"rank": context.rank, "preflight": preflight}), flush=True)
+        del fixture_model
+        for entry in dispatch:
+            entry.flash_attn_func = fa4
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            records = {scope: measure_pair(arms, examples, model, pad_id, device, fa4)
+                       for scope, arms in plans.items()}
+    finally:
+        fa4.cute.compile = fa4.original_compile
+        for entry, original in zip(dispatch, original_calls):
+            entry.flash_attn_func = original
+    per_rank = [None] * context.world_size
+    dist.all_gather_object(per_rank, {
+        "rank": context.rank, "gpu": torch.cuda.get_device_name(device), "comparisons": records, "preflight": preflight,
+    })
+    if context.rank == 0:
+        print(json.dumps({
+            "checkpoint": vars(args), "model_config": model.config.model_dump(mode="json"),
+            "torch": torch.__version__, "cuda": torch.version.cuda, "dtype": "bfloat16",
+            "fa4_repo": FA4_REPO, "fa4_revision": FA4_REVISION, "fa4_source": fa4.origin,
+            "nll_atol": BF16_NLL_ATOL, "nll_rtol": 0,
+            "comparisons": aggregate_pair(per_rank, plans, unique_count), "per_rank": per_rank,
+        }, indent=2))
 
 
 @torch.inference_mode()
@@ -228,6 +378,7 @@ def main():
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--step", required=True, type=int)
     parser.add_argument("--max-per-task", type=int, default=64)
+    parser.add_argument("--compare-four-question", action="store_true")
     args = parser.parse_args()
     if args.max_per_task < 11 or args.step < 0:
         parser.error("use at least 11 examples per task and an explicit nonnegative checkpoint step")
@@ -238,7 +389,10 @@ def main():
     try:
         if "H100" not in torch.cuda.get_device_name(context.device) or context.compute_dtype != torch.bfloat16:
             raise RuntimeError("Each rank requires an H100 and BF16 compute")
-        run(args, context)
+        if args.compare_four_question:
+            run_paired(args, context)
+        else:
+            run(args, context)
     finally:
         cleanup_dist_groups()
 
