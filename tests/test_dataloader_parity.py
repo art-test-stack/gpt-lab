@@ -80,7 +80,7 @@ def test_batch_padding_adapter_uses_scalar_encoding(shards):
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_batches_and_resume_across_boundaries(shards, rank):
+def test_batches_and_resume_across_boundaries(shards, rank, native_extension):
     scalar = loader(shards, 1, rank=rank, tokenizer=BatchTokenizer())
     tokenizer = BatchTokenizer()
     batched = loader(shards, 64, rank=rank, tokenizer=tokenizer)
@@ -114,7 +114,7 @@ def test_batches_and_resume_across_boundaries(shards, rank):
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("kind", ["batch", "scalar", "pretokenized"])
-def test_finite_validation_and_flexible_inputs(shards, rank, kind):
+def test_finite_validation_and_flexible_inputs(shards, rank, kind, native_extension):
     tokenizer = {"batch": BatchTokenizer, "scalar": ScalarTokenizer}.get(kind)
     kwargs = dict(rank=rank, split="val", column="tokens" if kind == "pretokenized" else "text")
     left = loader(shards, 1, tokenizer=tokenizer() if tokenizer else None, **kwargs)()
@@ -135,7 +135,7 @@ def test_finite_validation_and_flexible_inputs(shards, rank, kind):
     assert count > 0
 
 
-def test_validation_drops_incomplete_final_batch(tmp_path):
+def test_validation_drops_incomplete_final_batch(tmp_path, native_extension):
     path = tmp_path / "tail"
     path.mkdir()
     # No BOS and one document: 25 tokens fill one 2x9 batch, leaving 7 tokens.
@@ -154,7 +154,9 @@ def test_validation_drops_incomplete_final_batch(tmp_path):
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
-def test_checkpoint_recovery_after_refill_error(tmp_path, backend):
+def test_checkpoint_recovery_after_refill_error(tmp_path, backend, request):
+    if backend == "rust":
+        request.getfixturevalue("native_extension")
     path = tmp_path / "recovery"
     path.mkdir()
     pq.write_table(pa.table({"tokens": [list(range(6)), list(range(10, 20))]}),

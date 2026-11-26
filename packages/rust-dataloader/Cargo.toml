@@ -18,3 +18,7 @@ libc = "0.2"
 
 [build-dependencies]
 pyo3-build-config = "=0.30.1"
+
+[profile.release]
+# Rust stripping can produce an invalid Mach-O LINKEDIT string pool on macOS.
+strip = "none"

@@ -9,6 +9,7 @@ import torch
 from gpt_lab.utils.default import DATA_DIR, RANDOM_SEED
 from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import DataLoaderState, DocumentRef, TokenizerConfig
+from gpt_lab.data.backends import native_extension, resolve_packing_backend
 from gpt_lab.data.sharder import ShardManager
 
 _LOOKAHEAD_DOCUMENTS = 16
@@ -136,27 +137,12 @@ class DistDataLoader:
     ):
         if batch_size < 1 or seq_len < 1:
             raise ValueError("Batch size and sequence length must be positive")
-        if dataloader_backend == "rust-packing" and packing_backend == "python":
-            packing_backend = "rust"
-        elif dataloader_backend == "rust" and packing_backend != "python":
-            raise ValueError("The Rust dataloader includes its own packing backend")
-        elif dataloader_backend not in ("python", "rust-packing", "rust"):
-            raise ValueError(f"Unknown dataloader backend {dataloader_backend!r}")
-        if packing_strategy not in ("rolling-16", "block-best-fit"):
-            raise ValueError(f"Unknown packing strategy {packing_strategy!r}")
         split = getattr(dataset, "split", None)
+        packing_backend = resolve_packing_backend(dataloader_backend, packing_backend, packing_strategy, split)
         block_best_fit = packing_strategy == "block-best-fit"
-        if block_best_fit and (dataloader_backend != "rust" or split != "train"):
-            raise ValueError("block-best-fit requires the end-to-end Rust training loader")
         self._rust_pack = None
         if packing_backend == "rust":
-            try:
-                from gpt_lab_rust_packer import pack
-            except ImportError as exc:
-                raise ImportError("Rust packing requires the optional gpt_lab_rust_packer extension") from exc
-            self._rust_pack = pack
-        elif packing_backend != "python":
-            raise ValueError(f"Unknown packing backend {packing_backend!r}")
+            self._rust_pack = native_extension().pack
         self.B = batch_size
         self.T = seq_len
         self.device = torch.device(device)
@@ -233,10 +219,7 @@ class DistDataLoader:
 
         if not isinstance(dataset, ShardedDataset) or type(dataset.tokenizer) is not Tokenizer:
             raise TypeError("The Rust dataloader requires cached text and the repository's tiktoken Tokenizer")
-        try:
-            from gpt_lab_rust_packer import TextLoader
-        except ImportError as exc:
-            raise ImportError("The Rust dataloader requires the updated gpt_lab_rust_packer extension") from exc
+        TextLoader = native_extension().TextLoader
 
         sm = dataset.sm
         if sm.base_url:
@@ -573,6 +556,7 @@ def build_dataloader(
     """
     if comp_info is None:
         comp_info = get_comp_info()
+    resolve_packing_backend(dataloader_backend, packing_backend, packing_strategy, split)
     if use_nanochat:
         if packing_strategy != "rolling-16":
             raise ValueError("Packing strategies apply only to the gpt-lab loader")

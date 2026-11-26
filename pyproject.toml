@@ -49,6 +49,9 @@ gpu = [
 fp8 = [
     "torchao==0.17.0",
 ]
+rust-dataloader = [
+    "gpt-lab-rust-packer==0.1.0",
+]
 
 [dependency-groups]
 dev = [
@@ -92,6 +95,7 @@ conflicts = [
 ]
 
 [tool.uv.sources]
+gpt-lab-rust-packer = { path = "packages/rust-dataloader" }
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "gpu" },

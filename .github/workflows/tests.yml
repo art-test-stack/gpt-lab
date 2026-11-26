@@ -9,10 +9,6 @@ jobs:
     name: python-tests
     runs-on: ubuntu-latest
 
-    # strategy:
-    #   matrix:
-    #     python-version: ["3.11", "3.12", "3.13"]
-
     steps:
       - uses: actions/checkout@v4
 
@@ -28,14 +24,48 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
-          # Install a specific version of uv.
-          version: "0.9.21"
+          version: "0.11.28"
 
       - name: Install dependencies
         run: |
-          uv venv
-          uv sync --group dev --extra cpu
+          uv sync --locked --group dev --extra cpu
 
       - name: Run tests
         run: |
-          uv run pytest -m "not slow"
+          .venv/bin/python -m pytest -m "not slow"
+
+  native:
+    name: native-dataloader-tests
+    runs-on: ubuntu-latest
+    env:
+      GPT_LAB_REQUIRE_NATIVE: "1"
+      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.tmp/codex/native-ci/tiktoken
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.tmp/codex/native-ci/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.28"
+      - name: Install framework with native dataloader
+        run: uv sync --locked --extra cpu --extra rust-dataloader --group dev --no-editable
+      - name: Cache GPT-2 tokenizer
+        run: .venv/bin/python -c 'from gpt_lab.tokenizer import Tokenizer; Tokenizer.from_pretrained("gpt2", source="tiktoken")'
+      - name: Run installed backend parity and resume tests
+        run: |
+          project_root="$PWD"
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH "$project_root/.venv/bin/python" -m pytest -q \
+            --basetemp "$project_root/.tmp/codex/native-ci/pytest" \
+            "$project_root/tests/test_dataloader_parity.py" \
+            "$project_root/tests/test_native_dataloader.py" \
+            "$project_root/tests/cli/test_cli.py" \
+            "$project_root/tests/cli/test_workflows.py"
+      - name: Run native exact-pair and I/O retry tests
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --locked --manifest-path packages/rust-dataloader/Cargo.toml --lib

@@ -9,16 +9,18 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from gpt_lab.data.loader import build_dataloader
+from gpt_lab.data import build_dataloader
 from gpt_lab.tokenizer import Tokenizer
 from gpt_lab.utils.schemas import DataLoaderState
 
 
 @pytest.fixture(scope="module")
-def tokenizer():
+def tokenizer(native_extension):
     cache = os.environ.get("TIKTOKEN_CACHE_DIR")
     keys = ("6c7ea1a7e38e3a7f062df639a5b80947f075ffe6", "6d1cbeee0f20b3d9449abfede4726ed8212e3aee")
     if not cache or not all((Path(cache) / key).is_file() for key in keys):
+        if os.environ.get("GPT_LAB_REQUIRE_NATIVE") == "1":
+            pytest.fail("Preload GPT-2 into TIKTOKEN_CACHE_DIR before running native tests")
         pytest.skip("Set TIKTOKEN_CACHE_DIR to an existing GPT-2 cache")
     return Tokenizer.from_pretrained("gpt2", source="tiktoken")
 
@@ -193,3 +195,42 @@ def test_exact_pair_rejects_greedy_block_checkpoint(text_shards, tokenizer, monk
 def test_block_best_fit_is_training_only(text_shards, tokenizer):
     with pytest.raises(ValueError, match="train"):
         make_loader(text_shards, tokenizer, "rust", 0, split="val", packing_strategy="block-best-fit")()
+
+
+def test_exact_pair_nine_six_four(tmp_path, tokenizer):
+    dataset = tmp_path / "exact-pair"
+    dataset.mkdir()
+    texts = [" a" * 8, " b" * 5, " c" * 3]
+    documents = [tokenizer(text, prepend_bos=True) for text in texts]
+    assert list(map(len, documents)) == [9, 6, 4]
+    pq.write_table(pa.table({"text": texts}), dataset / "shard_00000.parquet")
+    loader = build_dataloader(
+        name=dataset.name, cachedir=tmp_path, max_shards=1, tokenizer=tokenizer,
+        batch_size=1, seq_len=9, dataloader_backend="rust", packing_strategy="block-best-fit",
+        comp_info=SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu")),
+    )
+    x, y, state = next(loader)
+    row = documents[1] + documents[2]
+    assert x.tolist() == [row[:-1]]
+    assert y.tolist() == [row[1:]]
+    assert state.lookahead_refs == ((0, 0, 0),)
+    assert state.pending_document_ref is None
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_rust_training_strategies_share_validation_batches(text_shards, tokenizer, rank):
+    validation = []
+    for strategy in ("rolling-16", "block-best-fit"):
+        training = make_loader(text_shards, tokenizer, "rust", rank, packing_strategy=strategy)
+        next(training)
+        # The workflow passes the strategy only to training, leaving validation at rolling-16.
+        validation.append(make_loader(text_shards, tokenizer, "rust", rank, split="val")())
+    batches = 0
+    while True:
+        left, right = (next(loader, None) for loader in validation)
+        if left is None:
+            assert right is None
+            break
+        assert_equal(left, right)
+        batches += 1
+    assert batches > 0

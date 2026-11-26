@@ -1,4 +1,4 @@
-# Rust dataloader prototype
+# Rust dataloader experiment
 
 Baseline is `61f066250420afbc121524037b996ee4a3524c0a`, fetched from `origin/master` before creating `experiment/rust-dataloader`.
 
@@ -18,48 +18,37 @@ Rolling-16 remains the default and keeps its existing checkpoint signature. Exac
 
 ## Reproduce on macOS arm64
 
-From the repository root, use the project’s Python 3.12 CPU environment. The optional extension uses PyO3 0.30.1 and was built with Rust 1.91. On the macOS 27.2.1 test host, disabling Rust’s post-link stripping prevents [misaligned dynamic libraries](https://github.com/rust-lang/rust/issues/157750).
+From the repository root, install the optional production package in the project’s Python 3.12 CPU environment. The PyO3 crate lives in `packages/rust-dataloader` and uses PyO3 0.30.1. The measurements below used Rust 1.91.
 
 ```sh
 scratch="$PWD/.tmp/codex/rust-dataloader"
 mkdir -p "$scratch"
-export PYO3_PYTHON="$PWD/.venv/bin/python"
 export PYTHONDONTWRITEBYTECODE=1
-env -u PYTHONPATH "$PYO3_PYTHON" -m pytest -q -p no:cacheprovider \
-  --basetemp "$scratch/pytest-default" tests/test_sharder.py tests/test_bpb.py
-
-PYO3_BUILD_EXTENSION_MODULE=1 CARGO_HOME="$scratch/cargo" CARGO_NET_GIT_FETCH_WITH_CLI=true \
-  MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_PROFILE_RELEASE_STRIP=none RUSTFLAGS="-C strip=none" \
-  cargo build --release --locked \
-  --manifest-path experiments/20261124-rust-dataloader/rust/Cargo.toml \
-  --target-dir "$scratch/target-native"
-env -u PYO3_BUILD_EXTENSION_MODULE CARGO_HOME="$scratch/cargo" \
-  MACOSX_DEPLOYMENT_TARGET=14.0 CARGO_PROFILE_RELEASE_STRIP=none RUSTFLAGS="-C strip=none" \
-  cargo test --release --locked --lib \
-  --manifest-path experiments/20261124-rust-dataloader/rust/Cargo.toml \
-  --target-dir "$scratch/target-native"
-extension_suffix=$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
-ln -sf "$scratch/target-native/release/libgpt_lab_rust_packer.dylib" \
-  "$scratch/gpt_lab_rust_packer$extension_suffix"
-export PYTHONPATH="$scratch:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+uv sync --locked --extra cpu --extra rust-dataloader --group dev
 
 export TIKTOKEN_CACHE_DIR=.tmp/codex/training-data-inspection/tiktoken
-"$PYO3_PYTHON" -m pytest -q -p no:cacheprovider --basetemp "$scratch/pytest-parity" \
-  experiments/20261124-rust-dataloader/test_parity.py \
-  experiments/20261124-rust-dataloader/test_benchmark.py \
-  experiments/20261124-rust-dataloader/test_native_text.py
+.venv/bin/python -c 'from gpt_lab.tokenizer import Tokenizer; Tokenizer.from_pretrained("gpt2", source="tiktoken")'
+env -u PYTHONPATH GPT_LAB_REQUIRE_NATIVE=1 .venv/bin/python -m pytest -q -p no:cacheprovider \
+  --basetemp "$scratch/pytest-parity" \
+  tests/test_sharder.py tests/test_bpb.py \
+  tests/test_dataloader_parity.py tests/test_native_dataloader.py \
+  experiments/20261124-rust-dataloader/test_benchmark.py
+
+PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --release --locked --lib \
+  --manifest-path packages/rust-dataloader/Cargo.toml \
+  --target-dir "$scratch/target-native"
 
 # Run the four-backend comparison with untimed parity passes.
-"$PYO3_PYTHON" experiments/20261124-rust-dataloader/benchmark_four.py \
+env -u PYTHONPATH .venv/bin/python experiments/20261124-rust-dataloader/benchmark_four.py \
   --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet
 
 # Run the packing-only comparison.
-"$PYO3_PYTHON" experiments/20261124-rust-dataloader/benchmark.py \
+env -u PYTHONPATH .venv/bin/python experiments/20261124-rust-dataloader/benchmark.py \
   --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet \
   --threads 4 --repeats 4
 ```
 
-The locked build works with `--offline` when its Cargo dependencies are cached. The standard Python install requires no Rust build. The native text parity tests require an existing GPT-2 cache under `TIKTOKEN_CACHE_DIR`.
+The native text parity tests use GPT-2 from `TIKTOKEN_CACHE_DIR`. Installation and mode combinations are documented in the [project README](../../README.md).
 
 The ClimbMix input is the cached `shard_01061.parquet`, with SHA-256 `9025ed81d751886e7810238f2c71a4d68ee907860f3c506d1cd3e74bda135fd8`, 86,016 documents and 84 row groups. The harness reads it in full using finite validation iteration and loads GPT-2 from the existing tiktoken cache. `--shard` accepts a local shard. The harness links it into a temporary dataset directory under its original shard ID so it can write benchmark metadata there. The pretokenized run uses 10,000 documents from `experiments/dataloaders.py` and prepares contiguous token arrays before timing.
 
@@ -71,7 +60,7 @@ Run both sweep regimes in the same environment using the cached shard.
 runner=experiments/20261124-rust-dataloader/benchmark_four.py
 shard=.tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet
 for shape in 16:2048 16:512 16:1024 16:4096 16:8192 64:512 32:1024 8:4096 4:8192; do
-  "$PYO3_PYTHON" "$runner" --shard "$shard" --batch-size "${shape%:*}" --context "${shape#*:}"
+  env -u PYTHONPATH .venv/bin/python "$runner" --shard "$shard" --batch-size "${shape%:*}" --context "${shape#*:}"
 done
 ```
 
@@ -124,7 +113,7 @@ End-to-end Rust had 1.67–2.03× the median throughput of Rust packing across t
 
 ## Training-mode packing benchmark
 
-`benchmark_training.py` compares full Rust rolling-16 and greedy blocks at `f008399` with exact-pair blocks at the candidate commit. It builds each revision from Git into a temporary directory and runs `split="train"` through one epoch. The timing builds add only the epoch stop. Separate builds count splits and verify their emitted tensors and state against the timing builds.
+`benchmark_training.py` compares full Rust rolling-16 and greedy blocks at `f008399` with exact-pair blocks at the candidate commit. It resolves `experiments/20261124-rust-dataloader/rust` in historical commits and `packages/rust-dataloader` in production commits, then builds each revision from Git into a temporary directory and runs `split="train"` through one epoch. The timing builds add only the epoch stop. Separate builds count splits and verify their emitted tensors and state against the timing builds.
 
 ```sh
 .venv/bin/python experiments/20261124-rust-dataloader/benchmark_training.py \

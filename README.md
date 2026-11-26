@@ -133,6 +133,15 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
   uv sync --group=notebook
   ```
 
+The standard install uses the Python dataloader. To install the optional native
+dataloader, install a Rust toolchain with Cargo and run this from the repository root.
+
+```sh
+uv sync --locked --extra cpu --extra rust-dataloader
+```
+
+Use `--extra gpu` in place of `--extra cpu` for a CUDA environment.
+
 > [!NOTE]  
 > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation. Default mode uses `kernels` implementation, making the installation easier.
 
@@ -207,6 +216,32 @@ val_loader_fn = build_dataloader(
 ) 
 
 val_loader = val_loader_fn() # called as a function to get the dataloader instance in trainer
+```
+
+#### Dataloader backends
+
+Use `gpt_lab.data.build_dataloader` with the `dataloader_backend` and
+`packing_strategy` keyword arguments. The same choices are available as
+`--dataloader-backend` and `--packing-strategy` on `gpt-lab train auto` and
+`gpt-lab train resume`.
+
+| Backend | Training packing | Validation packing | Requirements |
+| --- | --- | --- | --- |
+| `python` (default) | `rolling-16` | `rolling-16` | Standard Python install |
+| `rust-packing` | `rolling-16` | `rolling-16` | `rust-dataloader` extra. Python handles input and tokenization. |
+| `rust` | `rolling-16` or `block-best-fit` | `rolling-16` | `rust-dataloader` extra, cached text Parquet shards, and the gpt-lab tiktoken tokenizer |
+
+`block-best-fit` uses up to 64 documents at a time and tries an exact single,
+then an exact pair, then a greedy fit. It has a distinct training checkpoint
+signature. Select it again when resuming a block-packed run. Rolling-16
+checkpoints can move between compatible backends with the same data, tokenizer,
+batch shape, and rank layout. The CLI always uses rolling-16 for validation.
+When calling `build_dataloader` directly, select `block-best-fit` for training
+and use the default packing strategy for validation.
+
+```sh
+uv run --no-sync gpt-lab train auto --dataloader-backend rust --packing-strategy block-best-fit
+uv run --no-sync gpt-lab train resume --dataloader-backend rust --packing-strategy block-best-fit
 ```
 
 We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 

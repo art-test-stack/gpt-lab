@@ -1,5 +1,18 @@
+import importlib
+import os
+
 import pytest
 import torch
+
+
+@pytest.fixture(scope="session")
+def native_extension():
+    try:
+        return importlib.import_module("gpt_lab_rust_packer")
+    except ImportError:
+        if os.environ.get("GPT_LAB_REQUIRE_NATIVE") == "1":
+            pytest.fail("Install the rust-dataloader extra before running native tests")
+        pytest.skip("Optional rust-dataloader extra is not installed")
 
 
 def _available_devices():

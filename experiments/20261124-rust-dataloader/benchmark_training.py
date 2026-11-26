@@ -23,7 +23,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 SCRATCH = ROOT / ".tmp/codex/rust-dataloader/training-comparison"
 SHARD = ROOT / ".tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet"
-RUST = Path("experiments/20261124-rust-dataloader/rust")
+RUST_PATHS = (Path("packages/rust-dataloader"), Path("experiments/20261124-rust-dataloader/rust"))
 BASELINE = "f008399"
 CONTEXTS = (512, 1024, 2048, 4096, 8192)
 ARMS = {"A": ("rolling-16", "baseline"), "B": ("greedy-block", "baseline"),
@@ -83,6 +83,14 @@ def git(*args):
     return subprocess.check_output(["git", *args], cwd=ROOT)
 
 
+def rust_path(revision):
+    manifests = git("ls-tree", "--name-only", revision, "--",
+                    *(str(path / "Cargo.toml") for path in RUST_PATHS)).decode().splitlines()
+    if len(manifests) != 1:
+        raise ValueError(f"Expected one Rust dataloader crate at {revision}, found {manifests}")
+    return Path(manifests[0]).parent
+
+
 def prepare(scratch, candidate, offline):
     revisions = {"baseline": git("rev-parse", BASELINE).decode().strip(),
                  "candidate": git("rev-parse", candidate).decode().strip()}
@@ -93,14 +101,15 @@ def prepare(scratch, candidate, offline):
     if platform.system() == "Darwin":
         env.setdefault("MACOSX_DEPLOYMENT_TARGET", "14.0")
     for name, revision in revisions.items():
+        rust = rust_path(revision)
         snapshot = scratch / name
         snapshot.mkdir()
-        archive = git("archive", revision, "--", "src/gpt_lab", str(RUST))
+        archive = git("archive", revision, "--", "src/gpt_lab", str(rust))
         with tarfile.open(fileobj=io.BytesIO(archive)) as files:
             files.extractall(snapshot, filter="data")
         for variant in ("timing", "counts"):
             crate = snapshot / variant
-            shutil.copytree(snapshot / RUST, crate)
+            shutil.copytree(snapshot / rust, crate)
             source = crate / "src/parquet_source.rs"
             source.write_text(replace_once(source.read_text(), EPOCH_END, FINITE_END))
             if variant == "counts":

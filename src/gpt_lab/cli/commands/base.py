@@ -1,5 +1,6 @@
 from argparse import ArgumentParser, Namespace, SUPPRESS
 
+from gpt_lab.data.backends import DATALOADER_BACKENDS, PACKING_STRATEGIES
 from gpt_lab.cli.options import attention_impl, boolean, cache_dir, checkpoint_step, positive_int
 
 
@@ -26,8 +27,8 @@ def add_common_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--device-batch-size', type=int, default=32, help='Batch size for each device during training. Batch size define further effective batch size as device_batch_size * max_seq_len * n_acc_steps.')
     parser.add_argument('--use-nanochat-dataloader', action='store_true', help='Whether to use the nanochat dataloader instead of the default dataloader.')
     parser.add_argument('--tokenizer-batch-size', type=positive_int, default=None, help='Documents per tokenizer call for train and validation. Unset uses the selected dataloader backend default.')
-    parser.add_argument('--dataloader-backend', choices=('python', 'rust-packing', 'rust'), default='python', help='Train and validation dataloader backend. Rust backends require the optional extension; rust reads cached text and tokenizes in Rust.')
-    parser.add_argument('--packing-strategy', choices=('rolling-16', 'block-best-fit'), default='rolling-16', help='Training packing strategy. block-best-fit requires the end-to-end Rust dataloader. Validation uses rolling-16.')
+    parser.add_argument('--dataloader-backend', choices=DATALOADER_BACKENDS, default='python', help='Train and validation dataloader backend. Rust backends require the optional extension; rust reads cached text and tokenizes in Rust.')
+    parser.add_argument('--packing-strategy', choices=PACKING_STRATEGIES, default='rolling-16', help='Training packing strategy. block-best-fit requires the end-to-end Rust dataloader. Validation uses rolling-16.')
     parser.add_argument('--stop-after-step', type=int, default=None, help='Absolute cap on completed optimizer steps, including before resume; >=0. Leaves the scheduling horizon unchanged. Unset retains the saved cap on resume.')
     parser.add_argument('--cuda-graph-mode', choices=('disabled', 'forward_backward'), default=None, help='Opt-in fixed-shape compiled forward/backward CUDA capture (FP32/BF16). Unset retains the saved mode on resume.')
 
