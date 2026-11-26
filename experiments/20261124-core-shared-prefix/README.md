@@ -49,6 +49,26 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 uv run --locked --extra cpu \
 
 Each eligible question runs through the reference, the separate-row scoring control, and the packed scorer in a rotated order. The control applies the packed scorer's first-token calculation to separate rows and skips the unused argmax. The benchmark warms up the entire sample and reports trial totals and medians. It synchronizes each scorer call and includes packing, mask construction, model forward, and scoring. Prompt preparation and parity assertions run outside the timed sections. Each trial measures the fallback scorer once per ineligible question and shares its cost across the three full-sample totals.
 
+### Four questions per forward on MPS
+
+This experiment uses one frozen FP32 SDPA checkpoint from the seeded parity model and the same byte tokenizer for all paths. It archives master at `61f066250420afbc121524037b996ee4a3524c0a` and runs that source in a persistent subprocess. Before timing, the harness checks all 352 examples for exact winners, scored-token argmaxes, per-task scores, and centered CORE. It also reports bitwise equality and maximum absolute differences for logits and option NLLs.
+
+The four-question layouts group the 176 multiple-choice questions by packed width. Strict mode sends packed widths above 2,048 to the separate-row scorer. Wide mode accepts those rows when their largest logical position is at most 2047. Both preserve per-choice cropping, exclude padding keys and targets, and compute option reductions and first-minimum selection on-device. The 2,160-token fixture runs separately from the timing sample and checks that mutating a branch or padding leaves unrelated logits exactly equal.
+
+After staging the CORE bundle as above, run the comparison from the checkout root.
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 uv run --locked --extra cpu \
+  python experiments/20261124-core-shared-prefix/batching.py \
+  --device mps --work-dir .tmp/codex/core-question-batching --repeats 3
+```
+
+The work directory stores the frozen checkpoint and `report.json`. The harness warms each scorer before running paired sweeps with CPU prefetch off and on. Prefetch builds one upcoming batch's inputs on a worker thread. The timed sweep includes CPU collation, transfer, mask construction, forward, and scoring, with MPS synchronization at both boundaries. Prompt rendering, tokenization, parity checks, and subprocess startup run outside the timed sweeps.
+
+On Apple M2 with PyTorch 2.11.0, all three packed paths matched pinned master on all 352 examples and 33,244 scored-token argmaxes. All 22 per-task scores matched and centered CORE was `0.03214244121780599`. Each path had the same largest absolute differences, `7.1525574e-7` for scored logits and `9.5367432e-7` for option NLLs. Bitwise equality was false for both quantities. The 2,160-token fixture reached logical position 2047. The unaffected logits after branch or padding mutation matched exactly.
+
+The measured frozen checkpoint has SHA-256 `c8102efd75dfd7f2cfcba814916a53eb0db43e41cc86c0ab3b9c29b63cca595f`.
+
 ## Two-H100 follow-up
 
 Use the same CORE bundle and a single GPT-Lab RoPE checkpoint with its tokenizer. Set `GPTLAB_BENCH_MODEL_DIR` to the checkpoint cache root, `GPTLAB_BENCH_MODEL` and `GPTLAB_BENCH_RUN` to its model and run names, and `GPTLAB_BENCH_STEP` to the explicit checkpoint step. Point `GPTLAB_CACHE_DIR` at the staged CORE bundle and tokenizer cache on the node.

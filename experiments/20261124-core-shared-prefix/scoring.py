@@ -42,13 +42,17 @@ def pack_choices(tokens, starts, ends):
 
 
 def tree_masks(positions, branches, windows):
-    distance = positions[:, None] - positions
-    visible = (distance >= 0) & ((branches == 0) | (branches[:, None] == branches))
+    distance = positions[..., :, None] - positions[..., None, :]
+    keys = branches[..., None, :]
+    visible = (distance >= 0) & ((keys == 0) | (branches[..., :, None] == keys))
+    if positions.ndim == 2:
+        # Padding queries may see the first prefix token. Padding is never a key.
+        visible = visible & (keys >= 0)
     masks = {
         left: visible if left < 0 else visible & (distance <= left)
         for left in dict.fromkeys(left for left, _ in windows)
     }
-    return tuple(masks[left] for left, _ in windows)
+    return tuple(masks[left].unsqueeze(1) if positions.ndim == 2 else masks[left] for left, _ in windows)
 
 
 def separate_choices(model, tokens, starts, ends, pad_id, device, *, capture_logits=False):

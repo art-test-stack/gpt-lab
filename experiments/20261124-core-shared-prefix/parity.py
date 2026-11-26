@@ -5,38 +5,12 @@ import platform
 import torch
 
 from gpt_lab.evaluate.core import evaluate_core, first_minimum, prepare_example
-from gpt_lab.model.gpt import DenseTransformer
-from gpt_lab.utils.schemas import TransformerConfig
+from fixture_model import ByteTokenizer, small_model
 from scoring import pack_choices, packed_sdpa, separate_choices, separate_choices_with_prefix_scoring, tree_masks
 
 
 ATOL = 2e-5
 MC = dict(task_type="multiple_choice", num_fewshot=0, continuation_delimiter=" ")
-
-
-class ByteTokenizer:
-    """Deterministic UTF-8 tokenizer with a separate BOS for the small model."""
-    def get_bos_token_id(self):
-        return 256
-
-    def __call__(self, texts, *, prepend):
-        return [[prepend, *text.encode("utf-8")] for text in texts]
-
-
-def small_model(device, *, head_dim=16):
-    torch.manual_seed(29)
-    model = DenseTransformer(TransformerConfig(
-        vocab_size=257, max_context=2048, n_layers=2, n_heads=2, d_head=head_dim,
-        d_model=2 * head_dim, d_ffn=4 * head_dim, window_pattern="SL", window_size=4, attn_impl="sdpa",
-    ))
-    model.init_weights()
-    # Training initialization zeros residual projections. Exercise both layers.
-    with torch.no_grad():
-        model.lm_head.weight.normal_(std=0.08)
-        for block in model.blocks:
-            block.attention.o_proj.weight.normal_(std=0.08)
-            block.ffn.w_2.weight.normal_(std=0.05)
-    return model.to(device).eval()
 
 
 class Parity:

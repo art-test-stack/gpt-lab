@@ -394,13 +394,13 @@ class DenseTransformer(BaseTransformer):
             complete_attn_masks: tuple[torch.Tensor, ...] | None = None,
             position_ids: torch.Tensor | None = None,
         ) -> ModelOutput:
-        """Run the model with optional attention masks and shared RoPE position IDs.
+        """Run the model with optional attention masks and RoPE position IDs.
 
         An ordinary mask further restricts each layer's causal window. A mask
         shaped (batch_size, sequence_length) masks keys. For packed SDPA,
         complete_attn_masks supplies one boolean mask per layer with all
-        visibility rules included. Position IDs have shape (sequence_length,)
-        and apply to every row.
+        visibility rules included. Position IDs can be shared across rows
+        (sequence_length,) or supplied per row (batch_size, sequence_length).
         """
         return self._forward(
             input_ids, labels, attn_mask, past_key_values,
@@ -450,8 +450,8 @@ class DenseTransformer(BaseTransformer):
         if position_ids is not None:
             if past_key_values is not None or self.config.positional_encoding != "rope":
                 raise ValueError("Explicit RoPE positions require RoPE and no KV cache")
-            if position_ids.shape != (T,) or position_ids.dtype != torch.long:
-                raise ValueError("Expected one integer RoPE position per input column")
+            if position_ids.shape not in ((T,), (B, T)) or position_ids.dtype != torch.long:
+                raise ValueError("Expected integer RoPE positions shaped (T,) or (B, T)")
         T0 = 0
         if past_key_values is not None:
             if hasattr(past_key_values, "cur_pos"):
@@ -473,8 +473,13 @@ class DenseTransformer(BaseTransformer):
             x = x + self.pe_cache[:x.size(2)]
 
         if self.config.positional_encoding == "rope":
-            rope_cache = (self.pe_cache[T0:T0+T] if position_ids is None
-                          else self.pe_cache.index_select(0, position_ids))
+            if position_ids is None:
+                rope_cache = self.pe_cache[T0:T0+T]
+            elif position_ids.ndim == 1:
+                rope_cache = self.pe_cache.index_select(0, position_ids)
+            else:
+                cache = self.pe_cache[:self.config.max_context]
+                rope_cache = cache.index_select(0, position_ids.reshape(-1)).unflatten(0, (B, T))
         else:
             rope_cache = None
 
