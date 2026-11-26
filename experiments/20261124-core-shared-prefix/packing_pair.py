@@ -1,4 +1,4 @@
-"""Compare separate and packed answer rows with the same four-question batching."""
+"""Compare separate and packed answer rows at matched question batch sizes."""
 import argparse
 import hashlib
 import json
@@ -20,7 +20,7 @@ from scoring import pack_choices
 ARMS = ("separate", "packed")
 
 
-def comparison_plans(examples):
+def comparison_plans(examples, batch_size=4):
     eligible = sorted(
         (i for i, example in enumerate(examples) if example.packed is not None),
         key=lambda i: len(examples[i].packed.tokens),
@@ -30,15 +30,15 @@ def comparison_plans(examples):
         key=lambda i: max(map(len, examples[i].prepared[0])),
     )
     indices = eligible + fallback
-    matched = [eligible[i:i + 4] for i in range(0, len(eligible), 4)]
+    matched = [eligible[i:i + batch_size] for i in range(0, len(eligible), batch_size)]
     comparisons = {
         "eligible": {
             "separate": [(False, group) for group in matched],
             "packed": [(True, group) for group in matched],
         },
         "all": {
-            "separate": [(False, indices[i:i + 4]) for i in range(0, len(indices), 4)],
-            "packed": plan_groups(examples, indices, "wide"),
+            "separate": [(False, indices[i:i + batch_size]) for i in range(0, len(indices), batch_size)],
+            "packed": plan_groups(examples, indices, "wide", batch_size=batch_size),
         },
     }
     for scope, arms in comparisons.items():
@@ -113,17 +113,102 @@ def mps_peak(score):
     return {"sampled_peak_mps_tensor_bytes": peak, "memory_samples": samples}
 
 
+def mps_attempt(run):
+    try:
+        return run(), None
+    except RuntimeError as error:
+        message = str(error)
+        if not any(text in message.lower() for text in ("out of memory", "invalid buffer size", "failed to allocate")):
+            raise
+    torch.mps.synchronize()
+    torch.mps.empty_cache()
+    return None, message
+
+
+def mps_compare(scope, arms, score, repeats, batch_size):
+    warmup, failures = {}, {}
+    for arm in ARMS:
+        result, failure = mps_attempt(lambda: score(arm))
+        if failure is None:
+            warmup[arm] = result
+        else:
+            failures[arm] = failure
+    parity = None
+    if len(warmup) == len(ARMS):
+        parity = check_fp32(warmup["separate"], warmup["packed"])
+
+    def time_arm(arm):
+        torch.mps.synchronize()
+        start = perf_counter()
+        score(arm)
+        torch.mps.synchronize()
+        return perf_counter() - start
+
+    trials = {arm: [] for arm in ARMS}
+    for trial in range(repeats):
+        for arm in (ARMS if trial % 2 == 0 else ARMS[::-1]):
+            if arm in failures:
+                continue
+            seconds, failure = mps_attempt(lambda: time_arm(arm))
+            if failure is None:
+                trials[arm].append(seconds)
+            else:
+                failures[arm] = failure
+            print(json.dumps({
+                "batch_size": batch_size, "scope": scope, "arm": arm, "trial": trial + 1,
+                "seconds": seconds, "allocation_error": failure,
+            }), flush=True)
+
+    comparison = {}
+    for arm, plan in arms.items():
+        counts = plan_counts(plan, arm)
+        if arm in failures:
+            comparison[arm] = {**counts, "allocation_error": failures[arm]}
+            continue
+        seconds = median(trials[arm])
+        memory, failure = mps_attempt(lambda: mps_peak(lambda: score(arm)))
+        comparison[arm] = {
+            **counts, "trial_seconds": trials[arm], "median_seconds": seconds,
+            "questions_per_second": counts["questions"] / seconds,
+            **(memory if failure is None else {"memory_allocation_error": failure}),
+        }
+    comparison["paired_speedup"] = None if failures else median(
+        a / b for a, b in zip(trials["separate"], trials["packed"])
+    )
+    return comparison, parity
+
+
+def fastest_sizes(sizes):
+    winner = {}
+    for scope in ("eligible", "all"):
+        winner[scope] = {}
+        for arm in ARMS:
+            measured = [
+                (size, results["comparisons"][scope][arm])
+                for size, results in sizes.items()
+                if "questions_per_second" in results["comparisons"][scope][arm]
+            ]
+            if measured:
+                size, result = max(measured, key=lambda item: item[1]["questions_per_second"])
+                winner[scope][arm] = {"batch_size": size, **result}
+    return winner
+
+
 @torch.no_grad()
 def main():
-    parser = argparse.ArgumentParser(description="Measure the incremental benefit of packing four questions on MPS.")
+    parser = argparse.ArgumentParser(description="Measure CORE packing throughput across question batch sizes on MPS.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[4])
     args = parser.parse_args()
     if not torch.backends.mps.is_available() or args.repeats < 1:
         parser.error("an MPS device and at least one timed trial are required")
+    if min(args.batch_sizes) < 1 or len(set(args.batch_sizes)) != len(args.batch_sizes):
+        parser.error("batch sizes must be distinct positive integers")
     torch.set_num_threads(1)
     device = torch.device("mps")
+    torch.mps.set_per_process_memory_fraction(1.0)
     model, tokenizer = load_frozen_checkpoint(args.checkpoint, device), ByteTokenizer()
     pad_id = tokenizer.get_bos_token_id()
     fixture = check_wide_fixture(model, pad_id, device)
@@ -140,49 +225,28 @@ def main():
 
     examples, _ = load_examples(tokenizer)
     examples = [example for example in examples if example.task_type == "multiple_choice"]
-    plans = comparison_plans(examples)
-    assert len(examples) == 176 and len(plans["eligible"]["packed"]) == 35
-    assert len(plans["all"]["separate"]) == 44
-    assert plan_counts(plans["all"]["packed"], "packed")["fallback_questions"] == 36
-
-    def score(scope, arm):
-        return score_plan(plans[scope][arm], examples, model, pad_id, device)
-
-    # Both full parity passes exercise the exact groups and device paths used in timing.
-    parity = {scope: check_fp32(score(scope, "separate"), score(scope, "packed")) for scope in plans}
-    print(json.dumps({"parity": parity}), flush=True)
-    comparisons = {}
-    for scope, arms in plans.items():
-        trials = {arm: [] for arm in ARMS}
-        for trial in range(args.repeats):
-            for arm in (ARMS if trial % 2 == 0 else ARMS[::-1]):
-                torch.mps.synchronize()
-                start = perf_counter()
-                score(scope, arm)
-                torch.mps.synchronize()
-                seconds = perf_counter() - start
-                trials[arm].append(seconds)
-                print(json.dumps({"scope": scope, "arm": arm, "trial": trial + 1, "seconds": seconds}), flush=True)
-        arms_report = {}
-        for arm, plan in arms.items():
-            counts = plan_counts(plan, arm)
-            seconds = median(trials[arm])
-            arms_report[arm] = {
-                **counts, "trial_seconds": trials[arm], "median_seconds": seconds,
-                "questions_per_second": counts["questions"] / seconds,
-                **mps_peak(lambda: score(scope, arm)),
-            }
-        comparisons[scope] = {
-            **arms_report,
-            "paired_speedup": median(a / b for a, b in zip(trials["separate"], trials["packed"])),
-        }
+    assert len(examples) == 176 and sum(example.packed is not None for example in examples) == 140
+    sizes = {}
     report = {
         "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
         "device": "mps", "torch": torch.__version__, "prefetch": False,
-        "fixture": fixture, "parity": parity, "comparisons": comparisons,
+        "fixture": fixture, "batch_sizes": sizes,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(report, indent=2) + "\n")
+    for batch_size in args.batch_sizes:
+        comparisons, parity = {}, {}
+        for scope, arms in comparison_plans(examples, batch_size).items():
+            comparisons[scope], parity[scope] = mps_compare(
+                scope, arms, lambda arm: score_plan(arms[arm], examples, model, pad_id, device),
+                args.repeats, batch_size,
+            )
+        sizes[batch_size] = {"comparisons": comparisons, "parity": parity}
+        report["fastest_sizes"] = fastest_sizes(sizes)
+        if len(args.batch_sizes) == 1:
+            report.update(sizes[batch_size])
+        staged = args.report.with_suffix(".tmp")
+        staged.write_text(json.dumps(report, indent=2) + "\n")
+        staged.replace(args.report)
 
 
 if __name__ == "__main__":

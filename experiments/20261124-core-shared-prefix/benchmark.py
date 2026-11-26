@@ -19,7 +19,7 @@ from gpt_lab.utils.distributed import cleanup_dist_groups, init_dist_groups
 from batching import Example
 from batched_scoring import check_wide_fixture
 from fa4 import FA4_REPO, FA4_REVISION, NativeFA4
-from packing_pair import ARMS as PAIRED_ARMS, comparison_plans, plan_counts, score_plan
+from packing_pair import ARMS as PAIRED_ARMS, comparison_plans, fastest_sizes, plan_counts, score_plan
 from parity import ByteTokenizer, check_sibling_isolation, cropped_sibling_examples, small_model
 from scoring import pack_choices, separate_choices, separate_choices_with_prefix_scoring, tree_masks
 
@@ -159,14 +159,27 @@ def compare(reference, candidate):
     return result
 
 
-def measure_pair(arms, examples, model, pad_id, device, fa4):
-    scores, warmup = {}, {}
-    for arm, plan in arms.items():
-        before_compiles, before_seconds = fa4.compiles, fa4.compile_seconds
-        dist.barrier()
+def cuda_attempt(run, device):
+    error = result = None
+    try:
+        result = run()
+    except torch.cuda.OutOfMemoryError as failure:
+        error = str(failure)
+    if error is not None:
         torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+    errors = [None] * dist.get_world_size()
+    dist.all_gather_object(errors, error)
+    return (None, errors) if any(errors) else (result, None)
+
+
+def measure_pair(arms, examples, model, pad_id, device, fa4):
+    scores, warmup, failures = {}, {}, {}
+
+    def warm(arm, plan):
+        before_compiles, before_seconds = fa4.compiles, fa4.compile_seconds
         start = perf_counter()
-        scores[arm] = score_plan(plan, examples, model, pad_id, device, fa4=fa4)
+        values = score_plan(plan, examples, model, pad_id, device, fa4=fa4)
         torch.cuda.synchronize(device)
         elapsed = perf_counter() - start
         if arm == "packed" and not plan[0][0]:
@@ -175,37 +188,65 @@ def measure_pair(arms, examples, model, pad_id, device, fa4):
             lambda: score_plan(plan[:1], examples, model, pad_id, device, fa4=fa4),
             device, ("flashattentionforwardsm90",),
         )
-        warmup[arm] = {
+        return values, {
             "warmup_seconds": elapsed, "kernel_symbols": kernels,
             "compiles": fa4.compiles - before_compiles,
             "compilation_seconds": fa4.compile_seconds - before_seconds,
         }
-    parity = compare(scores["separate"], scores["packed"])
-    outside_tolerance = torch.tensor(parity["outside_tolerance"], device=device)
-    dist.all_reduce(outside_tolerance)
-    if outside_tolerance.item():
-        print(json.dumps({"rank": dist.get_rank(), "bf16_parity": parity}), flush=True)
-        raise SystemExit("Per-option BF16 NLL exceeded 0.05 nats before timing")
+
+    for arm, plan in arms.items():
+        dist.barrier()
+        torch.cuda.synchronize(device)
+        result, failure = cuda_attempt(lambda: warm(arm, plan), device)
+        if failure is None:
+            scores[arm], warmup[arm] = result
+        else:
+            failures[arm] = failure
+
+    parity = None
+    if not failures:
+        parity = compare(scores["separate"], scores["packed"])
+        outside_tolerance = torch.tensor(parity["outside_tolerance"], device=device)
+        dist.all_reduce(outside_tolerance)
+        if outside_tolerance.item():
+            print(json.dumps({"rank": dist.get_rank(), "bf16_parity": parity}), flush=True)
+            raise SystemExit("Per-option BF16 NLL exceeded 0.05 nats before timing")
+
+    def timed(plan):
+        torch.cuda.reset_peak_memory_stats(device)
+        start = perf_counter()
+        score_plan(plan, examples, model, pad_id, device, fa4=fa4)
+        torch.cuda.synchronize(device)
+        return {
+            "seconds": perf_counter() - start,
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        }
 
     trials = {arm: [] for arm in arms}
     before_compiles = fa4.compiles
     for trial in range(3):
         for arm in (PAIRED_ARMS if trial % 2 == 0 else PAIRED_ARMS[::-1]):
+            if arm in failures:
+                continue
             dist.barrier()
             torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-            start = perf_counter()
-            score_plan(arms[arm], examples, model, pad_id, device, fa4=fa4)
-            torch.cuda.synchronize(device)
-            trials[arm].append({
-                "seconds": perf_counter() - start,
-                "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
-            })
+            result, failure = cuda_attempt(lambda: timed(arms[arm]), device)
+            if failure is None:
+                trials[arm].append(result)
+            else:
+                failures[arm] = failure
     if fa4.compiles != before_compiles:
         raise RuntimeError("FA4 compiled during the timed paired sweep")
     return {
-        "ids": list(scores["separate"]), "parity": parity,
-        "arms": {arm: {**plan_counts(plan, arm), **warmup[arm], "trials": trials[arm]} for arm, plan in arms.items()},
+        "ids": [(examples[i].label, examples[i].index) for _, group in arms["separate"] for i in group],
+        "parity": parity,
+        "arms": {
+            arm: {
+                **plan_counts(plan, arm), **warmup.get(arm, {}), "trials": trials[arm],
+                **({"allocation_errors_by_rank": failures[arm]} if arm in failures else {}),
+            }
+            for arm, plan in arms.items()
+        },
     }
 
 
@@ -220,10 +261,14 @@ def aggregate_pair(per_rank, scopes, unique_count):
         arms_report = {}
         for arm in PAIRED_ARMS:
             records = [result["arms"][arm] for result in results]
-            times[arm] = [max(record["trials"][i]["seconds"] for record in records) for i in range(3)]
-            seconds = median(times[arm])
             counts = {key: sum(record[key] for record in records)
                       for key in ("forwards", "packed_forwards", "fallback_forwards", "fallback_questions")}
+            errors = records[0].get("allocation_errors_by_rank")
+            if errors is not None:
+                arms_report[arm] = {**counts, "allocation_errors_by_rank": errors}
+                continue
+            times[arm] = [max(record["trials"][i]["seconds"] for record in records) for i in range(3)]
+            seconds = median(times[arm])
             arms_report[arm] = {
                 **counts, "median_seconds": seconds, "questions_per_second": len(ids) / seconds,
                 "peak_allocated_bytes_by_rank": [
@@ -232,7 +277,8 @@ def aggregate_pair(per_rank, scopes, unique_count):
             }
         comparisons[scope] = {
             **arms_report, "questions": len(ids),
-            "paired_speedup": median(a / b for a, b in zip(times["separate"], times["packed"])),
+            "paired_speedup": (median(a / b for a, b in zip(times["separate"], times["packed"]))
+                               if len(times) == len(PAIRED_ARMS) else None),
         }
     return comparisons
 
@@ -259,9 +305,8 @@ def run_paired(args, context):
             prepared = prepare_example(index, tokenizer, data, meta, model.max_seq_len)
             examples.append(Example(task["label"], index, meta["task_type"], data[index]["gold"],
                                     prepared, pack_choices(*prepared)))
-    plans = comparison_plans(examples)
-    if not plans["eligible"]["packed"]:
-        raise RuntimeError("Each rank needs an eligible four-question group for the native probe")
+    if not any(example.packed is not None for example in examples):
+        raise RuntimeError("Each rank needs an eligible question batch for the native probe")
 
     fixture_model = small_model(device, head_dim=64)
     fa4 = NativeFA4(model.window_sizes + fixture_model.window_sizes, device)
@@ -277,24 +322,37 @@ def run_paired(args, context):
         del fixture_model
         for entry in dispatch:
             entry.flash_attn_func = fa4
+        records = {}
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            records = {scope: measure_pair(arms, examples, model, pad_id, device, fa4)
-                       for scope, arms in plans.items()}
+            for size in args.batch_sizes:
+                records[size] = {
+                    scope: measure_pair(arms, examples, model, pad_id, device, fa4)
+                    for scope, arms in comparison_plans(examples, size).items()
+                }
     finally:
         fa4.cute.compile = fa4.original_compile
         for entry, original in zip(dispatch, original_calls):
             entry.flash_attn_func = original
     per_rank = [None] * context.world_size
-    dist.all_gather_object(per_rank, {
-        "rank": context.rank, "gpu": torch.cuda.get_device_name(device), "comparisons": records, "preflight": preflight,
-    })
+    local = {"rank": context.rank, "gpu": torch.cuda.get_device_name(device),
+             "batch_sizes": records, "preflight": preflight}
+    if len(args.batch_sizes) == 1:
+        local["comparisons"] = records[args.batch_sizes[0]]
+    dist.all_gather_object(per_rank, local)
     if context.rank == 0:
+        sizes = {
+            size: {"comparisons": aggregate_pair(
+                [{"comparisons": rank["batch_sizes"][size]} for rank in per_rank], records[size], unique_count,
+            )}
+            for size in args.batch_sizes
+        }
         print(json.dumps({
             "checkpoint": vars(args), "model_config": model.config.model_dump(mode="json"),
             "torch": torch.__version__, "cuda": torch.version.cuda, "dtype": "bfloat16",
             "fa4_repo": FA4_REPO, "fa4_revision": FA4_REVISION, "fa4_source": fa4.origin,
             "nll_atol": BF16_NLL_ATOL, "nll_rtol": 0,
-            "comparisons": aggregate_pair(per_rank, plans, unique_count), "per_rank": per_rank,
+            "batch_sizes": sizes, "fastest_sizes": fastest_sizes(sizes), "per_rank": per_rank,
+            **(sizes[args.batch_sizes[0]] if len(args.batch_sizes) == 1 else {}),
         }, indent=2))
 
 
@@ -379,7 +437,13 @@ def main():
     parser.add_argument("--step", required=True, type=int)
     parser.add_argument("--max-per-task", type=int, default=64)
     parser.add_argument("--compare-four-question", action="store_true")
+    parser.add_argument("--batch-sizes", type=int, nargs="+")
     args = parser.parse_args()
+    if args.batch_sizes and not args.compare_four_question:
+        parser.error("--batch-sizes requires --compare-four-question")
+    args.batch_sizes = args.batch_sizes or [4]
+    if min(args.batch_sizes) < 1 or len(set(args.batch_sizes)) != len(args.batch_sizes):
+        parser.error("batch sizes must be distinct positive integers")
     if args.max_per_task < 11 or args.step < 0:
         parser.error("use at least 11 examples per task and an explicit nonnegative checkpoint step")
     if int(os.environ.get("WORLD_SIZE", "1")) != 2 or not torch.cuda.is_available():

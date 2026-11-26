@@ -48,9 +48,10 @@ def load_examples(tokenizer):
     return examples, baselines
 
 
-def plan_groups(examples, indices, mode):
+def plan_groups(examples, indices, mode, *, batch_size=4):
     """Keep contiguous groups of similar-width eligible questions."""
-    batch_size = 1 if mode == "one_question" else 4
+    if mode == "one_question":
+        batch_size = 1
     groups, pending = [], []
     for index in indices:
         packed = examples[index].packed

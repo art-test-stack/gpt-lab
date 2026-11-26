@@ -84,6 +84,8 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 uv run --locked --extra cpu \
   --report .tmp/codex/core-question-batching/packing-pair.json --repeats 3
 ```
 
+Append `--batch-sizes 4 8 16 32` to measure both scorers at each question batch size. Each size reports the eligible and full cohorts separately, plus the fastest observed size for each scorer and cohort. The MPS process uses Metal's recommended working-set limit and records allocation failures per scorer and size. Sampled peak memory covers standalone evaluation tensors.
+
 ## Two-H100 follow-up
 
 Use the same CORE bundle and a single GPT-Lab RoPE checkpoint with its tokenizer. Set `GPTLAB_BENCH_MODEL_DIR` to the checkpoint cache root, `GPTLAB_BENCH_MODEL` and `GPTLAB_BENCH_RUN` to its model and run names, and `GPTLAB_BENCH_STEP` to the explicit checkpoint step. Point `GPTLAB_CACHE_DIR` at the staged CORE bundle and tokenizer cache on the node.
@@ -130,3 +132,5 @@ CUDA_VISIBLE_DEVICES=0,1 GPTLAB_DTYPE=bfloat16 uv run --locked --extra gpu \
   --run-name "${GPTLAB_BENCH_RUN:?set the run name}" \
   --step "${GPTLAB_BENCH_STEP:?set the checkpoint step}" --max-per-task 64
 ```
+
+Append `--batch-sizes 4 8 16 32` to the paired FA4 command for the same throughput sweep. If either rank runs out of CUDA memory, that scorer and size are recorded as an allocation failure. The runner keeps measuring the other scorer and requested sizes.
