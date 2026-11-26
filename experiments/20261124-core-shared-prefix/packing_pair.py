@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+from multiprocessing import get_context
 from pathlib import Path
 from statistics import median
 from threading import Event, Thread
@@ -141,31 +142,42 @@ def mps_attempt(run):
     return None, message
 
 
-def mps_compare(scope, arms, score, repeats, batch_size):
+def mps_phase(score, phase):
+    if phase == "warmup":
+        return mps_attempt(score)
+    if phase == "memory":
+        return mps_attempt(lambda: mps_peak(score))
+
+    def timed():
+        torch.mps.synchronize()
+        start = perf_counter()
+        score()
+        torch.mps.synchronize()
+        return perf_counter() - start
+
+    return mps_attempt(timed)
+
+
+def mps_compare(scope, arms, run_phase, repeats, batch_size):
     warmup, failures = {}, {}
     for arm in ARMS:
-        result, failure = mps_attempt(lambda: score(arm))
+        result, failure = run_phase(arm, "warmup")
         if failure is None:
             warmup[arm] = result
         else:
             failures[arm] = failure
+            print(json.dumps({"batch_size": batch_size, "scope": scope, "arm": arm,
+                              "warmup_allocation_error": failure}), flush=True)
     parity = None
     if len(warmup) == len(ARMS):
         parity = check_fp32(warmup["separate"], warmup["packed"])
-
-    def time_arm(arm):
-        torch.mps.synchronize()
-        start = perf_counter()
-        score(arm)
-        torch.mps.synchronize()
-        return perf_counter() - start
 
     trials = {arm: [] for arm in ARMS}
     for trial in range(repeats):
         for arm in (ARMS if trial % 2 == 0 else ARMS[::-1]):
             if arm in failures:
                 continue
-            seconds, failure = mps_attempt(lambda: time_arm(arm))
+            seconds, failure = run_phase(arm, "time")
             if failure is None:
                 trials[arm].append(seconds)
             else:
@@ -182,7 +194,7 @@ def mps_compare(scope, arms, score, repeats, batch_size):
             comparison[arm] = {**counts, "allocation_error": failures[arm]}
             continue
         seconds = median(trials[arm])
-        memory, failure = mps_attempt(lambda: mps_peak(lambda: score(arm)))
+        memory, failure = run_phase(arm, "memory")
         comparison[arm] = {
             **counts, "trial_seconds": trials[arm], "median_seconds": seconds,
             "questions_per_second": counts["questions"] / seconds,
@@ -210,6 +222,58 @@ def fastest_sizes(sizes):
     return winner
 
 
+def load_mps_model(checkpoint):
+    torch.set_num_threads(1)
+    device = torch.device("mps")
+    memory_fraction = os.getenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO")
+    if memory_fraction is not None:
+        # Honor an explicit cap after GPT-Lab initializes the backend.
+        torch.mps.set_per_process_memory_fraction(float(memory_fraction))
+    model, tokenizer = load_frozen_checkpoint(checkpoint, device), ByteTokenizer()
+    pad_id = tokenizer.get_bos_token_id()
+    return model, tokenizer, pad_id, device
+
+
+def check_fixture(model, pad_id, device, width_buckets):
+    fixture = check_wide_fixture(model, pad_id, device)
+    fixture_examples = [
+        Example("fixture", i, "multiple_choice", None, choices, pack_choices(*choices))
+        for i, choices in enumerate(wide_fixture(pad_id))
+    ]
+    group = [0, 1]
+    fixture.update(check_fp32(
+        score_plan([(False, group)], fixture_examples, model, pad_id, device, width_buckets=width_buckets),
+        score_plan([(True, group)], fixture_examples, model, pad_id, device, width_buckets=width_buckets),
+    ))
+    return fixture
+
+
+def load_sample(tokenizer):
+    examples, _ = load_examples(tokenizer)
+    examples = [example for example in examples if example.task_type == "multiple_choice"]
+    assert len(examples) == 176 and sum(example.packed is not None for example in examples) == 140
+    return examples
+
+
+@torch.no_grad()
+def isolated_phase(checkpoint, width_buckets, batch_size=None, scope=None, arm=None, phase=None):
+    model, tokenizer, pad_id, device = load_mps_model(checkpoint)
+    if scope is None:
+        return check_fixture(model, pad_id, device, width_buckets)
+    examples = load_sample(tokenizer)
+    plan = comparison_plans(examples, batch_size)[scope][arm]
+
+    def score():
+        return score_plan(plan, examples, model, pad_id, device, width_buckets=width_buckets)
+
+    if phase != "warmup":
+        _, failure = mps_phase(score, "warmup")
+        if failure is not None:
+            return None, f"Warm-up before {phase}: {failure}"
+        torch.mps.empty_cache()
+    return mps_phase(score, phase)
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description="Measure CORE packing throughput across question batch sizes on MPS.")
@@ -218,6 +282,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[4])
     parser.add_argument("--width-buckets", type=int, nargs="+", default=[])
+    parser.add_argument("--isolate-trials", action="store_true")
     args = parser.parse_args()
     if not torch.backends.mps.is_available() or args.repeats < 1:
         parser.error("an MPS device and at least one timed trial are required")
@@ -225,46 +290,45 @@ def main():
         parser.error("batch sizes must be distinct positive integers")
     if args.width_buckets != sorted(set(args.width_buckets)) or any(width < 1 for width in args.width_buckets):
         parser.error("width buckets must be increasing positive integers")
-    torch.set_num_threads(1)
-    device = torch.device("mps")
-    memory_fraction = os.getenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO")
-    if memory_fraction is not None:
-        # Honor an explicit cap after GPT-Lab initializes the backend.
-        torch.mps.set_per_process_memory_fraction(float(memory_fraction))
-    model, tokenizer = load_frozen_checkpoint(args.checkpoint, device), ByteTokenizer()
-    pad_id = tokenizer.get_bos_token_id()
-    fixture = check_wide_fixture(model, pad_id, device)
-    fixture_examples = [
-        Example("fixture", i, "multiple_choice", None, choices, pack_choices(*choices))
-        for i, choices in enumerate(wide_fixture(pad_id))
-    ]
-    group = [0, 1]
-    fixture.update(check_fp32(
-        score_plan([(False, group)], fixture_examples, model, pad_id, device, width_buckets=args.width_buckets),
-        score_plan([(True, group)], fixture_examples, model, pad_id, device, width_buckets=args.width_buckets),
-    ))
-    print(json.dumps({"fixture": fixture}), flush=True)
+    if args.isolate_trials:
+        with get_context("spawn").Pool(1, maxtasksperchild=1) as pool:
+            run_mps_sweep(args, pool)
+    else:
+        run_mps_sweep(args)
 
-    examples, _ = load_examples(tokenizer)
-    examples = [example for example in examples if example.task_type == "multiple_choice"]
-    assert len(examples) == 176 and sum(example.packed is not None for example in examples) == 140
+
+def run_mps_sweep(args, pool=None):
+    if pool is None:
+        model, tokenizer, pad_id, device = load_mps_model(args.checkpoint)
+        fixture = check_fixture(model, pad_id, device, args.width_buckets)
+    else:
+        tokenizer = ByteTokenizer()
+        fixture = pool.apply(isolated_phase, (args.checkpoint, args.width_buckets))
+    print(json.dumps({"fixture": fixture}), flush=True)
+    examples = load_sample(tokenizer)
     sizes = {}
     report = {
         "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
         "device": "mps", "torch": torch.__version__, "prefetch": False,
-        "width_buckets": args.width_buckets, "mps_high_watermark_ratio": memory_fraction,
+        "width_buckets": args.width_buckets, "isolated_trials": args.isolate_trials,
+        "mps_high_watermark_ratio": os.getenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO"),
+        "mps_low_watermark_ratio": os.getenv("PYTORCH_MPS_LOW_WATERMARK_RATIO"),
         "fixture": fixture, "batch_sizes": sizes,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     for batch_size in args.batch_sizes:
         comparisons, parity = {}, {}
         for scope, arms in comparison_plans(examples, batch_size).items():
-            comparisons[scope], parity[scope] = mps_compare(
-                scope, arms, lambda arm: score_plan(
+            def run_phase(arm, phase):
+                if pool is not None:
+                    return pool.apply(
+                        isolated_phase, (args.checkpoint, args.width_buckets, batch_size, scope, arm, phase),
+                    )
+                return mps_phase(lambda: score_plan(
                     arms[arm], examples, model, pad_id, device, width_buckets=args.width_buckets,
-                ),
-                args.repeats, batch_size,
-            )
+                ), phase)
+
+            comparisons[scope], parity[scope] = mps_compare(scope, arms, run_phase, args.repeats, batch_size)
         sizes[batch_size] = {"comparisons": comparisons, "parity": parity}
         report["fastest_sizes"] = fastest_sizes(sizes)
         if len(args.batch_sizes) == 1:
