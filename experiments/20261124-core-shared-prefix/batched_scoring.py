@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 from gpt_lab.evaluate.core import stack_sequences
 from fixture_model import wide_fixture
@@ -29,9 +30,18 @@ class SeparateBatch:
     valid: torch.Tensor
 
 
-def collate_separate(examples, pad_id):
-    rows = [row for tokens, _, _ in examples for row in tokens]
+def stack_at_width(rows, pad_id, width):
     tokens = stack_sequences(rows, pad_id)
+    if width is None or width == tokens.size(1):
+        return tokens
+    if width < tokens.size(1):
+        raise ValueError("Padded width must fit every row")
+    return F.pad(tokens, (0, width - tokens.size(1)), value=pad_id)
+
+
+def collate_separate(examples, pad_id, *, padded_width=None):
+    rows = [row for tokens, _, _ in examples for row in tokens]
+    tokens = stack_at_width(rows, pad_id, padded_width)
     width = tokens.size(1)
     keys = torch.arange(width) < torch.tensor(list(map(len, rows)))[:, None]
     spans = []
@@ -53,13 +63,13 @@ def collate_separate(examples, pad_id):
     return SeparateBatch(tokens, keys, sources, valid)
 
 
-def collate_packed(choices, pad_id, *, max_context=CONTEXT):
+def collate_packed(choices, pad_id, *, max_context=CONTEXT, padded_width=None):
     """Build the CPU tensors for a batch of already eligible questions."""
     if any(max(question.positions) >= max_context or min(question.positions) < 0 for question in choices):
         raise ValueError(f"A packed path exceeds the model context ({max_context} tokens)")
-    tokens = stack_sequences([question.tokens for question in choices], pad_id)
-    positions = stack_sequences([question.positions for question in choices], 0)
-    branches = stack_sequences([question.branches for question in choices], -1)
+    tokens = stack_at_width([question.tokens for question in choices], pad_id, padded_width)
+    positions = stack_at_width([question.positions for question in choices], 0, padded_width)
+    branches = stack_at_width([question.branches for question in choices], -1, padded_width)
     batch_size, width = tokens.shape
     max_options = max(len(question.lengths) for question in choices)
     max_answer = max(max(question.lengths) for question in choices)

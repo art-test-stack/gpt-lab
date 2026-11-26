@@ -86,6 +86,19 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 uv run --locked --extra cpu \
 
 Append `--batch-sizes 4 8 16 32` to measure both scorers at each question batch size. Each size reports the eligible and full cohorts separately, plus the fastest observed size for each scorer and cohort. The harness records allocation failures per scorer and size. For isolated Metal driver allocations, run the command once per size with a separate report path. Sampled peak memory covers standalone evaluation tensors.
 
+For a fixed-width MPS sweep, run each size in a fresh process. Both scorers round physical width up to the next bucket. Separate rows still cap width at 2,048. Padding does not change logical positions or the tokens included in the loss. The synthetic parity question still uses logical position 2047.
+
+```bash
+for size in 4 8 16 32; do
+  PYTORCH_ENABLE_MPS_FALLBACK=0 PYTORCH_MPS_LOW_WATERMARK_RATIO=1.0 \
+    PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.2 uv run --locked --extra cpu \
+    python experiments/20261124-core-shared-prefix/packing_pair.py \
+    --checkpoint .tmp/codex/core-question-batching/frozen.pt \
+    --report ".tmp/codex/core-question-batching/bucket-$size.json" \
+    --batch-sizes "$size" --width-buckets 512 1024 2048 2160 --repeats 3
+done
+```
+
 ## Two-H100 follow-up
 
 Use the same CORE bundle and a single GPT-Lab RoPE checkpoint with its tokenizer. Set `GPTLAB_BENCH_MODEL_DIR` to the checkpoint cache root, `GPTLAB_BENCH_MODEL` and `GPTLAB_BENCH_RUN` to its model and run names, and `GPTLAB_BENCH_STEP` to the explicit checkpoint step. Point `GPTLAB_CACHE_DIR` at the staged CORE bundle and tokenizer cache on the node.

@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 from statistics import median
 from threading import Event, Thread
@@ -48,14 +49,29 @@ def comparison_plans(examples, batch_size=4):
     return comparisons
 
 
-def score_plan(plan, examples, model, pad_id, device, *, fa4=None):
+def bucket_width(width, buckets):
+    return next((bound for bound in buckets if width <= bound), None)
+
+
+def score_plan(plan, examples, model, pad_id, device, *, fa4=None, width_buckets=()):
     scores = {}
     for packed, indices in plan:
         if packed:
-            batch = collate_packed([examples[i].packed for i in indices], pad_id, max_context=model.max_seq_len)
+            questions = [examples[i].packed for i in indices]
+            width = None
+            if width_buckets:
+                width = bucket_width(max(len(question.tokens) for question in questions), width_buckets)
+            batch = collate_packed(questions, pad_id, max_context=model.max_seq_len, padded_width=width)
             nll, winners, _ = score_packed_batch(model, batch, device, fa4=fa4)
         else:
-            batch = collate_separate([examples[i].prepared for i in indices], pad_id)
+            prepared = [examples[i].prepared for i in indices]
+            width = None
+            if width_buckets:
+                widest = max(len(row) for tokens, _, _ in prepared for row in tokens)
+                width = bucket_width(widest, width_buckets)
+                if width is not None:
+                    width = min(width, model.max_seq_len)
+            batch = collate_separate(prepared, pad_id, padded_width=width)
             nll, winners = score_separate_batch(model, batch, device)
         # One readback per forward in both arms, for all options and winners.
         results = nll.new_empty((len(indices), nll.size(1) + 1))
@@ -201,13 +217,20 @@ def main():
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[4])
+    parser.add_argument("--width-buckets", type=int, nargs="+", default=[])
     args = parser.parse_args()
     if not torch.backends.mps.is_available() or args.repeats < 1:
         parser.error("an MPS device and at least one timed trial are required")
     if min(args.batch_sizes) < 1 or len(set(args.batch_sizes)) != len(args.batch_sizes):
         parser.error("batch sizes must be distinct positive integers")
+    if args.width_buckets != sorted(set(args.width_buckets)) or any(width < 1 for width in args.width_buckets):
+        parser.error("width buckets must be increasing positive integers")
     torch.set_num_threads(1)
     device = torch.device("mps")
+    memory_fraction = os.getenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO")
+    if memory_fraction is not None:
+        # Honor an explicit cap after GPT-Lab initializes the backend.
+        torch.mps.set_per_process_memory_fraction(float(memory_fraction))
     model, tokenizer = load_frozen_checkpoint(args.checkpoint, device), ByteTokenizer()
     pad_id = tokenizer.get_bos_token_id()
     fixture = check_wide_fixture(model, pad_id, device)
@@ -217,8 +240,8 @@ def main():
     ]
     group = [0, 1]
     fixture.update(check_fp32(
-        score_plan([(False, group)], fixture_examples, model, pad_id, device),
-        score_plan([(True, group)], fixture_examples, model, pad_id, device),
+        score_plan([(False, group)], fixture_examples, model, pad_id, device, width_buckets=args.width_buckets),
+        score_plan([(True, group)], fixture_examples, model, pad_id, device, width_buckets=args.width_buckets),
     ))
     print(json.dumps({"fixture": fixture}), flush=True)
 
@@ -229,6 +252,7 @@ def main():
     report = {
         "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
         "device": "mps", "torch": torch.__version__, "prefetch": False,
+        "width_buckets": args.width_buckets, "mps_high_watermark_ratio": memory_fraction,
         "fixture": fixture, "batch_sizes": sizes,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -236,7 +260,9 @@ def main():
         comparisons, parity = {}, {}
         for scope, arms in comparison_plans(examples, batch_size).items():
             comparisons[scope], parity[scope] = mps_compare(
-                scope, arms, lambda arm: score_plan(arms[arm], examples, model, pad_id, device),
+                scope, arms, lambda arm: score_plan(
+                    arms[arm], examples, model, pad_id, device, width_buckets=args.width_buckets,
+                ),
                 args.repeats, batch_size,
             )
         sizes[batch_size] = {"comparisons": comparisons, "parity": parity}
