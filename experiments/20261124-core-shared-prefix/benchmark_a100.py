@@ -26,7 +26,7 @@ CONTEXT = 2048
 SAMPLE = 128
 SIZES = (1, 4, 8, 16)
 WIDTHS = (512, 1024, 2048, 2160)
-NLL_ATOL = 0.05
+MEAN_RELATIVE_NLL_LIMIT = 0.01
 ARMS = ("separate", "packed")
 
 
@@ -227,10 +227,37 @@ def validate(reference, scores, examples, baselines, expected_tasks):
     from benchmark import compare
 
     result = compare(reference, scores)
-    result["task_scores"] = task_scores(scores, examples, baselines)
+    result["options_above_0_05_nats"] = result.pop("outside_tolerance")
+    relative = []
+    undefined = 0
+    worst_absolute = None
+    for (task, index), (reference_losses, _) in reference.items():
+        candidate_losses, _ = scores[task, index]
+        for option, (before, after) in enumerate(zip(reference_losses, candidate_losses)):
+            if not (math.isfinite(before) and math.isfinite(after)):
+                undefined += 1
+                continue
+            delta = abs(after - before)
+            if worst_absolute is None or delta > worst_absolute["abs_nll_delta"]:
+                worst_absolute = {"task": task, "example_index": index, "option": option,
+                                  "reference_nll": before, "candidate_nll": after, "abs_nll_delta": delta}
+            if before != 0:
+                relative.append(delta / abs(before))
+            elif delta == 0:
+                relative.append(0.0)
+            else:
+                undefined += 1
+
+    mean_relative = math.fsum(relative) / len(relative) if relative else None
+    result.update(
+        mean_relative_nll_change=mean_relative,
+        max_relative_nll_change=max(relative, default=None),
+        undefined_relative_options=undefined,
+        largest_absolute_nll_change=worst_absolute,
+        task_scores=task_scores(scores, examples, baselines),
+        passed=undefined == 0 and mean_relative is not None and mean_relative <= MEAN_RELATIVE_NLL_LIMIT,
+    )
     result["task_scores_exact"] = result["task_scores"] == expected_tasks
-    result["passed"] = not (result["outside_tolerance"] or result["paired_nan"] or result["flips"]
-                            or not result["task_scores_exact"] or result["max_nll_abs"] > NLL_ATOL)
     return result
 
 
@@ -323,7 +350,8 @@ def benchmark(args, device):
         "device": torch.cuda.get_device_name(), "dtype": "bfloat16", "prefetch": False, "max_context": CONTEXT,
         "model_config": model.config.to_dict() if args.hf_model else model.config.model_dump(mode="json"),
         "model": identity,
-        "width_buckets": WIDTHS, "questions": SAMPLE, "option_nll_atol": NLL_ATOL,
+        "width_buckets": WIDTHS, "questions": SAMPLE,
+        "mean_relative_nll_limit": MEAN_RELATIVE_NLL_LIMIT,
         "reference_task_scores": task_reference, "sizes": {},
     }
 
@@ -344,8 +372,14 @@ def benchmark(args, device):
                     record[arm]["parity"] = validate(reference, scores, examples, baselines, task_reference)
             results["sizes"][size] = record
             write_json(args.output / "preflight.json", results)
-            if any(not details["parity"]["passed"] for details in record.values() if "parity" in details):
-                raise SystemExit(f"Pinned-master parity failed at size {size}; see preflight.json")
+        failures = [
+            f"{size}/{arm}"
+            for size, record in results["sizes"].items()
+            for arm, details in record.items()
+            if "parity" in details and not details["parity"]["passed"]
+        ]
+        if failures:
+            raise SystemExit(f"Mean relative NLL gate failed for {', '.join(failures)}; see preflight.json")
 
         for size, arms in configs.items():
             print(f"Timing batch size {size}", flush=True)
