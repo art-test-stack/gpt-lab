@@ -133,13 +133,7 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
   uv sync --group=notebook
   ```
 
-Repository-root `uv sync` installs the Rust dataloader by default. For a Python-only environment without a Rust toolchain, exclude the native dependency group:
-
-```sh
-uv sync --locked --extra cpu --no-group rust-dataloader
-```
-
-Use `--extra gpu` in place of `--extra cpu` for a CUDA environment.
+For a Python-only install without Cargo, add `--no-group rust-dataloader` to either device’s `uv sync` command.
 
 > [!NOTE]  
 > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation. Default mode uses `kernels` implementation, making the installation easier.
@@ -219,30 +213,11 @@ val_loader = val_loader_fn() # called as a function to get the dataloader instan
 
 #### Dataloader backends
 
-Use `gpt_lab.data.build_dataloader` with the `dataloader_backend` and
-`packing_strategy` keyword arguments. The same choices are available as
-`--dataloader-backend` and `--packing-strategy` on `gpt-lab train auto` and
-`gpt-lab train resume`.
+**End-to-end Rust is the default** for cached Parquet text with gpt-lab’s tiktoken tokenizer. The default `auto` selector uses Python for pretokenized data, other tokenizers, shards that still need downloading, or a Python-only install.
 
-| Backend | Training packing | Validation packing | Requirements |
-| --- | --- | --- | --- |
-| `auto` (default) | `rolling-16` or `block-best-fit` with full Rust | `rolling-16` | Uses end-to-end Rust for cached text Parquet with the gpt-lab tiktoken tokenizer. Uses Python for other tokenizers, pretokenized input, shards that still need downloading, or a Python-only install. |
-| `python` | `rolling-16` | `rolling-16` | Selects the Python loader explicitly. |
-| `rust-packing` | `rolling-16` | `rolling-16` | Native package installed. Python handles input and tokenization. |
-| `rust` | `rolling-16` or `block-best-fit` | `rolling-16` | Requires the native package, cached text Parquet shards, and the gpt-lab tiktoken tokenizer. |
+On `gpt-lab train auto` and `gpt-lab train resume`, use `--dataloader-backend python` to force Python, `rust-packing` for native packing only, or `rust` to require the full Rust backend. `gpt_lab.data.build_dataloader()` accepts the same choices via `dataloader_backend`.
 
-`block-best-fit` uses up to 64 documents at a time and tries an exact single,
-then an exact pair, then a greedy fit. It has a distinct training checkpoint
-signature. Select it again when resuming a block-packed run. Rolling-16
-checkpoints can move between compatible backends with the same data, tokenizer,
-batch shape, and rank layout. The CLI always uses rolling-16 for validation.
-When calling `build_dataloader` directly, select `block-best-fit` for training
-and use the default packing strategy for validation.
-
-```sh
-uv run --no-sync gpt-lab train auto --dataloader-backend rust --packing-strategy block-best-fit
-uv run --no-sync gpt-lab train resume --dataloader-backend rust --packing-strategy block-best-fit
-```
+**Packing defaults to `rolling-16`.** For full Rust training, `--packing-strategy block-best-fit` looks for one document or a pair that exactly fills the remaining row, then falls back to a greedy fit. It considers up to 64 documents at a time. Pass it again on resume. Validation uses `rolling-16`. In `build_dataloader()`, set `packing_strategy` on the training loader only. Rolling-16 checkpoints work across compatible backends with the same data, tokenizer, batch shape, and rank layout.
 
 We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
 
