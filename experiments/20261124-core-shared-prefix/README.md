@@ -157,6 +157,18 @@ GPTLAB_DTYPE=bfloat16 uv run --locked --extra gpu \
   --run-name "$GPTLAB_BENCH_RUN" --step "$GPTLAB_BENCH_STEP" --output "$GPTLAB_BENCH_OUTPUT"
 ```
 
+The sweep also accepts a pretrained Llama-family model through Transformers. For the locked environment, omit the optional Hub kernels package to use PyTorch SDPA.
+
+```bash
+uv sync --locked --extra gpu --no-install-package kernels
+GPTLAB_DTYPE=bfloat16 uv run --no-sync \
+  python experiments/20261124-core-shared-prefix/benchmark_a100.py \
+  --hf-model HuggingFaceTB/SmolLM2-360M \
+  --hf-revision f8027fd0eaeea54caa13c31d31b9fdc459c38b49 --output "$GPTLAB_BENCH_OUTPUT"
+```
+
+This path uses the same Hub weights, tokenizer, and Transformers SDPA forward in both scorers. The pinned master still supplies the separate-row CORE reference. Prompts and choices are cropped to 2,048 logical tokens with the model's pretrained RoPE settings.
+
 The sweep starts with the PR's 176 multiple-choice candidates and checks packing eligibility using the checkpoint tokenizer. It extends the seeded task pools if fewer than 128 qualify. It balances selection across tasks and chooses evenly spaced sequence lengths within each task. It saves the question IDs, physical lengths, and batch membership in `selected.json`. Both scorers use those same prepared questions at sizes 1, 4, 8, and 16, with 128, 32, 16, and 8 forwards per sweep respectively.
 
 `master-reference.json` comes from the pinned master's original separate-row forward and option reduction. `preflight.json` records the branch and padding fixture and BF16 parity against that reference. Each size gets three alternating timed pairs after warm-up, with CUDA synchronization and prefetch off. `batch-<size>.json` and `report.json` record SDPA operators and GPU kernel symbols from a probe for each batch shape, raw timing and peak CUDA allocation, paired packing speedup, and each scorer's throughput relative to its own size 1. If a configuration runs out of CUDA memory, its partner can still be checked against the saved master reference. A winner change, changed task score, or an option-NLL difference above 0.05 nats stops the benchmark before timing.

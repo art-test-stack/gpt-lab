@@ -11,6 +11,7 @@ import sys
 import tarfile
 from tempfile import TemporaryDirectory
 from time import perf_counter
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -63,6 +64,59 @@ def load_checkpoint_model(args, device):
     if model.max_seq_len != CONTEXT or model.config.positional_encoding != "rope":
         raise ValueError("Use a trained RoPE checkpoint with a 2,048-token context")
     return model, tokenizer
+
+
+
+class LlamaScorer(torch.nn.Module):
+    """Use the model's native SDPA with CORE's pre-shifted targets."""
+
+    max_seq_len = CONTEXT
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.config = model.config
+        if self.config.model_type != "llama" or self.config.max_position_embeddings < CONTEXT:
+            raise ValueError("The Hub model must use Llama full attention with at least 2,048 positions")
+        self.window_sizes = ((-1, -1),) * self.config.num_hidden_layers
+
+    def forward(self, input_ids, labels, reduction, *, position_ids=None, complete_attn_masks=None):
+        mask = None if complete_attn_masks is None else complete_attn_masks[0]
+        logits = self.model(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=mask, use_cache=False,
+        ).logits
+        loss = torch.nn.functional.cross_entropy(
+            logits.float().flatten(0, 1), labels.flatten(), ignore_index=-1, reduction=reduction,
+        )
+        return SimpleNamespace(logits=logits, loss=loss)
+
+
+class HubTokenizer:
+    def __init__(self, args):
+        from transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(args.hf_model, revision=args.hf_revision)
+        self.bos = self.tokenizer.bos_token_id
+        if self.bos is None:
+            raise ValueError("CORE requires a BOS token in the Hub tokenizer")
+
+    def get_bos_token_id(self):
+        return self.bos
+
+    def __call__(self, texts, *, prepend):
+        return [[prepend, *tokens] for tokens in self.tokenizer(texts, add_special_tokens=False)["input_ids"]]
+
+
+def load_scoring_model(args, device, dtype=torch.bfloat16):
+    if not args.hf_model:
+        return load_checkpoint_model(args, device)
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.hf_model, revision=args.hf_revision, dtype=dtype, use_safetensors=True,
+        attn_implementation="sdpa",
+    ).to(device)
+    return LlamaScorer(model).eval(), HubTokenizer(args)
 
 
 def choose_examples(tokenizer):
@@ -124,7 +178,7 @@ def choose_examples(tokenizer):
 def master_reference(args, device):
     if not Path(core.__file__).is_relative_to(Path(os.environ["PYTHONPATH"])):
         raise RuntimeError("Pinned-master worker imported an unexpected CORE module")
-    model, tokenizer = load_checkpoint_model(args, device)
+    model, tokenizer = load_scoring_model(args, device)
     questions = json.loads(args.master_input.read_text())
     pad = tokenizer.get_bos_token_id()
     predictions = []
@@ -238,15 +292,22 @@ def benchmark(args, device):
     from fixture_model import small_model
     from packing_pair import comparison_plans, score_plan
 
-    metadata = checkpoint.load_meta_config(args.model_name, run_name=args.run_name, model_cachedir=args.model_dir)
-    tokenizer = build_cached_tokenizer(metadata.tokenizer_cfg, checkpoint.build_tokenizer)
-    if tokenizer.vocab_size != metadata.model_cfg.vocab_size:
-        raise ValueError("Checkpoint and tokenizer vocabulary sizes differ")
+    if args.hf_model:
+        tokenizer = HubTokenizer(args)
+        identity = {"name": args.hf_model, "revision": args.hf_revision}
+        tokenizer_config = identity | {"bos_token_id": tokenizer.get_bos_token_id()}
+    else:
+        metadata = checkpoint.load_meta_config(args.model_name, run_name=args.run_name, model_cachedir=args.model_dir)
+        tokenizer = build_cached_tokenizer(metadata.tokenizer_cfg, checkpoint.build_tokenizer)
+        if tokenizer.vocab_size != metadata.model_cfg.vocab_size:
+            raise ValueError("Checkpoint and tokenizer vocabulary sizes differ")
+        identity = {"dir": str(args.model_dir), "name": args.model_name, "run": args.run_name, "step": args.step}
+        tokenizer_config = tokenizer.config.model_dump(mode="json")
     examples, baselines, selection = choose_examples(tokenizer)
     configs = {size: comparison_plans(examples, size)["eligible"] for size in SIZES}
     assert all(len(group) == size for size, arms in configs.items() for plan in arms.values() for _, group in plan)
     write_json(args.output / "selected.json", {
-        **selection, "tokenizer": tokenizer.config.model_dump(mode="json"),
+        **selection, "tokenizer": tokenizer_config,
         "questions": [{"task": ex.label, "index": ex.index, "gold": ex.gold,
                        "packed_width": len(ex.packed.tokens), "max_position": max(ex.packed.positions)} for ex in examples],
         "groups_by_size": {size: [group for _, group in arms["separate"]] for size, arms in configs.items()},
@@ -254,14 +315,14 @@ def benchmark(args, device):
     reference = get_master_reference(args, examples, MASTER)
     assert len(reference) == SAMPLE and all(math.isfinite(nll) for losses, _ in reference.values() for nll in losses)
     task_reference = task_scores(reference, examples, baselines)
-    model, tokenizer = load_checkpoint_model(args, device)
+    model, tokenizer = load_scoring_model(args, device)
     pad = tokenizer.get_bos_token_id()
     results = {
         "master": MASTER, "torch": torch.__version__, "cuda": torch.version.cuda,
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "device": torch.cuda.get_device_name(), "dtype": "bfloat16", "prefetch": False, "max_context": CONTEXT,
-        "model_config": model.config.model_dump(mode="json"),
-        "model": {"dir": str(args.model_dir), "name": args.model_name, "run": args.run_name, "step": args.step},
+        "model_config": model.config.to_dict() if args.hf_model else model.config.model_dump(mode="json"),
+        "model": identity,
         "width_buckets": WIDTHS, "questions": SAMPLE, "option_nll_atol": NLL_ATOL,
         "reference_task_scores": task_reference, "sizes": {},
     }
@@ -270,7 +331,9 @@ def benchmark(args, device):
         return score_plan(plan, examples, model, pad, device, width_buckets=WIDTHS)
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        results["isolation_fixture"] = check_wide_fixture(small_model(device, head_dim=64), 256, device)
+        fixture_model, fixture_pad = (model, pad) if args.hf_model else (small_model(device, head_dim=64), 256)
+        results["isolation_fixture"] = check_wide_fixture(fixture_model, fixture_pad, device)
+        del fixture_model
         write_json(args.output / "preflight.json", results)
         for size, arms in configs.items():
             print(f"Checking batch size {size} against pinned master", flush=True)
@@ -322,15 +385,20 @@ def benchmark(args, device):
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--model-name", required=True)
-    parser.add_argument("--run-name", required=True)
-    parser.add_argument("--step", type=int, required=True)
+    parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--model-name")
+    parser.add_argument("--run-name")
+    parser.add_argument("--step", type=int)
+    parser.add_argument("--hf-model")
+    parser.add_argument("--hf-revision", help="Exact Hub commit of the model and tokenizer")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--master-input", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.step < 0:
-        parser.error("an explicit nonnegative checkpoint step is required")
+    if args.hf_model:
+        if not args.hf_revision or any(value is not None for value in (args.model_dir, args.model_name, args.run_name, args.step)):
+            parser.error("use --hf-model with --hf-revision, or the native checkpoint options")
+    elif args.hf_revision or not all((args.model_dir, args.model_name, args.run_name)) or args.step is None or args.step < 0:
+        parser.error("an explicit model directory, model name, run name, and nonnegative step are required")
     if torch.cuda.device_count() != 1 or "A100" not in torch.cuda.get_device_name():
         parser.error("exactly one CUDA A100 is required")
     args.output.mkdir(parents=True, exist_ok=True)
