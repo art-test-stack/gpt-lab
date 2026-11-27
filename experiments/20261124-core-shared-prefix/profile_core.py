@@ -10,6 +10,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import batched_scoring
+import batching
 import packing_pair
 from batching import load_examples
 from core_timing import planned_winners, timed
@@ -90,18 +91,29 @@ class Measurements(TorchDispatchMode):
         return result
 
     def report(self):
-        return {
-            name: {"host_seconds": value, "calls": self.counts[name],
-                   **({"mps_interval_seconds": sum(a.elapsed_time(b) for a, b in self.events[name]) / 1000}
-                      if name in self.events else {})}
-            for name, value in self.cpu.items()
-        }
+        report = {}
+        for name, seconds in self.cpu.items():
+            entry = report[name] = {"host_seconds": seconds, "calls": self.counts[name]}
+            if name in self.events:
+                intervals = []
+                for before, after in self.events[name]:
+                    try:
+                        intervals.append(before.elapsed_time(after) / 1000)
+                    except RuntimeError as error:
+                        entry.setdefault("first_mps_event_error", str(error))
+                entry["mps_interval_seconds"] = sum(intervals) if intervals else None
+                entry["mps_interval_samples"] = len(intervals)
+        return report
 
 
 def components(model, tokenizer, device):
     measured = Measurements(model.pe_cache)
     pad = tokenizer.get_bos_token_id()
     with ExitStack() as stack:
+        stack.enter_context(patch.object(type(tokenizer), "__call__",
+                                         measured.measure("tokenization", type(tokenizer).__call__)))
+        stack.enter_context(patch.object(batching, "pack_choices",
+                                         measured.measure("prefix_layout_and_positions", batching.pack_choices)))
         for prefix in ("mc", "schema", "lm"):
             for operation, name in (("render_prompts", "rendering"), ("batch_sequences", "tokenization_and_spans")):
                 target = f"{operation}_{prefix}"
@@ -149,5 +161,7 @@ def components(model, tokenizer, device):
         stack.enter_context(measured)
         elapsed, actual = timed(run, device)
     assert warm == actual
+    measured.measure("host_accuracy_aggregation", lambda: sum(winner == examples[i].gold
+                                                             for i, winner in actual.items()))()
     return {"instrumented_seconds": elapsed, "stages": measured.report(), "batch_shapes": shapes,
             "sampled_peak_mask_tensor_bytes_above_call_entry": measured.mask_peak}

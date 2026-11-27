@@ -1,7 +1,7 @@
 """Validate matched attention backends on the one-A100 CORE experiment."""
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from importlib import util
+from importlib import import_module, util
 from pathlib import Path
 from statistics import median
 import sys
@@ -11,7 +11,7 @@ from unittest.mock import patch
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from benchmark import check_native_fa4, probe_kernels
+from benchmark import check_native_fa4, compare, probe_kernels
 from benchmark_a100 import ARMS, WIDTHS, attempt, model_command, profile_shapes, summarize_trial, validate, write_json
 from batched_scoring import check_wide_fixture
 from core_timing import paired
@@ -40,8 +40,7 @@ def load_fa4_source():
 @contextmanager
 def matched_sdpa(model, backend):
     if hasattr(model, "blocks"):
-        from gpt_lab.model import flash_attn
-
+        flash_attn = import_module("gpt_lab.model.flash_attn")
         fallback = flash_attn._sdpa_fallback
 
         def repeat_kv(q, k, v, **kwargs):
@@ -82,8 +81,12 @@ def native_attention(model, fa4):
 
         name = "gptlab_core_fa4_sm80"
         AttentionInterface.register(name, forward)
-        with patch.object(model.config, "_attn_implementation", name):
+        original = model.config._attn_implementation
+        model.config._attn_implementation = name
+        try:
             yield
+        finally:
+            model.config._attn_implementation = original
 
 
 def option_records(scores):
@@ -94,8 +97,8 @@ def option_records(scores):
 def replay_questions(examples, model, pad, device, *, fa4=None):
     groups = [[i] for i, ex in enumerate(examples) if (ex.label, ex.index) in REPLAY]
     return {
-        arm: option_records(score_plan([(arm == "packed", group) for group in groups], examples, model, pad,
-                                      device, fa4=fa4, width_buckets=WIDTHS))
+        arm: score_plan([(arm == "packed", group) for group in groups], examples, model, pad,
+                        device, fa4=fa4, width_buckets=WIDTHS)
         for arm in ARMS
     }
 
@@ -110,10 +113,20 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
     def save():
         write_json(args.output / "validated-report.json", report)
 
-    report["replay_master"] = option_records({key: value for key, value in reference.items() if key in REPLAY})
+    replay_reference = {key: value for key, value in reference.items() if key in REPLAY}
+    report["replay_master"] = option_records(replay_reference)
+
+    def replay(fa4=None):
+        scores = replay_questions(examples, model, pad, device, fa4=fa4)
+        return {
+            arm: {"options": option_records(scores[arm]), "vs_master": compare(replay_reference, scores[arm]),
+                  "vs_same_backend_separate": compare(scores["separate"], scores[arm])}
+            for arm in ARMS
+        }
+
     with torch.autocast("cuda", dtype=torch.bfloat16):
         report["replay_default_sdpa"] = attempt(
-            lambda: replay_questions(examples, model, pad, device), report, "replay_default_sdpa",
+            replay, report, "replay_default_sdpa",
         )
         save()
         fixture = small_model(device, head_dim=64)
@@ -127,8 +140,9 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
                 if name == "native_fa4":
                     fa4 = NativeFA4((*model.window_sizes, *fixture.window_sizes), device, kernel=load_fa4_source())
                     record["source"] = fa4.origin
-                    record["short_window_probe"] = check_native_fa4(fixture, fa4, device)
-                    record["isolation_fixture"] = check_wide_fixture(fixture, 256, device, fa4=fa4)
+                    with patch.object(fa4.cute, "compile", fa4.timed_compile):
+                        record["short_window_probe"] = check_native_fa4(fixture, fa4, device)
+                        record["isolation_fixture"] = check_wide_fixture(fixture, 256, device, fa4=fa4)
                 else:
                     with matched_sdpa(fixture, backend):
                         record["isolation_fixture"] = check_wide_fixture(fixture, 256, device)
@@ -144,9 +158,7 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
                 return score_plan(plan, examples, model, pad, device, fa4=fa4, width_buckets=WIDTHS)
 
             with attention(), compiler:
-                record["replay"] = attempt(
-                    lambda: replay_questions(examples, model, pad, device, fa4=fa4), record, "replay",
-                )
+                record["replay"] = attempt(lambda: replay(fa4), record, "replay")
                 save()
                 if "execution_error" in record or "allocation_error" in record:
                     continue
@@ -175,21 +187,20 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
                         if scores is not None:
                             case["parity"] = validate(reference, scores, examples, baselines, task_reference)
                             failures = case["parity"]["flips"]
+                            case["predictions_agree"] = (
+                                case["parity"]["passed"] and not failures and case["parity"]["task_scores_exact"]
+                            )
                             if failures:
                                 changed = {(flip["task"], flip["example_index"]) for flip in failures}
                                 case["option_nlls_for_flips"] = option_records({key: scores[key] for key in sorted(changed)})
                     save()
                 eligible_cases = [case for entry in record["sizes"].values() for case in entry.values()]
-                record["predictions_agree"] = all(
-                    "parity" in case and case["parity"]["passed"] and not case["parity"]["flips"]
-                    and case["parity"]["task_scores_exact"]
-                    for case in eligible_cases
-                )
+                record["predictions_agree"] = all(case.get("predictions_agree", False) for case in eligible_cases)
                 if fa4:
                     record["warmup_compilation"] = {"seconds": fa4.compile_seconds, "compiles": fa4.compiles}
                 save()
-                if not record["predictions_agree"]:
-                    record["timing_skipped"] = "predictions differ from pinned master or an arm failed validation"
+                if not any(case.get("predictions_agree") for case in eligible_cases):
+                    record["timing_skipped"] = "no configuration passed validation against pinned master"
                     save()
                     continue
 
@@ -201,6 +212,8 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
                     for i in range(3):
                         for arm in (ARMS if i % 2 == 0 else ARMS[::-1]):
                             case = entry[arm]
+                            if not case.get("predictions_agree") or "execution_error" in case or "allocation_error" in case:
+                                continue
                             sample = attempt(lambda: summarize_trial(lambda: run(plans[arm])), case, "timing")
                             if sample is not None:
                                 case["trials"].append(sample)
@@ -210,12 +223,16 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
                             elapsed = median(sample["seconds"] for sample in case["trials"])
                             case.update(median_seconds=elapsed, questions_per_second=len(examples) / elapsed,
                                         peak_allocated_bytes=max(sample["peak_allocated_bytes"] for sample in case["trials"]))
-                            baseline.setdefault(arm, elapsed)
-                            case["batching_speedup_vs_size_1"] = baseline[arm] / elapsed
+                            if size == 1:
+                                baseline[arm] = elapsed
+                            case["batching_speedup_vs_size_1"] = baseline[arm] / elapsed if arm in baseline else None
                     if all(len(entry[arm]["trials"]) == 3 for arm in ARMS):
                         entry["median_paired_packing_speedup"] = median(
                             a["seconds"] / b["seconds"] for a, b in zip(*(entry[arm]["trials"] for arm in ARMS))
                         )
+                    save()
+                if fa4:
+                    record["eligible_sweep_extra_compiles"] = fa4.compiles - record["warmup_compilation"]["compiles"]
                     save()
             directory = args.output / name
             directory.mkdir(exist_ok=True)

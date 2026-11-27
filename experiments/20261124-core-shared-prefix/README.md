@@ -2,6 +2,84 @@
 
 CORE keeps separate choice rows as its default. A question is eligible for packing when every cropped row has the same nonempty prefix at the same positions, every continuation starts immediately after that prefix, and every choice has at least one scored token. Ineligible questions use the separate-row scorer. Schema and language-modeling tasks use the default common-suffix and exact-match scoring paths.
 
+## Time to returned CORE scores
+
+`core_timing.py` is the user-facing command for the opt-in mode. It calls `evaluate_core` with a task scorer that batches up to four multiple-choice questions within each task. Unpackable questions use separate rows, and schema and language-modeling tasks use the stock task scorer. The trainer still calls CORE with its default options.
+
+On Apple M2, stock master took a median of **106.47 s** and the opt-in mode took **57.01 s**. The median paired speedup was **1.87×**, saving **49.46 s per evaluation**. Both used the frozen two-layer FP32 GPT-Lab checkpoint, the byte tokenizer, and a 2,048-token logical context. All 352 predictions and all 22 task scores matched. Centered CORE was `0.03214244121780599` in both arms. The machine paged during the run, with noticeable variation across the three pairs.
+
+| Pair | Stock master | Batched wide, prefetch and deferred readback | Time saved |
+| --- | ---: | ---: | ---: |
+| 1 | 106.47 s | 57.01 s | 49.46 s |
+| 2 | 124.34 s | 76.32 s | 48.03 s |
+| 3 | 85.93 s | 10.14 s | 75.80 s |
+
+Timing used stock `61f066250420afbc121524037b996ee4a3524c0a` and candidate `4aab1cd2fd031abfe8714714b6ebec2adf988f94`. The checkpoint SHA-256 was `c8102efd75dfd7f2cfcba814916a53eb0db43e41cc86c0ab3b9c29b63cca595f`.
+
+Stage the CORE bundle and use the frozen `frozen.pt` from the MPS parity run below. From the repository root, set `FROZEN` to that checkpoint and `RESULTS` to a directory under `.tmp/codex/`.
+
+```bash
+script=experiments/20261124-core-shared-prefix/core_timing.py
+export PYTORCH_ENABLE_MPS_FALLBACK=0 PYTORCH_MPS_LOW_WATERMARK_RATIO=0.7
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.2
+uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/core"
+uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/paired" \
+  --mode paired --isolated-trials
+uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/overlap" --mode overlap
+uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/profile" --mode profile
+```
+
+The paired command runs stock master at `61f066250420afbc121524037b996ee4a3524c0a` and records the candidate commit. Each trial starts after model load and warm-up, before CORE loads task data and renders prompts, and ends after scores are on the host and the device is synchronized. Fresh processes keep Metal allocations from carrying across arms. A separate pass records multiple-choice and schema winners, scored language-model predictions, and the exact cropped tokens and scoring spans. The report includes all 352 examples across 22 tasks, three alternating timing pairs, per-task score deltas, and changed predictions.
+
+The prepared-token overlap command keeps the same packed groups and 36 fallbacks across all four configurations. Prefetch prepares one upcoming batch on a worker. Deferred readback concatenates the small winner tensors and reads them in one call. All configurations include readback and aggregation. The component profile separately reports host dispatch and instrumented MPS intervals. Overlapping intervals and profiling overhead make these durations unsuitable for summing into an uninstrumented wall time.
+
+| Four-question loop | Median wall | Questions/s | Sampled peak live tensors | GPU idle in trace | Collation overlapping GPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Current | 5.061 s | 34.78 | 285.1 MiB | 1.853 s | 0.00 ms |
+| Prefetch only | 4.832 s | 36.42 | 285.7 MiB | 9.445 s | 0.51 ms |
+| Deferred readback only | 4.747 s | 37.07 | 293.3 MiB | 2.015 s | 0.00 ms |
+| Both | 4.824 s | 36.49 | 293.3 MiB | 1.916 s | 2.76 ms |
+
+The separate Metal traces count time with no active GPU interval for the benchmark process. The prefetch-only trace was an outlier at 12.22 s, while the other traces took 4.55–4.75 s. With prefetch enabled, every subsequent batch finished collation by the end of the preceding CPU submission. The traces showed no collation on that critical path, so a Rust prototype was unnecessary.
+
+In the component pass, rendering took 220 ms, byte tokenization took 5.9 ms, tokenization and span discovery together took 114 ms, grouping took 0.10 ms, and collation took 148 ms including 18 ms to stack position IDs. The single deferred host copy including device wait took 0.61 ms in this pass. Transferring the resulting tensor to Python values took 0.02 ms and accuracy aggregation took 0.10 ms.
+
+| Stage | Instrumented MPS interval total |
+| --- | ---: |
+| Attention | 3.662 s |
+| Dense branch masks | 0.652 s |
+| Native RoPE table gather | 0.013 s |
+| Q/K rotation | 0.092 s |
+| Vocabulary projection | 0.015 s |
+| FP32 cross-entropy | 0.200 s |
+| Option reduction | 0.244 s |
+
+The largest mask allocation sampled inside a construction call was 154 MiB above its entry allocation. The sweep forwarded 421,272 physical token slots, including 2,986 padding slots. Its largest physical row was 2,056 and its highest logical position was 2047. The profile reports the number of valid MPS intervals per stage, since Metal dropped some event pairs. Attention and mask construction accounted for most of the sampled intervals. The measurements did not warrant RoPE caching or selective vocabulary projection on this checkpoint.
+
+Record Metal GPU execution separately from wall timing. Compile the optional signpost library, then run the following for each of `current`, `prefetch`, `deferred`, and `both` as `CONFIG`. Set `PYTHON` to the repository environment's absolute Python executable.
+
+```bash
+mkdir -p "$RESULTS/traces"
+xcrun clang -dynamiclib -O2 experiments/20261124-core-shared-prefix/core_signposts.c \
+  -o "$RESULTS/traces/core_signposts.dylib"
+xcrun xctrace record --template 'Metal System Trace' --instrument 'Points of Interest' --no-prompt \
+  --env "PYTHONPATH=$PWD/src" --output "$RESULTS/traces/$CONFIG.trace" \
+  --launch -- "$PYTHON" "$script" --mode overlap --configuration "$CONFIG" --repeats 1 \
+  --metal-trace --signpost-library "$RESULTS/traces/core_signposts.dylib" \
+  --checkpoint "$FROZEN" --output "$RESULTS/traces/$CONFIG"
+```
+
+Export the two interval tables from each recording and summarize them with `trace_summary.py`.
+
+```bash
+for SCHEMA in OSSignpostIntervals metal-gpu-intervals; do
+  xcrun xctrace export --input "$RESULTS/traces/$CONFIG.trace" \
+    --xpath "/trace-toc/run[@number='1']/data/table[@schema='$SCHEMA']" \
+    --output "$RESULTS/traces/$CONFIG-$SCHEMA.xml"
+done
+python experiments/20261124-core-shared-prefix/trace_summary.py "$RESULTS/traces"
+```
+
 The packed row contains the prefix followed by each choice in order. A branch starts at the prefix length in RoPE positions and can see the prefix and its own causal history. Each layer applies its left window to the difference in logical positions. The final prefix logit supplies all first-token losses. Each later token uses the loss from its own predecessor. The score is mean continuation NLL, with ties going to the first minimum.
 
 Packed SDPA uses the model's explicit `complete_attn_masks` input to supply these visibility rules. Ordinary `attn_mask` tensors restrict the model's usual causal and sliding-window rules.
@@ -147,6 +225,8 @@ CUDA_VISIBLE_DEVICES=0,1 GPTLAB_DTYPE=bfloat16 uv run --locked --extra gpu \
 Append `--batch-sizes 4 8 16 32` to the paired FA4 command for the same throughput sweep. If either rank runs out of CUDA memory, that scorer and size are recorded as an allocation failure. The runner keeps measuring the other scorer and requested sizes.
 
 ## Single-A100 PyTorch SDPA sweep
+
+Append `--validate-backends` to run the single-A100 follow-up. The runner replays the three previous batch-1 winner changes, forces both arms onto the same SDPA implementation, and probes the pinned Hub FA4 source for native SM80 dispatch, sibling isolation, padding, and the sliding-window boundary. It tries SDPA math if matched memory-efficient SDPA fails validation. Both matched SDPA and native FA4 get timed sweeps when their winners, sampled task scores, and 1% relative NLL criterion agree with pinned master. Each passing backend gets an all-task score comparison before its all-task timing. `validated-report.json` records the diagnostics even when timing is skipped. The local Hugging Face Jobs launcher stages the optional pinned FA4 dependencies and uses the existing cache bucket for results.
 
 Run from the repository root with CORE staged at `GPTLAB_CACHE_DIR/data/core/eval_bundle`. Use a trained base RoPE checkpoint with a 2,048-token context and its matching tokenizer. The runner loads the tokenizer from checkpoint metadata. For a relocated local tokenizer, set `GPTLAB_BENCH_TOKENIZER_DIR` to its directory.
 
