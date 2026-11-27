@@ -58,7 +58,8 @@ def planned_winners(plan, examples, model, pad, device, *, prefetch, defer, widt
     return output
 
 
-def score_task(model, tokenizer, data, device, meta, *, batch_size, prefetch, defer, records=None, fa4=None):
+def score_task(model, tokenizer, data, device, meta, *, batch_size, prefetch, defer, records=None,
+               fa4=None, width_buckets=(), backend=nullcontext):
     from gpt_lab.evaluate import core
     from batching import Example
     from packing_pair import comparison_plans
@@ -74,8 +75,9 @@ def score_task(model, tokenizer, data, device, meta, *, batch_size, prefetch, de
         examples.append(Example(meta["dataset_uri"], index, "multiple_choice", item["gold"],
                                 prepared, pack_choices(*prepared)))
     plan = comparison_plans(examples, batch_size)["all"]["packed"]
-    predictions = planned_winners(plan, examples, model, tokenizer.get_bos_token_id(), device,
-                                  prefetch=prefetch, defer=defer, fa4=fa4)
+    with backend():
+        predictions = planned_winners(plan, examples, model, tokenizer.get_bos_token_id(), device,
+                                      prefetch=prefetch, defer=defer, width_buckets=width_buckets, fa4=fa4)
     correct = 0
     for ex in examples:
         winner = predictions[ex.index]
@@ -86,14 +88,15 @@ def score_task(model, tokenizer, data, device, meta, *, batch_size, prefetch, de
     return correct / len(examples)
 
 
-def evaluate(model, tokenizer, device, *, batch_size=4, configuration="both", records=None, fa4=None):
+def evaluate(model, tokenizer, device, *, batch_size=4, configuration="both", records=None, fa4=None,
+             width_buckets=(), backend=nullcontext):
     from gpt_lab.evaluate import core
 
     prefetch, defer = CONFIGS[configuration]
     return core.evaluate_core(
         model, tokenizer, device, max_per_task=16,
         score_task=partial(score_task, batch_size=batch_size, prefetch=prefetch, defer=defer,
-                           records=records, fa4=fa4),
+                           records=records, fa4=fa4, width_buckets=width_buckets, backend=backend),
     )
 
 
@@ -112,10 +115,10 @@ def stock_worker(model, tokenizer, device, output):
     if not Path(core.__file__).is_relative_to(Path(os.environ["PYTHONPATH"])):
         raise RuntimeError("Stock worker imported CORE outside the archived revision")
     with redirect_stdout(sys.stderr):
-        records, _ = record_predictions(model, tokenizer, device)
+        records, scores = record_predictions(model, tokenizer, device)
         (output / "stock-predictions.json").write_text(json.dumps(records))
         core.evaluate_core(model, tokenizer, device, max_per_task=16)
-    print(json.dumps({"ready": True}), flush=True)
+    print(json.dumps({"ready": True, "scores": scores}), flush=True)
     for line in sys.stdin:
         if line.strip() == "run":
             with redirect_stdout(sys.stderr):
@@ -209,27 +212,35 @@ def paired_isolated(args):
     return paired_summary(trials, changes, args.configuration, MASTER) | {"isolated_trials": True}
 
 
-def paired(args, model, tokenizer, device, *, extra_worker_args=(), fa4=None):
+def paired(args, model, tokenizer, device, *, extra_worker_args=(), fa4=None, require_predictions=False,
+           width_buckets=(), backend=nullcontext):
     from batching import MASTER, read_worker
 
-    candidate = partial(evaluate, model, tokenizer, device, configuration=args.configuration, fa4=fa4)
+    candidate = partial(evaluate, model, tokenizer, device, configuration=args.configuration, fa4=fa4,
+                        width_buckets=width_buckets, backend=backend)
     trials = {"stock": [], "candidate": []}
     archive = subprocess.check_output(["git", "archive", MASTER, "src"], cwd=HERE.parents[1])
     with TemporaryDirectory(dir=args.output, prefix="master-") as folder:
         with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
             bundle.extractall(folder, filter="data")
         worker = subprocess.Popen(
-            [sys.executable, __file__, "--stock-worker", "--device", str(device), "--output", str(args.output),
+            [sys.executable, __file__, "--stock-worker", "--device", device.type, "--output", str(args.output),
              *extra_worker_args],
             env=os.environ | {"PYTHONPATH": str(Path(folder) / "src"), "DEVELOPMENT": "0"},
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
         )
         try:
-            assert read_worker(worker)["ready"]
+            ready = read_worker(worker)
+            assert ready["ready"]
             stock_records = json.loads((args.output / "stock-predictions.json").read_text())
-            candidate_records, _ = record_predictions(model, tokenizer, device, candidate=lambda records:
-                                                       candidate(records=records))
+            candidate_records, candidate_scores = record_predictions(
+                model, tokenizer, device, candidate=lambda records: candidate(records=records),
+            )
             changes = compare_predictions(stock_records, candidate_records)
+            if require_predictions and changes:
+                return {"changed_predictions": changes, "candidate_scores": candidate_scores,
+                        "stock_scores": ready["scores"], "score_deltas": compare_returned(ready["scores"], candidate_scores),
+                        "timing_skipped": "all-task predictions differ from pinned master"}
             candidate()
             for i in range(args.repeats):
                 for arm in (("stock", "candidate") if i % 2 == 0 else ("candidate", "stock")):
@@ -294,9 +305,12 @@ def overlap(args, model, tokenizer, device):
 
 @torch.no_grad()
 def main():
+    from benchmark_a100 import check_model_arguments, load_scoring_model, model_arguments
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", choices=("cpu", "mps"), default="mps")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="mps")
+    parser.add_argument("--checkpoint", type=Path, help="Frozen byte-tokenizer fixture for CPU or MPS.")
+    model_arguments(parser)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mode", choices=("core", "paired", "overlap", "profile"), default="core")
     parser.add_argument("--configuration", choices=CONFIGS, default="both")
@@ -321,6 +335,16 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(1)
     device = torch.device(args.device)
+    if device.type == "cuda":
+        check_model_arguments(parser, args)
+        if not args.stock_worker:
+            parser.error("Use benchmark_a100.py --validate-backends for CUDA")
+        with redirect_stdout(sys.stderr), torch.autocast("cuda", dtype=torch.bfloat16):
+            model, tokenizer = load_scoring_model(args, device)
+            stock_worker(model, tokenizer, device, args.output)
+        return
+    if args.checkpoint is None:
+        parser.error("--checkpoint is required for CPU or MPS")
     if args.mode == "paired" and args.isolated_trials:
         report = paired_isolated(args)
         report.update(device=str(device), torch=torch.__version__, max_context=2048,

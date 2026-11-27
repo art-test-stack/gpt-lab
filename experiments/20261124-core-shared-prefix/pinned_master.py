@@ -25,11 +25,14 @@ def record_core(model, tokenizer, device, *, evaluate=None, capture_logits=True)
     def remember_spans(batch_sequences):
         def wrapped(*args):
             result = batch_sequences(*args)
-            current["uncropped"] = result
+            if "index" in current:
+                current["uncropped"] = result
             return result
         return wrapped
 
     def remember_rows(tokens, pad_id):
+        if "index" not in current:
+            return stock_stack(tokens, pad_id)
         original, starts, ends = current.pop("uncropped")
         shift = [len(row) - len(cropped) for row, cropped in zip(original, tokens)]
         current["prepared"] = (

@@ -357,6 +357,12 @@ def benchmark(args, device):
         "reference_task_scores": task_reference, "sizes": {},
     }
 
+    if args.validate_backends:
+        from a100_preflight import validated_sweep
+
+        validated_sweep(args, device, model, tokenizer, configs, examples, baselines, reference, task_reference, results)
+        return
+
     def run(plan):
         return score_plan(plan, examples, model, pad, device, width_buckets=WIDTHS)
 
@@ -432,23 +438,40 @@ def benchmark(args, device):
         raise SystemExit(f"Mean relative NLL gate failed for {', '.join(failures)}; timing saved to report.json")
 
 
-@torch.inference_mode()
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def model_arguments(parser):
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--model-name")
     parser.add_argument("--run-name")
     parser.add_argument("--step", type=int)
     parser.add_argument("--hf-model")
     parser.add_argument("--hf-revision", help="Exact Hub commit of the model and tokenizer")
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--master-input", type=Path, help=argparse.SUPPRESS)
-    args = parser.parse_args()
+
+
+def check_model_arguments(parser, args):
     if args.hf_model:
         if not args.hf_revision or any(value is not None for value in (args.model_dir, args.model_name, args.run_name, args.step)):
             parser.error("use --hf-model with --hf-revision, or the native checkpoint options")
     elif args.hf_revision or not all((args.model_dir, args.model_name, args.run_name)) or args.step is None or args.step < 0:
         parser.error("an explicit model directory, model name, run name, and nonnegative step are required")
+
+
+def model_command(args):
+    if args.hf_model:
+        return ["--hf-model", args.hf_model, "--hf-revision", args.hf_revision]
+    return ["--model-dir", str(args.model_dir), "--model-name", args.model_name,
+            "--run-name", args.run_name, "--step", str(args.step)]
+
+
+@torch.inference_mode()
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    model_arguments(parser)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--master-input", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--validate-backends", action="store_true",
+                        help="Validate matched SDPA and native SM80 FA4 before timing eligible and all-task runs.")
+    args = parser.parse_args()
+    check_model_arguments(parser, args)
     if torch.cuda.device_count() != 1 or "A100" not in torch.cuda.get_device_name():
         parser.error("exactly one CUDA A100 is required")
     args.output.mkdir(parents=True, exist_ok=True)

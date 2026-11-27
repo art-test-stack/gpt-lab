@@ -14,12 +14,14 @@ FA4_REVISION = "a3944dc87df804a42f0248d16c780fed90f84508"  # Hub v0
 
 
 class NativeFA4:
-    def __init__(self, windows, device):
+    def __init__(self, windows, device, *, kernel=None):
         import cutlass
         import cutlass.cute as cute
-        from kernels import get_kernel
 
-        kernel = get_kernel(FA4_REPO, revision=FA4_REVISION)
+        if kernel is None:
+            from kernels import get_kernel
+
+            kernel = get_kernel(FA4_REPO, revision=FA4_REVISION)
         if FA4_REVISION not in Path(kernel.__file__).parts:
             raise RuntimeError(f"Unexpected FA4 source path: {kernel.__file__}")
         self.origin = kernel.__file__
@@ -64,15 +66,16 @@ class NativeFA4:
             self.compile_seconds += perf_counter() - start
             self.compiles += 1
 
-    def __call__(self, q, k, v, *, dropout_p, causal, window_size, use_packed):
+    def __call__(self, q, k, v, *, dropout_p, causal, window_size, use_packed, softmax_scale=None):
         assert causal and dropout_p == 0 and not use_packed
         q, k, v = (x.to(torch.bfloat16) for x in (q, k, v))
         left, right = window_size
         assert right == 0
         if self.coords is None:
-            return self.separate(q, k, v, causal=True, window_size=(None if left < 0 else left, 0))[0]
+            return self.separate(q, k, v, causal=True, softmax_scale=softmax_scale,
+                                 window_size=(None if left < 0 else left, 0))[0]
         return self.forward(
-            q, k, v, causal=False, mask_mod=self.mask,
+            q, k, v, causal=False, mask_mod=self.mask, softmax_scale=softmax_scale,
             aux_tensors=[*self.coords, self.windows[left]],
         )[0]
 
