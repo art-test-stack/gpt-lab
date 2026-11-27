@@ -150,6 +150,65 @@ def compare_predictions(stock, candidate):
     return changes
 
 
+def paired_summary(trials, changes, configuration, master):
+    pairs = list(zip(trials["stock"], trials["candidate"]))
+    return {
+        "stock_sha": master, "candidate_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True,
+                                                                     cwd=HERE).strip(),
+        "configuration": configuration, "tasks": 22, "examples": 352,
+        "trials": trials, "changed_predictions": changes,
+        "score_deltas": [compare_returned(a["scores"], b["scores"]) for a, b in pairs],
+        "seconds_saved": [a["seconds"] - b["seconds"] for a, b in pairs],
+        "median_seconds_saved": median(a["seconds"] - b["seconds"] for a, b in pairs),
+        "median_paired_speedup": median(a["seconds"] / b["seconds"] for a, b in pairs),
+    }
+
+
+def isolated_trial(args, model, tokenizer, device):
+    from gpt_lab.evaluate import core
+
+    stock = args.isolated_arm == "stock"
+    run = (partial(core.evaluate_core, model, tokenizer, device, max_per_task=16) if stock else
+           partial(evaluate, model, tokenizer, device, configuration=args.configuration))
+    if args.record_predictions:
+        capture = None if stock else lambda records: run(records=records)
+        records, _ = record_predictions(model, tokenizer, device, candidate=capture)
+        (args.output / f"{args.isolated_arm}-predictions.json").write_text(json.dumps(records))
+    else:
+        run()
+    synchronize(device)
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    seconds, scores = timed(run, device)
+    (args.output / f"{args.isolated_arm}-trial.json").write_text(json.dumps({"seconds": seconds, "scores": scores}))
+
+
+def paired_isolated(args):
+    from batching import MASTER
+
+    trials = {"stock": [], "candidate": []}
+    archive = subprocess.check_output(["git", "archive", MASTER, "src"], cwd=HERE.parents[1])
+    with TemporaryDirectory(dir=args.output, prefix="master-") as folder:
+        with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+            bundle.extractall(folder, filter="data")
+        for i in range(args.repeats):
+            for arm in (("stock", "candidate") if i % 2 == 0 else ("candidate", "stock")):
+                source = Path(folder) / "src" if arm == "stock" else HERE.parents[1] / "src"
+                subprocess.run(
+                    [sys.executable, __file__, "--device", args.device, "--checkpoint", str(args.checkpoint.resolve()),
+                     "--output", str(args.output), "--configuration", args.configuration, "--isolated-arm", arm,
+                     *(["--record-predictions"] if i == 0 else [])],
+                    env=os.environ | {"PYTHONPATH": str(source)}, check=True,
+                )
+                run = json.loads((args.output / f"{arm}-trial.json").read_text())
+                trials[arm].append(run)
+                print(json.dumps({"pair": i + 1, "arm": arm, "seconds": run["seconds"]}), flush=True)
+                (args.output / "partial-trials.json").write_text(json.dumps(trials))
+    changes = compare_predictions(*(json.loads((args.output / f"{arm}-predictions.json").read_text())
+                                    for arm in trials))
+    return paired_summary(trials, changes, args.configuration, MASTER) | {"isolated_trials": True}
+
+
 def paired(args, model, tokenizer, device, *, extra_worker_args=(), fa4=None):
     from batching import MASTER, read_worker
 
@@ -188,17 +247,7 @@ def paired(args, model, tokenizer, device, *, extra_worker_args=(), fa4=None):
             worker.wait()
     if worker.returncode:
         raise RuntimeError(f"Stock worker exited with status {worker.returncode}")
-    pairs = list(zip(trials["stock"], trials["candidate"]))
-    return {
-        "stock_sha": MASTER, "candidate_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True,
-                                                                     cwd=HERE).strip(),
-        "configuration": args.configuration, "tasks": 22, "examples": 352,
-        "trials": trials, "changed_predictions": changes,
-        "score_deltas": [compare_returned(a["scores"], b["scores"]) for a, b in pairs],
-        "seconds_saved": [a["seconds"] - b["seconds"] for a, b in pairs],
-        "median_seconds_saved": median(a["seconds"] - b["seconds"] for a, b in pairs),
-        "median_paired_speedup": median(a["seconds"] / b["seconds"] for a, b in pairs),
-    }
+    return paired_summary(trials, changes, args.configuration, MASTER)
 
 
 def overlap(args, model, tokenizer, device):
@@ -223,7 +272,12 @@ def overlap(args, model, tokenizer, device):
         for config in (configs if trial % 2 == 0 else configs[::-1]):
             profile = (torch.mps.profiler.profile(mode="interval", wait_until_completed=False)
                        if args.metal_trace else nullcontext())
-            with profile:
+            markers = nullcontext()
+            if args.signpost_library:
+                from profile_core import metal_markers
+
+                markers = metal_markers(args.signpost_library)
+            with profile, markers:
                 seconds, output = timed(partial(run, config), device)
             assert output == warm[config]
             samples[config].append(seconds)
@@ -244,32 +298,53 @@ def main():
     parser.add_argument("--device", choices=("cpu", "mps"), default="mps")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mode", choices=("core", "paired", "overlap"), default="core")
+    parser.add_argument("--mode", choices=("core", "paired", "overlap", "profile"), default="core")
     parser.add_argument("--configuration", choices=CONFIGS, default="both")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--metal-trace", action="store_true", help="Emit MPS signposts for a separate trace run.")
+    parser.add_argument("--signpost-library", type=Path, help="Optional CPU signposts for a Metal System Trace.")
     parser.add_argument("--stock-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--isolated-trials", action="store_true", help="Warm and time each arm in a fresh process.")
+    parser.add_argument("--isolated-arm", choices=("stock", "candidate"), help=argparse.SUPPRESS)
+    parser.add_argument("--record-predictions", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
     if args.metal_trace and (args.device != "mps" or args.mode != "overlap"):
         parser.error("--metal-trace requires --device mps and --mode overlap")
+    if args.signpost_library and not args.metal_trace:
+        parser.error("--signpost-library requires --metal-trace")
+    if args.mode == "profile" and args.device != "mps":
+        parser.error("Component profiling requires MPS")
     os.environ["DEVELOPMENT"] = "0"
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(1)
     device = torch.device(args.device)
+    if args.mode == "paired" and args.isolated_trials:
+        report = paired_isolated(args)
+        report.update(device=str(device), torch=torch.__version__, max_context=2048,
+                      checkpoint_sha256=hashlib.sha256(args.checkpoint.read_bytes()).hexdigest())
+        (args.output / "paired.json").write_text(json.dumps(report, indent=2) + "\n")
+        return
     if args.stock_worker:
         with redirect_stdout(sys.stderr):
             model, tokenizer = load_frozen_checkpoint(args.checkpoint, device), ByteTokenizer()
         stock_worker(model, tokenizer, device, args.output)
         return
     model, tokenizer = load_frozen_checkpoint(args.checkpoint, device), ByteTokenizer()
+    if args.isolated_arm:
+        isolated_trial(args, model, tokenizer, device)
+        return
     if args.mode == "paired":
         report = paired(args, model, tokenizer, device,
                         extra_worker_args=("--checkpoint", str(args.checkpoint.resolve())))
     elif args.mode == "overlap":
         report = overlap(args, model, tokenizer, device)
+    elif args.mode == "profile":
+        from profile_core import components
+
+        report = components(model, tokenizer, device)
     else:
         elapsed, scores = timed(partial(evaluate, model, tokenizer, device, configuration=args.configuration), device)
         report = {"seconds": elapsed, "scores": scores}
