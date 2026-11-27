@@ -14,8 +14,6 @@ import time
 from tempfile import TemporaryDirectory
 
 
-SCRATCH = Path(".tmp/codex/rust-dataloader/four-backend")
-SOURCE = Path(".tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet")
 PATHS = {
     "A": ("Scalar Python", "python", 1),
     "B": ("Batched Python", "python", 64),
@@ -43,8 +41,7 @@ def worker(mode, key, source, batch_size=BATCH, context_length=CONTEXT):
     context = ComputeContext(torch.device("cpu"))
     _, backend, encode_batch = PATHS[key]
     shard_id = int(source.stem.split("_")[-1])
-    SCRATCH.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(dir=SCRATCH, prefix="shard-cache-") as temporary:
+    with TemporaryDirectory(prefix="shard-cache-") as temporary:
         dataset = Path(temporary) / "climbmix"
         dataset.mkdir()
         (dataset / source.name).symlink_to(source)
@@ -74,7 +71,7 @@ def worker(mode, key, source, batch_size=BATCH, context_length=CONTEXT):
         return dict(batches=batches, content_tokens=content_tokens, sha256=digest.hexdigest())
 
 
-def run(source, batch_size=BATCH, context_length=CONTEXT):
+def run(source, batch_size=BATCH, context_length=CONTEXT, output=None):
     env = os.environ.copy()
     env.update(OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", VECLIB_MAXIMUM_THREADS="1")
 
@@ -106,8 +103,10 @@ def run(source, batch_size=BATCH, context_length=CONTEXT):
         "context": context_length, "tokenizer_threads": THREADS, "orders": ORDERS,
         "verification": verified, "runs": [],
     }
-    filename = "benchmarks.json" if (batch_size, context_length) == (BATCH, CONTEXT) else f"benchmarks-b{batch_size}-t{context_length}.json"
-    output = SCRATCH / filename
+    if output is None:
+        filename = "benchmarks.json" if (batch_size, context_length) == (BATCH, CONTEXT) else f"benchmarks-b{batch_size}-t{context_length}.json"
+        output = Path(filename)
+    output.parent.mkdir(parents=True, exist_ok=True)
     for repeat, order in enumerate(ORDERS, 1):
         for position, key in enumerate(order, 1):
             values = fresh("time", key)
@@ -133,7 +132,8 @@ def run(source, batch_size=BATCH, context_length=CONTEXT):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shard", type=Path, default=SOURCE)
+    parser.add_argument("--shard", type=Path, required=True, help="Cached ClimbMix Parquet shard")
+    parser.add_argument("--output", type=Path, help="Results JSON path (default: shape-specific file in the current directory)")
     parser.add_argument("--batch-size", type=int, default=BATCH)
     parser.add_argument("--context", type=int, default=CONTEXT)
     parser.add_argument("--worker", nargs=2)
@@ -146,4 +146,4 @@ if __name__ == "__main__":
     if args.worker:
         print(json.dumps(worker(*args.worker, source, args.batch_size, args.context)))
     else:
-        run(source, args.batch_size, args.context)
+        run(source, args.batch_size, args.context, args.output)

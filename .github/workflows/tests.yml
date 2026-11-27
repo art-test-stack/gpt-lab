@@ -39,8 +39,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GPT_LAB_REQUIRE_NATIVE: "1"
-      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.tmp/codex/native-ci/tiktoken
-      CARGO_TARGET_DIR: ${{ github.workspace }}/.tmp/codex/native-ci/target
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -53,6 +51,10 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.28"
+      - name: Configure native test directories
+        run: |
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cargo-target" >> "$GITHUB_ENV"
+          echo "TIKTOKEN_CACHE_DIR=$RUNNER_TEMP/tiktoken" >> "$GITHUB_ENV"
       - name: Install framework with default dataloader
         run: uv sync --locked --extra cpu --group dev --no-editable
       - name: Cache GPT-2 tokenizer
@@ -62,7 +64,7 @@ jobs:
           project_root="$PWD"
           cd "$RUNNER_TEMP"
           env -u PYTHONPATH "$project_root/.venv/bin/python" -m pytest -q \
-            --basetemp "$project_root/.tmp/codex/native-ci/pytest" \
+            --basetemp "$RUNNER_TEMP/native-pytest" \
             "$project_root/tests/test_dataloader_parity.py" \
             "$project_root/tests/test_native_dataloader.py" \
             "$project_root/tests/cli/test_cli.py" \

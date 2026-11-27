@@ -21,8 +21,6 @@ from tempfile import TemporaryDirectory
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRATCH = ROOT / ".tmp/codex/rust-dataloader/training-comparison"
-SHARD = ROOT / ".tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet"
 RUST_PATHS = (Path("packages/rust-dataloader"), Path("experiments/20261124-rust-dataloader/rust"))
 BASELINE = "f008399"
 CONTEXTS = (512, 1024, 2048, 4096, 8192)
@@ -97,7 +95,6 @@ def prepare(scratch, candidate, offline):
     env = os.environ.copy()
     env.update(PYO3_PYTHON=sys.executable, PYO3_BUILD_EXTENSION_MODULE="1",
                CARGO_PROFILE_RELEASE_STRIP="none", RUSTFLAGS="-C strip=none")
-    env.setdefault("CARGO_HOME", str(ROOT / ".tmp/codex/rust-dataloader/cargo"))
     if platform.system() == "Darwin":
         env.setdefault("MACOSX_DEPLOYMENT_TARGET", "14.0")
     for name, revision in revisions.items():
@@ -316,11 +313,11 @@ def run(source, contexts, scratch, output, revisions):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shard", type=Path, default=SHARD)
+    parser.add_argument("--shard", type=Path, help="Cached ClimbMix Parquet shard (required unless running --self-check)")
     parser.add_argument("--candidate", default="HEAD")
     parser.add_argument("--context", type=int, nargs="+", default=CONTEXTS)
-    parser.add_argument("--scratch", type=Path, default=SCRATCH)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--scratch", type=Path, help="Parent for temporary builds (default: system temporary directory)")
+    parser.add_argument("--output", type=Path, help="Results JSON path (default: comparison.json in --scratch or the current directory)")
     parser.add_argument("--offline", action="store_true", help="Build using cached Cargo dependencies")
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--worker", nargs=2)
@@ -330,8 +327,12 @@ def main():
         parser.error("Context and batch size must be positive")
     if not args.worker and any(context not in CONTEXTS for context in args.context):
         parser.error(f"Contexts must be drawn from {CONTEXTS}")
-    source, scratch = args.shard.resolve(), args.scratch.resolve()
-    scratch.mkdir(parents=True, exist_ok=True)
+    source = args.shard.resolve() if args.shard is not None else None
+    if (args.worker or not args.self_check) and (source is None or not source.is_file()):
+        parser.error("A cached Parquet file is required; pass --shard")
+    scratch = args.scratch
+    if scratch is not None:
+        scratch.mkdir(parents=True, exist_ok=True)
     if args.worker:
         mode, arm = args.worker
         result = histogram(source, CONTEXTS) if mode == "histogram" else worker(
@@ -339,14 +340,12 @@ def main():
         )
         print(json.dumps(result))
         return
-    if not source.is_file() and not args.self_check:
-        parser.error(f"Missing cached shard {source}")
     with TemporaryDirectory(prefix="build-", dir=scratch) as temporary:
-        work = Path(temporary)
+        work = Path(temporary).resolve()
         revisions = prepare(work, args.candidate, args.offline)
         self_check(work)
         if not args.self_check:
-            output = (args.output or scratch / "comparison.json").resolve()
+            output = (args.output or (scratch or Path.cwd()) / "comparison.json").resolve()
             run(source, args.context, work, output, revisions)
 
 

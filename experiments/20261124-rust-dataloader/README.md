@@ -18,15 +18,18 @@ Rolling-16 remains the default and keeps its existing checkpoint signature. Exac
 
 ## Reproduce on macOS arm64
 
-From the repository root, install the project’s standard Python 3.12 CPU environment with Cargo available. The PyO3 crate lives in `packages/rust-dataloader` and uses PyO3 0.30.1. The measurements below used Rust 1.91.
+Run from the repository root with Python 3.12 and Cargo. Set `CLIMBMIX_SHARD` to your cached `shard_01061.parquet`. To keep the JSON reports in a directory of your choice, set `RESULTS_DIR`. The measurements below used Rust 1.91 and PyO3 0.30.1.
 
 ```sh
-scratch="$PWD/.tmp/codex/rust-dataloader"
-mkdir -p "$scratch"
+: "${CLIMBMIX_SHARD:?Set CLIMBMIX_SHARD to the path of your cached shard_01061.parquet}"
+scratch=$(mktemp -d)
+results_dir=${RESULTS_DIR:-$scratch}
+mkdir -p "$results_dir"
+echo "Benchmark reports: $results_dir"
 export PYTHONDONTWRITEBYTECODE=1
 uv sync --locked --extra cpu --group dev
 
-export TIKTOKEN_CACHE_DIR=.tmp/codex/training-data-inspection/tiktoken
+export TIKTOKEN_CACHE_DIR="${TIKTOKEN_CACHE_DIR:-$scratch/tiktoken}"
 .venv/bin/python -c 'from gpt_lab.tokenizer import Tokenizer; Tokenizer.from_pretrained("gpt2", source="tiktoken")'
 env -u PYTHONPATH GPT_LAB_REQUIRE_NATIVE=1 .venv/bin/python -m pytest -q -p no:cacheprovider \
   --basetemp "$scratch/pytest-parity" \
@@ -40,11 +43,11 @@ PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --release --locked --lib \
 
 # Run the four-backend comparison with untimed parity passes.
 env -u PYTHONPATH .venv/bin/python experiments/20261124-rust-dataloader/benchmark_four.py \
-  --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet
+  --shard "$CLIMBMIX_SHARD" --output "$results_dir/benchmarks.json"
 
 # Run the packing-only comparison.
 env -u PYTHONPATH .venv/bin/python experiments/20261124-rust-dataloader/benchmark.py \
-  --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet \
+  --shard "$CLIMBMIX_SHARD" --output "$results_dir/benchmark.json" \
   --threads 4 --repeats 4
 ```
 
@@ -52,19 +55,19 @@ The native text parity tests use GPT-2 from `TIKTOKEN_CACHE_DIR`. Installation a
 
 The ClimbMix input is the cached `shard_01061.parquet`, with SHA-256 `9025ed81d751886e7810238f2c71a4d68ee907860f3c506d1cd3e74bda135fd8`, 86,016 documents and 84 row groups. The harness reads it in full using finite validation iteration and loads GPT-2 from the existing tiktoken cache. `--shard` accepts a local shard. The harness links it into a temporary dataset directory under its original shard ID so it can write benchmark metadata there. The pretokenized run uses 10,000 documents from `experiments/dataloaders.py` and prepares contiguous token arrays before timing.
 
-`benchmark_four.py` records untimed verification and all 16 timed observations in `.tmp/codex/rust-dataloader/four-backend/benchmarks.json`. In the original `benchmark.py`, `--backend rust` selects Rust packing.
+`benchmarks.json` records untimed verification and all 16 timed observations. In the original `benchmark.py`, `--backend rust` selects Rust packing.
 
 Run both sweep regimes in the same environment using the cached shard.
 
 ```sh
 runner=experiments/20261124-rust-dataloader/benchmark_four.py
-shard=.tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet
 for shape in 16:2048 16:512 16:1024 16:4096 16:8192 64:512 32:1024 8:4096 4:8192; do
-  env -u PYTHONPATH .venv/bin/python "$runner" --shard "$shard" --batch-size "${shape%:*}" --context "${shape#*:}"
+  batch=${shape%:*}
+  context=${shape#*:}
+  env -u PYTHONPATH .venv/bin/python "$runner" --shard "$CLIMBMIX_SHARD" \
+    --batch-size "$batch" --context "$context" --output "$results_dir/benchmarks-b$batch-t$context.json"
 done
 ```
-
-For each nondefault shape, the runner writes `benchmarks-b<B>-t<T>.json` in the same directory.
 
 ## Parity
 
@@ -117,10 +120,10 @@ End-to-end Rust had 1.67–2.03× the median throughput of Rust packing across t
 
 ```sh
 .venv/bin/python experiments/20261124-rust-dataloader/benchmark_training.py \
-  --candidate fe0f648 --shard .tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet
+  --candidate fe0f648 --shard "$CLIMBMIX_SHARD" --output "$results_dir/comparison.json"
 ```
 
-Use the GPT-2 cache from the setup above. Add `--offline` when the locked Cargo dependencies are cached. The runner saves individual observations to `.tmp/codex/rust-dataloader/training-comparison/comparison.json` by default.
+Use the GPT-2 cache from the setup above. Add `--offline` when the locked Cargo dependencies are cached. The command saves individual observations to `comparison.json` in the selected results directory.
 
 Throughput counts non-BOS tokens at unique positions in emitted full batches, using the first column of `x` and all of `y`. Row-fit eligibility uses the encoded document length including BOS and the packed row width of `context + 1`. A split is counted once at the first cut. The untimed counts cover all source documents, and the JSON records the counts added during the final incomplete batch separately.
 
@@ -154,7 +157,7 @@ These measurements predate the PyO3 upgrade and the end-to-end backend. The earl
 
 Apple M2 CPU, 16 GiB RAM, macOS 27.2.1, Python 3.12.12, Torch 2.11.0, Arrow 22.0.0, and tiktoken 0.12.0. Batch size 16, context length 2,048, and one rank. The tokenizer has a four-thread budget and Torch and Arrow each use one thread. Each measurement uses a fresh process. Four rounds alternate forward and reverse backend order.
 
-Timing includes loader initialization and every batch request through exhaustion. Token counting and digest calculation are outside the timed calls. Each packed position contributes at most once, excluding document and continuation BOS. Peak RSS is the highest process peak across the four repetitions. The harness writes individual observations to `.tmp/codex/rust-dataloader/benchmark.json`.
+Timing includes loader initialization and every batch request through exhaustion. Token counting and digest calculation are outside the timed calls. Each packed position contributes at most once, excluding document and continuation BOS. Peak RSS is the highest process peak across the four repetitions. The command above writes individual observations to `benchmark.json` in the selected results directory.
 
 | Input | Backend | Median source tokens/s | Run-to-run range | Peak RSS (MiB) |
 | --- | --- | ---: | ---: | ---: |

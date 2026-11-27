@@ -16,36 +16,38 @@ from tempfile import TemporaryDirectory
 
 
 BASELINE = "61f066250420afbc121524037b996ee4a3524c0a"
-SCRATCH = Path(".tmp/codex/rust-dataloader")
 BATCH_SIZE = 16
 CONTEXT = 2048
 
 
-def baseline_loader():
-    source = subprocess.check_output(["git", "show", f"{BASELINE}:src/gpt_lab/data/loader.py"])
-    path = SCRATCH / "baseline_loader.py"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(source)
-    spec = importlib.util.spec_from_file_location("baseline_loader", path)
+def load_module(path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
+def baseline_loader(directory):
+    source = subprocess.check_output(["git", "show", f"{BASELINE}:src/gpt_lab/data/loader.py"])
+    path = directory / "baseline_loader.py"
+    path.write_bytes(source)
+    return load_module(path)
+
+
 def measure(args):
-    if args.corpus != "climbmix":
-        return _measure(args, None)
-    source = Path(args.shard)
-    SCRATCH.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(prefix="dataset-", dir=SCRATCH) as temporary:
-        dataset = Path(temporary) / "dataset"
+    with TemporaryDirectory(prefix="gpt-lab-benchmark-") as temporary:
+        directory = Path(temporary)
+        if args.corpus != "climbmix":
+            return _measure(args, None, directory)
+        source = Path(args.shard)
+        dataset = directory / "dataset"
         dataset.mkdir()
         shard = dataset / source.name
         shard.symlink_to(source.resolve(strict=True))
-        return _measure(args, shard)
+        return _measure(args, shard, directory)
 
 
-def _measure(args, shard):
+def _measure(args, shard, directory):
     import numpy as np
     import pyarrow as pa
     import torch
@@ -54,13 +56,12 @@ def _measure(args, shard):
     from gpt_lab.tokenizer import Tokenizer
     from gpt_lab.utils.distributed import ComputeContext
     from gpt_lab.utils.schemas import DataLoaderState
-    from experiments.dataloaders import make_synthetic_bin_idx, SyntheticPretokenizedDataset
 
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     pa.set_cpu_count(1)
     pa.set_io_thread_count(1)
-    module = baseline_loader() if args.backend == "baseline" else current
+    module = baseline_loader(directory) if args.backend == "baseline" else current
     kwargs = {}
     if args.backend != "baseline":
         kwargs["dataloader_backend"] = "rust-packing" if args.backend == "rust" else "python"
@@ -79,8 +80,9 @@ def _measure(args, shard):
         )
         iterator = factory()
     else:
-        tokens, offsets = make_synthetic_bin_idx()
-        fixture = SyntheticPretokenizedDataset(tokens, offsets)
+        synthetic = load_module(Path(__file__).resolve().parents[1] / "dataloaders.py")
+        tokens, offsets = synthetic.make_synthetic_bin_idx()
+        fixture = synthetic.SyntheticPretokenizedDataset(tokens, offsets)
         bos = 0
         documents = [np.concatenate(([bos], fixture.get_doc(i).numpy())) for i in range(len(fixture))]
         cursor = DataLoaderState()
@@ -124,18 +126,20 @@ def _measure(args, shard):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shard", default=".tmp/codex/pr54-validation/recheck/climbmix-base/shard_01061.parquet")
+    parser.add_argument("--shard", type=Path, help="Cached ClimbMix Parquet shard (required for ClimbMix)")
     parser.add_argument("--threads", type=int, default=4, help="Tokenizer worker budget")
     parser.add_argument("--repeats", type=int, default=4)
-    parser.add_argument("--output", default=str(SCRATCH / "benchmark.json"))
+    parser.add_argument("--output", type=Path, default=Path("benchmark.json"), help="Results JSON path (default: benchmark.json)")
     parser.add_argument("--corpus", choices=["climbmix", "pretokenized"])
     parser.add_argument("--backend", choices=["baseline", "python", "rust"])
     args = parser.parse_args()
     if args.threads < 1 or args.repeats < 1:
         parser.error("threads and repeats must be positive")
+    if args.backend and not args.corpus:
+        parser.error("--backend requires --corpus")
+    if args.corpus != "pretokenized" and (args.shard is None or not args.shard.is_file()):
+        parser.error("ClimbMix requires --shard pointing to a cached Parquet file")
     if args.backend:
-        if not args.corpus:
-            parser.error("--backend requires --corpus")
         print(json.dumps(measure(args)))
         return
     runs = []
@@ -147,7 +151,9 @@ def main():
         for repeat in range(args.repeats):
             for backend in backends[::1 if repeat % 2 == 0 else -1]:
                 command = [sys.executable, __file__, "--corpus", corpus, "--backend", backend,
-                           "--shard", args.shard, "--threads", str(args.threads)]
+                           "--threads", str(args.threads)]
+                if corpus == "climbmix":
+                    command.extend(["--shard", str(args.shard)])
                 completed = subprocess.run(command, env=env, text=True, capture_output=True)
                 if completed.returncode:
                     sys.stderr.write(completed.stdout + completed.stderr)
@@ -157,7 +163,7 @@ def main():
                 runs.append(result)
                 print(json.dumps(result), flush=True)
         assert len({(r["batches"], r["content_tokens"], r["sha256"]) for r in runs if r["corpus"] == corpus}) == 1, "Backend output mismatch"
-    output = Path(args.output)
+    output = args.output
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(runs, indent=2) + "\n")
     print("| Corpus | Backend | Median content tokens/s | Range | Peak RSS MiB |")

@@ -37,7 +37,6 @@ def test_selected_shard_preserves_source_metadata(tmp_path, monkeypatch, metadat
 
     monkeypatch.setattr(Tokenizer, "from_pretrained", lambda *args, **kwargs: Encoder())
     monkeypatch.setattr(torch, "set_num_interop_threads", lambda count: None)
-    monkeypatch.setattr(benchmark, "SCRATCH", tmp_path / "benchmark-scratch")
     monkeypatch.setattr(benchmark, "BATCH_SIZE", 1)
     monkeypatch.setattr(benchmark, "CONTEXT", 3)
     result = benchmark.measure(SimpleNamespace(corpus="climbmix", backend=backend,
