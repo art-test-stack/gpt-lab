@@ -6,7 +6,7 @@ CORE keeps separate choice rows as its default. A question is eligible for packi
 
 `core_timing.py` is the user-facing command for the opt-in mode. It calls `evaluate_core` with a task scorer that batches up to four multiple-choice questions within each task. Unpackable questions use separate rows, and schema and language-modeling tasks use the stock task scorer. The trainer still calls CORE with its default options.
 
-On Apple M2, stock master took a median of **106.47 s** and the opt-in mode took **57.01 s**. The median paired speedup was **1.87×**, saving **49.46 s per evaluation**. Both used the frozen two-layer FP32 GPT-Lab checkpoint, the byte tokenizer, and a 2,048-token logical context. All 352 predictions and all 22 task scores matched. Centered CORE was `0.03214244121780599` in both arms. The machine paged during the run, with noticeable variation across the three pairs.
+On Apple M2, stock master took a median of **106.47 s** and the opt-in mode took **57.01 s**. The median paired speedup was **1.87×**, saving **49.46 s per evaluation**. Both used the frozen two-layer FP32 GPT-Lab checkpoint, the byte tokenizer, and a 2,048-token logical context. All 352 predictions and all 22 task scores matched. Centered CORE was `0.03214244121780599` in both arms. Mean absolute option-NLL drift was `3.76e-8` nats. The machine paged during the run, with noticeable variation across the three pairs.
 
 | Pair | Stock master | Batched wide, prefetch and deferred readback | Time saved |
 | --- | ---: | ---: | ---: |
@@ -15,6 +15,42 @@ On Apple M2, stock master took a median of **106.47 s** and the opt-in mode took
 | 3 | 85.93 s | 10.14 s | 75.80 s |
 
 Timing used stock `61f066250420afbc121524037b996ee4a3524c0a` and candidate `4aab1cd2fd031abfe8714714b6ebec2adf988f94`. The checkpoint SHA-256 was `c8102efd75dfd7f2cfcba814916a53eb0db43e41cc86c0ab3b9c29b63cca595f`.
+
+### Scored outputs and CORE accuracy
+
+The untimed pass used the same 352 examples, cropped token spans, and packed batch size 4. The numerical values differ, while every selected answer and all 33,244 scored-token argmaxes agree. Signed deltas are candidate minus master, in nats.
+
+| Output | Count | Mean signed Δ | Mean absolute Δ | p95 absolute Δ | Max absolute Δ |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Target-token log probability | 33,244 | -6.45e-10 | 4.87e-8 | 4.77e-7 | 9.54e-7 |
+| Mean option NLL | 672 | -1.06e-8 | 3.76e-8 | 4.77e-7 | 1.43e-6 |
+
+Mean absolute relative option-NLL drift was **0.000000667%**, passing the 1% gate. Raw accuracy was **23.011364%** and centered CORE was **0.03214244121780599** for both paths. Each scored 81 of 352 examples correctly. There were **0 correct → incorrect** and **0 incorrect → correct** changes. ΔCORE was **0**.
+
+| Task | Stock raw accuracy | Packed raw accuracy | Stock centered | Packed centered | Δ centered |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hellaswag_zeroshot | 0.312500 | 0.312500 | 0.083333 | 0.083333 | 0.000000 |
+| jeopardy | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| bigbench_qa_wikidata | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| arc_easy | 0.375000 | 0.375000 | 0.166667 | 0.166667 | 0.000000 |
+| arc_challenge | 0.312500 | 0.312500 | 0.083333 | 0.083333 | 0.000000 |
+| copa | 0.500000 | 0.500000 | 0.000000 | 0.000000 | 0.000000 |
+| commonsense_qa | 0.562500 | 0.562500 | 0.453125 | 0.453125 | 0.000000 |
+| piqa | 0.500000 | 0.500000 | 0.000000 | 0.000000 | 0.000000 |
+| openbook_qa | 0.250000 | 0.250000 | 0.000000 | 0.000000 | 0.000000 |
+| lambada_openai | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| hellaswag | 0.375000 | 0.375000 | 0.166667 | 0.166667 | 0.000000 |
+| winograd | 0.687500 | 0.687500 | 0.375000 | 0.375000 | 0.000000 |
+| winogrande | 0.375000 | 0.375000 | -0.250000 | -0.250000 | 0.000000 |
+| bigbench_dyck_languages | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| agi_eval_lsat_ar | 0.312500 | 0.312500 | 0.140625 | 0.140625 | 0.000000 |
+| bigbench_cs_algorithms | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| bigbench_operators | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| bigbench_repeat_copy_logic | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| squad | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| coqa | 0.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| boolq | 0.437500 | 0.437500 | -0.480263 | -0.480263 | 0.000000 |
+| bigbench_language_identification | 0.062500 | 0.062500 | -0.031353 | -0.031353 | 0.000000 |
 
 ### Matched packing and batching controls
 
@@ -45,12 +81,14 @@ export PYTORCH_ENABLE_MPS_FALLBACK=0 PYTORCH_MPS_LOW_WATERMARK_RATIO=0.7
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.2
 uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/core"
 uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/paired" \
-  --mode paired --isolated-trials
+  --mode paired --isolated-trials --batch-size 4
+uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/quality" \
+  --mode quality --batch-size 4
 uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/overlap" --mode overlap
 uv run --locked --extra cpu python "$script" --checkpoint "$FROZEN" --output "$RESULTS/profile" --mode profile
 ```
 
-The paired command runs stock master at `61f066250420afbc121524037b996ee4a3524c0a` and records the candidate commit. Each trial starts after model load and warm-up, before CORE loads task data and renders prompts, and ends after scores are on the host and the device is synchronized. Fresh processes keep Metal allocations from carrying across arms. A separate pass records multiple-choice and schema winners, scored language-model predictions, and the exact cropped tokens and scoring spans. The report includes all 352 examples across 22 tasks, three alternating timing pairs, per-task score deltas, and changed predictions.
+The paired command runs stock master at `61f066250420afbc121524037b996ee4a3524c0a` and records the candidate commit. Each trial starts after model load and warm-up, before CORE loads task data and renders prompts, and ends after scores are on the host and the device is synchronized. Fresh processes keep Metal allocations from carrying across arms. A separate untimed pass checks that the cropped tokens and scoring spans match and captures each target token’s log probability and argmax. It also records the option NLLs and winners actually used by the scorers. The report gives signed candidate-minus-stock drift and absolute drift in nats, the 1% mean absolute relative option-NLL gate, score deltas, and both correctness transition counts. Changed predictions include per-option NLLs and winner-to-runner-up margins. Use `--mode quality` to refresh these outputs independently of the three timed pairs.
 
 The prepared-token overlap command keeps the same packed groups and 36 fallbacks across all four configurations. Prefetch prepares one upcoming batch on a worker. Deferred readback concatenates the small winner tensors and reads them in one call. All configurations include readback and aggregation. The component profile separately reports host dispatch and instrumented MPS intervals. Overlapping intervals and profiling overhead make these durations unsuitable for summing into an uninstrumented wall time.
 
@@ -247,7 +285,11 @@ Append `--batch-sizes 4 8 16 32` to the paired FA4 command for the same throughp
 
 ## Single-A100 PyTorch SDPA sweep
 
-Append `--validate-backends` to run the single-A100 follow-up. The runner replays the three previous batch-1 winner changes, forces both arms onto the same SDPA implementation, and probes the pinned Hub FA4 source for native SM80 dispatch, sibling isolation, padding, and the sliding-window boundary. It tries SDPA math if matched memory-efficient SDPA fails validation. Both matched SDPA and native FA4 get timed sweeps when their winners, sampled task scores, and 1% relative NLL criterion agree with pinned master. Each passing backend gets an all-task score comparison before its all-task timing. `validated-report.json` records the diagnostics even when timing is skipped. The local Hugging Face Jobs launcher stages the optional pinned FA4 dependencies and uses the existing cache bucket for results.
+The earlier BF16 128-question run measured **1.22×, 2.06×, 2.27×, and 2.32×** paired packing speedups at batch sizes 1, 4, 8, and 16. At size 8, separate rows reached 34.37 questions/s at 30.70 GiB peak allocated memory, and packed rows reached 77.74 questions/s at 8.64 GiB. Relative to each scorer’s own size 1, those were 1.32× and 2.42×. The automatic CUDA dispatch used FlashAttention for separate rows and memory-efficient SDPA for packed rows. Packed results exceeded the 1% gate at each size with 1.21–1.28% mean relative option-NLL drift and three or four winner changes. This historical prepared-token run covers the eligible questions only. [Hugging Face job](https://huggingface.co/jobs/ai-testack/6b09bc0054072e8b716a2ec3)
+
+Use `--validate-backends --all-task-batch-size 8` for the one-A100 follow-up. It first measures the 352-example evaluation with the default SDPA dispatch and compares it with pinned stock master. It then replays the three earlier batch-1 winner changes, tests matched SDPA, and probes the pinned Hub FA4 source for native SM80 dispatch, sibling isolation, padding, and the sliding-window boundary. It tries matched SDPA math if the memory-efficient control fails exact prediction, task-score, or NLL validation. Matched SDPA and native FA4 that pass the dispatch and isolation checks get the 128-question batch-size sweep and their own all-task result. Numerical failures, changed winners, and any centered CORE drop are reported alongside saved measurements.
+
+The local launcher uses the existing Hugging Face cache bucket. The job writes `validated-report.json` and publishes the default SDPA all-task comparison under `default_sdpa/paired.json` and `default_sdpa/quality.json` in its results directory. The raw scored-token and option NLL observations are in `stock-quality.json` and `candidate-quality.json` alongside them. If the quality pass fails to execute, the job still retains any completed timing pairs. The paid run is pending.
 
 Run from the repository root with CORE staged at `GPTLAB_CACHE_DIR/data/core/eval_bundle`. Use a trained base RoPE checkpoint with a 2,048-token context and its matching tokenizer. The runner loads the tokenizer from checkpoint metadata. For a relocated local tokenizer, set `GPTLAB_BENCH_TOKENIZER_DIR` to its directory.
 
@@ -272,4 +314,4 @@ This path uses the same Hub weights, tokenizer, and Transformers SDPA forward in
 
 The sweep starts with the PR's 176 multiple-choice candidates and checks packing eligibility using the checkpoint tokenizer. It extends the seeded task pools if fewer than 128 qualify. It balances selection across tasks and chooses evenly spaced sequence lengths within each task. It saves the question IDs, physical lengths, and batch membership in `selected.json`. Both scorers use those same prepared questions at sizes 1, 4, 8, and 16, with 128, 32, 16, and 8 forwards per sweep respectively.
 
-`master-reference.json` comes from the pinned master's original separate-row forward and option reduction. `preflight.json` records the branch and padding fixture and BF16 parity against that reference. Each size gets three alternating timed pairs after warm-up, with CUDA synchronization and prefetch off. `batch-<size>.json` and `report.json` record SDPA operators and GPU kernel symbols from a probe for each batch shape, raw timing and peak CUDA allocation, paired packing speedup, and each scorer's throughput relative to its own size 1. If a configuration runs out of CUDA memory, its partner can still be checked against the saved master reference. The A100 parity gate requires the mean absolute relative change across option NLLs to be at most 1% of the pinned reference. A zero reference NLL contributes zero when the candidate is also zero. An undefined relative change fails the gate. Winner changes, their margins, task scores, and the largest absolute and relative NLL differences are reported for every configuration. The runner records parity before timing, saves the timing for every runnable size, and profiles afterward. Profiling errors are recorded with the results. The command returns a failed parity status after saving the reports when a configuration exceeds the limit.
+`master-reference.json` comes from the pinned master's original separate-row forward and option reduction. `preflight.json` records the branch and padding fixture and BF16 parity against that reference. Each size gets three alternating timed pairs after warm-up, with CUDA synchronization and prefetch off. `batch-<size>.json` and `report.json` record SDPA operators and GPU kernel symbols from a probe for each batch shape, raw timing and peak CUDA allocation, paired packing speedup, and each scorer's throughput relative to its own size 1. If a configuration runs out of CUDA memory, its partner can still be checked against the saved master reference. The A100 parity gate requires the mean absolute relative change across option NLLs to be at most 1% of the pinned reference. A zero reference NLL contributes zero when the candidate is also zero. An undefined relative change fails the gate. Winner changes, their margins, task scores, and the largest absolute and relative NLL differences are reported for every configuration. The runner records parity before timing, saves the timing for every runnable size, and profiles afterward. Profiling errors are recorded with the results. The eligible-only command without `--validate-backends` returns a failed parity status after saving the reports when a configuration exceeds the limit. The all-task launcher records failures in the report and continues the runnable comparisons.
