@@ -105,6 +105,8 @@ pub struct TextSource {
     had_documents: bool,
     resuming: bool,
     exhausted: bool,
+    #[cfg(all(test, unix))]
+    read_failures: std::sync::Mutex<Option<(usize, usize)>>,
 }
 
 impl TextSource {
@@ -147,6 +149,8 @@ impl TextSource {
             had_documents: cursor.is_some(),
             resuming: cursor.is_some(),
             exhausted: false,
+            #[cfg(all(test, unix))]
+            read_failures: std::sync::Mutex::new(None),
         })
     }
 
@@ -159,6 +163,13 @@ impl TextSource {
         reader: &SerializedFileReader<File>,
         group: usize,
     ) -> ParquetResult<Vec<String>> {
+        #[cfg(all(test, unix))]
+        if let Some((failed_group, remaining)) = self.read_failures.lock().unwrap().as_mut() {
+            if *failed_group == group && *remaining > 0 {
+                *remaining -= 1;
+                return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+            }
+        }
         if group >= reader.num_row_groups() {
             return Err(ParquetError::General(format!(
                 "Data checkpoint row group {group} is outside the shard"
@@ -195,7 +206,11 @@ impl TextSource {
             reader,
             || self.open(index),
             |reader| self.read_group(reader, group),
-            std::thread::sleep,
+            |delay| {
+                if !cfg!(test) {
+                    std::thread::sleep(delay);
+                }
+            },
         )
         .map_err(|error| {
             format!(
@@ -311,50 +326,56 @@ impl TextSource {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use parquet::data_type::{ByteArray, ByteArrayType};
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
     use std::cell::Cell;
 
     #[test]
     fn transient_eio_reopens_and_preserves_resume_cursor() {
-        let source = TextSource::new(
-            vec![(7, PathBuf::from("unused.parquet"))],
+        let path =
+            std::env::temp_dir().join(format!("gpt-lab-row-group-{}.parquet", std::process::id()));
+        let schema =
+            parse_message_type("message schema { REQUIRED BYTE_ARRAY text (UTF8); }").unwrap();
+        let mut writer = SerializedFileWriter::new(
+            File::create(&path).unwrap(),
+            schema.into(),
+            Default::default(),
+        )
+        .unwrap();
+        for texts in [["before", "previous", "end"], ["first", "second", "third"]] {
+            let mut group = writer.next_row_group().unwrap();
+            let mut column = group.next_column().unwrap().unwrap();
+            let values = texts.map(ByteArray::from);
+            column
+                .typed::<ByteArrayType>()
+                .write_batch(&values, None, None)
+                .unwrap();
+            column.close().unwrap();
+            group.close().unwrap();
+        }
+        writer.close().unwrap();
+        let committed = Cursor::from((0, Some(7), 1, 1, 4));
+        let mut source = TextSource::new(
+            vec![(7, path.clone())],
             "text".into(),
             true,
             0,
             1,
-            Some(Cursor::from((0, Some(7), 2, 3, 4))),
+            Some(committed),
         )
         .unwrap();
-        let committed = source.cursor;
-        let mut reader = Some(0);
-        let opens = Cell::new(0);
-        let attempts = Cell::new(0);
-        let mut delays = Vec::new();
-        let texts = read_group_with_retry(
-            &mut reader,
-            || {
-                opens.set(opens.get() + 1);
-                Ok(opens.get())
-            },
-            |reader| {
-                assert_eq!(source.cursor, committed);
-                assert!(source.texts.is_none());
-                attempts.set(attempts.get() + 1);
-                if attempts.get() < 3 {
-                    assert_eq!(*reader, attempts.get() - 1);
-                    Err(std::io::Error::from_raw_os_error(libc::EIO).into())
-                } else {
-                    assert_eq!(*reader, 2);
-                    Ok(vec!["first".to_owned(), "second".to_owned()])
-                }
-            },
-            |delay| delays.push(delay.as_secs()),
-        )
-        .unwrap();
-        assert_eq!(texts, ["first", "second"]);
-        assert_eq!(attempts.get(), 3);
-        assert_eq!(opens.get(), 2);
-        assert_eq!(delays, [1, 2]);
-        assert_eq!(source.cursor, committed);
+        *source.read_failures.lock().unwrap() = Some((1, 2));
+        let (texts, cursor) = source.next_chunk(1).unwrap().unwrap();
+        assert_eq!(texts, ["second"]);
+        assert_eq!(cursor, Cursor::from((0, Some(7), 1, 2, 4)));
+        assert_eq!(source.cursor, cursor);
+        assert_eq!(*source.read_failures.lock().unwrap(), Some((1, 0)));
+        let (texts, cursor) = source.next_chunk(2).unwrap().unwrap();
+        assert_eq!(texts, ["third"]);
+        assert_eq!(cursor, Cursor::from((0, Some(7), 1, 3, 4)));
+        drop(source);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

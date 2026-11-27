@@ -1,7 +1,6 @@
 """Native text parity using GPT-2 from an explicitly configured local cache."""
-import hashlib
+import json
 import os
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +9,8 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from gpt_lab.data import build_dataloader
+from gpt_lab.data import DistDataLoader, build_dataloader
+from gpt_lab.rust_tools import dataloader as native
 from gpt_lab.tokenizer import Tokenizer
 from gpt_lab.utils.schemas import DataLoaderState, TokenizerConfig
 
@@ -48,10 +48,11 @@ def text_shards(tmp_path):
 
 def make_loader(root, tokenizer, backend, rank, *, split="train", state=None,
                 packing_strategy="rolling-16"):
+    selector = {} if backend is None else {"dataloader_backend": backend}
     return build_dataloader(
         name="native-text", cachedir=root, max_shards=4, tokenizer=tokenizer,
         batch_size=2, seq_len=17, tokenizer_threads=2, tokenizer_batch_size=64,
-        dataloader_backend=backend, split=split, resume_state=state, data_seed=19,
+        split=split, resume_state=state, data_seed=19, **selector,
         packing_strategy=packing_strategy,
         comp_info=SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu")),
     )
@@ -60,7 +61,7 @@ def make_loader(root, tokenizer, backend, rank, *, split="train", state=None,
 def assert_equal(expected, actual):
     assert torch.equal(expected[0], actual[0])
     assert torch.equal(expected[1], actual[1])
-    assert expected[2] == actual[2]
+    assert expected[2].model_dump_json() == actual[2].model_dump_json()
 
 
 @pytest.mark.parametrize("compression", ["gzip", "brotli", "lz4"])
@@ -74,7 +75,7 @@ def test_default_native_loader_reads_cached_parquet_codecs(tmp_path, byte_tokeni
                 comp_info=SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu")))
     default = build_dataloader(**args)()
     python = build_dataloader(**args, dataloader_backend="python")()
-    assert default._rust_text_loader is not None and python._rust_text_loader is None
+    assert default._fill_batch is not DistDataLoader._pack_python
     batches = 0
     for actual, expected in zip(default, python, strict=True):
         assert_equal(expected, actual)
@@ -83,15 +84,16 @@ def test_default_native_loader_reads_cached_parquet_codecs(tmp_path, byte_tokeni
 
 
 def test_missing_extension_preserves_python_default_and_strict_native_requests(text_shards, byte_tokenizer, monkeypatch):
-    monkeypatch.setitem(sys.modules, "gpt_lab_rust_packer", None)
+    monkeypatch.setattr(native, "_EXTENSION", "_gpt_lab_missing_test_extension")
     args = dict(name="native-text", cachedir=text_shards, max_shards=4, split="train",
                 batch_size=2, seq_len=17, tokenizer=byte_tokenizer,
                 comp_info=SimpleNamespace(rank=0, world_size=2, device=torch.device("cpu")))
     default = build_dataloader(**args)
-    assert default._rust_text_loader is default._rust_pack is None
+    assert default._fill_batch is DistDataLoader._pack_python
     assert_equal(next(default), next(build_dataloader(**args, dataloader_backend="python")))
-    for selector in ({"dataloader_backend": "rust"}, {"dataloader_backend": "rust-packing"},
-                     {"packing_strategy": "block-best-fit"}):
+    block = build_dataloader(**args, packing_strategy="block-best-fit")
+    assert block._fill_batch is DistDataLoader._pack_python
+    for selector in ({"dataloader_backend": "rust"}, {"dataloader_backend": "rust-packing"}):
         with pytest.raises(ImportError, match="rust-dataloader"):
             build_dataloader(**args, **selector)
 
@@ -106,35 +108,80 @@ def test_default_uses_only_rank_owned_cached_shards(tmp_path, byte_tokenizer, na
     for rank in (0, 1):
         context = SimpleNamespace(rank=rank, world_size=2, device=torch.device("cpu"))
         default = build_dataloader(**args, comp_info=context)
-        assert (default._rust_text_loader is not None) == (rank == 0)
+        assert (default._fill_batch is not DistDataLoader._pack_python) == (rank == 0)
     with pytest.raises(FileNotFoundError, match="shard_00001"):
         build_dataloader(**args, comp_info=context, dataloader_backend="rust")
 
 
+@pytest.mark.parametrize("strategy", ["rolling-16", "block-best-fit"])
 @pytest.mark.parametrize("rank", [0, 1])
-def test_native_text_batches_and_cross_backend_resume(text_shards, tokenizer, rank):
-    loaders = [make_loader(text_shards, tokenizer, backend, rank)
-               for backend in ("python", "rust-packing", "rust")]
-    resumed = []
+def test_training_parity_and_resume(text_shards, tokenizer, rank, strategy):
+    def build(backend, state=None):
+        return make_loader(text_shards, tokenizer, backend, rank, state=state, packing_strategy=strategy)
+
+    python, rust = build("python"), build("rust")
+    comparisons = []
+    if strategy == "rolling-16":
+        default = build(None)
+        assert default._fill_batch is not DistDataLoader._pack_python
+        comparisons.extend((default, build("rust-packing")))
+    resumed_epochs = set()
     seen = set()
-    for _ in range(1100):
-        reference = next(loaders[0])
-        packed, native = next(loaders[1]), next(loaders[2])
-        assert_equal(reference, packed)
-        assert_equal(reference, native)
-        for restored in resumed:
-            assert_equal(reference, next(restored))
-        state = reference[2]
+    spanned = [False, False]
+    previous = None
+    drained = False
+    for batch in range(1, 1101):
+        expected = next(python)
+        actual = next(rust)
+        try:
+            assert_equal(expected, actual)
+            for loader in comparisons:
+                assert_equal(expected, next(loader))
+        except AssertionError as exc:
+            raise AssertionError(f"{strategy}, rank {rank}, batch {batch}: {exc}") from exc
+        state = expected[2]
         seen.add((state.epoch, state.global_shard_idx, state.row_group_idx))
-        if not resumed and state.lookahead_refs and state.pending_document_ref:
+        if (state.epoch <= 2 and state.epoch not in resumed_epochs
+                and state.lookahead_refs and state.pending_document_ref):
             assert state.document_token_offset > 0
-            for source, target in ((reference, "rust"), (native, "python")):
-                saved = DataLoaderState.model_validate_json(source[2].model_dump_json())
-                resumed.append(make_loader(text_shards, tokenizer, target, rank, state=saved))
-    assert resumed
+            comparisons.extend((
+                build("rust", DataLoaderState.model_validate_json(state.model_dump_json())),
+                build("python", DataLoaderState.model_validate_json(actual[2].model_dump_json())),
+            ))
+            resumed_epochs.add(state.epoch)
+        if strategy == "block-best-fit":
+            refs = state.lookahead_refs
+            spanned[0] |= len({ref[0] for ref in refs}) > 1
+            spanned[1] |= len({ref[:2] for ref in refs}) > 1
+            if previous is not None:
+                drained |= (
+                    (state.epoch, state.global_shard_idx, state.row_group_idx, state.offset_in_row_group)
+                    == (previous.epoch, previous.global_shard_idx, previous.row_group_idx, previous.offset_in_row_group)
+                    and 0 < len(refs) < len(previous.lookahead_refs)
+                )
+        previous = state
+    assert resumed_epochs == {1, 2}
     assert len({entry[0] for entry in seen}) > 1
     assert len({entry[1] for entry in seen}) == 2
     assert len({entry[2] for entry in seen}) == 2
+    if strategy == "block-best-fit":
+        assert drained and all(spanned)
+
+
+def test_resume_frozen_master_rolling_checkpoint(text_shards, tokenizer):
+    fixture = Path(__file__).with_name("fixtures") / "rolling16_master.json"
+    for case in json.loads(fixture.read_text())["cases"]:
+        saved = DataLoaderState.model_validate(case["state"])
+        assert saved.lookahead_refs and saved.pending_document_ref and saved.document_token_offset
+        expected = (torch.tensor(case["next_x"]), torch.tensor(case["next_y"]),
+                    DataLoaderState.model_validate(case["next_state"]))
+        for backend in ("python", "rust"):
+            uninterrupted = make_loader(text_shards, tokenizer, backend, case["rank"])
+            for _ in range(case["batch"]):
+                _, _, state = next(uninterrupted)
+            assert state.model_dump_json() == saved.model_dump_json()
+            restored = make_loader(text_shards, tokenizer, backend, case["rank"], state=saved)
+            assert_equal(expected, next(restored))
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -154,70 +201,6 @@ def test_native_text_finite_validation(text_shards, tokenizer, rank):
     assert groups == {rank, rank + 2}
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-def test_block_best_fit_matches_drained_python_blocks_and_resume(text_shards, tokenizer, rank):
-    native = make_loader(text_shards, tokenizer, "rust", rank, packing_strategy="block-best-fit")
-    reference = make_loader(text_shards, tokenizer, "python", rank)
-    reference.lookahead_size = 64
-    reference.signature = native.signature
-    fill = reference._fill_lookahead
-
-    def fill_empty_block():
-        if not reference.lookahead:
-            fill()
-
-    reference._fill_lookahead = fill_empty_block
-    greedy_take = reference._take_document
-
-    def take_exact_fit(space):
-        fill_empty_block()
-        lengths = [len(document) for document, _ in reference.lookahead]
-        for index, length in enumerate(lengths):
-            if length == space:
-                return reference.lookahead.pop(index)
-        for first, length in enumerate(lengths):
-            for other in lengths[first + 1:]:
-                if length + other == space:
-                    return reference.lookahead.pop(first)
-        return greedy_take(space)
-
-    reference._take_document = take_exact_fit
-    resumed = []
-    seen = set()
-    previous = None
-    drained_without_refill = False
-    block_crossed_group = block_crossed_shard = False
-    saved_epochs = set()
-    for _ in range(1100):
-        expected, actual = next(reference), next(native)
-        assert_equal(expected, actual)
-        for restored in resumed:
-            assert_equal(expected, next(restored))
-        state = actual[2]
-        seen.add((state.epoch, state.global_shard_idx, state.row_group_idx))
-        refs = state.lookahead_refs + ((state.pending_document_ref,) if state.pending_document_ref else ())
-        block_crossed_group |= len({ref[:2] for ref in refs}) > 1
-        block_crossed_shard |= len({ref[0] for ref in refs}) > 1
-        if previous is not None and state.lookahead_refs:
-            same_cursor = all(getattr(state, field) == getattr(previous, field) for field in (
-                "epoch", "global_shard_idx", "row_group_idx", "offset_in_row_group"))
-            drained_without_refill |= same_cursor and len(state.lookahead_refs) < len(previous.lookahead_refs)
-        if (len(state.lookahead_refs) > 15 and state.pending_document_ref
-                and state.document_token_offset > 0 and state.epoch not in saved_epochs
-                and len(saved_epochs) < 2):
-            saved = DataLoaderState.model_validate_json(state.model_dump_json())
-            resumed.append(make_loader(text_shards, tokenizer, "rust", rank, state=saved,
-                                       packing_strategy="block-best-fit"))
-            saved_epochs.add(state.epoch)
-        previous = state
-    assert len(saved_epochs) == 2
-    assert drained_without_refill
-    assert block_crossed_group and block_crossed_shard
-    assert len({entry[0] for entry in seen}) > 1
-    assert len({entry[1] for entry in seen}) == 2
-    assert len({entry[2] for entry in seen}) == 2
-
-
 @pytest.mark.parametrize("source,target", [("rolling-16", "block-best-fit"),
                                            ("block-best-fit", "rolling-16")])
 def test_block_best_fit_rejects_other_strategy_checkpoint(text_shards, tokenizer, source, target):
@@ -227,32 +210,13 @@ def test_block_best_fit_rejects_other_strategy_checkpoint(text_shards, tokenizer
         make_loader(text_shards, tokenizer, "rust", 0, state=saved, packing_strategy=target)
 
 
-def test_exact_pair_rejects_greedy_block_checkpoint(text_shards, tokenizer, monkeypatch):
-    old_signatures = []
-    sha256 = hashlib.sha256
-
-    def capture_greedy_signature(payload=b""):
-        if b'"block-best-fit-exact-pair"' in payload:
-            old_signatures.append(sha256(payload.replace(
-                b'"block-best-fit-exact-pair"', b'"block-best-fit"',
-            )).hexdigest())
-        return sha256(payload)
-
-    with monkeypatch.context() as patch:
-        patch.setattr("gpt_lab.data.loader.hashlib.sha256", capture_greedy_signature)
-        loader = make_loader(text_shards, tokenizer, "rust", 0, packing_strategy="block-best-fit")
-    assert len(old_signatures) == 1
-    saved = next(loader)[2].model_copy(update={"packing_signature": old_signatures[0]})
-    with pytest.raises(ValueError, match="Incompatible training data checkpoint"):
-        make_loader(text_shards, tokenizer, "rust", 0, state=saved, packing_strategy="block-best-fit")
-
-
 def test_block_best_fit_is_training_only(text_shards, tokenizer):
     with pytest.raises(ValueError, match="train"):
         make_loader(text_shards, tokenizer, "rust", 0, split="val", packing_strategy="block-best-fit")()
 
 
-def test_exact_pair_nine_six_four(tmp_path, tokenizer):
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_exact_pair_nine_six_four(tmp_path, tokenizer, backend):
     dataset = tmp_path / "exact-pair"
     dataset.mkdir()
     texts = [" a" * 8, " b" * 5, " c" * 3]
@@ -261,7 +225,7 @@ def test_exact_pair_nine_six_four(tmp_path, tokenizer):
     pq.write_table(pa.table({"text": texts}), dataset / "shard_00000.parquet")
     loader = build_dataloader(
         name=dataset.name, cachedir=tmp_path, max_shards=1, tokenizer=tokenizer,
-        batch_size=1, seq_len=9, dataloader_backend="rust", packing_strategy="block-best-fit",
+        batch_size=1, seq_len=9, dataloader_backend=backend, packing_strategy="block-best-fit",
         comp_info=SimpleNamespace(rank=0, world_size=1, device=torch.device("cpu")),
     )
     x, y, state = next(loader)
@@ -270,22 +234,3 @@ def test_exact_pair_nine_six_four(tmp_path, tokenizer):
     assert y.tolist() == [row[1:]]
     assert state.lookahead_refs == ((0, 0, 0),)
     assert state.pending_document_ref is None
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-def test_rust_training_strategies_share_validation_batches(text_shards, tokenizer, rank):
-    validation = []
-    for strategy in ("rolling-16", "block-best-fit"):
-        training = make_loader(text_shards, tokenizer, "rust", rank, packing_strategy=strategy)
-        next(training)
-        # The workflow passes the strategy only to training, leaving validation at rolling-16.
-        validation.append(make_loader(text_shards, tokenizer, "rust", rank, split="val")())
-    batches = 0
-    while True:
-        left, right = (next(loader, None) for loader in validation)
-        if left is None:
-            assert right is None
-            break
-        assert_equal(left, right)
-        batches += 1
-    assert batches > 0

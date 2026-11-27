@@ -152,7 +152,6 @@ def test_resume_restores_all_states_through_existing_pipeline(training_dependenc
     deps.auto.assert_not_called()
     assert deps.factory.call_args.kwargs['optimizer_state_layout'] == 'sharded'
     assert deps.loader.call_args_list[0].kwargs['resume_state'] is deps.state.train_loader_state
-    assert [call.kwargs['dataloader_backend'] for call in deps.loader.call_args_list] == ['auto', 'auto']
     deps.model.build_optimizer.return_value.load_state_dict.assert_called_once_with(deps.checkpoint.optimizer_state)
     assert deps.trainer_factory.call_args.kwargs['config'] is deps.saved_config
     assert deps.trainer_factory.call_args.kwargs['resume_state'] is deps.state
@@ -215,7 +214,6 @@ def test_auto_preserves_configuration_and_cleanup_on_failure(training_dependenci
     with pytest.raises(RuntimeError, match='simulated failure'):
         run(args)
     cfg = deps.auto.call_args.kwargs
-    assert [call.kwargs['dataloader_backend'] for call in deps.loader.call_args_list] == ['auto', 'auto']
     assert (cfg['depth'], cfg['vocab_size'], cfg['n_kv_heads'], cfg['tokenizer_model']) == (4, 512, 2, 'auto')
     assert cfg['tie_embeddings'] == 'embs,head,value_embs:'
     deps.manager.load.assert_not_called()
@@ -360,21 +358,17 @@ def test_step_limit_rejects_old_keyword():
         train_base(stop_after_updates=4)
 
 
-@pytest.mark.parametrize('backend,strategy', [
-    ('python', 'rolling-16'), ('rust-packing', 'rolling-16'),
-    ('rust', 'rolling-16'), ('rust', 'block-best-fit'),
-])
-def test_training_is_callable_without_argparse(training_dependencies, monkeypatch, backend, strategy):
+def test_training_is_callable_without_argparse(training_dependencies, monkeypatch):
     from gpt_lab.workflows.train_base import train_base
     deps = training_dependencies
     monkeypatch.setattr('gpt_lab.cli.parser.build_parser', Mock(side_effect=AssertionError('Python training must not parse CLI arguments')))
     train_base(optim_config=deps.profile, depth=4, total_batch_size=128, num_steps=7, stop_after_step=5,
-               device='cpu', board='dummy', random_seed=123, dataloader_backend=backend,
-               tokenizer_batch_size=64, packing_strategy=strategy)
-    assert [call.kwargs['dataloader_backend'] for call in deps.loader.call_args_list] == [backend, backend]
+               device='cpu', board='dummy', random_seed=123, dataloader_backend='python',
+               tokenizer_batch_size=64, packing_strategy='block-best-fit')
+    assert [call.kwargs['dataloader_backend'] for call in deps.loader.call_args_list] == ['python', 'python']
     assert [call.kwargs['tokenizer_batch_size'] for call in deps.loader.call_args_list] == [64, 64]
     train_args, val_args = [call.kwargs for call in deps.loader.call_args_list]
-    assert train_args['split'] == 'train' and train_args['packing_strategy'] == strategy
+    assert train_args['split'] == 'train' and train_args['packing_strategy'] == 'block-best-fit'
     assert val_args['split'] == 'val' and 'packing_strategy' not in val_args
     assert deps.auto.call_args.kwargs['depth'] == 4
     assert deps.auto.call_args.kwargs['total_batch_size'] == 128

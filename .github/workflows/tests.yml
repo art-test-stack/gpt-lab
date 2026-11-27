@@ -31,7 +31,7 @@ jobs:
 
       - name: Run tests
         run: |
-          .venv/bin/python -I -c 'import importlib.util; assert importlib.util.find_spec("gpt_lab_rust_packer") is None'
+          .venv/bin/python -I -c 'from gpt_lab.rust_tools.dataloader import _extension; assert _extension(required=False) is None'
           .venv/bin/python -m pytest -m "not slow"
 
   native:

@@ -162,21 +162,17 @@ def test_step_limit_flag():
 
 
 @pytest.mark.parametrize('mode', ['auto', 'resume'])
-def test_tokenizer_batch_size_flag(mode):
-    parser = build_parser()
-    assert parser.parse_args(['train', mode]).tokenizer_batch_size is None
-    assert parser.parse_args(['train', mode, '--tokenizer-batch-size', '64']).tokenizer_batch_size == 64
-    with pytest.raises(SystemExit):
-        parser.parse_args(['train', mode, '--tokenizer-batch-size', '0'])
-
-
-@pytest.mark.parametrize('mode', ['auto', 'resume'])
-def test_packing_strategy_flag(mode):
+def test_dataloader_flags(mode):
     parser = build_parser()
     defaults = parser.parse_args(['train', mode])
-    assert (defaults.dataloader_backend, defaults.packing_strategy) == ('auto', 'rolling-16')
-    args = parser.parse_args(['train', mode, '--dataloader-backend', 'rust', '--packing-strategy', 'block-best-fit'])
-    assert args.packing_strategy == 'block-best-fit'
+    assert (defaults.dataloader_backend, defaults.packing_strategy, defaults.tokenizer_batch_size) == (
+        'auto', 'rolling-16', None,
+    )
+    args = parser.parse_args(['train', mode, '--dataloader-backend', 'python', '--packing-strategy', 'block-best-fit',
+                              '--tokenizer-batch-size', '64'])
+    assert (args.dataloader_backend, args.packing_strategy, args.tokenizer_batch_size) == ('python', 'block-best-fit', 64)
+    with pytest.raises(SystemExit):
+        parser.parse_args(['train', mode, '--tokenizer-batch-size', '0'])
 
 
 def test_step_limit_rejects_old_flag():

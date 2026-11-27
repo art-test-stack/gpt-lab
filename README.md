@@ -217,7 +217,9 @@ val_loader = val_loader_fn() # called as a function to get the dataloader instan
 
 On `gpt-lab train auto` and `gpt-lab train resume`, use `--dataloader-backend python` to force Python, `rust-packing` for native packing only, or `rust` to require the full Rust backend. `gpt_lab.data.build_dataloader()` accepts the same choices via `dataloader_backend`.
 
-**Packing defaults to `rolling-16`.** For full Rust training, `--packing-strategy block-best-fit` looks for one document or a pair that exactly fills the remaining row, then falls back to a greedy fit. It considers up to 64 documents at a time. Pass it again on resume. Validation uses `rolling-16`. In `build_dataloader()`, set `packing_strategy` on the training loader only. Rolling-16 checkpoints work across compatible backends with the same data, tokenizer, batch shape, and rank layout.
+**Packing defaults to `rolling-16`.** With Python or end-to-end Rust, `--packing-strategy block-best-fit` drains blocks of up to 64 documents. It looks for an exact single, then the earliest exact pair, then uses the greedy fit. Pass the same strategy on resume. Both strategies have backend-independent training checkpoints. Validation uses rolling-16. In `build_dataloader()`, set `packing_strategy` on the training loader only.
+
+Use `--tokenizer-batch-size 64` to compare Python and Rust with the same tokenization batch size. Batch encoding requires an adapter that opts in to exact scalar-equivalent results. See the [dataloader benchmark](experiments/20261124-rust-dataloader/README.md) for the paired training measurements.
 
 We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
 

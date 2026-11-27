@@ -3,22 +3,15 @@ import json
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple, Union
 
-import numpy as np
 import torch
 
+from gpt_lab.rust_tools.dataloader import PACKING_STRATEGIES, native_batch
 from gpt_lab.utils.default import DATA_DIR, RANDOM_SEED
 from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import DataLoaderState, DocumentRef, TokenizerConfig
-from gpt_lab.data.backends import native_extension, resolve_packing_backend
 from gpt_lab.data.sharder import ShardManager
 
 _LOOKAHEAD_DOCUMENTS = 16
-
-
-def _contiguous_tokens(document) -> np.ndarray:
-    if isinstance(document, torch.Tensor):
-        document = document.detach().to(device="cpu", dtype=torch.long).numpy()
-    return np.ascontiguousarray(document, dtype=np.int64)
 
 
 class ShardedDataset:
@@ -115,25 +108,6 @@ class ShardedDataset:
                     yield tokens, cursor.model_copy(update={"offset_in_row_group": offset})
 
 
-def _select_dataloader_backend(dataset, backend, packing_backend, packing_strategy):
-    if backend != "auto":
-        return backend
-    if packing_backend == "rust":
-        # Legacy packing-only callers keep Python's tokenizer and chunk-size default.
-        return "python"
-    if packing_strategy == "block-best-fit":
-        return "rust"
-    if type(dataset) is not ShardedDataset:
-        return "python"
-    from gpt_lab.tokenizer import Tokenizer
-
-    if type(dataset.tokenizer) is not Tokenizer:
-        return "python"
-    if dataset.sm.base_url and any(not path.is_file() for path in dataset.sm.shard_paths):
-        return "python"
-    return "rust" if native_extension(required=False) is not None else "python"
-
-
 class DistDataLoader:
     """Pack each row without discarding document tails, starting with BOS when available.
 
@@ -156,19 +130,18 @@ class DistDataLoader:
     ):
         if batch_size < 1 or seq_len < 1:
             raise ValueError("Batch size and sequence length must be positive")
-        split = getattr(dataset, "split", None)
-        dataloader_backend = _select_dataloader_backend(dataset, dataloader_backend, packing_backend, packing_strategy)
-        packing_backend = resolve_packing_backend(dataloader_backend, packing_backend, packing_strategy, split)
-        block_best_fit = packing_strategy == "block-best-fit"
-        self._rust_pack = None
-        if packing_backend == "rust":
-            self._rust_pack = native_extension().pack
         self.B = batch_size
         self.T = seq_len
         self.device = torch.device(device)
         self.bos_token_id = getattr(dataset, "bos_token_id", getattr(dataset, "bos_id", None))
         self.lookahead_size = _LOOKAHEAD_DOCUMENTS if self.bos_token_id is not None else 1
-        if block_best_fit:
+        split = getattr(dataset, "split", None)
+        if packing_strategy not in PACKING_STRATEGIES:
+            raise ValueError(f"Unknown packing strategy {packing_strategy!r}")
+        self.block_best_fit = packing_strategy == "block-best-fit"
+        if self.block_best_fit:
+            if split != "train":
+                raise ValueError("block-best-fit applies only to training")
             self.lookahead_size = 64
         start_state = getattr(dataset, "start_state", None)
 
@@ -188,7 +161,7 @@ class DistDataLoader:
                 config.model_dump(mode="json", exclude={"dirname", "trainer", "save_token_bytes"})
                 if isinstance(config, TokenizerConfig) else None,
             )
-            if block_best_fit:
+            if self.block_best_fit:
                 signature_data += ("block-best-fit-exact-pair",)
             self.signature = hashlib.sha256(json.dumps(signature_data, sort_keys=True).encode()).hexdigest()
 
@@ -197,76 +170,43 @@ class DistDataLoader:
         self.document = None
         self.document_ref = self.cursor.pending_document_ref
         self.offset = self.cursor.document_token_offset
-        if start_state is not None:
-            if split == "train" and self.cursor.packing_signature != self.signature:
-                raise ValueError("Incompatible training data checkpoint (loader, dataset, topology, tokenizer or batch shape)")
+        if start_state is not None and split == "train" and self.cursor.packing_signature != self.signature:
+            raise ValueError("Incompatible training data checkpoint (loader, dataset, topology, tokenizer or batch shape)")
+        self.cpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, pin_memory=self.device.type == "cuda")
+        self._fill_batch = native_batch(self, dataset, dataloader_backend, packing_backend)
+        if self._fill_batch is None:
+            self._restore_python(dataset)
+            self._fill_batch = type(self)._pack_python
+        self.gpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, device=self.device)
+        self.inputs = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
+        self.targets = torch.empty_like(self.inputs)
+
+    def _restore_python(self, dataset, prepare=None):
+        if getattr(dataset, "start_state", None) is not None:
             refs = self.cursor.lookahead_refs
             if self.document_ref is not None:
                 refs += (self.document_ref,)
             if len(self.cursor.lookahead_refs) >= self.lookahead_size or len(set(refs)) != len(refs):
                 raise ValueError("Invalid packing buffer in data checkpoint")
-            if dataloader_backend != "rust":
-                documents = {ref: dataset.tokenize(text) for ref, text in dataset.sm.read_documents(refs)}
-                self.lookahead = [(documents[ref], ref) for ref in self.cursor.lookahead_refs]
-                self.document = documents.get(self.document_ref)
-                if (any(not doc for doc in documents.values())
-                        or (self.document is None and self.offset != 0)
-                        or (self.document is not None and not 0 < self.offset < len(self.document))):
-                    raise ValueError("Invalid packing buffer in data checkpoint")
-
-        self.document_tensor = None
-        if self._rust_pack is not None:
-            self.lookahead = [(_contiguous_tokens(doc), ref) for doc, ref in self.lookahead]
-            if self.document is not None:
-                self.document = _contiguous_tokens(self.document)
-        elif self.document is not None:
-            self.document_tensor = torch.tensor(self.document, dtype=torch.long)
-        self._rust_text_loader = (
-            self._build_rust_text_loader(dataset, block_best_fit) if dataloader_backend == "rust" else None
+            documents = {ref: dataset.tokenize(text) for ref, text in dataset.sm.read_documents(refs)}
+            if (any(not doc for doc in documents.values())
+                    or (self.document_ref is None and self.offset != 0)
+                    or (self.document_ref is not None and not 0 < self.offset < len(documents[self.document_ref]))):
+                raise ValueError("Invalid packing buffer in data checkpoint")
+            if prepare is not None:
+                documents = {ref: prepare(doc) for ref, doc in documents.items()}
+            self.lookahead = [(documents[ref], ref) for ref in self.cursor.lookahead_refs]
+            self.document = documents.get(self.document_ref)
+        self.document_tensor = (
+            torch.tensor(self.document, dtype=torch.long) if prepare is None and self.document is not None else None
         )
-        self.iterator = iter(dataset) if self._rust_text_loader is None else None
+        self.iterator = iter(dataset)
         self.next_epoch_document = None
-        self.cpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, pin_memory=self.device.type == "cuda")
-        self._rust_output = (
-            self.cpu.numpy() if self._rust_pack is not None or self._rust_text_loader is not None else None
-        )
-        self.gpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, device=self.device)
-        self.inputs = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
-        self.targets = torch.empty_like(self.inputs)
-
-    def _build_rust_text_loader(self, dataset, block_best_fit: bool):
-        from gpt_lab.tokenizer import Tokenizer
-
-        if not isinstance(dataset, ShardedDataset) or type(dataset.tokenizer) is not Tokenizer:
-            raise TypeError("The Rust dataloader requires cached text and the repository's tiktoken Tokenizer")
-        TextLoader = native_extension().TextLoader
-
-        sm = dataset.sm
-        if sm.base_url:
-            missing = next((path for path in sm.shard_paths if not path.is_file()), None)
-            if missing is not None:
-                raise FileNotFoundError(f"The Rust dataloader requires a cached shard at {missing}")
-        encoding = dataset.tokenizer.main
-        resume = None
-        if dataset.start_state is not None:
-            state = dataset.start_state
-            resume = (
-                (state.shard_idx, state.global_shard_idx, state.row_group_idx, state.offset_in_row_group, state.epoch),
-                state.lookahead_refs, state.pending_document_ref, state.document_token_offset,
-            )
-        options = {"block_exact_pair": True} if block_best_fit else {}
-        return TextLoader(
-            list(zip(sm.shard_idx, sm.shard_paths, strict=True)), sm.column_name,
-            dataset.split == "train", sm.ddp_rank, sm.world_size, (self.B, self.T + 1),
-            dataset.tokenizer_threads, dataset.tokenizer_batch_size or 64,
-            (encoding._mergeable_ranks, encoding._pat_str, encoding._special_tokens, self.bos_token_id),
-            resume, **options,
-        )
 
     def __iter__(self):
         return self
 
-    def _fill_lookahead(self) -> None:
+    def _fill_lookahead(self, prepare=None) -> None:
         while len(self.lookahead) < self.lookahead_size:
             if self.next_epoch_document is None:
                 self.next_epoch_document = next(self.iterator, None)
@@ -279,16 +219,21 @@ class DistDataLoader:
             ref = None
             if self.signature is not None:
                 ref = (cursor.global_shard_idx, cursor.row_group_idx, cursor.offset_in_row_group - 1)
-            if self._rust_pack is not None:
-                document = _contiguous_tokens(document)
+            if prepare is not None:
+                document = prepare(document)
             self.lookahead.append((document, ref))
             self.cursor = cursor
             self.next_epoch_document = None
 
     def _take_document(self, space: int) -> tuple[list[int] | torch.Tensor, Optional[DocumentRef]]:
-        self._fill_lookahead()
+        if not self.block_best_fit or not self.lookahead:
+            self._fill_lookahead()
         if not self.lookahead:
             raise StopIteration
+        if self.block_best_fit:
+            exact = self._exact_fit(space)
+            if exact is not None:
+                return self.lookahead.pop(exact)
         best = None
         for index, (document, _) in enumerate(self.lookahead):
             if len(document) <= space and (best is None or len(document) > len(self.lookahead[best][0])):
@@ -298,7 +243,21 @@ class DistDataLoader:
             best = min(range(len(self.lookahead)), key=lambda index: len(self.lookahead[index][0]))
         return self.lookahead.pop(best)
 
-    def _pack_python(self) -> None:
+    def _exact_fit(self, space: int) -> Optional[int]:
+        lengths = [len(document) for document, _ in self.lookahead]
+        if space in lengths:
+            return lengths.index(space)
+        later_lengths = set()
+        first = None
+        for index in range(len(lengths) - 1, -1, -1):
+            length = lengths[index]
+            if space - length in later_lengths:
+                first = index
+            later_lengths.add(length)
+        # After taking the earliest pair's first member, its mate is an exact single fit.
+        return first
+
+    def _pack_python(self) -> DataLoaderState:
         capacity = self.T + 1
         for row in self.cpu:
             pos = 0
@@ -319,41 +278,29 @@ class DistDataLoader:
                     self.document_ref = None
                     self.document_tensor = None
                     self.offset = 0
+        return self._python_checkpoint()
 
     def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
-        if self._rust_text_loader is not None:
-            cursor, lookahead_refs, self.document_ref, self.offset = self._rust_text_loader.fill(self._rust_output)
-            shard_idx, global_shard_idx, row_group_idx, offset_in_row_group, epoch = cursor
-            self.cursor = DataLoaderState(
-                shard_idx=shard_idx, global_shard_idx=global_shard_idx, row_group_idx=row_group_idx,
-                offset_in_row_group=offset_in_row_group, epoch=epoch,
-            )
-        elif self._rust_pack is None:
-            self._pack_python()
-        else:
-            try:
-                self.document, self.document_ref, self.offset = self._rust_pack(
-                    self._rust_output, self.lookahead, self._fill_lookahead,
-                    self.document, self.document_ref, self.offset, self.bos_token_id,
-                )
-            except StopIteration:
-                self.document = self.document_ref = None
-                self.offset = 0
-                raise
+        state = self._fill_batch(self)
         self.gpu.copy_(self.cpu)
         self.inputs.copy_(self.gpu[:, :-1])
         self.targets.copy_(self.gpu[:, 1:])
-        state = self.cursor
-        if self.signature is not None:
-            state = state.model_copy(update=dict(
-                packing_signature=self.signature,
-                ordered_shard_ids=self.ordered_shard_ids,
-                lookahead_refs=(tuple(lookahead_refs) if self._rust_text_loader is not None
-                                else tuple(ref for _, ref in self.lookahead)),
-                pending_document_ref=self.document_ref,
-                document_token_offset=self.offset,
-            ))
         return self.inputs, self.targets, state
+
+    def _python_checkpoint(self) -> DataLoaderState:
+        refs = tuple(ref for _, ref in self.lookahead) if self.signature is not None else ()
+        return self._checkpoint(self.cursor, refs, self.document_ref, self.offset)
+
+    def _checkpoint(self, cursor, refs, pending, offset) -> DataLoaderState:
+        if self.signature is None:
+            return cursor
+        return cursor.model_copy(update=dict(
+            packing_signature=self.signature,
+            ordered_shard_ids=self.ordered_shard_ids,
+            lookahead_refs=refs,
+            pending_document_ref=pending,
+            document_token_offset=offset,
+        ))
 
 
 # just to compare
@@ -571,13 +518,12 @@ def build_dataloader(
     repository's tiktoken tokenizer and an installed native extension. Other
     inputs use Python. The Rust backends encode 64 documents at a time by default.
     packing_strategy="block-best-fit" selects fixed 64-document blocks for
-    end-to-end Rust training. Validation uses rolling-16.
+    Python or end-to-end Rust training. Validation uses rolling-16.
     packing_backend="rust" also selects packing-only acceleration. The
     buffer_size argument configures the nanochat backend.
     """
     if comp_info is None:
         comp_info = get_comp_info()
-    resolve_packing_backend(dataloader_backend, packing_backend, packing_strategy, split)
     if use_nanochat:
         if packing_strategy != "rolling-16":
             raise ValueError("Packing strategies apply only to the gpt-lab loader")
@@ -635,7 +581,4 @@ def build_dataloader(
             dataloader_backend=dataloader_backend,
             packing_strategy=packing_strategy,
         )
-    if split == "val":
-        return dataloader
-    else:
-        return dataloader()
+    return dataloader if split == "val" else dataloader()

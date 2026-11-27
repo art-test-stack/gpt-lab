@@ -1,180 +1,163 @@
-"""Full finite-corpus CPU benchmark. Run from the repository root."""
+"""Compare the installed Python and Rust training loaders on a cached text shard."""
 
 import argparse
 import hashlib
-import importlib.util
+from itertools import islice
 import json
 import os
 from pathlib import Path
 import platform
-import resource
-import statistics
+from statistics import median
 import subprocess
 import sys
-import time
 from tempfile import TemporaryDirectory
+from time import perf_counter
 
 
-BASELINE = "61f066250420afbc121524037b996ee4a3524c0a"
-BATCH_SIZE = 16
-CONTEXT = 2048
+ROOT = Path(__file__).resolve().parents[2]
+BATCH, THREADS, CHUNK = 16, 4, 64
+CONTEXTS = (512, 1024, 2048, 4096, 8192)
+STRATEGIES = ("rolling-16", "block-best-fit")
+ORDERS = (("python", "rust"), ("rust", "python")) * 2
 
 
-def load_module(path):
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def baseline_loader(directory):
-    source = subprocess.check_output(["git", "show", f"{BASELINE}:src/gpt_lab/data/loader.py"])
-    path = directory / "baseline_loader.py"
-    path.write_bytes(source)
-    return load_module(path)
-
-
-def measure(args):
-    with TemporaryDirectory(prefix="gpt-lab-benchmark-") as temporary:
-        directory = Path(temporary)
-        if args.corpus != "climbmix":
-            return _measure(args, None, directory)
-        source = Path(args.shard)
-        dataset = directory / "dataset"
-        dataset.mkdir()
-        shard = dataset / source.name
-        shard.symlink_to(source.resolve(strict=True))
-        return _measure(args, shard, directory)
-
-
-def _measure(args, shard, directory):
+def worker(dataset, context, strategy, backend=None, batches=None):
     import numpy as np
     import pyarrow as pa
     import torch
 
-    from gpt_lab.data import loader as current
+    from gpt_lab.data import build_dataloader
     from gpt_lab.tokenizer import Tokenizer
     from gpt_lab.utils.distributed import ComputeContext
-    from gpt_lab.utils.schemas import DataLoaderState
 
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     pa.set_cpu_count(1)
     pa.set_io_thread_count(1)
-    module = baseline_loader(directory) if args.backend == "baseline" else current
-    kwargs = {}
-    if args.backend != "baseline":
-        kwargs["dataloader_backend"] = "rust-packing" if args.backend == "rust" else "python"
-    if shard is not None:
-        tokenizer = Tokenizer.from_pretrained("gpt2", source="tiktoken")
-        bos = tokenizer.get_bos_token_id()
-        start = time.perf_counter()
-        factory = module.build_dataloader(
-            name=shard.parent.name, cachedir=shard.parent.parent,
-            batch_size=BATCH_SIZE, seq_len=CONTEXT, tokenizer=tokenizer,
-            split="val", max_shards=int(shard.stem.split("_")[-1]),
-            comp_info=ComputeContext(device=torch.device("cpu")),
-            tokenizer_threads=args.threads,
-            **({"tokenizer_batch_size": 64} if args.backend != "baseline" else {}),
-            **kwargs,
+    tokenizer = Tokenizer.from_pretrained("gpt2", source="tiktoken")
+    compute = ComputeContext(torch.device("cpu"))
+
+    def build(backend):
+        return build_dataloader(
+            dataset.name, BATCH, context, tokenizer, split="train", cachedir=dataset.parent,
+            max_shards=1, comp_info=compute, dataloader_backend=backend, packing_strategy=strategy,
+            tokenizer_threads=THREADS, tokenizer_batch_size=CHUNK,
         )
-        iterator = factory()
-    else:
-        synthetic = load_module(Path(__file__).resolve().parents[1] / "dataloaders.py")
-        tokens, offsets = synthetic.make_synthetic_bin_idx()
-        fixture = synthetic.SyntheticPretokenizedDataset(tokens, offsets)
-        bos = 0
-        documents = [np.concatenate(([bos], fixture.get_doc(i).numpy())) for i in range(len(fixture))]
-        cursor = DataLoaderState()
 
-        class Documents:
-            bos_token_id = bos
-            split = "val"
-            start_state = None
+    if backend is not None:
+        start = perf_counter()
+        emitted = sum(1 for _ in islice(build(backend), batches))
+        elapsed = perf_counter() - start
+        if emitted != batches:
+            raise ValueError(f"{backend}: expected {batches} batches, emitted {emitted}")
+        return dict(seconds=elapsed, batches=emitted)
 
-            def __iter__(self):
-                for document in documents:
-                    yield document, cursor
-
-        start = time.perf_counter()
-        iterator = module.DistDataLoader(Documents(), BATCH_SIZE, CONTEXT, device="cpu", **kwargs)
-
-    elapsed = time.perf_counter() - start
-    batches = content = 0
+    python, rust = build("python"), build("rust")
     digest = hashlib.sha256()
-    while True:
-        start = time.perf_counter()
-        try:
-            x, y, state = next(iterator)
-        except StopIteration:
-            elapsed += time.perf_counter() - start
-            break
-        elapsed += time.perf_counter() - start
-        # Together these contain every packed position once. Inspection is untimed.
-        content += x.shape[0] * (x.shape[1] + 1) - int((x[:, 0] == bos).sum()) - int((y == bos).sum())
-        digest.update(x[:, :1].numpy().tobytes())
-        digest.update(y.numpy().tobytes())
-        digest.update(state.model_dump_json().encode())
-        batches += 1
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    rss_bytes = rss if platform.system() == "Darwin" else rss * 1024
-    return dict(corpus=args.corpus, backend=args.backend, threads=args.threads,
-                batches=batches, content_tokens=content, seconds=elapsed,
-                tokens_per_second=content / elapsed, peak_rss_bytes=rss_bytes,
-                sha256=digest.hexdigest(), baseline=BASELINE)
+    tokens = 0
+    bos = tokenizer.get_bos_token_id()
+    for batch in range(1, sys.maxsize):
+        x, y, state = next(python)
+        other_x, other_y, other_state = next(rust)
+        serialized = state.model_dump_json()
+        for field, equal in (
+            ("x", torch.equal(x, other_x)),
+            ("y", torch.equal(y, other_y)),
+            ("DataLoaderState", serialized == other_state.model_dump_json()),
+        ):
+            if not equal:
+                raise ValueError(f"{strategy}, context {context}, rank {compute.rank}, batch {batch}: {field} mismatch")
+        if state.epoch != 1:
+            if batch == 1:
+                raise ValueError(f"Shard does not fill one epoch-1 batch at context {context}")
+            return dict(batches=batch - 1, emitted_source_tokens=tokens, sha256=digest.hexdigest())
+        x, y = x.numpy(), y.numpy()
+        tokens += int(np.count_nonzero(x[:, 0] != bos) + np.count_nonzero(y != bos))
+        digest.update(x.tobytes())
+        digest.update(y.tobytes())
+        digest.update(serialized.encode())
+
+
+def run(shard, contexts, output):
+    environment = dict(os.environ, OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+                       VECLIB_MAXIMUM_THREADS="1")
+    environment.pop("PYTHONPATH", None)
+
+    def fresh(dataset, context, strategy, *timing):
+        command = [sys.executable, "-I", str(Path(__file__).resolve()), "--worker",
+                   str(dataset), str(context), strategy, *map(str, timing)]
+        result = subprocess.run(command, env=environment, cwd=dataset.parent, capture_output=True, text=True)
+        if result.returncode:
+            print(result.stdout + result.stderr, file=sys.stderr)
+            result.check_returncode()
+        return json.loads(result.stdout.splitlines()[-1])
+
+    cpu = platform.processor()
+    if platform.system() == "Darwin":
+        cpu = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
+                             text=True).stdout.strip() or cpu
+    with shard.open("rb") as file:
+        shard_hash = hashlib.file_digest(file, "sha256").hexdigest()
+    results = dict(
+        commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        platform=platform.platform(), cpu=cpu, python=platform.python_version(),
+        shard=shard.name, shard_sha256=shard_hash, batch_size=BATCH, rank=0, world_size=1,
+        tokenizer="gpt2", tokenizer_threads=THREADS, tokenizer_batch_size=CHUNK,
+        orders=ORDERS, results=[],
+    )
+    metadata = shard.with_name("meta.json")
+    original = metadata.read_bytes() if metadata.is_file() else None
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="gpt-lab-benchmark-") as temporary:
+        dataset = Path(temporary) / "climbmix"
+        dataset.mkdir()
+        # A single-shard train manifest uses slot zero. Both backends read the original bytes.
+        (dataset / "shard_00000.parquet").symlink_to(shard)
+        for context in contexts:
+            for strategy in STRATEGIES:
+                verified = fresh(dataset, context, strategy)
+                samples = dict(context=context, strategy=strategy, **verified, runs=[])
+                results["results"].append(samples)
+                print(context, strategy, "parity", verified, flush=True)
+                for repeat, order in enumerate(ORDERS, 1):
+                    for backend in order:
+                        observed = fresh(dataset, context, strategy, backend, verified["batches"])
+                        rate = verified["emitted_source_tokens"] / observed["seconds"]
+                        samples["runs"].append(dict(repeat=repeat, backend=backend, **observed, tokens_per_second=rate))
+                        print(f"  {repeat} {backend}: {rate:,.0f} source tokens/s", flush=True)
+                output.write_text(json.dumps(results, indent=2) + "\n")
+    if (metadata.read_bytes() if metadata.is_file() else None) != original:
+        raise ValueError(f"Source metadata changed: {metadata}")
+
+    for result in results["results"]:
+        python, rust = ([run["tokens_per_second"] for run in result["runs"] if run["backend"] == backend]
+                        for backend in ("python", "rust"))
+
+        def summary(rates):
+            return f"{median(rates)/1e6:.3f} ({min(rates)/1e6:.3f}–{max(rates)/1e6:.3f})"
+
+        print(f"| {result['context']} | {result['strategy']} | {result['batches']:,} | "
+              f"{result['emitted_source_tokens']:,} | {summary(python)} | {summary(rust)} | "
+              f"{median(rust)/median(python):.2f}× |", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shard", type=Path, help="Cached ClimbMix Parquet shard (required for ClimbMix)")
-    parser.add_argument("--threads", type=int, default=4, help="Tokenizer worker budget")
-    parser.add_argument("--repeats", type=int, default=4)
-    parser.add_argument("--output", type=Path, default=Path("benchmark.json"), help="Results JSON path (default: benchmark.json)")
-    parser.add_argument("--corpus", choices=["climbmix", "pretokenized"])
-    parser.add_argument("--backend", choices=["baseline", "python", "rust"])
+    parser.add_argument("--shard", type=Path, help="Path to a cached ClimbMix Parquet shard")
+    parser.add_argument("--output", type=Path, help="Path for per-run JSON")
+    parser.add_argument("--contexts", type=int, nargs="+", default=CONTEXTS)
+    parser.add_argument("--worker", nargs="+", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.threads < 1 or args.repeats < 1:
-        parser.error("threads and repeats must be positive")
-    if args.backend and not args.corpus:
-        parser.error("--backend requires --corpus")
-    if args.corpus != "pretokenized" and (args.shard is None or not args.shard.is_file()):
-        parser.error("ClimbMix requires --shard pointing to a cached Parquet file")
-    if args.backend:
-        print(json.dumps(measure(args)))
+    if args.worker:
+        directory, context, strategy, *timing = args.worker
+        backend, batches = (timing[0], int(timing[1])) if timing else (None, None)
+        print(json.dumps(worker(Path(directory), int(context), strategy, backend, batches)))
         return
-    runs = []
-    env = os.environ.copy()
-    env.update(OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", VECLIB_MAXIMUM_THREADS="1")
-    corpora = [args.corpus] if args.corpus else ["climbmix", "pretokenized"]
-    for corpus in corpora:
-        backends = ["baseline", "python", "rust"] if corpus == "climbmix" else ["python", "rust"]
-        for repeat in range(args.repeats):
-            for backend in backends[::1 if repeat % 2 == 0 else -1]:
-                command = [sys.executable, __file__, "--corpus", corpus, "--backend", backend,
-                           "--threads", str(args.threads)]
-                if corpus == "climbmix":
-                    command.extend(["--shard", str(args.shard)])
-                completed = subprocess.run(command, env=env, text=True, capture_output=True)
-                if completed.returncode:
-                    sys.stderr.write(completed.stdout + completed.stderr)
-                    completed.check_returncode()
-                result = json.loads(completed.stdout.splitlines()[-1])
-                result["repeat"] = repeat
-                runs.append(result)
-                print(json.dumps(result), flush=True)
-        assert len({(r["batches"], r["content_tokens"], r["sha256"]) for r in runs if r["corpus"] == corpus}) == 1, "Backend output mismatch"
-    output = args.output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(runs, indent=2) + "\n")
-    print("| Corpus | Backend | Median content tokens/s | Range | Peak RSS MiB |")
-    print("|---|---|---:|---:|---:|")
-    for corpus in corpora:
-        for backend in ("baseline", "python", "rust"):
-            group = [r for r in runs if r["corpus"] == corpus and r["backend"] == backend]
-            if group:
-                rates = [r["tokens_per_second"] for r in group]
-                peak = max(r["peak_rss_bytes"] for r in group) / 2**20
-                print(f"| {corpus} | {backend} | {statistics.median(rates):,.0f} | {min(rates):,.0f}–{max(rates):,.0f} | {peak:.1f} |")
+    if args.shard is None or not args.shard.is_file() or args.output is None:
+        parser.error("Pass an existing --shard and a path for --output")
+    if min(args.contexts) < 1:
+        parser.error("Contexts must be positive")
+    run(args.shard.resolve(), args.contexts, args.output)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from gpt_lab.data.loader import DistDataLoader, build_dataloader
+from gpt_lab.data import build_dataloader
 from gpt_lab.utils.schemas import DataLoaderState
 
 
