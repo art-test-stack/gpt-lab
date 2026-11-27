@@ -16,6 +16,27 @@ On Apple M2, stock master took a median of **106.47 s** and the opt-in mode took
 
 Timing used stock `61f066250420afbc121524037b996ee4a3524c0a` and candidate `4aab1cd2fd031abfe8714714b6ebec2adf988f94`. The checkpoint SHA-256 was `c8102efd75dfd7f2cfcba814916a53eb0db43e41cc86c0ab3b9c29b63cca595f`.
 
+### Matched packing and batching controls
+
+Three alternating pairs used the same prepared tokens, option reducer, and no prefetch. The eligible cohort used identical groups in both arms. The full multiple-choice cohort let the separate-row arm batch the 36 fallback questions, each of which still required its own forward in the packed arm. Both cohort comparisons agreed on every winner. The maximum option NLL difference was `9.5367432e-7` nats.
+
+| Cohort | Questions per batch | Separate s / questions/s | Packed s / questions/s | Paired packing speedup | Separate / packed throughput relative to own size 1 | Separate / packed peak live tensors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 140 eligible | 1 | 5.287 / 26.48 | 2.971 / 47.12 | 1.77× | 1.00× / 1.00× | 179.9 / 87.4 MiB |
+| 140 eligible | 4 | 9.340 / 14.99 | 2.022 / 69.23 | 4.75× | 0.57× / 1.47× | 633.6 / 330.5 MiB |
+| 176 with fallbacks | 1 | 7.697 / 22.87 | 4.586 / 38.38 | 1.68× | 1.00× / 1.00× | 179.9 / 159.7 MiB |
+| 176 with fallbacks | 4 | 11.393 / 15.45 | 3.955 / 44.50 | 3.13× | 0.68× / 1.16× | 633.6 / 330.5 MiB |
+
+At size 4, both eligible arms made 35 forwards. Across the full multiple-choice cohort, separate rows made 44 forwards and packing made 35 packed forwards plus 36 fallbacks. Separate and packed arms used 811,008 and 229,312 physical token slots on the eligible cohort, including 154,702 and 40,356 padding slots. At size 1 the slot counts were 786,432 and 227,440. Separate-row size-4 trials on the eligible cohort ranged from 9.08 to 15.53 s while packed took 1.97 to 2.04 s.
+
+```bash
+uv run --locked --extra cpu python experiments/20261124-core-shared-prefix/packing_pair.py \
+  --checkpoint "$FROZEN" --report "$RESULTS/matched.json" --batch-sizes 1 4 \
+  --width-buckets 512 1024 2048 2160 --isolate-trials
+```
+
+### Reproduction and component measurements
+
 Stage the CORE bundle and use the frozen `frozen.pt` from the MPS parity run below. From the repository root, set `FROZEN` to that checkpoint and `RESULTS` to a directory under `.tmp/codex/`.
 
 ```bash
@@ -40,7 +61,7 @@ The prepared-token overlap command keeps the same packed groups and 36 fallbacks
 | Deferred readback only | 4.747 s | 37.07 | 293.3 MiB | 2.015 s | 0.00 ms |
 | Both | 4.824 s | 36.49 | 293.3 MiB | 1.916 s | 2.76 ms |
 
-The separate Metal traces count time with no active GPU interval for the benchmark process. The prefetch-only trace was an outlier at 12.22 s, while the other traces took 4.55–4.75 s. With prefetch enabled, every subsequent batch finished collation by the end of the preceding CPU submission. The traces showed no collation on that critical path, so a Rust prototype was unnecessary.
+The separate Metal traces count time with no active GPU interval for the benchmark process. The prefetch-only trace was an outlier at 12.22 s, while the other traces took 4.55–4.75 s. The largest idle gap was 204 ms in the current-loop trace and 85 ms with both changes. With prefetch enabled, every subsequent batch finished collation by the end of the preceding CPU submission. The traces showed no collation on that critical path, so a Rust prototype was unnecessary.
 
 In the component pass, rendering took 220 ms, byte tokenization took 5.9 ms, tokenization and span discovery together took 114 ms, grouping took 0.10 ms, and collation took 148 ms including 18 ms to stack position IDs. The single deferred host copy including device wait took 0.61 ms in this pass. Transferring the resulting tensor to Python values took 0.02 ms and accuracy aggregation took 0.10 ms.
 
