@@ -46,9 +46,10 @@ def apply_rope(x: torch.Tensor, rope_cache: torch.Tensor, pairwise_split: bool =
     D = x.shape[-1]
     assert D % 2 == 0, 'Embedding dimension D must be even for RoPE. Got D: {}'.format(D)
 
-    sin, cos = rope_cache[..., 0], rope_cache[..., 1]
-    sin = sin.unsqueeze(0).unsqueeze(2).to(x.device) # 1, T, 1, D//2
-    cos = cos.unsqueeze(0).unsqueeze(2).to(x.device) # 1, T, 1, D//2
+    if rope_cache.ndim == 3:
+        rope_cache = rope_cache.unsqueeze(0)
+    sin = rope_cache[..., 0].unsqueeze(2).to(x.device)
+    cos = rope_cache[..., 1].unsqueeze(2).to(x.device)
     if pairwise_split:
         x1, x2 = x[..., ::2], x[..., 1::2]
     else:

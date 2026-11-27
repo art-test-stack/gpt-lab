@@ -1,0 +1,432 @@
+"""Run the opt-in batched CORE scorer or compare its returned results with stock master."""
+import argparse
+from contextlib import contextmanager, nullcontext, redirect_stdout
+from functools import partial
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+from statistics import median
+import subprocess
+import sys
+import tarfile
+from tempfile import TemporaryDirectory
+from time import perf_counter
+
+import torch
+
+from fixture_model import ByteTokenizer, load_frozen_checkpoint
+
+
+HERE = Path(__file__).resolve().parent
+CONFIGS = {"current": (False, False), "prefetch": (True, False),
+           "deferred": (False, True), "both": (True, True)}
+
+
+def synchronize(device):
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def timed(run, device):
+    synchronize(device)
+    start = perf_counter()
+    result = run()
+    synchronize(device)
+    return perf_counter() - start, result
+
+
+def planned_winners(plan, examples, model, pad, device, *, prefetch, defer, width_buckets=(), fa4=None, records=None):
+    from batch_timing import batches
+    from batched_scoring import score_packed_batch, score_separate_batch
+    from output_quality import finite_nlls, scored_outputs
+    from packing_pair import collate_group, score_group
+
+    prepare = partial(collate_group, examples=examples, pad_id=pad, max_context=model.max_seq_len,
+                      width_buckets=width_buckets)
+    output, pending, indices = {}, [], []
+    for packed, group, batch in batches(plan, prepare, prefetch):
+        if records is None:
+            _, winners = score_group(packed, batch, model, device, fa4=fa4)
+        else:
+            nll, winners, logits = (score_packed_batch(model, batch, device, capture_logits=True, fa4=fa4)
+                                    if packed else score_separate_batch(model, batch, device, capture_logits=True))
+            for index, values, winner, rows in zip(group, nll.cpu().tolist(), winners.cpu().tolist(), logits):
+                ex = examples[index]
+                options = len(ex.prepared[0])
+                log_probs, predictions = scored_outputs(rows[:options], ex.prepared)
+                records.append({
+                    "dataset": ex.label, "index": ex.index, "task_type": ex.task_type,
+                    "winner": winner, "correct": winner == ex.gold, "prepared": list(ex.prepared),
+                    "option_nll": finite_nlls(values[:options]), "target_log_probs": log_probs,
+                    "predictions": predictions,
+                })
+        if defer:
+            indices.extend(group)
+            pending.append(winners)
+        else:
+            output.update(zip(group, winners.cpu().tolist()))
+    if pending:
+        output.update(zip(indices, torch.cat(pending).cpu().tolist()))
+    return output
+
+
+def score_task(model, tokenizer, data, device, meta, *, batch_size, prefetch, defer, records=None,
+               fa4=None, width_buckets=(), backend=nullcontext):
+    from gpt_lab.evaluate import core
+    from batching import Example
+    from packing_pair import comparison_plans
+    from scoring import pack_choices
+
+    if meta["task_type"] != "multiple_choice":
+        return core.evaluate_task(model, tokenizer, data, device, meta)
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        raise ValueError("The experimental batched CORE entry point requires one rank")
+    examples = []
+    for index, item in enumerate(data):
+        prepared = core.prepare_example(index, tokenizer, data, meta, model.max_seq_len)
+        examples.append(Example(meta["dataset_uri"], index, "multiple_choice", item["gold"],
+                                prepared, pack_choices(*prepared)))
+    plan = comparison_plans(examples, batch_size)["all"]["packed"]
+    with backend():
+        predictions = planned_winners(plan, examples, model, tokenizer.get_bos_token_id(), device,
+                                      prefetch=prefetch, defer=defer, width_buckets=width_buckets, fa4=fa4,
+                                      records=records)
+    return sum(predictions[ex.index] == ex.gold for ex in examples) / len(examples)
+
+
+def evaluate(model, tokenizer, device, *, batch_size=4, configuration="both", records=None, fa4=None,
+             width_buckets=(), backend=nullcontext):
+    from gpt_lab.evaluate import core
+
+    prefetch, defer = CONFIGS[configuration]
+    return core.evaluate_core(
+        model, tokenizer, device, max_per_task=16,
+        score_task=partial(score_task, batch_size=batch_size, prefetch=prefetch, defer=defer,
+                           records=records, fa4=fa4, width_buckets=width_buckets, backend=backend),
+    )
+
+
+def record_predictions(model, tokenizer, device, *, candidate=None):
+    from output_quality import finite_nlls
+    from pinned_master import record_core
+
+    records, results = record_core(model, tokenizer, device, evaluate=candidate, capture_logits=False,
+                                   capture_log_probs=True)
+    for record in records:
+        if "nll" in record:
+            values = record.pop("nll")
+            record["option_nll"] = finite_nlls(values.tolist() if values is not None else None)
+            record["predictions"] = [row.tolist() for row in record["predictions"]]
+            record["prepared"] = list(record["prepared"])
+    return {"records": records, "scores": results}
+
+
+WORKER_PREFIX = "CORE_WORKER "
+
+
+def stock_worker(model, tokenizer, device, output):
+    from gpt_lab.evaluate import core
+
+    if not Path(core.__file__).is_relative_to(Path(os.environ["PYTHONPATH"])):
+        raise RuntimeError("Stock worker imported CORE outside the archived revision")
+    protocol = sys.stdout
+
+    def send(message):
+        print(WORKER_PREFIX + json.dumps(message), file=protocol, flush=True)
+
+    with redirect_stdout(sys.stderr):
+        core.evaluate_core(model, tokenizer, device, max_per_task=16)
+        synchronize(device)
+    send({"ready": True})
+    for line in sys.stdin:
+        command = line.strip()
+        with redirect_stdout(sys.stderr):
+            if command == "run":
+                elapsed, results = timed(partial(core.evaluate_core, model, tokenizer, device, max_per_task=16), device)
+                reply = {"seconds": elapsed, "scores": results}
+            elif command == "quality":
+                run = record_predictions(model, tokenizer, device)
+                (output / "stock-quality.json").write_text(json.dumps(run))
+                reply = {"quality_saved": True}
+            else:
+                raise ValueError(f"Unknown stock worker command {command!r}")
+        send(reply)
+
+
+def read_stock_worker(worker):
+    for line in worker.stdout:
+        if line.startswith(WORKER_PREFIX):
+            return json.loads(line.removeprefix(WORKER_PREFIX))
+        print(line, file=sys.stderr, end="")
+    raise RuntimeError(f"Pinned master closed its protocol stream (exit {worker.wait()})")
+
+
+def quality_report(output):
+    from benchmark_a100 import MEAN_RELATIVE_NLL_LIMIT
+    from output_quality import compare_quality
+
+    stock, candidate = (json.loads((output / f"{arm}-quality.json").read_text()) for arm in ("stock", "candidate"))
+    report = compare_quality(stock["records"], candidate["records"], stock["scores"], candidate["scores"],
+                             MEAN_RELATIVE_NLL_LIMIT)
+    (output / "quality.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    return report
+
+
+def compare_returned(stock, candidate):
+    assert stock["all_core_results"].keys() == candidate["all_core_results"].keys()
+    return {
+        "accuracy": candidate["core/accuracy"] - stock["core/accuracy"],
+        "centered_core": candidate["core/core"] - stock["core/core"],
+        "tasks": {
+            task: {key: result[key] - stock["all_core_results"][task][key]
+                   for key in ("accuracy", "centered_result")}
+            for task, result in candidate["all_core_results"].items()
+        },
+    }
+
+
+def paired_summary(trials, configuration, master, batch_size):
+    pairs = list(zip(trials["stock"], trials["candidate"]))
+    return {
+        "stock_sha": master, "candidate_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True,
+                                                                     cwd=HERE).strip(),
+        "configuration": configuration, "packed_batch_size": batch_size, "tasks": 22, "examples": 352,
+        "trials": trials,
+        "median_seconds": {arm: median(run["seconds"] for run in runs) for arm, runs in trials.items()},
+        "score_deltas": [compare_returned(a["scores"], b["scores"]) for a, b in pairs],
+        "seconds_saved": [a["seconds"] - b["seconds"] for a, b in pairs],
+        "median_seconds_saved": median(a["seconds"] - b["seconds"] for a, b in pairs),
+        "median_paired_speedup": median(a["seconds"] / b["seconds"] for a, b in pairs),
+    }
+
+
+def isolated_trial(args, model, tokenizer, device):
+    from gpt_lab.evaluate import core
+
+    stock = args.isolated_arm == "stock"
+    run = (partial(core.evaluate_core, model, tokenizer, device, max_per_task=16) if stock else
+           partial(evaluate, model, tokenizer, device, batch_size=args.batch_size, configuration=args.configuration))
+    if args.mode == "quality":
+        capture = None if stock else lambda records: run(records=records)
+        result = record_predictions(model, tokenizer, device, candidate=capture)
+        (args.output / f"{args.isolated_arm}-quality.json").write_text(json.dumps(result))
+        return
+    run()
+    synchronize(device)
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    seconds, scores = timed(run, device)
+    (args.output / f"{args.isolated_arm}-trial.json").write_text(json.dumps({"seconds": seconds, "scores": scores}))
+
+
+@contextmanager
+def stock_source(output):
+    from batching import MASTER
+
+    archive = subprocess.check_output(["git", "archive", MASTER, "src"], cwd=HERE.parents[1])
+    with TemporaryDirectory(dir=output, prefix="master-") as folder:
+        with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+            bundle.extractall(folder, filter="data")
+        yield MASTER, Path(folder) / "src"
+
+
+def paired_isolated(args):
+    trials = {"stock": [], "candidate": []}
+    with stock_source(args.output) as (master, stock):
+        def run(arm, mode):
+            source = stock if arm == "stock" else HERE.parents[1] / "src"
+            subprocess.run(
+                [sys.executable, __file__, "--device", args.device, "--checkpoint", str(args.checkpoint.resolve()),
+                 "--output", str(args.output), "--configuration", args.configuration, "--mode", mode,
+                 "--batch-size", str(args.batch_size), "--isolated-arm", arm],
+                env=os.environ | {"PYTHONPATH": str(source)}, check=True,
+            )
+
+        if args.mode == "paired":
+            for i in range(args.repeats):
+                for arm in (("stock", "candidate") if i % 2 == 0 else ("candidate", "stock")):
+                    run(arm, "paired")
+                    trial = json.loads((args.output / f"{arm}-trial.json").read_text())
+                    trials[arm].append(trial)
+                    print(json.dumps({"pair": i + 1, "arm": arm, "seconds": trial["seconds"]}), flush=True)
+                    (args.output / "partial-trials.json").write_text(json.dumps(trials))
+            report = paired_summary(trials, args.configuration, master, args.batch_size) | {"isolated_trials": True}
+            (args.output / "paired.json").write_text(json.dumps(report, indent=2) + "\n")
+        else:
+            report = {}
+        for arm in trials:
+            run(arm, "quality")
+    return report | {"stock_sha": master, "packed_batch_size": args.batch_size,
+                     "quality": quality_report(args.output)}
+
+
+def paired(args, model, tokenizer, device, *, extra_worker_args=(), fa4=None,
+           width_buckets=(), backend=nullcontext, batch_size=4):
+    candidate = partial(evaluate, model, tokenizer, device, batch_size=batch_size, configuration=args.configuration,
+                        fa4=fa4, width_buckets=width_buckets, backend=backend)
+    trials = {"stock": [], "candidate": []}
+    with stock_source(args.output) as (master, source):
+        worker = subprocess.Popen(
+            [sys.executable, __file__, "--stock-worker", "--device", device.type, "--output", str(args.output),
+             *extra_worker_args],
+            env=os.environ | {"PYTHONPATH": str(source), "DEVELOPMENT": "0"},
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            assert read_stock_worker(worker)["ready"]
+            candidate()
+            synchronize(device)
+            for i in range(args.repeats):
+                for arm in (("stock", "candidate") if i % 2 == 0 else ("candidate", "stock")):
+                    if arm == "stock":
+                        worker.stdin.write("run\n")
+                        worker.stdin.flush()
+                        run = read_stock_worker(worker)
+                    else:
+                        seconds, scores = timed(candidate, device)
+                        run = {"seconds": seconds, "scores": scores}
+                    trials[arm].append(run)
+                    print(json.dumps({"pair": i + 1, "arm": arm, "seconds": run["seconds"]}), flush=True)
+                    (args.output / "partial-trials.json").write_text(json.dumps(trials))
+            report = paired_summary(trials, args.configuration, master, batch_size)
+            (args.output / "paired.json").write_text(json.dumps(report, indent=2) + "\n")
+            worker.stdin.write("quality\n")
+            worker.stdin.flush()
+            assert read_stock_worker(worker)["quality_saved"]
+        finally:
+            worker.stdin.close()
+            worker.wait()
+    if worker.returncode:
+        raise RuntimeError(f"Stock worker exited with status {worker.returncode}")
+    actual = record_predictions(model, tokenizer, device, candidate=lambda records: candidate(records=records))
+    (args.output / "candidate-quality.json").write_text(json.dumps(actual))
+    report["quality"] = quality_report(args.output)
+    (args.output / "paired.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report
+
+
+def overlap(args, model, tokenizer, device):
+    from batching import load_examples
+    from packing_pair import comparison_plans, mps_peak, plan_counts
+
+    examples, _ = load_examples(tokenizer)
+    examples = [example for example in examples if example.task_type == "multiple_choice"]
+    plan = comparison_plans(examples, 4)["all"]["packed"]
+    pad = tokenizer.get_bos_token_id()
+
+    def run(config):
+        prefetch, defer = CONFIGS[config]
+        scores = planned_winners(plan, examples, model, pad, device, prefetch=prefetch, defer=defer)
+        return scores, sum(winner == examples[i].gold for i, winner in scores.items())
+
+    configs = [args.configuration] if args.metal_trace else list(CONFIGS)
+    warm = {config: run(config) for config in configs}
+    assert all(result == warm[configs[0]] for result in warm.values())
+    samples = {config: [] for config in configs}
+    for trial in range(args.repeats):
+        for config in (configs if trial % 2 == 0 else configs[::-1]):
+            profile = (torch.mps.profiler.profile(mode="interval", wait_until_completed=False)
+                       if args.metal_trace else nullcontext())
+            markers = nullcontext()
+            if args.signpost_library:
+                from profile_core import metal_markers
+
+                markers = metal_markers(args.signpost_library)
+            with profile, markers:
+                seconds, output = timed(partial(run, config), device)
+            assert output == warm[config]
+            samples[config].append(seconds)
+            print(json.dumps({"trial": trial + 1, "configuration": config, "seconds": seconds}), flush=True)
+    report = {"plan": plan_counts(plan, "packed"), "configs": {}}
+    for config, values in samples.items():
+        elapsed = median(values)
+        report["configs"][config] = {"raw_seconds": values, "median_seconds": elapsed,
+                                     "questions_per_second": len(examples) / elapsed}
+        if device.type == "mps" and not args.metal_trace:
+            report["configs"][config].update(mps_peak(partial(run, config)))
+    return report
+
+
+@torch.no_grad()
+def main():
+    from benchmark_a100 import check_model_arguments, load_scoring_model, model_arguments
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="mps")
+    parser.add_argument("--checkpoint", type=Path, help="Frozen byte-tokenizer fixture for CPU or MPS.")
+    model_arguments(parser)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--mode", choices=("core", "paired", "quality", "overlap", "profile"), default="core")
+    parser.add_argument("--configuration", choices=CONFIGS, default="both")
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--metal-trace", action="store_true", help="Emit MPS signposts for a separate trace run.")
+    parser.add_argument("--signpost-library", type=Path, help="Optional CPU signposts for a Metal System Trace.")
+    parser.add_argument("--stock-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--isolated-trials", action="store_true", help="Warm and time each arm in a fresh process.")
+    parser.add_argument("--isolated-arm", choices=("stock", "candidate"), help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if min(args.repeats, args.batch_size) < 1:
+        parser.error("--repeats and --batch-size must be positive")
+    if args.metal_trace and (args.device != "mps" or args.mode != "overlap"):
+        parser.error("--metal-trace requires --device mps and --mode overlap")
+    if args.signpost_library and not args.metal_trace:
+        parser.error("--signpost-library requires --metal-trace")
+    if args.mode == "profile" and args.device != "mps":
+        parser.error("Component profiling requires MPS")
+    os.environ["DEVELOPMENT"] = "0"
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=True)
+    torch.set_num_threads(1)
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        check_model_arguments(parser, args)
+        if not args.stock_worker:
+            parser.error("Use benchmark_a100.py --validate-backends for CUDA")
+        with redirect_stdout(sys.stderr):
+            model, tokenizer = load_scoring_model(args, device)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            stock_worker(model, tokenizer, device, args.output)
+        return
+    if args.checkpoint is None:
+        parser.error("--checkpoint is required for CPU or MPS")
+    if not args.isolated_arm and (args.mode == "quality" or (args.mode == "paired" and args.isolated_trials)):
+        report = paired_isolated(args)
+        report.update(device=str(device), torch=torch.__version__, max_context=2048,
+                      checkpoint_sha256=hashlib.sha256(args.checkpoint.read_bytes()).hexdigest())
+        filename = "paired.json" if args.mode == "paired" else "quality-run.json"
+        (args.output / filename).write_text(json.dumps(report, indent=2) + "\n")
+        return
+    if args.stock_worker:
+        with redirect_stdout(sys.stderr):
+            model, tokenizer = load_frozen_checkpoint(args.checkpoint, device), ByteTokenizer()
+        stock_worker(model, tokenizer, device, args.output)
+        return
+    model, tokenizer = load_frozen_checkpoint(args.checkpoint, device), ByteTokenizer()
+    if args.isolated_arm:
+        isolated_trial(args, model, tokenizer, device)
+        return
+    if args.mode == "paired":
+        report = paired(args, model, tokenizer, device,
+                        extra_worker_args=("--checkpoint", str(args.checkpoint.resolve())), batch_size=args.batch_size)
+    elif args.mode == "overlap":
+        report = overlap(args, model, tokenizer, device)
+    elif args.mode == "profile":
+        from profile_core import components
+
+        report = components(model, tokenizer, device)
+    else:
+        elapsed, scores = timed(partial(evaluate, model, tokenizer, device, configuration=args.configuration,
+                                        batch_size=args.batch_size), device)
+        report = {"seconds": elapsed, "scores": scores}
+    report.update(device=str(device), torch=torch.__version__, max_context=model.max_seq_len,
+                  checkpoint_sha256=hashlib.sha256(args.checkpoint.read_bytes()).hexdigest())
+    (args.output / f"{args.mode}.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

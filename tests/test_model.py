@@ -1,7 +1,7 @@
 import pytest
 import torch
 from gpt_lab.model.wrapper import Engine
-from gpt_lab.model.utils import KVCache
+from gpt_lab.model.utils import KVCache, SelfAttentionMask
 from gpt_lab.model.gpt import DenseTransformer
 
 from gpt_lab.utils.schemas import (
@@ -40,6 +40,59 @@ def test_training_logits_remain_in_autocast_dtype(compute_dtype):
 
     assert output.logits.dtype == compute_dtype
     assert torch.isfinite(output.loss)
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("mask_format", ["padding", "causal_bool", "causal_bias"])
+@torch.no_grad()
+def test_model_attention_mask_preserves_causality_window_and_padding(mask_format):
+    torch.manual_seed(29)
+    model = DenseTransformer(TransformerConfig(
+        vocab_size=64, max_context=7, d_model=16, d_ffn=32, n_heads=2, d_head=8,
+        n_layers=2, window_pattern="SL", window_size=2, attn_impl="sdpa",
+    )).to("cpu").eval()
+    model.init_weights()
+    for block in model.blocks:
+        block.attention.o_proj.weight.normal_(std=0.15)
+
+    tokens = torch.arange(1, 15).reshape(2, 7)
+    padding_mask = SelfAttentionMask(pad_idx=0, max_context=7)
+
+    def mask(ids):
+        if mask_format == "padding":
+            return ids != 0
+        return padding_mask.get(ids, to_bool=mask_format == "causal_bool")
+
+    short_outputs = []
+    hook = model.blocks[0].register_forward_hook(
+        lambda module, args, outputs: short_outputs.append(outputs[0][0, -1].clone())
+    )
+    try:
+        allowed = mask(tokens)
+        baseline = model(tokens, tokens, attn_mask=allowed).logits
+        modified = tokens.clone()
+        modified[0, -1] = 20
+        later_token = model(modified, tokens, attn_mask=allowed).logits
+        torch.testing.assert_close(baseline[0, 0], later_token[0, 0], atol=0, rtol=0)
+
+        modified = tokens.clone()
+        modified[0, 0] = 20
+        model(modified, tokens, attn_mask=allowed)
+        torch.testing.assert_close(short_outputs[0], short_outputs[-1], atol=0, rtol=0)
+
+        modified = tokens.clone()
+        modified[0, -3] = 20
+        model(modified, tokens, attn_mask=allowed)
+        assert not torch.equal(short_outputs[0], short_outputs[-1])
+
+        padding = tokens.clone()
+        padding[0, -3] = 0
+        allowed = mask(padding)
+        model(tokens, tokens, attn_mask=allowed)
+        model(modified, tokens, attn_mask=allowed)
+        torch.testing.assert_close(short_outputs[-2], short_outputs[-1], atol=0, rtol=0)
+    finally:
+        hook.remove()
 
 # TODO: use fixtures for config and model initialization
 # @pytest.fixture(scope="module")

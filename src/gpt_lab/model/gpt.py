@@ -390,10 +390,22 @@ class DenseTransformer(BaseTransformer):
             return_attentions: bool = False,
             return_hidden_states: bool = False,
             reduction: str = "mean",
+            *,
+            complete_attn_masks: tuple[torch.Tensor, ...] | None = None,
+            position_ids: torch.Tensor | None = None,
         ) -> ModelOutput:
+        """Run the model with optional attention masks and RoPE position IDs.
+
+        An ordinary mask further restricts each layer's causal window. A mask
+        shaped (batch_size, sequence_length) masks keys. For packed SDPA,
+        complete_attn_masks supplies one boolean mask per layer with all
+        visibility rules included. Position IDs can be shared across rows
+        (sequence_length,) or supplied per row (batch_size, sequence_length).
+        """
         return self._forward(
             input_ids, labels, attn_mask, past_key_values,
             return_attentions, return_hidden_states, reduction,
+            complete_attn_masks=complete_attn_masks, position_ids=position_ids,
         )
 
     def training_loss(self, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -412,11 +424,14 @@ class DenseTransformer(BaseTransformer):
             return_hidden_states: bool = False,
             reduction: str = "mean",
             loss_only: bool = False,
+            *,
+            complete_attn_masks: tuple[torch.Tensor, ...] | None = None,
+            position_ids: torch.Tensor | None = None,
         ) -> ModelOutput | torch.Tensor:
         assert (past_key_values is None) or (not self.training), "KV cache can not be used during training."
         # assert input_ids.shape[-1] <= self.config.max_context, f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}"
         assert input_ids.dim() == 2, "Input ids should be of shape (batch_size, seq_len)"
-        if input_ids.shape[-1] > self.config.max_context:
+        if position_ids is None and input_ids.shape[-1] > self.config.max_context:
             log0(f"Input sequence length {input_ids.shape[-1]} exceeds max context {self.config.max_context}. "
                  f"May cause unexpected behavior if model was initialized with a different max context.", 
                  level="warning", logger=logger)
@@ -427,6 +442,16 @@ class DenseTransformer(BaseTransformer):
             input_ids = input_ids.unsqueeze(0)
 
         B, T = input_ids.size()
+        if complete_attn_masks is not None:
+            if attn_mask is not None:
+                raise ValueError("Choose either attn_mask or complete_attn_masks")
+            if len(complete_attn_masks) != len(self.blocks) or any(mask is None for mask in complete_attn_masks):
+                raise ValueError("Expected one complete attention mask per layer")
+        if position_ids is not None:
+            if past_key_values is not None or self.config.positional_encoding != "rope":
+                raise ValueError("Explicit RoPE positions require RoPE and no KV cache")
+            if position_ids.shape not in ((T,), (B, T)) or position_ids.dtype != torch.long:
+                raise ValueError("Expected integer RoPE positions shaped (T,) or (B, T)")
         T0 = 0
         if past_key_values is not None:
             if hasattr(past_key_values, "cur_pos"):
@@ -448,7 +473,13 @@ class DenseTransformer(BaseTransformer):
             x = x + self.pe_cache[:x.size(2)]
 
         if self.config.positional_encoding == "rope":
-            rope_cache = self.pe_cache[T0:T0+T]
+            if position_ids is None:
+                rope_cache = self.pe_cache[T0:T0+T]
+            elif position_ids.ndim == 1:
+                rope_cache = self.pe_cache.index_select(0, position_ids)
+            else:
+                cache = self.pe_cache[:self.config.max_context]
+                rope_cache = cache.index_select(0, position_ids.reshape(-1)).unflatten(0, (B, T))
         else:
             rope_cache = None
 
@@ -464,8 +495,10 @@ class DenseTransformer(BaseTransformer):
             ve = None
             if str(i) in self.value_embeds:
                 ve = self.value_embeds[str(i)](input_ids).to(x.dtype)
+            complete_mask = complete_attn_masks[i] if complete_attn_masks is not None else None
             x, attn = layer(x, value_embeds=ve, rope_cache=rope_cache, window_size=self.window_sizes[i],
-                            kv_cache=past_key_values, attn_mask=attn_mask, return_attn_weights=return_attn)
+                            kv_cache=past_key_values, attn_mask=attn_mask, return_attn_weights=return_attn,
+                            complete_attn_mask=complete_mask)
             if return_attn:
                 attentions.append(attn)
             if return_hidden_states:
