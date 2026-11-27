@@ -11,6 +11,7 @@ TODOs:
 """
 
 import os, csv, time, json, yaml, shutil, random, zipfile, tempfile
+from functools import partial
 
 from jinja2 import Template
 import torch
@@ -375,8 +376,12 @@ def load_core_task(data_base_path, task, max_per_task):
     return data, task_meta
 
 
-def evaluate_core(model, tokenizer, device, max_per_task=-1, *, score_multiple_choice=None):
-    """Evaluate a base model on CORE, with an optional multiple-choice scorer."""
+def evaluate_core(model, tokenizer, device, max_per_task=-1, *, score_multiple_choice=None, score_task=None):
+    """Evaluate CORE with an optional per-question or whole-task scorer."""
+    if score_task is None:
+        score_task = partial(evaluate_task, score_multiple_choice=score_multiple_choice)
+    elif score_multiple_choice is not None:
+        raise ValueError("Specify only one CORE scorer")
     data_base_path, tasks, random_baselines = load_core_bundle()
     results = {}
     centered_results = {}
@@ -395,9 +400,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, *, score_multiple_c
             end=""
         )
 
-        accuracy = evaluate_task(
-            model, tokenizer, data, device, task_meta, score_multiple_choice=score_multiple_choice,
-        )
+        accuracy = score_task(model, tokenizer, data, device, task_meta)
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result

@@ -54,26 +54,32 @@ def bucket_width(width, buckets):
     return next((bound for bound in buckets if width <= bound), None)
 
 
+def collate_group(group, examples, pad_id, max_context, width_buckets):
+    packed, indices = group
+    if packed:
+        questions = [examples[i].packed for i in indices]
+        width = bucket_width(max(len(question.tokens) for question in questions), width_buckets)
+        batch = collate_packed(questions, pad_id, max_context=max_context, padded_width=width)
+    else:
+        prepared = [examples[i].prepared for i in indices]
+        widest = max(len(row) for tokens, _, _ in prepared for row in tokens)
+        width = bucket_width(widest, width_buckets)
+        batch = collate_separate(prepared, pad_id, padded_width=None if width is None else min(width, max_context))
+    return packed, indices, batch
+
+
+def score_group(packed, batch, model, device, *, fa4=None):
+    if packed:
+        nll, winners, _ = score_packed_batch(model, batch, device, fa4=fa4)
+        return nll, winners
+    return score_separate_batch(model, batch, device)
+
+
 def score_plan(plan, examples, model, pad_id, device, *, fa4=None, width_buckets=()):
     scores = {}
-    for packed, indices in plan:
-        if packed:
-            questions = [examples[i].packed for i in indices]
-            width = None
-            if width_buckets:
-                width = bucket_width(max(len(question.tokens) for question in questions), width_buckets)
-            batch = collate_packed(questions, pad_id, max_context=model.max_seq_len, padded_width=width)
-            nll, winners, _ = score_packed_batch(model, batch, device, fa4=fa4)
-        else:
-            prepared = [examples[i].prepared for i in indices]
-            width = None
-            if width_buckets:
-                widest = max(len(row) for tokens, _, _ in prepared for row in tokens)
-                width = bucket_width(widest, width_buckets)
-                if width is not None:
-                    width = min(width, model.max_seq_len)
-            batch = collate_separate(prepared, pad_id, padded_width=width)
-            nll, winners = score_separate_batch(model, batch, device)
+    for group in plan:
+        packed, indices, batch = collate_group(group, examples, pad_id, model.max_seq_len, width_buckets)
+        nll, winners = score_group(packed, batch, model, device, fa4=fa4)
         # One readback per forward in both arms, for all options and winners.
         results = nll.new_empty((len(indices), nll.size(1) + 1))
         results[:, :-1] = nll
