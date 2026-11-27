@@ -13,7 +13,7 @@ from batch_timing import observe_rows, time_sweep
 from fixture_model import ByteTokenizer, load_frozen_checkpoint, wide_fixture
 
 
-def record_core(model, tokenizer, device, *, evaluate=None, capture_logits=True):
+def record_core(model, tokenizer, device, *, evaluate=None, capture_logits=True, capture_log_probs=False):
     records = []
     batch = {name: getattr(core, name) for name in (
         "batch_sequences_mc", "batch_sequences_schema", "batch_sequences_lm",
@@ -49,6 +49,11 @@ def record_core(model, tokenizer, device, *, evaluate=None, capture_logits=True)
                                  for i, (start, end) in enumerate(zip(starts, ends))]
         current["predictions"] = [predictions[i, start - 1:end - 1].cpu()
                                   for i, (start, end) in enumerate(zip(starts, ends))]
+        if capture_log_probs:
+            from output_quality import scored_outputs
+
+            scored = [logits[0][i, start - 1:end - 1] for i, (start, end) in enumerate(zip(starts, ends))]
+            current["target_log_probs"], _ = scored_outputs(scored, current["prepared"])
         if current["task_type"] != "language_modeling":
             nll = [losses[i, start - 1:end - 1].mean().item() for i, (start, end) in enumerate(zip(starts, ends))]
             current.update(nll=torch.tensor(nll), winner=nll.index(min(nll)))
@@ -56,16 +61,19 @@ def record_core(model, tokenizer, device, *, evaluate=None, capture_logits=True)
 
     def remember_example(idx, model, tokenizer, data, device, meta, **kwargs):
         current.update(index=idx, task_type=meta["task_type"], nll=None, winner=None)
-        if not capture_logits:
-            current["dataset"] = meta["dataset_uri"]
+        current["dataset"] = meta["dataset_uri"]
         current["correct"] = stock_evaluate(idx, model, tokenizer, data, device, meta, **kwargs)
         records.append(dict(current))
         current.clear()
         logits.clear()
         return records[-1]["correct"]
 
+    def remember_logits(_, args, output):
+        if "index" in current:
+            logits.append(output.logits)
+
+    hook = model.register_forward_hook(remember_logits) if capture_logits or capture_log_probs else None
     replacements = {name: remember_spans(fn) for name, fn in batch.items()}
-    hook = model.register_forward_hook(lambda _, args, output: logits.append(output.logits)) if capture_logits else None
     try:
         with patch.multiple(core, **replacements, stack_sequences=remember_rows,
                             forward_model=remember_losses, evaluate_example=remember_example):

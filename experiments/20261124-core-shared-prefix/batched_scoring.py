@@ -102,10 +102,20 @@ def reduce_options(losses, sources, valid, first_nll=None):
     return means, winners
 
 
-def score_separate_batch(model, batch, device):
+def gather_scored_logits(logits, batch):
+    flat = logits.flatten(0, 1)
+    return [[flat.index_select(0, offsets[keep].to(flat.device))
+             for offsets, keep in zip(row_sources, row_valid)]
+            for row_sources, row_valid in zip(batch.sources, batch.valid)]
+
+
+def score_separate_batch(model, batch, device, *, capture_logits=False):
     tokens, keys = batch.tokens.to(device), batch.keys.to(device)
     outputs = model(tokens, shifted_labels(tokens, keys), reduction="none")
-    return reduce_options(outputs.loss, batch.sources.to(device), batch.valid.to(device))
+    means, winners = reduce_options(outputs.loss, batch.sources.to(device), batch.valid.to(device))
+    if capture_logits:
+        return means, winners, gather_scored_logits(outputs.logits, batch)
+    return means, winners
 
 
 def score_packed_batch(model, batch, device, *, capture_logits=False, fa4=None):
@@ -124,12 +134,7 @@ def score_packed_batch(model, batch, device, *, capture_logits=False, fa4=None):
     means, winners = reduce_options(outputs.loss, sources, valid, first_nll)
     logits = None
     if capture_logits:
-        flat = outputs.logits.flatten(0, 1)
-        logits = [
-            [flat.index_select(0, offsets[keep].to(device)) for offsets, keep in zip(row_sources, row_valid)
-             if keep[0]]
-            for row_sources, row_valid in zip(batch.sources, batch.valid)
-        ]
+        logits = [[option for option in row if option.size(0)] for row in gather_scored_logits(outputs.logits, batch)]
     return means, winners, logits
 
 

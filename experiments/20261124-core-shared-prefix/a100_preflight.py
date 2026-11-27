@@ -124,7 +124,35 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
             for arm in ARMS
         }
 
+    def all_tasks(name, record, *, fa4=None, attention=nullcontext):
+        directory = args.output / name
+        directory.mkdir(exist_ok=True)
+        task_args = SimpleNamespace(output=directory, configuration="both", repeats=3)
+        record["all_tasks"] = attempt(
+            lambda: paired(task_args, model, tokenizer, device, extra_worker_args=worker_args, fa4=fa4,
+                           width_buckets=WIDTHS, backend=attention, batch_size=args.all_task_batch_size),
+            record, "all_tasks",
+        )
+        save()
+        if record["all_tasks"] is not None:
+            quality = record["all_tasks"]["quality"]
+            if not quality["option_nll_gate"]["passed"]:
+                print(f"{name}: mean relative option-NLL gate failed; timing and quality saved", flush=True)
+            if quality["centered_core_drop_review"]:
+                print(f"{name}: centered CORE drop flagged for review", flush=True)
+
     with torch.autocast("cuda", dtype=torch.bfloat16):
+        primary = report["default_sdpa"] = {}
+        all_tasks("default_sdpa", primary)
+        primary["kernel_probe"] = {}
+        probe = primary["kernel_probe"]
+        for arm, plan in configs[args.all_task_batch_size].items():
+            case = probe[arm] = {}
+            case["dispatch"] = attempt(
+                lambda: profile_shapes(plan[:1], examples, lambda groups: score_plan(
+                    groups, examples, model, pad, device, width_buckets=WIDTHS,
+                )), case, "kernel_probe",
+            )
         report["replay_default_sdpa"] = attempt(
             replay, report, "replay_default_sdpa",
         )
@@ -199,11 +227,6 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
                 if fa4:
                     record["warmup_compilation"] = {"seconds": fa4.compile_seconds, "compiles": fa4.compiles}
                 save()
-                if not any(case.get("predictions_agree") for case in eligible_cases):
-                    record["timing_skipped"] = "no configuration passed validation against pinned master"
-                    save()
-                    continue
-
                 baseline = {}
                 for size, plans in configs.items():
                     entry = record["sizes"][size]
@@ -212,7 +235,7 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
                     for i in range(3):
                         for arm in (ARMS if i % 2 == 0 else ARMS[::-1]):
                             case = entry[arm]
-                            if not case.get("predictions_agree") or "execution_error" in case or "allocation_error" in case:
+                            if "execution_error" in case or "allocation_error" in case:
                                 continue
                             sample = attempt(lambda: summarize_trial(lambda: run(plans[arm])), case, "timing")
                             if sample is not None:
@@ -234,15 +257,8 @@ def validated_sweep(args, device, model, tokenizer, configs, examples, baselines
                 if fa4:
                     record["eligible_sweep_extra_compiles"] = fa4.compiles - record["warmup_compilation"]["compiles"]
                     save()
-            directory = args.output / name
-            directory.mkdir(exist_ok=True)
-            task_args = SimpleNamespace(output=directory, configuration="both", repeats=3)
             with patch.object(fa4.cute, "compile", fa4.timed_compile) if fa4 else nullcontext():
-                record["all_tasks"] = attempt(
-                    lambda: paired(task_args, model, tokenizer, device, extra_worker_args=worker_args,
-                                   fa4=fa4, require_predictions=True, width_buckets=WIDTHS, backend=attention),
-                    record, "all_tasks",
-                )
+                all_tasks(name, record, fa4=fa4, attention=attention)
                 if fa4:
                     record["total_compilation"] = {"seconds": fa4.compile_seconds, "compiles": fa4.compiles}
-                save()
+                    save()

@@ -469,9 +469,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--master-input", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--validate-backends", action="store_true",
-                        help="Validate matched SDPA and native SM80 FA4 before timing eligible and all-task runs.")
+                        help="Time all-task CORE and validate matched SDPA and native SM80 FA4.")
+    parser.add_argument("--all-task-batch-size", type=int, choices=SIZES, default=8,
+                        help="Questions per packed forward in the all-task comparison.")
     args = parser.parse_args()
     check_model_arguments(parser, args)
+    args.output = args.output.resolve()
     if torch.cuda.device_count() != 1 or "A100" not in torch.cuda.get_device_name():
         parser.error("exactly one CUDA A100 is required")
     args.output.mkdir(parents=True, exist_ok=True)
