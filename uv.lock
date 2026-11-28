@@ -726,6 +726,9 @@ fp8 = [
 gpu = [
     { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" } },
 ]
+rust-dataloader = [
+    { name = "gpt-lab-rust-packer" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -737,10 +740,14 @@ notebook = [
     { name = "ipykernel" },
     { name = "jupyter" },
 ]
+rust-dataloader = [
+    { name = "gpt-lab-rust-packer" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "datasets", specifier = "==4.8.4" },
+    { name = "gpt-lab-rust-packer", marker = "extra == 'rust-dataloader'", directory = "packages/rust-dataloader" },
     { name = "gradio", specifier = "==3.18.0" },
     { name = "jinja2", specifier = "==3.1.6" },
     { name = "kernels", specifier = "==0.18.3" },
@@ -763,7 +770,7 @@ requires-dist = [
     { name = "uvicorn", specifier = "==0.40.0" },
     { name = "wandb", specifier = "==0.25.1" },
 ]
-provides-extras = ["cpu", "gpu", "fp8"]
+provides-extras = ["cpu", "gpu", "fp8", "rust-dataloader"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -775,6 +782,12 @@ notebook = [
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "jupyter", specifier = ">=1.1.1" },
 ]
+rust-dataloader = [{ name = "gpt-lab-rust-packer", directory = "packages/rust-dataloader" }]
+
+[[package]]
+name = "gpt-lab-rust-packer"
+version = "0.1.0"
+source = { directory = "packages/rust-dataloader" }
 
 [[package]]
 name = "gradio"

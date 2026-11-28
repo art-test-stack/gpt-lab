@@ -61,6 +61,9 @@ def train_base(
     monitor_grad_norms=False,
     device_batch_size=32,
     use_nanochat_dataloader=False,
+    dataloader_backend='auto',
+    tokenizer_batch_size=None,
+    packing_strategy='rolling-16',
     architecture_config=None,
     max_seq_len=_UNSET,
     tokenizer_model=None,
@@ -242,10 +245,14 @@ def train_base(
             batch_size=base_training_config.get("device_batch_size", device_batch_size),
             comp_info=comp_info,
             use_nanochat=use_nanochat_dataloader,
+            dataloader_backend=dataloader_backend,
+            tokenizer_batch_size=tokenizer_batch_size,
             data_seed=random_seed,
         )
         # TODO: add option to configure buffer size
-        train_loader = build_dataloader(split="train", resume_state=resume_state, **loader_common_kwargs)
+        train_loader = build_dataloader(
+            split="train", resume_state=resume_state, packing_strategy=packing_strategy, **loader_common_kwargs,
+        )
         val_loader = build_dataloader(split="val", **loader_common_kwargs)
 
         # ------------------------------------------------------------------------------

@@ -161,6 +161,20 @@ def test_step_limit_flag():
     assert not hasattr(args, 'stop_after_updates')
 
 
+@pytest.mark.parametrize('mode', ['auto', 'resume'])
+def test_dataloader_flags(mode):
+    parser = build_parser()
+    defaults = parser.parse_args(['train', mode])
+    assert (defaults.dataloader_backend, defaults.packing_strategy, defaults.tokenizer_batch_size) == (
+        'auto', 'rolling-16', None,
+    )
+    args = parser.parse_args(['train', mode, '--dataloader-backend', 'python', '--packing-strategy', 'block-best-fit',
+                              '--tokenizer-batch-size', '64'])
+    assert (args.dataloader_backend, args.packing_strategy, args.tokenizer_batch_size) == ('python', 'block-best-fit', 64)
+    with pytest.raises(SystemExit):
+        parser.parse_args(['train', mode, '--tokenizer-batch-size', '0'])
+
+
 def test_step_limit_rejects_old_flag():
     with pytest.raises(SystemExit):
         build_parser().parse_args(['train', '--stop-after-updates', '5'])

@@ -1,0 +1,24 @@
+[package]
+name = "gpt-lab-rust-packer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gpt_lab_rust_packer"
+crate-type = ["cdylib"]
+
+[dependencies]
+parquet = { version = "=60.2.0", default-features = false, features = ["snap", "zstd", "brotli", "flate2-zlib-rs", "lz4"] }
+pyo3 = "=0.30.1"
+rayon = "1.11"
+tiktoken = { git = "https://github.com/openai/tiktoken.git", rev = "97e49cbadd500b5cc9dbb51a486f0b42e6701bee", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+pyo3-build-config = "=0.30.1"
+
+[profile.release]
+# Rust stripping can produce an invalid Mach-O LINKEDIT string pool on macOS.
+strip = "none"

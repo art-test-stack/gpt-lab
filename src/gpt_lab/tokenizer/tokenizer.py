@@ -139,6 +139,9 @@ class Tokenizer(_BaseTokenizer):
         special_tokens (list[str]): The list of special tokens for the tokenizer
         config (gpt_lab.utils.schemas.TokenizerConfig): Configuration settings for the tokenizer
     """
+
+    supports_exact_batch_encoding = True
+
     def __init__(
             self, 
             # enc: Callable, 
@@ -488,6 +491,11 @@ class Tokenizer(_BaseTokenizer):
             log_error(msg, error_type=TypeError, logger=logger)
 
         return token_ids
+
+    def encode_batch(
+        self, texts: List[str], *, prepend_bos: bool = False, num_threads: int = 8
+    ) -> List[List[int]]:
+        return self.encode(texts, prepend_bos=prepend_bos, num_threads=num_threads)
 
     def decode(self, token_ids: List[int]) -> str:
         return self.main.decode(token_ids)

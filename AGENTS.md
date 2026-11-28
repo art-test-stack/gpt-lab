@@ -14,6 +14,8 @@ Use `configs/` for experiment configuration, `scripts/` for runnable training, e
 
 Start each new experiment in its own `experiments/YYYYMMDD-experiment-name/` subfolder, using its start date and a short kebab-case name (for example, `experiments/20261031-h100-input-pipeline/`). Keep its entry points, checks, configuration fixtures, and notes together; keep disposable outputs under `.tmp/codex/`.
 
+Avoid hardcoded agent or machine-specific paths in code, CI, and documentation. Use the system or test runner’s temporary directory for disposable files. Accept caller-supplied paths for local datasets and saved results.
+
 ## Environment and Development Commands
 
 Use `pyproject.toml`, `.python-version`, and `uv.lock` as the source of truth for Python and dependencies. The current project targets Python 3.12.

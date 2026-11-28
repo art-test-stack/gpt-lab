@@ -116,7 +116,7 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
    git clone git@github.com:art-test-stack/gpt-lab.git
    ```
 
-- Install dependencies for CUDA device:
+- Install a Rust toolchain with Cargo for the default native dataloader, then install dependencies for your device. For CUDA:
   ```bash
   uv sync --extra gpu
   ```
@@ -132,6 +132,8 @@ This project has been developed and tested with Python 3.12. gpt-lab uses [`uv`]
   ```bash
   uv sync --group=notebook
   ```
+
+For a Python-only install without Cargo, add `--no-group rust-dataloader` to either device’s `uv sync` command.
 
 > [!NOTE]  
 > Make sure to adjust the CUDA version in `uv.toml` if needed. This extra is only available for Linux systems with compatible NVIDIA GPUs. It permits using `flash_attention` for faster attention computation. Default mode uses `kernels` implementation, making the installation easier.
@@ -208,6 +210,16 @@ val_loader_fn = build_dataloader(
 
 val_loader = val_loader_fn() # called as a function to get the dataloader instance in trainer
 ```
+
+#### Dataloader backends
+
+**End-to-end Rust is the default** for cached Parquet text with gpt-lab’s tiktoken tokenizer. The default `auto` selector uses Python for pretokenized data, other tokenizers, shards that still need downloading, or a Python-only install.
+
+On `gpt-lab train auto` and `gpt-lab train resume`, use `--dataloader-backend python` to force Python, `rust-packing` for native packing only, or `rust` to require the full Rust backend. `gpt_lab.data.build_dataloader()` accepts the same choices via `dataloader_backend`.
+
+**Packing defaults to `rolling-16`.** With Python or end-to-end Rust, `--packing-strategy block-best-fit` drains blocks of up to 64 documents. It looks for an exact single, then the earliest exact pair, then uses the greedy fit. Pass the same strategy on resume. Both strategies have backend-independent training checkpoints. Validation uses rolling-16. In `build_dataloader()`, set `packing_strategy` on the training loader only.
+
+Use `--tokenizer-batch-size 64` to compare Python and Rust with the same tokenization batch size. Batch encoding requires an adapter that opts in to exact scalar-equivalent results. See the [dataloader benchmark](experiments/20261124-rust-dataloader/README.md) for the paired training measurements.
 
 We can do whatever we want with maths, modelization, the implementation in PyTorch, etc, but the core component of any Machine Learning system is still its data. 
 

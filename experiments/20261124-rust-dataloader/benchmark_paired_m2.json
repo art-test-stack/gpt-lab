@@ -1,0 +1,684 @@
+{
+  "commit": "4de4d9abaf0df74ed9db6fcdba015a0d91229012",
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "cpu": "Apple M2",
+  "python": "3.12.12",
+  "shard": "shard_01061.parquet",
+  "shard_sha256": "9025ed81d751886e7810238f2c71a4d68ee907860f3c506d1cd3e74bda135fd8",
+  "batch_size": 16,
+  "rank": 0,
+  "world_size": 1,
+  "tokenizer": "gpt2",
+  "tokenizer_threads": 4,
+  "tokenizer_batch_size": 64,
+  "orders": [
+    [
+      "python",
+      "rust"
+    ],
+    [
+      "rust",
+      "python"
+    ],
+    [
+      "python",
+      "rust"
+    ],
+    [
+      "rust",
+      "python"
+    ]
+  ],
+  "results": [
+    {
+      "context": 512,
+      "strategy": "rolling-16",
+      "batches": 6605,
+      "emitted_source_tokens": 54022291,
+      "sha256": "0eaa9ac73be56e4738081d847a8219617c6e62e3ea44038b367ef7b849f066c0",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 19.731663083002786,
+          "batches": 6605,
+          "tokens_per_second": 2737847.832326703
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 11.54792274999636,
+          "batches": 6605,
+          "tokens_per_second": 4678095.980510177
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 9.060977541994362,
+          "batches": 6605,
+          "tokens_per_second": 5962081.988353483
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 22.06149608299893,
+          "batches": 6605,
+          "tokens_per_second": 2448713.8495394588
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 21.861271083005704,
+          "batches": 6605,
+          "tokens_per_second": 2471141.3528921157
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 8.8905715410001,
+          "batches": 6605,
+          "tokens_per_second": 6076357.492976547
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 7.754263542003173,
+          "batches": 6605,
+          "tokens_per_second": 6966785.524811338
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 18.125394125003368,
+          "batches": 6605,
+          "tokens_per_second": 2980475.383179562
+        }
+      ]
+    },
+    {
+      "context": 512,
+      "strategy": "block-best-fit",
+      "batches": 6604,
+      "emitted_source_tokens": 54023422,
+      "sha256": "3e09ce27cbe822b74d1792b71185c02aad948d9452718854d3d60cc1715f9cae",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 14.3744827920018,
+          "batches": 6604,
+          "tokens_per_second": 3758286.317616904
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 6.824112416004937,
+          "batches": 6604,
+          "tokens_per_second": 7916549.245773872
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 7.087828833995445,
+          "batches": 6604,
+          "tokens_per_second": 7621998.677632671
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 14.210690125000838,
+          "batches": 6604,
+          "tokens_per_second": 3801604.3925239565
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 10.771968582994305,
+          "batches": 6604,
+          "tokens_per_second": 5015185.625892626
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 4.71735395900032,
+          "batches": 6604,
+          "tokens_per_second": 11452060.301077852
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 4.590551708002749,
+          "batches": 6604,
+          "tokens_per_second": 11768394.179248758
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 10.713099708002119,
+          "batches": 6604,
+          "tokens_per_second": 5042744.25446142
+        }
+      ]
+    },
+    {
+      "context": 1024,
+      "strategy": "rolling-16",
+      "batches": 3302,
+      "emitted_source_tokens": 54014048,
+      "sha256": "c4b61aba0cfa8a15341e0cdc577980f0dc7034715ab484de5c04a646b4a09c83",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 11.982034958004078,
+          "batches": 3302,
+          "tokens_per_second": 4507919.41346476
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 5.450271416993928,
+          "batches": 3302,
+          "tokens_per_second": 9910340.947715811
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 5.576098249999632,
+          "batches": 3302,
+          "tokens_per_second": 9686710.236858465
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 13.393472332994861,
+          "batches": 3302,
+          "tokens_per_second": 4032863.6709791995
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 10.515845709000132,
+          "batches": 3302,
+          "tokens_per_second": 5136443.562857843
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 8.529622958994878,
+          "batches": 3302,
+          "tokens_per_second": 6332524.691849329
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 6.790068084002996,
+          "batches": 3302,
+          "tokens_per_second": 7954861.031107176
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 13.672881457998301,
+          "batches": 3302,
+          "tokens_per_second": 3950450.9832785176
+        }
+      ]
+    },
+    {
+      "context": 1024,
+      "strategy": "block-best-fit",
+      "batches": 3302,
+      "emitted_source_tokens": 54024176,
+      "sha256": "ed328d13eba00743addbbab23433385edc8e739362952432673a1ac7b7343d73",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 10.920431917002134,
+          "batches": 3302,
+          "tokens_per_second": 4947073.193679199
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 5.071882042000652,
+          "batches": 3302,
+          "tokens_per_second": 10651701.98214816
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 5.045266250002896,
+          "batches": 3302,
+          "tokens_per_second": 10707893.959009396
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 11.063299499997811,
+          "batches": 3302,
+          "tokens_per_second": 4883188.419513608
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 13.295499333005864,
+          "batches": 3302,
+          "tokens_per_second": 4063343.139425072
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 7.421468332999211,
+          "batches": 3302,
+          "tokens_per_second": 7279445.734449076
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 5.810469458003354,
+          "batches": 3302,
+          "tokens_per_second": 9297729.966653034
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 15.318916333002562,
+          "batches": 3302,
+          "tokens_per_second": 3526631.7032890976
+        }
+      ]
+    },
+    {
+      "context": 2048,
+      "strategy": "rolling-16",
+      "batches": 1651,
+      "emitted_source_tokens": 54014008,
+      "sha256": "47bc33c2065f443b970a5d05cc7b5ba9364f9ec87205556d62c1bc64a881181f",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 11.659588375005114,
+          "batches": 1651,
+          "tokens_per_second": 4632582.75187406
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 8.585178374996758,
+          "batches": 1651,
+          "tokens_per_second": 6291541.729326083
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 6.663348708003468,
+          "batches": 1651,
+          "tokens_per_second": 8106135.57341263
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 16.935822083003586,
+          "batches": 1651,
+          "tokens_per_second": 3189334.8746387255
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 16.337349166999047,
+          "batches": 1651,
+          "tokens_per_second": 3306167.203006634
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 5.66144579200045,
+          "batches": 1651,
+          "tokens_per_second": 9540673.881629512
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 5.007255167001858,
+          "batches": 1651,
+          "tokens_per_second": 10787149.086380873
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 11.382050291998894,
+          "batches": 1651,
+          "tokens_per_second": 4745542.9043368045
+        }
+      ]
+    },
+    {
+      "context": 2048,
+      "strategy": "block-best-fit",
+      "batches": 1651,
+      "emitted_source_tokens": 54022890,
+      "sha256": "c2a6cef4ed70421cc2dd6125ab9d51e01cfc7fe2029e77e01e016fe7657bdb78",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 11.023978375000297,
+          "batches": 1651,
+          "tokens_per_second": 4900489.475061996
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 6.626555832997838,
+          "batches": 1651,
+          "tokens_per_second": 8152483.939090298
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 6.077204250002978,
+          "batches": 1651,
+          "tokens_per_second": 8889431.353236733
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 11.228874833999726,
+          "batches": 1651,
+          "tokens_per_second": 4811068.855841636
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 11.109910084000148,
+          "batches": 1651,
+          "tokens_per_second": 4862585.708753903
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 5.367268874993897,
+          "batches": 1651,
+          "tokens_per_second": 10065247.56970768
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 5.107032291001815,
+          "batches": 1651,
+          "tokens_per_second": 10578137.54089318
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 11.341367458000605,
+          "batches": 1651,
+          "tokens_per_second": 4763348.881874939
+        }
+      ]
+    },
+    {
+      "context": 4096,
+      "strategy": "rolling-16",
+      "batches": 825,
+      "emitted_source_tokens": 53981212,
+      "sha256": "a9fecc396fac7e5372c275ace1d2c92c6b2d9fc71f25e4e06aeb3d6ae28a84bc",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 10.572257792002347,
+          "batches": 825,
+          "tokens_per_second": 5105930.35679053
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 5.525978707999457,
+          "batches": 825,
+          "tokens_per_second": 9768624.682150206
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 5.382609332998982,
+          "batches": 825,
+          "tokens_per_second": 10028818.489400523
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 10.543628500003251,
+          "batches": 825,
+          "tokens_per_second": 5119794.575461698
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 11.519729999999981,
+          "batches": 825,
+          "tokens_per_second": 4685978.924853281
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 5.080687790999946,
+          "batches": 825,
+          "tokens_per_second": 10624784.324599445
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 4.936848249999457,
+          "batches": 825,
+          "tokens_per_second": 10934347.030011695
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 10.449426582999877,
+          "batches": 825,
+          "tokens_per_second": 5165949.688361061
+        }
+      ]
+    },
+    {
+      "context": 4096,
+      "strategy": "block-best-fit",
+      "batches": 825,
+      "emitted_source_tokens": 53987722,
+      "sha256": "996d30feedb6aeb79c49f6fd799c5ca1f157b17146228a1769da229837924455",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 10.188510457999655,
+          "batches": 825,
+          "tokens_per_second": 5298882.719172238
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 5.15764408299583,
+          "batches": 825,
+          "tokens_per_second": 10467516.007549148
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 5.052374584003701,
+          "batches": 825,
+          "tokens_per_second": 10685613.487750942
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 10.549186374999408,
+          "batches": 825,
+          "tokens_per_second": 5117714.303346264
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 9.99231454099936,
+          "batches": 825,
+          "tokens_per_second": 5402924.595546262
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 4.733373875002144,
+          "batches": 825,
+          "tokens_per_second": 11405759.068625346
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 5.330289792000258,
+          "batches": 825,
+          "tokens_per_second": 10128477.832673416
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 9.913234833002207,
+          "batches": 825,
+          "tokens_per_second": 5446024.724469269
+        }
+      ]
+    },
+    {
+      "context": 8192,
+      "strategy": "rolling-16",
+      "batches": 412,
+      "emitted_source_tokens": 53915669,
+      "sha256": "1089e9e4842152bc2f3f87101fc5b887ddeb0c14357d781030f773c3dfcec715",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 10.070800749999762,
+          "batches": 412,
+          "tokens_per_second": 5353662.567497552
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 4.6477546250025625,
+          "batches": 412,
+          "tokens_per_second": 11600369.070682228
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 4.566211959005159,
+          "batches": 412,
+          "tokens_per_second": 11807526.563385071
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 9.572892541997135,
+          "batches": 412,
+          "tokens_per_second": 5632118.898594876
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 9.653146332995675,
+          "batches": 412,
+          "tokens_per_second": 5585294.901798952
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 4.630014416994527,
+          "batches": 412,
+          "tokens_per_second": 11644816.655883802
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 4.892757540997991,
+          "batches": 412,
+          "tokens_per_second": 11019485.13659695
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 9.544601249996049,
+          "batches": 412,
+          "tokens_per_second": 5648813.144501172
+        }
+      ]
+    },
+    {
+      "context": 8192,
+      "strategy": "block-best-fit",
+      "batches": 412,
+      "emitted_source_tokens": 53919817,
+      "sha256": "b3cb7e59e34b127d4ae769e04634a5e9bc6f396629de0b4b4c24719d18019e37",
+      "runs": [
+        {
+          "repeat": 1,
+          "backend": "python",
+          "seconds": 9.817446583001583,
+          "batches": 412,
+          "tokens_per_second": 5492244.5000474425
+        },
+        {
+          "repeat": 1,
+          "backend": "rust",
+          "seconds": 4.559163166995859,
+          "batches": 412,
+          "tokens_per_second": 11826691.659190835
+        },
+        {
+          "repeat": 2,
+          "backend": "rust",
+          "seconds": 4.582508457999211,
+          "batches": 412,
+          "tokens_per_second": 11766441.348488458
+        },
+        {
+          "repeat": 2,
+          "backend": "python",
+          "seconds": 9.756966624998313,
+          "batches": 412,
+          "tokens_per_second": 5526288.965860773
+        },
+        {
+          "repeat": 3,
+          "backend": "python",
+          "seconds": 10.481979834003141,
+          "batches": 412,
+          "tokens_per_second": 5144048.915748357
+        },
+        {
+          "repeat": 3,
+          "backend": "rust",
+          "seconds": 5.616429249996145,
+          "batches": 412,
+          "tokens_per_second": 9600373.226465376
+        },
+        {
+          "repeat": 4,
+          "backend": "rust",
+          "seconds": 5.025879125001666,
+          "batches": 412,
+          "tokens_per_second": 10728434.898438217
+        },
+        {
+          "repeat": 4,
+          "backend": "python",
+          "seconds": 9.75962029099901,
+          "batches": 412,
+          "tokens_per_second": 5524786.35359703
+        }
+      ]
+    }
+  ]
+}

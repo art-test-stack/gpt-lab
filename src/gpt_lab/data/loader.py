@@ -5,6 +5,7 @@ from typing import Callable, Iterator, Optional, Tuple, Union
 
 import torch
 
+from gpt_lab.rust_tools.dataloader import PACKING_STRATEGIES, native_batch
 from gpt_lab.utils.default import DATA_DIR, RANDOM_SEED
 from gpt_lab.utils.distributed import ComputeContext, get_comp_info
 from gpt_lab.utils.schemas import DataLoaderState, DocumentRef, TokenizerConfig
@@ -14,7 +15,13 @@ _LOOKAHEAD_DOCUMENTS = 16
 
 
 class ShardedDataset:
-    """Read and tokenize documents alongside the cursor immediately after each one."""
+    """Read documents alongside their cursors, optionally using tokenizer.encode_batch.
+
+    A tokenizer opts in by declaring supports_exact_batch_encoding = True on
+    its concrete class. Its encode_batch accepts prepend_bos and num_threads
+    and returns deterministic, unpadded sequences in source order, identical
+    to scalar encoding including BOS. Checkpoint restore encodes individually.
+    """
 
     def __init__(
         self,
@@ -30,7 +37,11 @@ class ShardedDataset:
         comp_info: Optional[ComputeContext] = None,
         tokenizer_threads: int = 4,
         data_seed: int = RANDOM_SEED,
+        *,
+        tokenizer_batch_size: Optional[int] = None,
     ):
+        if tokenizer_batch_size is not None and tokenizer_batch_size < 1:
+            raise ValueError("Tokenizer batch size must be positive")
         if split == "train" and start_state is not None and start_state.ordered_shard_ids is None:
             raise ValueError("Training data checkpoint predates saved shard order and document references")
         self.sm = ShardManager(
@@ -51,6 +62,7 @@ class ShardedDataset:
         self.split = split
         self.start_state = start_state
         self.tokenizer_threads = tokenizer_threads
+        self.tokenizer_batch_size = tokenizer_batch_size
 
     def tokenize(self, text) -> list[int]:
         tokens = (
@@ -58,6 +70,9 @@ class ShardedDataset:
             if self.tokenizer is not None
             else text
         )
+        return self._normalize_tokens(tokens)
+
+    def _normalize_tokens(self, tokens) -> list[int]:
         if isinstance(tokens, torch.Tensor):
             if tokens.ndim != 1:
                 raise ValueError("Source document must be a 1-D token sequence")
@@ -69,14 +84,36 @@ class ShardedDataset:
         return tokens
 
     def __iter__(self) -> Iterator[Tuple[list[int], DataLoaderState]]:
+        if (self.tokenizer_batch_size is not None and self.tokenizer_batch_size > 1
+                and vars(type(self.tokenizer)).get("supports_exact_batch_encoding") is True):
+            encode_batch = getattr(self.tokenizer, "encode_batch", None)
+            if callable(encode_batch):
+                yield from self._iter_tokenized_chunks(encode_batch)
+                return
         for (text,), cursor in self.sm.iterate(start_state=self.start_state, batch_size=1):
             tokens = self.tokenize(text)
             if tokens:
                 yield tokens, cursor
 
+    def _iter_tokenized_chunks(self, encode_batch) -> Iterator[Tuple[list[int], DataLoaderState]]:
+        for texts, cursor in self.sm.iterate(start_state=self.start_state, batch_size=self.tokenizer_batch_size):
+            documents = encode_batch(texts, prepend_bos=True, num_threads=self.tokenizer_threads)
+            if len(documents) != len(texts):
+                raise ValueError("Batch tokenizer must return one token sequence per source document")
+            # A checkpoint advances only past documents admitted to packing.
+            first_offset = cursor.offset_in_row_group - len(texts) + 1
+            for offset, document in enumerate(documents, start=first_offset):
+                tokens = self._normalize_tokens(document)
+                if tokens:
+                    yield tokens, cursor.model_copy(update={"offset_in_row_group": offset})
+
 
 class DistDataLoader:
-    """Pack each row without discarding document tails, starting with BOS when available."""
+    """Pack each row without discarding document tails, starting with BOS when available.
+
+    If a refill error escapes, discard the iterator and rebuild the training
+    loader with resume_state from the last committed batch.
+    """
 
     def __init__(
         self,
@@ -86,6 +123,10 @@ class DistDataLoader:
         device: str = "cuda",
         buffer_size: Optional[int] = None,
         eos_token_id: Optional[int] = None,
+        *,
+        packing_backend: str = "python",
+        dataloader_backend: str = "auto",
+        packing_strategy: str = "rolling-16",
     ):
         if batch_size < 1 or seq_len < 1:
             raise ValueError("Batch size and sequence length must be positive")
@@ -95,6 +136,13 @@ class DistDataLoader:
         self.bos_token_id = getattr(dataset, "bos_token_id", getattr(dataset, "bos_id", None))
         self.lookahead_size = _LOOKAHEAD_DOCUMENTS if self.bos_token_id is not None else 1
         split = getattr(dataset, "split", None)
+        if packing_strategy not in PACKING_STRATEGIES:
+            raise ValueError(f"Unknown packing strategy {packing_strategy!r}")
+        self.block_best_fit = packing_strategy == "block-best-fit"
+        if self.block_best_fit:
+            if split != "train":
+                raise ValueError("block-best-fit applies only to training")
+            self.lookahead_size = 64
         start_state = getattr(dataset, "start_state", None)
 
         self.signature = None
@@ -113,6 +161,8 @@ class DistDataLoader:
                 config.model_dump(mode="json", exclude={"dirname", "trainer", "save_token_bytes"})
                 if isinstance(config, TokenizerConfig) else None,
             )
+            if self.block_best_fit:
+                signature_data += ("block-best-fit-exact-pair",)
             self.signature = hashlib.sha256(json.dumps(signature_data, sort_keys=True).encode()).hexdigest()
 
         self.cursor = start_state or DataLoaderState()
@@ -120,34 +170,43 @@ class DistDataLoader:
         self.document = None
         self.document_ref = self.cursor.pending_document_ref
         self.offset = self.cursor.document_token_offset
-        if start_state is not None:
-            if split == "train" and self.cursor.packing_signature != self.signature:
-                raise ValueError("Incompatible training data checkpoint (loader, dataset, topology, tokenizer or batch shape)")
+        if start_state is not None and split == "train" and self.cursor.packing_signature != self.signature:
+            raise ValueError("Incompatible training data checkpoint (loader, dataset, topology, tokenizer or batch shape)")
+        self.cpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, pin_memory=self.device.type == "cuda")
+        self._fill_batch = native_batch(self, dataset, dataloader_backend, packing_backend)
+        if self._fill_batch is None:
+            self._restore_python(dataset)
+            self._fill_batch = type(self)._pack_python
+        self.gpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, device=self.device)
+        self.inputs = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
+        self.targets = torch.empty_like(self.inputs)
+
+    def _restore_python(self, dataset, prepare=None):
+        if getattr(dataset, "start_state", None) is not None:
             refs = self.cursor.lookahead_refs
             if self.document_ref is not None:
                 refs += (self.document_ref,)
             if len(self.cursor.lookahead_refs) >= self.lookahead_size or len(set(refs)) != len(refs):
                 raise ValueError("Invalid packing buffer in data checkpoint")
             documents = {ref: dataset.tokenize(text) for ref, text in dataset.sm.read_documents(refs)}
+            if (any(not doc for doc in documents.values())
+                    or (self.document_ref is None and self.offset != 0)
+                    or (self.document_ref is not None and not 0 < self.offset < len(documents[self.document_ref]))):
+                raise ValueError("Invalid packing buffer in data checkpoint")
+            if prepare is not None:
+                documents = {ref: prepare(doc) for ref, doc in documents.items()}
             self.lookahead = [(documents[ref], ref) for ref in self.cursor.lookahead_refs]
             self.document = documents.get(self.document_ref)
-            if (any(not doc for doc in documents.values())
-                    or (self.document is None and self.offset != 0)
-                    or (self.document is not None and not 0 < self.offset < len(self.document))):
-                raise ValueError("Invalid packing buffer in data checkpoint")
-
-        self.document_tensor = torch.tensor(self.document, dtype=torch.long) if self.document is not None else None
+        self.document_tensor = (
+            torch.tensor(self.document, dtype=torch.long) if prepare is None and self.document is not None else None
+        )
         self.iterator = iter(dataset)
         self.next_epoch_document = None
-        self.cpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, pin_memory=self.device.type == "cuda")
-        self.gpu = torch.empty((batch_size, seq_len + 1), dtype=torch.long, device=self.device)
-        self.inputs = torch.empty((batch_size, seq_len), dtype=torch.long, device=self.device)
-        self.targets = torch.empty_like(self.inputs)
 
     def __iter__(self):
         return self
 
-    def _take_document(self, space: int) -> tuple[list[int] | torch.Tensor, Optional[DocumentRef]]:
+    def _fill_lookahead(self, prepare=None) -> None:
         while len(self.lookahead) < self.lookahead_size:
             if self.next_epoch_document is None:
                 self.next_epoch_document = next(self.iterator, None)
@@ -160,12 +219,21 @@ class DistDataLoader:
             ref = None
             if self.signature is not None:
                 ref = (cursor.global_shard_idx, cursor.row_group_idx, cursor.offset_in_row_group - 1)
+            if prepare is not None:
+                document = prepare(document)
             self.lookahead.append((document, ref))
             self.cursor = cursor
             self.next_epoch_document = None
 
+    def _take_document(self, space: int) -> tuple[list[int] | torch.Tensor, Optional[DocumentRef]]:
+        if not self.block_best_fit or not self.lookahead:
+            self._fill_lookahead()
         if not self.lookahead:
             raise StopIteration
+        if self.block_best_fit:
+            exact = self._exact_fit(space)
+            if exact is not None:
+                return self.lookahead.pop(exact)
         best = None
         for index, (document, _) in enumerate(self.lookahead):
             if len(document) <= space and (best is None or len(document) > len(self.lookahead[best][0])):
@@ -175,7 +243,21 @@ class DistDataLoader:
             best = min(range(len(self.lookahead)), key=lambda index: len(self.lookahead[index][0]))
         return self.lookahead.pop(best)
 
-    def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
+    def _exact_fit(self, space: int) -> Optional[int]:
+        lengths = [len(document) for document, _ in self.lookahead]
+        if space in lengths:
+            return lengths.index(space)
+        later_lengths = set()
+        first = None
+        for index in range(len(lengths) - 1, -1, -1):
+            length = lengths[index]
+            if space - length in later_lengths:
+                first = index
+            later_lengths.add(length)
+        # After taking the earliest pair's first member, its mate is an exact single fit.
+        return first
+
+    def _pack_python(self) -> DataLoaderState:
         capacity = self.T + 1
         for row in self.cpu:
             pos = 0
@@ -196,20 +278,29 @@ class DistDataLoader:
                     self.document_ref = None
                     self.document_tensor = None
                     self.offset = 0
+        return self._python_checkpoint()
 
+    def __next__(self) -> Tuple[torch.Tensor, torch.Tensor, DataLoaderState]:
+        state = self._fill_batch(self)
         self.gpu.copy_(self.cpu)
         self.inputs.copy_(self.gpu[:, :-1])
         self.targets.copy_(self.gpu[:, 1:])
-        state = self.cursor
-        if self.signature is not None:
-            state = state.model_copy(update=dict(
-                packing_signature=self.signature,
-                ordered_shard_ids=self.ordered_shard_ids,
-                lookahead_refs=tuple(ref for _, ref in self.lookahead),
-                pending_document_ref=self.document_ref,
-                document_token_offset=self.offset,
-            ))
         return self.inputs, self.targets, state
+
+    def _python_checkpoint(self) -> DataLoaderState:
+        refs = tuple(ref for _, ref in self.lookahead) if self.signature is not None else ()
+        return self._checkpoint(self.cursor, refs, self.document_ref, self.offset)
+
+    def _checkpoint(self, cursor, refs, pending, offset) -> DataLoaderState:
+        if self.signature is None:
+            return cursor
+        return cursor.model_copy(update=dict(
+            packing_signature=self.signature,
+            ordered_shard_ids=self.ordered_shard_ids,
+            lookahead_refs=refs,
+            pending_document_ref=pending,
+            document_token_offset=offset,
+        ))
 
 
 # just to compare
@@ -413,15 +504,31 @@ def build_dataloader(
     tokenizer_threads: int = 4,
     use_nanochat: bool = False,
     data_seed: int = RANDOM_SEED,
+    *,
+    tokenizer_batch_size: Optional[int] = None,
+    packing_backend: str = "python",
+    dataloader_backend: str = "auto",
+    packing_strategy: str = "rolling-16",
 ) -> DistDataLoader:
     """Build a training iterator or a factory for independent validation iterators.
 
-    Native tokenized input uses a fixed 16-document lookahead. The buffer_size
-    argument configures the nanochat backend.
+    For the native loader, tokenizer_batch_size controls read-ahead for
+    tokenizers that opt in to exact batch encoding. Packing lookahead is independent.
+    dataloader_backend="auto" selects end-to-end Rust for cached text with the
+    repository's tiktoken tokenizer and an installed native extension. Other
+    inputs use Python. The Rust backends encode 64 documents at a time by default.
+    packing_strategy="block-best-fit" selects fixed 64-document blocks for
+    Python or end-to-end Rust training. Validation uses rolling-16.
+    packing_backend="rust" also selects packing-only acceleration. The
+    buffer_size argument configures the nanochat backend.
     """
     if comp_info is None:
         comp_info = get_comp_info()
     if use_nanochat:
+        if packing_strategy != "rolling-16":
+            raise ValueError("Packing strategies apply only to the gpt-lab loader")
+        if packing_backend != "python" or dataloader_backend not in ("auto", "python"):
+            raise ValueError("Rust backends apply only to the gpt-lab loader")
         if resume_state is not None and resume_state.packing_signature is not None:
             raise ValueError("Cannot resume a native dataloader checkpoint with nanochat")
         # This is the original dataloader from nanochat, from which I derived the pipeline for gpt-lab.
@@ -447,6 +554,8 @@ def build_dataloader(
             base_path=Path(datadir or cachedir or DATA_DIR) / name
         )
     else:
+        if tokenizer_batch_size is None and dataloader_backend == "rust-packing":
+            tokenizer_batch_size = 64
         ds = ShardedDataset(
             name=name,
             tokenizer=tokenizer,
@@ -460,6 +569,7 @@ def build_dataloader(
             comp_info=comp_info,
             tokenizer_threads=tokenizer_threads,
             data_seed=data_seed,
+            tokenizer_batch_size=tokenizer_batch_size,
         )
         dataloader = lambda: DistDataLoader(
             ds,
@@ -467,8 +577,8 @@ def build_dataloader(
             seq_len=seq_len,
             device=comp_info.device,
             buffer_size=buffer_size,
+            packing_backend=packing_backend,
+            dataloader_backend=dataloader_backend,
+            packing_strategy=packing_strategy,
         )
-    if split == "val":
-        return dataloader
-    else:
-        return dataloader()
+    return dataloader if split == "val" else dataloader()

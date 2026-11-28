@@ -363,7 +363,13 @@ def test_training_is_callable_without_argparse(training_dependencies, monkeypatc
     deps = training_dependencies
     monkeypatch.setattr('gpt_lab.cli.parser.build_parser', Mock(side_effect=AssertionError('Python training must not parse CLI arguments')))
     train_base(optim_config=deps.profile, depth=4, total_batch_size=128, num_steps=7, stop_after_step=5,
-               device='cpu', board='dummy', random_seed=123)
+               device='cpu', board='dummy', random_seed=123, dataloader_backend='python',
+               tokenizer_batch_size=64, packing_strategy='block-best-fit')
+    assert [call.kwargs['dataloader_backend'] for call in deps.loader.call_args_list] == ['python', 'python']
+    assert [call.kwargs['tokenizer_batch_size'] for call in deps.loader.call_args_list] == [64, 64]
+    train_args, val_args = [call.kwargs for call in deps.loader.call_args_list]
+    assert train_args['split'] == 'train' and train_args['packing_strategy'] == 'block-best-fit'
+    assert val_args['split'] == 'val' and 'packing_strategy' not in val_args
     assert deps.auto.call_args.kwargs['depth'] == 4
     assert deps.auto.call_args.kwargs['total_batch_size'] == 128
     assert deps.auto.call_args.kwargs['n_steps'] == 7

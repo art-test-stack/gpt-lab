@@ -1,6 +1,7 @@
 from argparse import ArgumentParser, Namespace, SUPPRESS
 
-from gpt_lab.cli.options import attention_impl, boolean, cache_dir, checkpoint_step
+from gpt_lab.cli.options import attention_impl, boolean, cache_dir, checkpoint_step, positive_int
+from gpt_lab.rust_tools.dataloader import DATALOADER_BACKENDS, PACKING_STRATEGIES
 
 
 def add_common_arguments(parser: ArgumentParser) -> None:
@@ -25,6 +26,9 @@ def add_common_arguments(parser: ArgumentParser) -> None:
     parser.add_argument('--monitor-grad-norms', action='store_true', help='Whether to monitor gradient norms during training. If set, will log the norm of the gradients of each parameter to the board at each training step.')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Batch size for each device during training. Batch size define further effective batch size as device_batch_size * max_seq_len * n_acc_steps.')
     parser.add_argument('--use-nanochat-dataloader', action='store_true', help='Whether to use the nanochat dataloader instead of the default dataloader.')
+    parser.add_argument('--tokenizer-batch-size', type=positive_int, default=None, help='Documents per tokenizer call for train and validation. Unset uses the selected dataloader backend default.')
+    parser.add_argument('--dataloader-backend', choices=DATALOADER_BACKENDS, default='auto', help='Train and validation backend. Auto prefers full Rust for cached text with the gpt-lab tiktoken tokenizer and uses Python for other inputs.')
+    parser.add_argument('--packing-strategy', choices=PACKING_STRATEGIES, default='rolling-16', help='Training packing strategy for Python and full Rust. Validation uses rolling-16.')
     parser.add_argument('--stop-after-step', type=int, default=None, help='Absolute cap on completed optimizer steps, including before resume; >=0. Leaves the scheduling horizon unchanged. Unset retains the saved cap on resume.')
     parser.add_argument('--cuda-graph-mode', choices=('disabled', 'forward_backward'), default=None, help='Opt-in fixed-shape compiled forward/backward CUDA capture (FP32/BF16). Unset retains the saved mode on resume.')
 

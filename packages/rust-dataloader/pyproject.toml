@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "gpt-lab-rust-packer"
+version = "0.1.0"
+description = "Optional native CPU dataloader for gpt-lab"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "gpt_lab_rust_packer"
+features = ["pyo3/extension-module"]
+locked = true
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "build.rs" },
+    { file = "LICENSE" },
+    { file = "src/**/*.rs" },
+]
